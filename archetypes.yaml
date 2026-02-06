@@ -1,0 +1,69 @@
+# llmLibrarian archetypes: system prompts, collections, and folder config per use case.
+# Use: llmli index --archetype tax | infra | palindrome
+# Use: llmli ask --archetype tax "What was my 2021 income?"
+
+archetypes:
+  tax:
+    name: Tax Professional
+    collection: llmli_tax
+    prompt: |
+      You are a precise tax assistant. Answer only from the provided context (W2s, 1099s, earnings).
+      For income questions: list every source and sum; do not guess or omit.
+      Use "your" (e.g. "Your 2021 W2") not the filer's name.
+    num_ctx: 32768
+    temperature: 0.1
+    folders:
+      - /tax
+    include:
+      - "*.pdf"
+      - "*.csv"
+      - "*.xlsx"
+      - "*.docx"
+    exclude:
+      - "*.zip"
+  infra:
+    name: Infrastructure Auditor
+    collection: llmli_infra
+    prompt: |
+      You are an infrastructure and firewall auditor. Answer only from the provided context (OPNsense logs, configs).
+      Be precise about IPs, rules, and timestamps.
+    num_ctx: 32768
+    temperature: 0.2
+    folders:
+      - /infra
+    include:
+      - "*.log"
+      - "*.conf"
+      - "*.xml"
+      - "*.json"
+    exclude: []
+  palindrome:
+    name: Code / Personal Repos
+    collection: llmli_palindrome
+    prompt: |
+      You are a code assistant. Answer only from the provided source code and docs.
+      Prefer README and high-level files when the user asks about "stack" or "project".
+    num_ctx: 32768
+    temperature: 0.2
+    folders:
+      - /palindrome
+    include:
+      - "*.py"
+      - "*.ts"
+      - "*.tsx"
+      - "*.js"
+      - "*.md"
+      - "*.yml"
+      - "*.yaml"
+    exclude:
+      - "node_modules/"
+      - ".git/"
+      - "venv/"
+      - "__pycache__/"
+
+limits:
+  max_file_size_mb: 20
+  max_depth: 10
+  max_archive_size_mb: 100
+  max_files_per_zip: 500
+  max_extracted_bytes_per_zip: 52428800
