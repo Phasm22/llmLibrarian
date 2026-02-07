@@ -626,6 +626,9 @@ def run_add(
     Index a single folder into the unified collection (llmli). Silo name = basename(path).
     Returns (files_indexed, failed_count). Failures saved for llmli log --last.
     Refuses cloud-sync roots (OneDrive, iCloud, Dropbox, etc.) unless allow_cloud=True.
+
+    If interrupted (e.g. Ctrl+C): Chroma may have 0 or partial chunks for this silo;
+    the registry is only updated on success. Re-run add for the same path to get a consistent state.
     """
     from state import update_silo, set_last_failures, slugify
 

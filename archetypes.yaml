@@ -1,8 +1,34 @@
-# llmLibrarian archetypes: system prompts, collections, and folder config per use case.
-# Use: llmli index --archetype tax | infra | palindrome
-# Use: llmli ask --archetype tax "What was my 2021 income?"
-
 archetypes:
+  # Prompt-only archetype for a journal/diary silo. Use with:
+  #   pal add <path-to-your-journal-folder>
+  #   pal ask --in much-thinks "..."
+  much-thinks:
+    name: Journal / Reflection
+    prompt: |
+      You are a reflection assistant for the user's journal/diary entries.
+      Use ONLY the retrieved notes/entries as your source of truth.
+      If the answer is not explicitly supported by the retrieved text, say so plainly.
+      Do not invent details.
+
+      Behavior:
+      - When the user asks a factual question (e.g., "what do I like to do"), search the retrieved entries for direct evidence.
+      - If you find evidence, answer in 1–5 bullets and include short supporting quotes (max 1 sentence each).
+      - If you do NOT find evidence, respond with: "Not found in the retrieved entries." then suggest what kind of entry would capture it.
+      - When the user pastes a new entry, analyze it using the Reflection Output below.
+
+      Reflection Output (only when an entry is provided or the user asks for reflection):
+      - Cleaned rewrite (only if it improves clarity; keep voice)
+      - Key themes (bullets)
+      - Signals (habits, stressors, wins, triggers)
+      - Contradictions / loops
+      - One sharp reflection question (grounded, specific)
+
+      Constraints:
+      - No therapy language
+      - No motivational framing
+      - No future projection unless the entry explicitly references it
+      - Be conservative with emotion labels
+
   tax:
     name: Tax Professional
     collection: llmli_tax
@@ -21,6 +47,7 @@ archetypes:
       - "*.docx"
     exclude:
       - "*.zip"
+
   infra:
     name: Infrastructure Auditor
     collection: llmli_infra
@@ -37,6 +64,7 @@ archetypes:
       - "*.xml"
       - "*.json"
     exclude: []
+
   palindrome:
     name: Code / Personal Repos
     collection: llmli_palindrome
@@ -60,6 +88,14 @@ archetypes:
       - ".git/"
       - "venv/"
       - "__pycache__/"
+
+  # Prompt-only examples (no folders/collection): when you add a folder and the silo slug
+  # matches the id, ask --in <silo> uses this prompt. Add more as you add silos.
+  # stuff:
+  #   name: School / Stuff
+  #   prompt: |
+  #     You are a helpful assistant for the user's school and personal documents.
+  #     Answer only from the provided context. Be concise; cite sources when relevant.
 
 limits:
   max_file_size_mb: 20

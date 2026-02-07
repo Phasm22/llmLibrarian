@@ -32,3 +32,14 @@ def get_archetype(config: dict[str, Any], archetype_id: str) -> dict[str, Any]:
     arch.setdefault("collection", f"llmli_{archetype_id}")
     arch.setdefault("name", archetype_id)
     return arch
+
+
+def get_archetype_optional(config: dict[str, Any], archetype_id: str) -> dict[str, Any] | None:
+    """Get archetype by id if present; else None. Use for prompt-only lookup (e.g. silo-scoped ask)."""
+    archs = config.get("archetypes") or {}
+    if archetype_id not in archs:
+        return None
+    arch = dict(archs[archetype_id])
+    arch.setdefault("collection", f"llmli_{archetype_id}")
+    arch.setdefault("name", archetype_id)
+    return arch
