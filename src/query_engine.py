@@ -4,9 +4,11 @@ Returns answer + "Answered by: <name>" + Sources (path, snippet, line/page).
 Optional ANSI styling when stdout is a TTY (see style.use_color).
 """
 import json
+import math
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,12 +30,18 @@ DEFAULT_N_RESULTS = 12
 DEFAULT_MODEL = "llama3.1:8b"
 SNIPPET_MAX_LEN = 180  # one-line preview
 
+# Relevance gate: if all retrieved chunks have distance above this (Chroma L2), skip LLM. Env: LLMLIBRARIAN_RELEVANCE_MAX_DISTANCE.
+DEFAULT_RELEVANCE_MAX_DISTANCE = 2.0
+# Diversity: max chunks per file so one big file doesn't dominate context.
+MAX_CHUNKS_PER_FILE = 4
+
 # Intent routing: silent, no CLI flags. Used to choose retrieval K and evidence handling.
 INTENT_LOOKUP = "LOOKUP"
 INTENT_EVIDENCE_PROFILE = "EVIDENCE_PROFILE"
 INTENT_AGGREGATE = "AGGREGATE"
 INTENT_REFLECT = "REFLECT"
 INTENT_CODE_LANGUAGE = "CODE_LANGUAGE"
+INTENT_CAPABILITIES = "CAPABILITIES"
 
 # EVIDENCE_PROFILE / AGGREGATE: wider retrieval (cap). n_results from CLI is still the final context size.
 K_PROFILE_MIN = 48
@@ -71,11 +79,75 @@ EXT_TO_LANG: dict[str, str] = {
 }
 
 
+def _relevance_max_distance() -> float:
+    """Max Chroma distance below which we consider chunks relevant. Env LLMLIBRARIAN_RELEVANCE_MAX_DISTANCE; conservative default."""
+    try:
+        v = os.environ.get("LLMLIBRARIAN_RELEVANCE_MAX_DISTANCE")
+        if v is not None:
+            return float(v)
+    except (ValueError, TypeError):
+        pass
+    return DEFAULT_RELEVANCE_MAX_DISTANCE
+
+
+def _all_dists_above_threshold(dists: list[float | None], threshold: float) -> bool:
+    """True if we have at least one distance and every non-None distance is > threshold (no chunk passed relevance bar)."""
+    non_none = [d for d in dists if d is not None]
+    if not non_none:
+        return False
+    return all(d > threshold for d in non_none)
+
+
+def _query_implies_recency(query: str) -> bool:
+    """True if the query asks for latest/current/recent or a time range (so recency tie-breaker is applied)."""
+    q = (query or "").strip().lower()
+    return bool(
+        re.search(
+            r"\b(?:latest|current|now|today|most\s+recent|recently)\b|"
+            r"\bthis\s+(?:year|month|semester)\b|\blast\s+(?:year|semester|month)\b|"
+            r"\bin\s+20\d{2}\b",
+            q,
+        )
+    )
+
+
+def _recency_score(mtime: float, half_life_days: float = 365.0) -> float:
+    """Decay from 1.0 (recent) to 0 (old). mtime = file mtime (seconds since epoch)."""
+    if mtime <= 0:
+        return 0.0
+    try:
+        now = datetime.now(timezone.utc).timestamp()
+        age_days = (now - float(mtime)) / 86400.0
+        return math.exp(-0.693 * age_days / half_life_days)
+    except (ValueError, TypeError, OSError):
+        return 0.0
+
+
+# Doc_type bonus for recency re-rank (authoritative types slightly boosted). Small values so similarity still dominates.
+DOC_TYPE_BONUS: dict[str, float] = {
+    "transcript": 0.15,
+    "audit": 0.15,
+    "tax_return": 0.15,
+    "syllabus": 0.08,
+    "paper": 0.05,
+    "homework": 0.05,
+    "other": 0.0,
+}
+RECENCY_WEIGHT = 0.15  # w in final_score = sim_score + w * recency_score (+ doc_type bonus)
+
+
 def _route_intent(query: str) -> str:
-    """Silent router: LOOKUP | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE. No user-facing flags."""
+    """Silent router: LOOKUP | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES. No user-facing flags."""
     q = query.strip().lower()
     if not q:
         return INTENT_LOOKUP
+    # CAPABILITIES: supported file types / formats / what can you index (source of truth, no RAG)
+    if re.search(
+        r"\bsupported\s+(?:file\s+)?(?:types?|formats?)\b|\bwhat\s+(?:file\s+)?(?:types?|formats?)\b|"
+        r"\bwhat\s+can\s+you\s+index\b|\bcapabilities\b|\bwhat\s+formats?\b",
+        q,
+    ):
+        return INTENT_CAPABILITIES
     # CODE_LANGUAGE: most common / primary / dominant coding language (deterministic count by extension)
     if re.search(
         r"\bmost common\s+(?:coding\s+)?(?:programming\s+)?language\b|\bmost used\s+(?:coding\s+)?language\b|"
@@ -457,6 +529,31 @@ def _diversify_by_source(
     return out_docs, out_metas, out_dists
 
 
+def _dedup_by_chunk_hash(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    """Keep first occurrence of each chunk_hash; drop later duplicates. Optional (env LLMLIBRARIAN_DEDUP_CHUNK_HASH=1)."""
+    if os.environ.get("LLMLIBRARIAN_DEDUP_CHUNK_HASH", "").strip().lower() not in ("1", "true", "yes"):
+        return docs, metas, dists
+    seen: set[str] = set()
+    out_docs: list[str] = []
+    out_metas: list[dict | None] = []
+    out_dists: list[float | None] = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else None
+        ch = (meta or {}).get("chunk_hash") or ""
+        if ch and ch in seen:
+            continue
+        if ch:
+            seen.add(ch)
+        out_docs.append(doc)
+        out_metas.append(meta)
+        out_dists.append(dists[i] if i < len(dists) else None)
+    return out_docs, out_metas, out_dists
+
+
 def _format_source(
     doc: str,
     meta: dict | None,
@@ -539,6 +636,9 @@ def run_ask(
             "If the context does not contain the answer, state that clearly but remain helpful."
         )
         source_label = arch.get("name") or archetype_id
+    # Today anchor: phrasing only (avoid "today/yesterday" confusion); not retrieval bias
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    system_prompt = system_prompt.rstrip() + f"\n\nToday's date: {today_str}. Use it only for phrasing time-sensitive answers; do not treat it as retrieval bias."
     if strict:
         system_prompt = (
             system_prompt.rstrip()
@@ -555,6 +655,16 @@ def run_ask(
     # Silent intent routing: choose retrieval K and evidence handling (no new CLI flags)
     t0 = time.perf_counter()
     intent = _route_intent(query)
+    # CAPABILITIES: return deterministic report inline (source of truth; no retrieval, no LLM)
+    if intent == INTENT_CAPABILITIES and use_unified:
+        try:
+            from ingest import get_capabilities_text
+            cap_text = get_capabilities_text()
+        except Exception:
+            cap_text = "Could not load capabilities."
+        out_lines = [cap_text, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label} (capabilities)")]
+        return "\n".join(out_lines)
+
     n_effective = _effective_k(intent, n_results)
     if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE):
         n_stage1 = max(n_effective, RERANK_STAGE1_N if use_reranker else 60)
@@ -668,14 +778,53 @@ def run_ask(
         dists = [c[2] for c in combined]
 
     # Diversify by source: cap chunks per file so one huge file (e.g. Closed Traffic.txt) doesn't crowd out others
-    docs, metas, dists = _diversify_by_source(docs, metas, dists, n_results, max_per_source=2)
+    docs, metas, dists = _diversify_by_source(docs, metas, dists, n_results, max_per_source=MAX_CHUNKS_PER_FILE)
+    docs, metas, dists = _dedup_by_chunk_hash(docs, metas, dists)
+
+    # Recency + doc_type tie-breaker: only when query implies recency; apply after diversity so caps are preserved
+    if docs and _query_implies_recency(query):
+        combined_list: list[tuple[float, str, dict | None, float | None]] = []
+        for i, doc in enumerate(docs):
+            meta = metas[i] if i < len(metas) else None
+            dist = dists[i] if i < len(dists) else None
+            sim = 1.0 / (1.0 + float(dist)) if dist is not None else 0.0
+            mtime = (meta or {}).get("mtime")
+            rec = _recency_score(float(mtime) if mtime is not None else 0.0)
+            dt = (meta or {}).get("doc_type") or "other"
+            bonus = DOC_TYPE_BONUS.get(dt, 0.0)
+            score = sim + RECENCY_WEIGHT * rec + bonus
+            combined_list.append((score, doc, meta, dist))
+        combined_list.sort(key=lambda x: -x[0])
+        combined_list = combined_list[:n_results]
+        docs = [x[1] for x in combined_list]
+        metas = [x[2] for x in combined_list]
+        dists = [x[3] for x in combined_list]
 
     if not docs:
         if use_unified:
             return f"No indexed content for {source_label}. Run: llmli add <path>"
         return f"No indexed content for {source_label}. Run: index --archetype {archetype_id}"
 
-    # Prefix each chunk with source path (and line). When querying all silos (no --in), show silo so the model can compare across sources.
+    # Relevance gate: if no chunk passes the bar, skip LLM (avoid confidently wrong answers)
+    threshold = _relevance_max_distance()
+    if _all_dists_above_threshold(dists, threshold):
+        return (
+            "I don't have relevant content for that. Try rephrasing or adding more specific documents (llmli add).\n\n"
+            + dim(no_color, "---") + "\n"
+            + label_style(no_color, f"Answered by: {source_label}")
+        )
+
+    # Exhaustive-list heuristic: when strict and query asks for a complete list but we have few sources, caveat
+    unique_sources = len({(m or {}).get("source") or "" for m in metas})
+    if strict and unique_sources <= 2 and re.search(
+        r"\b(?:list\s+all|every|complete\s+list|all\s+my\s+\w+)\b", query, re.IGNORECASE
+    ):
+        system_prompt = (
+            system_prompt.rstrip()
+            + f"\n\nI can't prove completeness; only {unique_sources} source(s) in context."
+        )
+
+    # Standardized context packaging: file, mtime, silo, doc_type, snippet (helps model and debugging)
     show_silo_in_context = use_unified and silo is None
     def _context_block(doc: str, meta: dict | None, show_silo: bool = False) -> str:
         m = meta or {}
@@ -684,8 +833,19 @@ def run_ask(
         line = m.get("line_start")
         page = m.get("page")
         loc = f" (line {line})" if line is not None else f" (page {page})" if page is not None else ""
-        silo_tag = f"[silo: {m.get('silo', '?')}] " if show_silo and m.get("silo") else ""
-        header = f"{silo_tag}[{short}{loc}]"
+        mtime = m.get("mtime")
+        if mtime is not None:
+            try:
+                mt = datetime.fromtimestamp(float(mtime), tz=timezone.utc).strftime("%Y-%m-%d")
+            except (ValueError, TypeError, OSError):
+                mt = str(mtime)
+        else:
+            mt = "?"
+        silo_val = m.get("silo") or "?"
+        doc_type = m.get("doc_type") or "other"
+        header = f"file={short}{loc} mtime={mt} silo={silo_val} doc_type={doc_type}"
+        if show_silo and m.get("silo"):
+            header = f"[silo: {m.get('silo')}] " + header
         return f"{header}\n{(doc or '')[:1000]}"
     context = "\n---\n".join(_context_block(docs[i], metas[i] if i < len(metas) else None, show_silo_in_context) for i, d in enumerate(docs) if d)
     user_prompt = f"Using ONLY the following context, answer: {query}\n\nContext:\n{context}"

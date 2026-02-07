@@ -92,6 +92,11 @@ def cmd_log(args: argparse.Namespace) -> int:
     return _run_llmli(["log", "--last"])
 
 
+def cmd_capabilities(args: argparse.Namespace) -> int:
+    """Delegate to llmli capabilities (supported file types and extractors)."""
+    return _run_llmli(["capabilities"])
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     """Show silo details and top files by chunk count (llmli inspect)."""
     silo = getattr(args, "silo", None)
@@ -120,7 +125,7 @@ def cmd_tool(args: argparse.Namespace) -> int:
     return 1
 
 
-KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "tool"})
+KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "tool"})
 
 
 def main() -> int:
@@ -163,6 +168,9 @@ def main() -> int:
 
     p_log = sub.add_parser("log", help="Last failures (llmli log --last)")
     p_log.set_defaults(_run=cmd_log)
+
+    p_capabilities = sub.add_parser("capabilities", help="Supported file types and extractors (llmli capabilities)")
+    p_capabilities.set_defaults(_run=cmd_capabilities)
 
     p_tool = sub.add_parser("tool", help="Passthrough to tool: pal tool llmli <args...>")
     p_tool.add_argument("tool_name", help="Tool name (e.g. llmli)")

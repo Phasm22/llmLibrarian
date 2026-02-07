@@ -145,6 +145,13 @@ def cmd_rm(args: argparse.Namespace) -> int:
         print(f"Removed chunks and file registry for silo: {slug_to_clean} (was not in silo list)")
     return 0
 
+def cmd_capabilities(args: argparse.Namespace) -> int:
+    """Print supported file types and extractors (source of truth). No LLM, no retrieval."""
+    from ingest import get_capabilities_text
+    print(get_capabilities_text())
+    return 0
+
+
 def cmd_log(args: argparse.Namespace) -> int:
     """Show last index/add failures (from llmli add)."""
     from state import get_last_failures
@@ -188,12 +195,21 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         result = coll.get(where={"silo": slug}, include=["metadatas"])
         metas = result.get("metadatas") or []
         by_source: dict[str, int] = {}
+        source_to_hash: dict[str, str] = {}
         for m in metas:
-            src = (m or {}).get("source") or "?"
+            meta = m or {}
+            src = meta.get("source") or "?"
             by_source[src] = by_source.get(src, 0) + 1
+            if src not in source_to_hash and meta.get("file_hash"):
+                source_to_hash[src] = meta["file_hash"]
         if not by_source:
             print("No indexed files (chunks) found for this silo in the store.")
             return 0
+        # Group by file_hash to mark duplicates (same content, different path)
+        hash_to_sources: dict[str, list[str]] = {}
+        for s, h in source_to_hash.items():
+            if h:
+                hash_to_sources.setdefault(h, []).append(s)
         ext_filter = getattr(args, "filter", None)
         if ext_filter == "pdf":
             by_source = {s: c for s, c in by_source.items() if s.lower().endswith(".pdf")}
@@ -208,7 +224,12 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         sorted_sources = sorted(by_source.items(), key=lambda x: -x[1])[:top_n]
         for src, count in sorted_sources:
             short = src if len(src) <= 72 else "..." + src[-69:]
-            print(f"  {count:6d} chunks  {short}")
+            dup_note = ""
+            h = source_to_hash.get(src)
+            if h and len(hash_to_sources.get(h, [])) > 1:
+                others = [s for s in hash_to_sources[h] if s != src]
+                dup_note = f"  [same content as {len(others)} other file(s)]"
+            print(f"  {count:6d} chunks  {short}{dup_note}")
     except Exception as e:
         print(f"Error reading store: {e}", file=sys.stderr)
         return 1
@@ -216,7 +237,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="llmli", description="llmLibrarian CLI: add, ask, ls, inspect, index, rm, log")
+    parser = argparse.ArgumentParser(prog="llmli", description="llmLibrarian CLI: add, ask, ls, inspect, index, rm, capabilities, log")
     parser.add_argument("--db", default=os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"), help="DB path")
     parser.add_argument("--config", help="Path to archetypes.yaml")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color")
@@ -262,6 +283,10 @@ def main() -> int:
     p_rm = sub.add_parser("rm", help="Remove silo (registry + chunks)")
     p_rm.add_argument("silo", help="Silo slug or display name")
     p_rm.set_defaults(_run=cmd_rm)
+
+    # capabilities
+    p_capabilities = sub.add_parser("capabilities", help="Supported file types and document extractors (source of truth)")
+    p_capabilities.set_defaults(_run=cmd_capabilities)
 
     # log [--last]
     p_log = sub.add_parser("log", help="Show last add failures")

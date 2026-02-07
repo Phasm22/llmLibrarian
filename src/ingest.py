@@ -66,6 +66,27 @@ ZIP_TEXT_EXTENSIONS = frozenset(
 )
 
 
+def get_capabilities_text() -> str:
+    """Deterministic report: supported extensions and document extractors. Source of truth for llmli capabilities and ask routing."""
+    exts = sorted({p.replace("*", "") for p in ADD_DEFAULT_INCLUDE if p.startswith("*.")})
+    lines = ["Supported file extensions (indexed by llmli add):", "  " + ", ".join(exts), ""]
+    lines.append("Document extractors:")
+    lines.append("  PDF: yes (pymupdf)")
+    lines.append("  DOCX: yes (python-docx)")
+    lines.append("  ZIP: yes (PDF/DOCX/XLSX/PPTX + text inside)")
+    try:
+        import openpyxl  # noqa: F401
+        lines.append("  XLSX: yes (openpyxl)")
+    except ImportError:
+        lines.append("  XLSX: no (install openpyxl for text extraction)")
+    try:
+        from pptx import Presentation  # noqa: F401
+        lines.append("  PPTX: yes (python-pptx)")
+    except ImportError:
+        lines.append("  PPTX: no (install python-pptx for text extraction)")
+    return "\n".join(lines)
+
+
 def _doc_type_from_path(path_str: str) -> str:
     """Tag by filename/path for evidence preference (transcript > audit > syllabus etc.). No ML."""
     p = (path_str or "").lower()
