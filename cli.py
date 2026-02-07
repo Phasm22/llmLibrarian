@@ -50,14 +50,15 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if archetype and in_silo:
         print("Error: use either --archetype or --in, not both.", file=sys.stderr)
         return 1
-    if in_silo:
+    unified = getattr(args, "unified", False)
+    if in_silo and not unified:
         db = _db_path(args)
         silo_slug = resolve_silo_to_slug(db, in_silo) or in_silo  # accept slug or display name
         archetype = None  # unified collection, filter by silo
     else:
-        silo_slug = None
+        silo_slug = None  # query all silos (unified)
         if not archetype:
-            archetype = None  # unified collection, all silos
+            archetype = None
     out = run_ask(
         archetype,
         " ".join(args.query),
@@ -67,6 +68,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
         no_color=args.no_color,
         silo=silo_slug,
         db_path=_db_path(args),
+        strict=getattr(args, "strict", False),
     )
     print(out)
     return 0
@@ -115,27 +117,32 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 1
 
 def cmd_rm(args: argparse.Namespace) -> int:
-    """Remove a silo from the registry and delete its chunks. Accepts slug or display name."""
+    """Remove a silo from the registry and delete its chunks. Accepts slug or display name.
+    If the silo is not in the silo list, still removes Chroma chunks and file-registry entries
+    for that slug (fixes orphaned 'desktop' etc.)."""
     silo = getattr(args, "silo", None)
     if not silo:
         print("Error: rm requires silo name as positional argument. Example: llmli rm tax", file=sys.stderr)
         return 1
-    from state import remove_silo
+    from state import remove_silo, slugify
     from indexer import LLMLI_COLLECTION, DB_PATH
+    from ingest import _file_registry_remove_silo
     import chromadb
     from chromadb.config import Settings
     db = _db_path(args)
     removed_slug = remove_silo(db, silo)
-    if removed_slug is None:
-        print(f"Error: silo not found: {silo}", file=sys.stderr)
-        return 1
+    slug_to_clean = removed_slug if removed_slug is not None else slugify(silo)
     try:
         client = chromadb.PersistentClient(path=str(db), settings=Settings(anonymized_telemetry=False))
         coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
-        coll.delete(where={"silo": removed_slug})
+        coll.delete(where={"silo": slug_to_clean})
     except Exception as e:
         print(f"Warning: could not delete chunks from DB: {e}", file=sys.stderr)
-    print(f"Removed silo: {removed_slug}")
+    _file_registry_remove_silo(db, slug_to_clean)
+    if removed_slug is not None:
+        print(f"Removed silo: {removed_slug}")
+    else:
+        print(f"Removed chunks and file registry for silo: {slug_to_clean} (was not in silo list)")
     return 0
 
 def cmd_log(args: argparse.Namespace) -> int:
@@ -187,9 +194,19 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         if not by_source:
             print("No indexed files (chunks) found for this silo in the store.")
             return 0
-        print(f"Indexed files: {len(by_source)}")
-        # Sort by chunk count descending so biggest files are first
-        for src, count in sorted(by_source.items(), key=lambda x: -x[1]):
+        ext_filter = getattr(args, "filter", None)
+        if ext_filter == "pdf":
+            by_source = {s: c for s, c in by_source.items() if s.lower().endswith(".pdf")}
+        elif ext_filter == "docx":
+            by_source = {s: c for s, c in by_source.items() if s.lower().endswith(".docx")}
+        elif ext_filter == "code":
+            code_exts = (".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cpp", ".cs", ".rb", ".sh", ".md", ".txt", ".yml", ".yaml")
+            by_source = {s: c for s, c in by_source.items() if any(s.lower().endswith(e) for e in code_exts)}
+        top_n = max(1, getattr(args, "top", 20))
+        total_files = len(by_source)
+        print(f"Indexed files: {total_files}" + (f" (showing top {top_n})" if total_files > top_n else ""))
+        sorted_sources = sorted(by_source.items(), key=lambda x: -x[1])[:top_n]
+        for src, count in sorted_sources:
             short = src if len(src) <= 72 else "..." + src[-69:]
             print(f"  {count:6d} chunks  {short}")
     except Exception as e:
@@ -212,10 +229,12 @@ def main() -> int:
     p_add.set_defaults(db=None)
     p_add.set_defaults(_run=cmd_add)
 
-    # ask [--archetype X | --in <silo>] <query...>  (default: unified llmli collection)
+    # ask [--archetype X | --in <silo>] [--strict] <query...>  (default: unified llmli collection)
     p_ask = sub.add_parser("ask", help="Ask (unified llmli by default; or archetype / --in silo)")
     p_ask.add_argument("--archetype", "-a", help="Archetype id (e.g. tax, infra)")
-    p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to silo (slug or display name)")
+    p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to one silo (slug or display name)")
+    p_ask.add_argument("--unified", action="store_true", help="Search across all silos (compare/analyze across indexed content)")
+    p_ask.add_argument("--strict", action="store_true", help="Never conclude absence from partial evidence; say unknown + sources when unsure")
     p_ask.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.1:8b)")
     p_ask.add_argument("--n-results", type=int, default=12, help="Retrieval count")
     p_ask.add_argument("query", nargs="+", help="Question")
@@ -225,9 +244,11 @@ def main() -> int:
     p_ls = sub.add_parser("ls", help="List silos")
     p_ls.set_defaults(_run=cmd_ls)
 
-    # inspect <silo>
-    p_inspect = sub.add_parser("inspect", help="Show silo details and per-file chunk counts")
+    # inspect <silo> [--top N] [--filter pdf|docx|code]
+    p_inspect = sub.add_parser("inspect", help="Show silo details and top files by chunk count (default: top 20)")
     p_inspect.add_argument("silo", help="Silo slug or display name")
+    p_inspect.add_argument("--top", type=int, default=20, help="Show top N chunkiest files (default: 20)")
+    p_inspect.add_argument("--filter", choices=["pdf", "docx", "code"], help="Show only this type (pdf, docx, or code)")
     p_inspect.set_defaults(_run=cmd_inspect)
 
     # index --archetype X

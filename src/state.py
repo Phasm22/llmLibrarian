@@ -51,8 +51,9 @@ def update_silo(
     chunks_count: int,
     updated_iso: str,
     display_name: str | None = None,
+    language_stats: dict | None = None,
 ) -> None:
-    """Record silo after add. Uses slug as key; display_name = original folder name."""
+    """Record silo after add. Uses slug as key; display_name = original folder name. language_stats optional for CODE_LANGUAGE pipeline."""
     reg = _read_registry(db_path)
     reg[slug] = {
         "slug": slug,
@@ -62,6 +63,8 @@ def update_silo(
         "chunks_count": chunks_count,
         "updated": updated_iso,
     }
+    if language_stats is not None:
+        reg[slug]["language_stats"] = language_stats
     _write_registry(db_path, reg)
 
 def list_silos(db_path: str | Path) -> list[dict[str, Any]]:

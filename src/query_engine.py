@@ -33,6 +33,7 @@ INTENT_LOOKUP = "LOOKUP"
 INTENT_EVIDENCE_PROFILE = "EVIDENCE_PROFILE"
 INTENT_AGGREGATE = "AGGREGATE"
 INTENT_REFLECT = "REFLECT"
+INTENT_CODE_LANGUAGE = "CODE_LANGUAGE"
 
 # EVIDENCE_PROFILE / AGGREGATE: wider retrieval (cap). n_results from CLI is still the final context size.
 K_PROFILE_MIN = 48
@@ -58,12 +59,32 @@ PROFILE_LEXICAL_PHRASES = [
 RRF_K = 60  # Reciprocal Rank Fusion constant
 MAX_LEXICAL_FOR_RRF = 200  # cap lexical get() results for RRF
 
+# CODE_LANGUAGE: only count actual code files (not PDF/DOCX/syllabi that mention languages)
+CODE_EXTENSIONS = frozenset(
+    {".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".sh", ".bash", ".zsh", ".php", ".kt", ".sql"}
+)
+EXT_TO_LANG: dict[str, str] = {
+    ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript", ".tsx": "TSX", ".jsx": "JSX",
+    ".mjs": "JavaScript", ".cjs": "JavaScript", ".go": "Go", ".rs": "Rust", ".java": "Java",
+    ".c": "C", ".cpp": "C++", ".h": "C", ".hpp": "C++", ".cs": "C#", ".rb": "Ruby",
+    ".sh": "Shell", ".bash": "Bash", ".zsh": "Zsh", ".php": "PHP", ".kt": "Kotlin", ".sql": "SQL",
+}
+
 
 def _route_intent(query: str) -> str:
-    """Silent router: LOOKUP | EVIDENCE_PROFILE | AGGREGATE | REFLECT. No user-facing flags."""
+    """Silent router: LOOKUP | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE. No user-facing flags."""
     q = query.strip().lower()
     if not q:
         return INTENT_LOOKUP
+    # CODE_LANGUAGE: most common / primary / dominant coding language (deterministic count by extension)
+    if re.search(
+        r"\bmost common\s+(?:coding\s+)?(?:programming\s+)?language\b|\bmost used\s+(?:coding\s+)?language\b|"
+        r"\b(?:my )?primary\s+(?:coding\s+)?language\b|\bdominant\s+(?:coding\s+)?language\b|"
+        r"\bwhat (?:language|lang)\s+(?:do i\s+)?(?:code|program)\s+(?:in\s+)?(?:the\s+)?most\b|"
+        r"\bwhat (?:is|'s)\s+my most common\s+(?:coding\s+)?language\b",
+        q,
+    ):
+        return INTENT_CODE_LANGUAGE
     # REFLECT: analyze / reflect on (often short or pasted)
     if re.search(r"\breflect\b|\bsummarize\s+this\b|\banalyze\s+this\b", q) and len(q) < 120:
         return INTENT_REFLECT
@@ -82,6 +103,98 @@ def _route_intent(query: str) -> str:
     ):
         return INTENT_AGGREGATE
     return INTENT_LOOKUP
+
+
+def _get_code_language_stats_from_registry(db_path: str | Path, silo: str | None) -> tuple[dict[str, int], dict[str, list[str]]] | None:
+    """Return (by_ext, sample_paths) from registry language_stats, or None if not available. silo=None = aggregate all silos."""
+    try:
+        from state import list_silos
+        silos = list_silos(db_path)
+    except Exception:
+        return None
+    if silo:
+        silos = [s for s in silos if s.get("slug") == silo]
+    by_ext: dict[str, int] = {}
+    sample_paths: dict[str, list[str]] = {}
+    for s in silos:
+        ls = (s or {}).get("language_stats")
+        if not ls or not isinstance(ls, dict):
+            continue
+        ext_counts = ls.get("by_ext") or ls
+        if isinstance(ext_counts.get("by_ext"), dict):
+            ext_counts = ext_counts["by_ext"]
+        samples = (ls.get("sample_paths") or {}) if isinstance(ls.get("sample_paths"), dict) else {}
+        for ext, count in (ext_counts or {}).items():
+            if ext in CODE_EXTENSIONS and isinstance(count, (int, float)):
+                by_ext[ext] = by_ext.get(ext, 0) + int(count)
+        for ext, paths in (samples or {}).items():
+            if ext not in sample_paths:
+                sample_paths[ext] = []
+            for p in (paths if isinstance(paths, list) else [paths])[:3]:
+                if p and p not in sample_paths[ext]:
+                    sample_paths[ext].append(p)
+    if not by_ext:
+        return None
+    return (by_ext, sample_paths)
+
+
+def _compute_code_language_from_chroma(
+    collection: Any,
+    silo: str | None,
+) -> tuple[dict[str, int], dict[str, list[str]]]:
+    """Get unique source paths from Chroma for scope (silo or all), filter to code exts, count and sample."""
+    try:
+        kw: dict = {"include": ["metadatas"]}
+        if silo:
+            kw["where"] = {"silo": silo}
+        res = collection.get(**kw)
+    except Exception:
+        return ({}, {})
+    metas = res.get("metadatas") or []
+    unique_by_ext: dict[str, set[str]] = {}
+    for m in metas:
+        src = (m or {}).get("source") or ""
+        if not src:
+            continue
+        ext = Path(src).suffix.lower()
+        if ext not in CODE_EXTENSIONS:
+            continue
+        unique_by_ext.setdefault(ext, set()).add(src)
+    by_ext = {ext: len(paths) for ext, paths in unique_by_ext.items()}
+    sample_paths = {ext: list(paths)[:3] for ext, paths in unique_by_ext.items()}
+    return (by_ext, sample_paths)
+
+
+def _format_code_language_answer(
+    by_ext: dict[str, int],
+    sample_paths: dict[str, list[str]],
+    source_label: str,
+    no_color: bool,
+) -> str:
+    """Format deterministic 'most common language' answer: top language, top 3, 3 sample paths."""
+    if not by_ext:
+        return f"No code files found for {source_label}. Add code (e.g. .py, .js) with: llmli add <path>"
+    sorted_exts = sorted(by_ext.keys(), key=lambda e: -by_ext[e])
+    top_ext = sorted_exts[0]
+    lang_name = EXT_TO_LANG.get(top_ext, top_ext)
+    count = by_ext[top_ext]
+    lines = [
+        bold(no_color, f"Most common coding language: {lang_name} ({count} file{'s' if count != 1 else ''})"),
+        "",
+        dim(no_color, "Top languages by file count:"),
+    ]
+    for ext in sorted_exts[:5]:
+        name = EXT_TO_LANG.get(ext, ext)
+        lines.append(f"  • {name}: {by_ext[ext]} files")
+    lines.append("")
+    lines.append(dim(no_color, "Sample files (evidence):"))
+    for ext in sorted_exts[:3]:
+        paths = sample_paths.get(ext, [])[:3]
+        for p in paths:
+            short = _shorten_path(p)
+            lines.append(f"  • {short}")
+    lines.extend(["", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")])
+    return "\n".join(lines)
 
 
 def _effective_k(intent: str, n_results: int) -> int:
@@ -385,6 +498,7 @@ def run_ask(
     use_reranker: bool | None = None,
     silo: str | None = None,
     db_path: str | Path | None = None,
+    strict: bool = False,
 ) -> str:
     """Query archetype's collection, or unified llmli collection if archetype_id is None (optional silo filter)."""
     if use_reranker is None:
@@ -425,6 +539,18 @@ def run_ask(
             "If the context does not contain the answer, state that clearly but remain helpful."
         )
         source_label = arch.get("name") or archetype_id
+    if strict:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nStrict mode: Never conclude that something is absent or that a list is complete based on partial evidence. "
+            "If the context does not clearly support a definitive answer (e.g. a full list of classes, payments), say \"I don't have enough evidence to say\" and cite what you do see. "
+            "Suggest what to index next if relevant (e.g. transcript folder, student portal exports)."
+        )
+    if use_unified and silo is None:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nWhen the question asks to compare, contrast, or relate different sources or time periods, use the context from each (and their paths/silos) to support your analysis."
+        )
 
     # Silent intent routing: choose retrieval K and evidence handling (no new CLI flags)
     t0 = time.perf_counter()
@@ -462,6 +588,27 @@ def run_ask(
         name=collection_name,
         embedding_function=ef,
     )
+
+    # CODE_LANGUAGE: deterministic count by extension (code files only). No retrieval, no LLM.
+    if intent == INTENT_CODE_LANGUAGE and use_unified:
+        stats = _get_code_language_stats_from_registry(db, silo)
+        if stats is None:
+            stats = _compute_code_language_from_chroma(collection, silo)
+        by_ext, sample_paths = stats
+        time_ms = (time.perf_counter() - t0) * 1000
+        _write_trace(
+            intent=intent,
+            n_stage1=0,
+            n_results=0,
+            model=model,
+            silo=silo,
+            source_label=source_label,
+            num_docs=0,
+            time_ms=time_ms,
+            query_len=len(query),
+            hybrid_used=False,
+        )
+        return _format_code_language_answer(by_ext, sample_paths, source_label, no_color)
 
     include_ids = intent == INTENT_EVIDENCE_PROFILE and use_unified and silo
     query_kw: dict = {
@@ -528,16 +675,19 @@ def run_ask(
             return f"No indexed content for {source_label}. Run: llmli add <path>"
         return f"No indexed content for {source_label}. Run: index --archetype {archetype_id}"
 
-    # Prefix each chunk with source path (and line) so the model can say where something is defined without guessing
-    def _context_block(doc: str, meta: dict | None) -> str:
-        src = (meta or {}).get("source") or "?"
+    # Prefix each chunk with source path (and line). When querying all silos (no --in), show silo so the model can compare across sources.
+    show_silo_in_context = use_unified and silo is None
+    def _context_block(doc: str, meta: dict | None, show_silo: bool = False) -> str:
+        m = meta or {}
+        src = m.get("source") or "?"
         short = _shorten_path(src)
-        line = (meta or {}).get("line_start")
-        page = (meta or {}).get("page")
+        line = m.get("line_start")
+        page = m.get("page")
         loc = f" (line {line})" if line is not None else f" (page {page})" if page is not None else ""
-        header = f"[{short}{loc}]"
+        silo_tag = f"[silo: {m.get('silo', '?')}] " if show_silo and m.get("silo") else ""
+        header = f"{silo_tag}[{short}{loc}]"
         return f"{header}\n{(doc or '')[:1000]}"
-    context = "\n---\n".join(_context_block(docs[i], metas[i] if i < len(metas) else None) for i, d in enumerate(docs) if d)
+    context = "\n---\n".join(_context_block(docs[i], metas[i] if i < len(metas) else None, show_silo_in_context) for i, d in enumerate(docs) if d)
     user_prompt = f"Using ONLY the following context, answer: {query}\n\nContext:\n{context}"
 
     import ollama

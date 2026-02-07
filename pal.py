@@ -70,10 +70,14 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    """Delegate to llmli ask (unified by default). --in <silo> for scoped ask."""
+    """Delegate to llmli ask (unified by default). --in <silo> for scoped ask; --strict for conservative answers."""
     llmli_args = ["ask"]
-    if getattr(args, "in_silo", None):
+    if getattr(args, "unified", False):
+        llmli_args.append("--unified")
+    if getattr(args, "in_silo", None) and not getattr(args, "unified", False):
         llmli_args.extend(["--in", args.in_silo])
+    if getattr(args, "strict", False):
+        llmli_args.append("--strict")
     llmli_args.extend(args.query)
     return _run_llmli(llmli_args)
 
@@ -89,12 +93,19 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
-    """Show silo details and per-file chunk counts (llmli inspect)."""
+    """Show silo details and top files by chunk count (llmli inspect)."""
     silo = getattr(args, "silo", None)
     if not silo:
         print("Error: inspect requires silo name. Example: pal inspect stuff", file=sys.stderr)
         return 1
-    return _run_llmli(["inspect", silo])
+    llmli_args = ["inspect", silo]
+    top = getattr(args, "top", None)
+    if top is not None:
+        llmli_args.extend(["--top", str(top)])
+    filt = getattr(args, "filter", None)
+    if filt:
+        llmli_args.extend(["--filter", filt])
+    return _run_llmli(llmli_args)
 
 
 def cmd_tool(args: argparse.Namespace) -> int:
@@ -109,10 +120,23 @@ def cmd_tool(args: argparse.Namespace) -> int:
     return 1
 
 
+KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "tool"})
+
+
 def main() -> int:
+    # Default to ask when first arg is not a known subcommand: pal "who is X" or pal who is X → pal ask ...
+    if len(sys.argv) >= 2 and sys.argv[1] not in KNOWN_COMMANDS and not sys.argv[1].startswith("-"):
+        sys.argv.insert(1, "ask")
+
+    # Natural "ask in <silo> ..." → treat as --in <silo> so silo scope isn't eaten as query words
+    if len(sys.argv) >= 4 and sys.argv[1] == "ask" and sys.argv[2].lower() == "in":
+        third = sys.argv[3]
+        if not third.startswith("-") and third:
+            sys.argv[2:4] = ["--in", third]
+
     parser = argparse.ArgumentParser(
         prog="pal",
-        description="Agent CLI: add, ask, ls, log (delegate to llmli); pal tool <name> <args> for passthrough.",
+        description="Agent CLI: add, ask, ls, log (delegate to llmli); pal <question> runs ask.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -121,16 +145,20 @@ def main() -> int:
     p_add.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive")
     p_add.set_defaults(_run=cmd_add)
 
-    p_ask = sub.add_parser("ask", help="Ask (llmli ask, unified by default)")
-    p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to silo")
+    p_ask = sub.add_parser("ask", help="Ask (llmli ask; use --unified to search all silos for comparison)")
+    p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to one silo")
+    p_ask.add_argument("--unified", action="store_true", help="Search across all silos (for compare/thematic questions)")
+    p_ask.add_argument("--strict", action="store_true", help="Conservative: never conclude absence from partial evidence; say 'unknown' + sources when unsure")
     p_ask.add_argument("query", nargs="+", help="Question")
     p_ask.set_defaults(_run=cmd_ask)
 
     p_ls = sub.add_parser("ls", help="List silos (llmli ls)")
     p_ls.set_defaults(_run=cmd_ls)
 
-    p_inspect = sub.add_parser("inspect", help="Silo details and per-file chunk counts (llmli inspect)")
+    p_inspect = sub.add_parser("inspect", help="Silo details and top files by chunk count (llmli inspect)")
     p_inspect.add_argument("silo", help="Silo slug or display name")
+    p_inspect.add_argument("--top", type=int, default=None, help="Show top N files (default: 20; pass to llmli)")
+    p_inspect.add_argument("--filter", choices=["pdf", "docx", "code"], help="Show only pdf, docx, or code")
     p_inspect.set_defaults(_run=cmd_inspect)
 
     p_log = sub.add_parser("log", help="Last failures (llmli log --last)")
