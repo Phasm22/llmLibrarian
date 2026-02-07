@@ -37,16 +37,32 @@ def cmd_add(args: argparse.Namespace) -> int:
         return 1
 
 def cmd_ask(args: argparse.Namespace) -> int:
-    """Query an archetype's collection via Ollama."""
+    """Query an archetype's collection or unified llmli collection (default) via Ollama."""
     from query import run_ask
+    from state import resolve_silo_to_slug
     config = _config_path(args)
+    archetype = getattr(args, "archetype", None)
+    in_silo = getattr(args, "in_silo", None)
+    if archetype and in_silo:
+        print("Error: use either --archetype or --in, not both.", file=sys.stderr)
+        return 1
+    if in_silo:
+        db = _db_path(args)
+        silo_slug = resolve_silo_to_slug(db, in_silo) or in_silo  # accept slug or display name
+        archetype = None  # unified collection, filter by silo
+    else:
+        silo_slug = None
+        if not archetype:
+            archetype = None  # unified collection, all silos
     out = run_ask(
-        args.archetype,
+        archetype,
         " ".join(args.query),
         config_path=config,
         n_results=getattr(args, "n_results", 12),
         model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.1:8b"),
         no_color=args.no_color,
+        silo=silo_slug,
+        db_path=_db_path(args),
     )
     print(out)
     return 0
@@ -62,11 +78,12 @@ def cmd_ls(args: argparse.Namespace) -> int:
         return 0
     for s in silos:
         slug = s.get("slug", "?")
+        display = s.get("display_name", slug)
         path = s.get("path", "?")
         files = s.get("files_indexed", 0)
         chunks = s.get("chunks_count", 0)
         updated = s.get("updated", "")[:19]
-        print(f"  {slug}\t{path}\t{files} files, {chunks} chunks\t{updated}")
+        print(f"  {display} ({slug})\t{path}\t{files} files, {chunks} chunks\t{updated}")
     return 0
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -94,7 +111,7 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 1
 
 def cmd_rm(args: argparse.Namespace) -> int:
-    """Remove a silo from the registry and delete its chunks from the llmli collection."""
+    """Remove a silo from the registry and delete its chunks. Accepts slug or display name."""
     silo = getattr(args, "silo", None)
     if not silo:
         print("Error: rm requires silo name as positional argument. Example: llmli rm tax", file=sys.stderr)
@@ -104,16 +121,17 @@ def cmd_rm(args: argparse.Namespace) -> int:
     import chromadb
     from chromadb.config import Settings
     db = _db_path(args)
-    if not remove_silo(db, silo):
+    removed_slug = remove_silo(db, silo)
+    if removed_slug is None:
         print(f"Error: silo not found: {silo}", file=sys.stderr)
         return 1
     try:
         client = chromadb.PersistentClient(path=str(db), settings=Settings(anonymized_telemetry=False))
         coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
-        coll.delete(where={"silo": silo})
+        coll.delete(where={"silo": removed_slug})
     except Exception as e:
         print(f"Warning: could not delete chunks from DB: {e}", file=sys.stderr)
-    print(f"Removed silo: {silo}")
+    print(f"Removed silo: {removed_slug}")
     return 0
 
 def cmd_log(args: argparse.Namespace) -> int:
@@ -141,9 +159,10 @@ def main() -> int:
     p_add.set_defaults(db=None)
     p_add.set_defaults(_run=cmd_add)
 
-    # ask [--archetype X] <query...>
-    p_ask = sub.add_parser("ask", help="Ask using an archetype's collection")
-    p_ask.add_argument("--archetype", "-a", required=True, help="Archetype id (e.g. tax, infra)")
+    # ask [--archetype X | --in <silo>] <query...>  (default: unified llmli collection)
+    p_ask = sub.add_parser("ask", help="Ask (unified llmli by default; or archetype / --in silo)")
+    p_ask.add_argument("--archetype", "-a", help="Archetype id (e.g. tax, infra)")
+    p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to silo (slug or display name)")
     p_ask.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.1:8b)")
     p_ask.add_argument("--n-results", type=int, default=12, help="Retrieval count")
     p_ask.add_argument("query", nargs="+", help="Question")
@@ -162,11 +181,12 @@ def main() -> int:
 
     # rm <silo>
     p_rm = sub.add_parser("rm", help="Remove silo (registry + chunks)")
-    p_rm.add_argument("silo", help="Silo name (slug)")
+    p_rm.add_argument("silo", help="Silo slug or display name")
     p_rm.set_defaults(_run=cmd_rm)
 
     # log [--last]
     p_log = sub.add_parser("log", help="Show last add failures")
+    p_log.add_argument("--last", action="store_true", help="Show last add failures (default)")
     p_log.set_defaults(_run=cmd_log)
 
     args = parser.parse_args()

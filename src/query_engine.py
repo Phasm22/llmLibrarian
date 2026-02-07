@@ -15,6 +15,11 @@ from load_config import load_config, get_archetype
 from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chunks
 from style import bold, dim, path_style, label_style, code_style, code_block_style
 
+try:
+    from ingest import LLMLI_COLLECTION
+except ImportError:
+    LLMLI_COLLECTION = "llmli"
+
 DB_PATH = "./my_brain_db"
 DEFAULT_N_RESULTS = 12
 DEFAULT_MODEL = "llama3.1:8b"
@@ -98,30 +103,44 @@ def _format_source(
 
 
 def run_ask(
-    archetype_id: str,
+    archetype_id: str | None,
     query: str,
     config_path: str | Path | None = None,
     n_results: int = DEFAULT_N_RESULTS,
     model: str = DEFAULT_MODEL,
     no_color: bool = False,
     use_reranker: bool | None = None,
+    silo: str | None = None,
+    db_path: str | Path | None = None,
 ) -> str:
-    """Query archetype's collection, call Ollama with archetype prompt, return answer + sources text."""
+    """Query archetype's collection, or unified llmli collection if archetype_id is None (optional silo filter)."""
     if use_reranker is None:
         use_reranker = is_reranker_enabled()
 
-    config = load_config(config_path)
-    arch = get_archetype(config, archetype_id)
-    collection_name = arch["collection"]
-    base_prompt = arch.get("prompt") or "Answer only from the provided context. Be concise."
-    system_prompt = (
-        base_prompt
-        + "\n\nAddress the user as 'you' and 'your' (e.g. 'Your 1099', not 'Tandon's 1099'). "
-        "If the context does not contain the answer, state that clearly but remain helpful."
-    )
+    db = str(db_path or DB_PATH)
+    use_unified = archetype_id is None
+
+    if use_unified:
+        collection_name = LLMLI_COLLECTION
+        system_prompt = (
+            "Answer only from the provided context. Be concise. "
+            "Address the user as 'you'. If the context does not contain the answer, state that clearly but remain helpful."
+        )
+        source_label = silo or "llmli"
+    else:
+        config = load_config(config_path)
+        arch = get_archetype(config, archetype_id)
+        collection_name = arch["collection"]
+        base_prompt = arch.get("prompt") or "Answer only from the provided context. Be concise."
+        system_prompt = (
+            base_prompt
+            + "\n\nAddress the user as 'you' and 'your' (e.g. 'Your 1099', not 'Tandon's 1099'). "
+            "If the context does not contain the answer, state that clearly but remain helpful."
+        )
+        source_label = arch.get("name") or archetype_id
 
     ef = get_embedding_function()
-    client = chromadb.PersistentClient(path=DB_PATH, settings=Settings(anonymized_telemetry=False))
+    client = chromadb.PersistentClient(path=db, settings=Settings(anonymized_telemetry=False))
     collection = client.get_or_create_collection(
         name=collection_name,
         embedding_function=ef,
@@ -129,11 +148,14 @@ def run_ask(
 
     # Stage 1: wide net if reranker on, else just n_results
     n_stage1 = RERANK_STAGE1_N if use_reranker else n_results
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_stage1,
-        include=["documents", "metadatas", "distances"],
-    )
+    query_kw: dict = {
+        "query_texts": [query],
+        "n_results": n_stage1,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if use_unified and silo:
+        query_kw["where"] = {"silo": silo}
+    results = collection.query(**query_kw)
     docs = (results.get("documents") or [[]])[0] or []
     metas = (results.get("metadatas") or [[]])[0] or []
     dists = (results.get("distances") or [[]])[0] or []
@@ -158,8 +180,9 @@ def run_ask(
         dists = [c[2] for c in combined]
 
     if not docs:
-        archetype_name = arch.get("name") or archetype_id
-        return f"No indexed content for {archetype_name}. Run: index --archetype {archetype_id}"
+        if use_unified:
+            return f"No indexed content for {source_label}. Run: llmli add <path>"
+        return f"No indexed content for {source_label}. Run: index --archetype {archetype_id}"
 
     context = "\n---\n".join((d or "")[:1000] for d in docs if d)
     user_prompt = f"Using ONLY the following context, answer: {query}\n\nContext:\n{context}"
@@ -176,12 +199,11 @@ def run_ask(
     answer = (response.get("message") or {}).get("content") or ""
     answer = _style_answer(answer.strip(), no_color)
 
-    archetype_name = arch.get("name") or archetype_id
     out = [
         answer,
         "",
         dim(no_color, "---"),
-        label_style(no_color, f"Answered by: {archetype_name}"),
+        label_style(no_color, f"Answered by: {source_label}"),
         "",
         bold(no_color, "Sources:"),
     ]

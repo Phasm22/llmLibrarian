@@ -7,44 +7,77 @@ See **gemini_summary.md** for the full project manifest and recovery roadmap.
 ## Quick start
 
 ```bash
-# From project root
-python3 -m venv .venv && source .venv/bin/activate  # or Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+# From project root (use uv for venv + deps)
+uv venv && source .venv/bin/activate   # or Windows: .venv\Scripts\activate
+uv sync
 
 # Ensure Ollama is running and a model is pulled (e.g. llama3.1:8b)
 ollama pull llama3.1:8b
 
-# Edit archetypes.yaml: set real paths under each archetype's `folders` (e.g. /tax → /path/to/your/tax)
-# Then index an archetype:
-python cli.py index --archetype tax
+# Option A: Agent CLI (pal) — orchestrates llmli; state in ~/.pal/registry.json
+pal add /path/to/code
+pal ask "what did I write about X?"
+pal ls
+pal log
+pal tool llmli ask --in my-silo "..."   # passthrough
 
-# Ask a question
-python cli.py ask --archetype tax "What was my 2021 income?"
+# Option B: Use llmli directly
+llmli add /path/to/code
+llmli ask "what is in my docs?"         # default: unified collection (all silos)
+llmli ask --in tax "what forms?"        # scoped to silo (slug or display name)
+llmli ask --archetype tax "..."         # archetype collection from archetypes.yaml
+llmli ls
+llmli rm job-related-stuff             # slug or display name
+llmli log --last
 
-# Or index a single folder as a "silo" (unified llmli collection)
-python cli.py add /path/to/code
-python cli.py ls
+# Archetypes (optional): set paths in archetypes.yaml, then
+llmli index --archetype tax
+llmli ask --archetype tax "What was my 2021 income?"
 ```
 
-## CLI commands
+## pal (agent CLI)
+
+**pal** is the control-plane: it delegates to **llmli** and keeps a small registry in `~/.pal/registry.json`. Use `pal` for daily workflows; use `llmli` directly when you need full options.
 
 | Command | Description |
 |--------|-------------|
-| `add <path>` | Index folder into unified collection (silo = basename) |
-| `ask --archetype <id> <query...>` | Query an archetype's collection via Ollama |
-| `ls` | List silos (from `add`) |
+| `pal add <path>` | llmli add + register source in ~/.pal |
+| `pal ask ["question"]` | llmli ask (unified); use `--in <silo>` to scope |
+| `pal ls` | llmli ls |
+| `pal log` | llmli log --last |
+| `pal tool llmli <args...>` | Passthrough to llmli |
+
+## llmli (librarian CLI)
+
+| Command | Description |
+|--------|-------------|
+| `add <path>` | Index folder into unified collection (silo = slug of basename) |
+| `ask [--archetype \<id\> \| --in \<silo\>] <query...>` | Query: default = unified llmli; `--in` = one silo; `--archetype` = archetype collection |
+| `ls` | List silos: `Display Name (slug)` + path, files, chunks |
 | `index --archetype <id>` | Rebuild archetype collection from `archetypes.yaml` folders |
-| `rm <silo>` | Remove silo from registry and delete its chunks |
-| `log` | Show last add failures |
+| `rm <silo>` | Remove silo (slug or display name) and delete its chunks |
+| `log [--last]` | Show last add failures |
+
+## Development setup (2025–2026)
+
+Plain **venv** is still fine, but for a small project like this the better default is **uv** (or **rye**): one tool for create-venv, install, lockfile, and run. This repo uses **uv**:
+
+- `uv venv` — create `.venv` (no need to pick a Python; uv finds it)
+- `uv sync` — install from `pyproject.toml` and lock
+- `uv run llmli ls` — run without activating the venv
+
+Alternatives: **rye** is similar (init, sync, run). **pip + venv** works but is slower and has no lockfile. **Poetry** is heavier than needed for a single-app project.
 
 ## Layout (rebuilt)
 
-- **cli.py** — Entrypoint: `python cli.py add|ask|ls|index|rm|log`
+- **pyproject.toml** — Project + deps; **uv** for venv and install (`uv venv`, `uv sync`).
+- **cli.py** — llmli entrypoint: `llmli add|ask|ls|index|rm|log`
+- **pal.py** — Agent CLI: `pal add|ask|ls|log|tool`; state in `~/.pal/registry.json`.
 - **archetypes.yaml** — Archetypes (tax, infra, palindrome) and limits; set your own `folders` paths.
 - **src/** — Librarian code:
   - **embeddings.py**, **load_config.py**, **style.py**, **reranker.py**, **state.py**, **floor.py** — Recreated support modules.
-  - **YRvy.py** — Indexing (archetype + add); **WsQD.py** — Query (ask).
-  - **indexer.py** / **query.py** — Thin wrappers that re-export from YRvy / WsQD for the CLI.
+  - **ingest.py** — Indexing core (archetype + add); **query_engine.py** — Query (ask).
+  - **indexer.py** / **query.py** — Thin wrappers that re-export from ingest / query_engine for the CLI.
 - **gemini_summary.md** — Project manifest and recovery notes.
 
 ## Env (optional)

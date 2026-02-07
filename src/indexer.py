@@ -6,8 +6,8 @@ Metadata: source_path, mtime, chunk_hash, line_start (code), page (PDF).
 Flow: collect file list -> read+chunk in ThreadPoolExecutor -> batch add().
 ZIPs processed in main thread (limits); regular files in parallel; add in batches.
 """
-# Re-export from recovered module so cli can import from indexer
-from YRvy import (
+# Re-export from ingest core so cli can import from indexer
+from ingest import (
     run_index,
     run_add,
     DB_PATH,

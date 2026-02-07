@@ -575,13 +575,14 @@ def run_add(
     Index a single folder into the unified collection (llmli). Silo name = basename(path).
     Returns (files_indexed, failed_count). Failures saved for llmli log --last.
     """
-    from state import update_silo, set_last_failures
+    from state import update_silo, set_last_failures, slugify
 
     db_path = db_path or DB_PATH
     path = Path(path).resolve()
     if not path.is_dir():
         raise NotADirectoryError(f"Not a directory: {path}")
-    silo_name = path.name
+    display_name = path.name
+    silo_slug = slugify(display_name)
     limits_cfg = {}
     try:
         config = load_config()
@@ -615,7 +616,7 @@ def run_add(
                 continue
             if chunks:
                 for _id, doc, meta in chunks:
-                    meta["silo"] = silo_name
+                    meta["silo"] = silo_slug
                 all_chunks.extend(chunks)
                 files_indexed += 1
             elif kind == "pdf":
@@ -635,7 +636,7 @@ def run_add(
             continue
         if chunks:
             for _id, doc, meta in chunks:
-                meta["silo"] = silo_name
+                meta["silo"] = silo_slug
             all_chunks.extend(chunks)
             files_indexed += 1
 
@@ -644,7 +645,7 @@ def run_add(
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
 
     try:
-        collection.delete(where={"silo": silo_name})
+        collection.delete(where={"silo": silo_slug})
     except Exception:
         pass  # no chunks for this silo yet
 
@@ -652,7 +653,7 @@ def run_add(
         _batch_add(collection, all_chunks, no_color=no_color)
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    update_silo(db_path, silo_name, str(path), files_indexed, len(all_chunks), now_iso)
+    update_silo(db_path, silo_slug, str(path), files_indexed, len(all_chunks), now_iso, display_name=display_name)
     set_last_failures(db_path, failures)
 
     if failures:
