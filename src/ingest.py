@@ -22,6 +22,7 @@ from typing import Any
 ChunkTuple = tuple[str, str, dict[str, Any]]
 # Embedding is the bottleneck (~1s per 100 chunks with ONNX). Larger batches = fewer add() calls.
 ADD_BATCH_SIZE = 256
+# Parallelism for file read+chunk only; embedding runs in main thread in batches.
 MAX_WORKERS = 8
 
 import chromadb
@@ -48,6 +49,37 @@ ADD_DEFAULT_EXCLUDE = [
     "node_modules/", ".venv/", "venv/", "env/", "__pycache__/", "vendor", "dist", "build", ".git",
     "llmLibrarianVenv/", "site-packages/", "Old Firefox Data", "Firefox", ".app/",
 ]
+
+# Path components that indicate a cloud-sync root (OneDrive, iCloud, Dropbox, etc.).
+# Ingestion is disabled for these by default; use --allow-cloud to override (e.g. after pinning).
+CLOUD_SYNC_NAMES = frozenset(
+    {"onedrive", "dropbox", "google drive", "icloud drive", "box", "microsoft onedrive"}
+)
+
+
+class CloudSyncPathError(Exception):
+    """Raised when add is run on a cloud-sync folder without --allow-cloud."""
+    def __init__(self, path: Path, kind: str):
+        self.path = path
+        self.kind = kind
+        super().__init__(f"Path is under a cloud-sync folder ({kind}). Ingestion may be unreliable (placeholders, offline files). Use --allow-cloud to override.")
+
+
+def is_cloud_sync_path(path: str | Path) -> str | None:
+    """
+    If path is under a known cloud-sync root, return the cloud name (e.g. 'OneDrive'); else None.
+    Relies on path components only (OneDrive, OneDrive - Org, iCloud Drive, Dropbox, Google Drive, Box).
+    """
+    resolved = Path(path).resolve()
+    parts = [p.lower() for p in resolved.parts]
+    for i, part in enumerate(parts):
+        if part in CLOUD_SYNC_NAMES:
+            return resolved.parts[i]  # return original casing for message
+        if part.startswith("onedrive ") or part.startswith("onedrive-"):
+            return resolved.parts[i]
+        if part == "library" and i + 1 < len(parts) and parts[i + 1] == "mobile documents":
+            return "iCloud"
+    return None
 
 
 def _path_matches(path_str: str, pattern: str) -> bool:
@@ -78,8 +110,26 @@ def should_descend_into_dir(dir_path: str | Path, exclude_patterns: list[str]) -
     return True
 
 
-def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[tuple[str, int]]:
-    """Returns list of (chunk_text, line_start). line_start is 1-based approximate."""
+def _chunk_params() -> tuple[int, int]:
+    """(chunk_size, overlap) from env or defaults. Used so add/index can be tuned without code change."""
+    size = CHUNK_SIZE
+    overlap = CHUNK_OVERLAP
+    try:
+        if os.environ.get("LLMLIBRARIAN_CHUNK_SIZE"):
+            size = max(100, min(int(os.environ["LLMLIBRARIAN_CHUNK_SIZE"]), 4000))
+        if os.environ.get("LLMLIBRARIAN_CHUNK_OVERLAP"):
+            overlap = max(0, min(int(os.environ["LLMLIBRARIAN_CHUNK_OVERLAP"]), size // 2))
+    except (TypeError, ValueError):
+        pass
+    return (size, overlap)
+
+
+def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -> list[tuple[str, int]]:
+    """Returns list of (chunk_text, line_start). line_start is 1-based approximate. Uses env LLMLIBRARIAN_CHUNK_* when size/overlap not passed."""
+    if size is None or overlap is None:
+        psize, poverlap = _chunk_params()
+        size = size if size is not None else psize
+        overlap = overlap if overlap is not None else poverlap
     if not text.strip():
         return []
     lines = text.split("\n")
@@ -570,10 +620,12 @@ def run_add(
     path: str | Path,
     db_path: str | Path | None = None,
     no_color: bool = False,
+    allow_cloud: bool = False,
 ) -> tuple[int, int]:
     """
     Index a single folder into the unified collection (llmli). Silo name = basename(path).
     Returns (files_indexed, failed_count). Failures saved for llmli log --last.
+    Refuses cloud-sync roots (OneDrive, iCloud, Dropbox, etc.) unless allow_cloud=True.
     """
     from state import update_silo, set_last_failures, slugify
 
@@ -581,6 +633,10 @@ def run_add(
     path = Path(path).resolve()
     if not path.is_dir():
         raise NotADirectoryError(f"Not a directory: {path}")
+    if not allow_cloud:
+        cloud_kind = is_cloud_sync_path(path)
+        if cloud_kind:
+            raise CloudSyncPathError(path, cloud_kind)
     display_name = path.name
     silo_slug = slugify(display_name)
     limits_cfg = {}
@@ -603,7 +659,12 @@ def run_add(
     files_indexed = 0
     failures: list[dict[str, str]] = []
 
-    workers = MAX_WORKERS
+    workers = max(1, min(MAX_WORKERS, (os.cpu_count() or 8)))
+    try:
+        workers = int(os.environ.get("LLMLIBRARIAN_MAX_WORKERS", workers))
+    except (TypeError, ValueError):
+        pass
+    workers = max(1, min(workers, 32))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_item = {executor.submit(process_one_file, p, k): (p, k) for p, k in regular}
         for future in as_completed(future_to_item):
@@ -650,7 +711,13 @@ def run_add(
         pass  # no chunks for this silo yet
 
     if all_chunks:
-        _batch_add(collection, all_chunks, no_color=no_color)
+        batch_size = ADD_BATCH_SIZE
+        try:
+            batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
+        except (TypeError, ValueError):
+            pass
+        batch_size = max(1, min(batch_size, 2000))
+        _batch_add(collection, all_chunks, batch_size=batch_size, no_color=no_color)
 
     now_iso = datetime.now(timezone.utc).isoformat()
     update_silo(db_path, silo_slug, str(path), files_indexed, len(all_chunks), now_iso, display_name=display_name)

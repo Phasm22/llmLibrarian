@@ -38,7 +38,6 @@ def _run_llmli(args: list[str]) -> int:
     """Run llmli as subprocess; return exit code."""
     root = Path(__file__).resolve().parent
     env = os.environ.copy()
-    # Prefer venv llmli if present
     venv_llmli = root / ".venv" / "bin" / "llmli"
     if venv_llmli.exists():
         cmd = [str(venv_llmli)] + args
@@ -49,15 +48,18 @@ def _run_llmli(args: list[str]) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
-    """Delegate to llmli add <path>; optionally record in pal registry."""
+    """Delegate to llmli add <path>; optionally record in pal registry. Cloud-sync paths blocked unless --allow-cloud."""
     path = Path(args.path).resolve()
     if not path.is_dir():
         print(f"Error: not a directory: {path}", file=sys.stderr)
         return 1
-    code = _run_llmli(["add", str(path)])
+    llmli_args = ["add"]
+    if getattr(args, "allow_cloud", False):
+        llmli_args.append("--allow-cloud")
+    llmli_args.append(str(path))
+    code = _run_llmli(llmli_args)
     if code == 0:
         reg = _read_registry()
-        # Record as source owned by llmli (idempotent by path)
         sources = reg.get("sources", [])
         entry = {"path": str(path), "tool": "llmli", "name": path.name}
         if not any(s.get("path") == str(path) for s in sources):
@@ -86,6 +88,15 @@ def cmd_log(args: argparse.Namespace) -> int:
     return _run_llmli(["log", "--last"])
 
 
+def cmd_inspect(args: argparse.Namespace) -> int:
+    """Show silo details and per-file chunk counts (llmli inspect)."""
+    silo = getattr(args, "silo", None)
+    if not silo:
+        print("Error: inspect requires silo name. Example: pal inspect stuff", file=sys.stderr)
+        return 1
+    return _run_llmli(["inspect", silo])
+
+
 def cmd_tool(args: argparse.Namespace) -> int:
     """Passthrough: pal tool <name> <args...> -> run underlying tool."""
     name = getattr(args, "tool_name", None)
@@ -105,8 +116,9 @@ def main() -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_add = sub.add_parser("add", help="Index folder (llmli add); register in ~/.pal")
+    p_add = sub.add_parser("add", help="Index folder (llmli add); register in ~/.pal; cloud paths blocked unless --allow-cloud")
     p_add.add_argument("path", help="Folder path to index")
+    p_add.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive")
     p_add.set_defaults(_run=cmd_add)
 
     p_ask = sub.add_parser("ask", help="Ask (llmli ask, unified by default)")
@@ -116,6 +128,10 @@ def main() -> int:
 
     p_ls = sub.add_parser("ls", help="List silos (llmli ls)")
     p_ls.set_defaults(_run=cmd_ls)
+
+    p_inspect = sub.add_parser("inspect", help="Silo details and per-file chunk counts (llmli inspect)")
+    p_inspect.add_argument("silo", help="Silo slug or display name")
+    p_inspect.set_defaults(_run=cmd_inspect)
 
     p_log = sub.add_parser("log", help="Last failures (llmli log --last)")
     p_log.set_defaults(_run=cmd_log)

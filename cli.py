@@ -24,14 +24,18 @@ def _config_path(args: argparse.Namespace) -> Path | None:
 def cmd_add(args: argparse.Namespace) -> int:
     """Index a folder into the unified llmli collection; silo name = basename(path)."""
     from indexer import run_add, DB_PATH
+    from ingest import CloudSyncPathError
     path = Path(args.path).resolve()
     db = args.db or DB_PATH
     if not path.is_dir():
         print(f"Error: not a directory: {path}", file=sys.stderr)
         return 1
     try:
-        run_add(path, db_path=db, no_color=args.no_color)
+        run_add(path, db_path=db, no_color=args.no_color, allow_cloud=getattr(args, "allow_cloud", False))
         return 0
+    except CloudSyncPathError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -146,16 +150,65 @@ def cmd_log(args: argparse.Namespace) -> int:
         print(f"  {f.get('path', '?')}: {f.get('error', '?')}")
     return 0
 
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    """Show silo details: path, total chunks, and per-file chunk counts (from indexed data)."""
+    from state import list_silos, resolve_silo_to_slug
+    from indexer import LLMLI_COLLECTION
+    import chromadb
+    from chromadb.config import Settings
+    db = _db_path(args)
+    silo_arg = getattr(args, "silo", None)
+    if not silo_arg:
+        print("Error: inspect requires silo name. Example: llmli inspect stuff", file=sys.stderr)
+        return 1
+    slug = resolve_silo_to_slug(db, silo_arg)
+    if slug is None:
+        print(f"Error: silo not found: {silo_arg}", file=sys.stderr)
+        return 1
+    silos = list_silos(db)
+    info = next((s for s in silos if s.get("slug") == slug), None)
+    display = (info or {}).get("display_name", slug)
+    path = (info or {}).get("path", "?")
+    total_chunks = (info or {}).get("chunks_count", 0)
+    print(f"Silo: {display} ({slug})")
+    print(f"Path: {path}")
+    print(f"Total chunks (registry): {total_chunks}")
+    try:
+        client = chromadb.PersistentClient(path=str(db), settings=Settings(anonymized_telemetry=False))
+        coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
+        # Get all chunk metadatas for this silo to aggregate by source file
+        result = coll.get(where={"silo": slug}, include=["metadatas"])
+        metas = result.get("metadatas") or []
+        by_source: dict[str, int] = {}
+        for m in metas:
+            src = (m or {}).get("source") or "?"
+            by_source[src] = by_source.get(src, 0) + 1
+        if not by_source:
+            print("No indexed files (chunks) found for this silo in the store.")
+            return 0
+        print(f"Indexed files: {len(by_source)}")
+        # Sort by chunk count descending so biggest files are first
+        for src, count in sorted(by_source.items(), key=lambda x: -x[1]):
+            short = src if len(src) <= 72 else "..." + src[-69:]
+            print(f"  {count:6d} chunks  {short}")
+    except Exception as e:
+        print(f"Error reading store: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="llmli", description="llmLibrarian CLI: add, ask, ls, index, rm, log")
+    parser = argparse.ArgumentParser(prog="llmli", description="llmLibrarian CLI: add, ask, ls, inspect, index, rm, log")
     parser.add_argument("--db", default=os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"), help="DB path")
     parser.add_argument("--config", help="Path to archetypes.yaml")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # add <path>
-    p_add = sub.add_parser("add", help="Index folder into llmli (silo = basename)")
+    # add <path> [--allow-cloud]
+    p_add = sub.add_parser("add", help="Index folder into llmli (silo = basename); cloud-sync paths blocked unless --allow-cloud")
     p_add.add_argument("path", help="Folder path to index")
+    p_add.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive (ingestion may be unreliable)")
     p_add.set_defaults(db=None)
     p_add.set_defaults(_run=cmd_add)
 
@@ -171,6 +224,11 @@ def main() -> int:
     # ls
     p_ls = sub.add_parser("ls", help="List silos")
     p_ls.set_defaults(_run=cmd_ls)
+
+    # inspect <silo>
+    p_inspect = sub.add_parser("inspect", help="Show silo details and per-file chunk counts")
+    p_inspect.add_argument("silo", help="Silo slug or display name")
+    p_inspect.set_defaults(_run=cmd_inspect)
 
     # index --archetype X
     p_index = sub.add_parser("index", help="Rebuild archetype collection from config folders")

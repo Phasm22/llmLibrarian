@@ -13,7 +13,7 @@ from chromadb.config import Settings
 from embeddings import get_embedding_function
 from load_config import load_config, get_archetype
 from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chunks
-from style import bold, dim, path_style, label_style, code_style, code_block_style
+from style import bold, dim, path_style, label_style, code_style, code_block_style, link_style
 
 try:
     from ingest import LLMLI_COLLECTION
@@ -72,13 +72,87 @@ def _snippet_preview(text: str, max_len: int = SNIPPET_MAX_LEN) -> str:
     return one
 
 
+# Extensions we open in the editor (vscode/cursor) with line number; everything else uses file:// so the OS opens in the default app (Word, Preview, etc.).
+_EDITOR_EXTENSIONS = frozenset(
+    {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+     ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".sh", ".bash", ".zsh",
+     ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cs", ".java", ".kt", ".rb", ".php",
+     ".sql", ".html", ".css", ".scss", ".xml", ".rss", ".svg", ".csv", ".log"}
+)
+
+
+def _use_editor_link(path: Path) -> bool:
+    """True if this file type should open in the editor (vscode/cursor) with line number; else use file://."""
+    return path.suffix.lower() in _EDITOR_EXTENSIONS
+
+
+def _source_url(source: str, line: int | None = None, page: int | None = None) -> str:
+    """
+    Build URL for OSC 8 hyperlink so click opens file (and line when possible).
+    Use vscode:// or cursor:// only for code/text extensions (.py, .md, .txt, etc.) so they open in the editor at line.
+    For .docx, .pdf, .xlsx, etc. use file:// so the OS opens in the default app (Word, Preview).
+    Set LLMLIBRARIAN_EDITOR_SCHEME=vscode|cursor|file (default vscode).
+    """
+    import os
+    if not source or source == "?":
+        return ""
+    try:
+        p = Path(source).resolve()
+        posix = p.as_posix()
+        scheme = (os.environ.get("LLMLIBRARIAN_EDITOR_SCHEME") or "vscode").strip().lower()
+        use_editor = scheme in ("vscode", "cursor") and _use_editor_link(p)
+        if use_editor and line is not None:
+            prefix = "cursor://file" if scheme == "cursor" else "vscode://file"
+            return f"{prefix}/{posix}:{line}:1"
+        # file:// for everything else: .docx, .pdf, binaries, or when scheme=file
+        url = "file://" + posix if posix.startswith("/") else "file:///" + posix
+        if line is not None:
+            url = f"{url}#L{line}"
+        elif page is not None:
+            url = f"{url}#page={page}"
+        return url
+    except Exception:
+        return ""
+
+
+def _diversify_by_source(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    top_k: int,
+    max_per_source: int = 2,
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    """Keep best chunks by distance but cap at max_per_source per unique source path so one big file doesn't dominate."""
+    if not docs or max_per_source < 1:
+        return docs[:top_k], (metas or [])[:top_k], (dists or [])[:top_k]
+    out_docs: list[str] = []
+    out_metas: list[dict | None] = []
+    out_dists: list[float | None] = []
+    count_per_source: dict[str, int] = {}
+    for i, doc in enumerate(docs):
+        if len(out_docs) >= top_k:
+            break
+        meta = metas[i] if i < len(metas) else None
+        source = (meta or {}).get("source") or ""
+        if not source:
+            source = f"__unknown_{i}"
+        n = count_per_source.get(source, 0)
+        if n >= max_per_source:
+            continue
+        count_per_source[source] = n + 1
+        out_docs.append(doc)
+        out_metas.append(meta)
+        out_dists.append(dists[i] if i < len(dists) else None)
+    return out_docs, out_metas, out_dists
+
+
 def _format_source(
     doc: str,
     meta: dict | None,
     distance: float | None,
     no_color: bool = True,
 ) -> str:
-    """Format one source: short path, line/page, score, and a one-line snippet."""
+    """Format one source: short path (with file:// hyperlink when TTY), line/page, score, and a one-line snippet."""
     source = (meta or {}).get("source") or "?"
     display_path = _shorten_path(source)
     line = (meta or {}).get("line_start")
@@ -96,7 +170,8 @@ def _format_source(
             score_str = f" · {score:.2f}"
         except (TypeError, ValueError):
             pass
-    path_part = path_style(no_color, display_path)
+    file_url = _source_url(source, line=line, page=page)
+    path_part = link_style(no_color, file_url, display_path)
     meta_part = dim(no_color, f"{loc}{score_str}")
     snippet_part = dim(no_color, snippet)
     return f"  • {path_part}{meta_part}\n    {snippet_part}"
@@ -146,8 +221,8 @@ def run_ask(
         embedding_function=ef,
     )
 
-    # Stage 1: wide net if reranker on, else just n_results
-    n_stage1 = RERANK_STAGE1_N if use_reranker else n_results
+    # Stage 1: fetch enough so we can diversify by source (one big file shouldn't dominate)
+    n_stage1 = RERANK_STAGE1_N if use_reranker else min(100, max(n_results * 5, 60))
     query_kw: dict = {
         "query_texts": [query],
         "n_results": n_stage1,
@@ -178,6 +253,9 @@ def run_ask(
         docs = [c[0] for c in combined]
         metas = [c[1] for c in combined]
         dists = [c[2] for c in combined]
+
+    # Diversify by source: cap chunks per file so one huge file (e.g. Closed Traffic.txt) doesn't crowd out others
+    docs, metas, dists = _diversify_by_source(docs, metas, dists, n_results, max_per_source=2)
 
     if not docs:
         if use_unified:
