@@ -11,7 +11,7 @@
 | `collection.add(ids, documents, metadatas)` in batches | ✅ | `ingest._batch_add` |
 | `collection.delete(where={"silo": ...})` | ✅ | `ingest` (replace silo), `cli rm` |
 | `collection.get(where=..., include=["metadatas"])` | ✅ | `cli inspect` (per-file chunk counts) |
-| **Metadata filters** `$eq`, `$in`, `$and`, `$or`, `$gt`/`$gte` | ❌ Only `silo` | Could filter by source path, file type, date |
+| **Metadata filters** `$eq`, `$in`, `$and`, `$or`, `$gt`/`$gte` | ✅ | `run_ask`: silo filter; catalog sub-scope uses `$in` on `source` to restrict to path set from file registry |
 | **`where_document`** (full-text: `$contains`, `$regex`) | ✅ | EVIDENCE_PROFILE hybrid: get() + RRF (see below) |
 | `client.delete_collection` | ✅ | Ingest archetype rebuild |
 | Update/upsert by id | ❌ | We delete + re-add; fine for replace-by-silo |

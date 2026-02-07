@@ -2,6 +2,7 @@
 Load archetypes.yaml and resolve archetype by id (slug). Used by indexer and query.
 """
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,17 +11,19 @@ def _default_config_path() -> Path:
     return Path(base) / "archetypes.yaml"
 
 def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
-    """Load YAML config (archetypes + limits). Returns dict with 'archetypes' and optional 'limits'."""
+    """Load YAML config (archetypes + limits). Returns dict with 'archetypes' and optional 'limits'. Warns on missing file or load failure."""
     path = config_path if config_path is not None else _default_config_path()
     path = Path(path)
     if not path.exists():
+        print(f"[llmli] config not found: {path}; using empty archetypes and limits.", file=sys.stderr)
         return {"archetypes": {}, "limits": {}}
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         return data
-    except Exception:
+    except Exception as e:
+        print(f"[llmli] config load failed: {path}: {e}; using empty archetypes and limits.", file=sys.stderr)
         return {"archetypes": {}, "limits": {}}
 
 def get_archetype(config: dict[str, Any], archetype_id: str) -> dict[str, Any]:

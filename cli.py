@@ -194,6 +194,9 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         # Get all chunk metadatas for this silo to aggregate by source file
         result = coll.get(where={"silo": slug}, include=["metadatas"])
         metas = result.get("metadatas") or []
+        chroma_count = len(metas)
+        if chroma_count != total_chunks:
+            print(f"[llmli] registry mismatch: Chroma has {chroma_count} chunks for this silo, registry says {total_chunks}. Re-run add to fix.", file=sys.stderr)
         by_source: dict[str, int] = {}
         source_to_hash: dict[str, str] = {}
         for m in metas:

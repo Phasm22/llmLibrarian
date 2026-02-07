@@ -155,15 +155,20 @@ def _read_file_registry(db_path: str | Path) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
             return data if isinstance(data.get("by_hash"), dict) else {"by_hash": {}}
-    except Exception:
+    except Exception as e:
+        print(f"[llmli] file registry read failed: {path}: {e}; using empty.", file=sys.stderr)
         return {"by_hash": {}}
 
 
 def _write_file_registry(db_path: str | Path, data: dict) -> None:
     path = _file_registry_path(db_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[llmli] file registry write failed: {path}: {e}", file=sys.stderr)
+        raise
 
 
 def _file_registry_get(db_path: str | Path, file_hash: str) -> list[dict]:
@@ -191,6 +196,19 @@ def _file_registry_remove_silo(db_path: str | Path, silo: str) -> None:
         else:
             by_hash[h] = new_entries
     _write_file_registry(db_path, reg)
+
+
+def get_paths_by_silo(db_path: str | Path) -> dict[str, set[str]]:
+    """Build catalog: silo -> set of indexed paths. Derived from file registry (by_hash -> [{silo, path}])."""
+    reg = _read_file_registry(db_path)
+    by_silo: dict[str, set[str]] = {}
+    for entries in (reg.get("by_hash") or {}).values():
+        for e in entries:
+            s = e.get("silo")
+            p = e.get("path")
+            if s is not None and p:
+                by_silo.setdefault(s, set()).add(p)
+    return by_silo
 
 
 # Path components that indicate a cloud-sync root (OneDrive, iCloud, Dropbox, etc.).

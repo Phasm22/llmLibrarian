@@ -4,6 +4,7 @@ Display name = original folder name; slug = canonical key (lowercase, hyphens).
 """
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -34,14 +35,19 @@ def _read_registry(db_path: str | Path) -> dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        print(f"[llmli] registry read failed: {path}: {e}; using empty registry.", file=sys.stderr)
         return {}
 
 def _write_registry(db_path: str | Path, data: dict[str, Any]) -> None:
     path = _registry_path(db_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"[llmli] registry write failed: {path}: {e}", file=sys.stderr)
+        raise
 
 def update_silo(
     db_path: str | Path,

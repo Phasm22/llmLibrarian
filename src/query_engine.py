@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,9 +22,10 @@ from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chun
 from style import bold, dim, path_style, label_style, code_style, code_block_style, link_style
 
 try:
-    from ingest import LLMLI_COLLECTION
+    from ingest import LLMLI_COLLECTION, get_paths_by_silo
 except ImportError:
     LLMLI_COLLECTION = "llmli"
+    get_paths_by_silo = None  # type: ignore[misc, assignment]
 
 DB_PATH = "./my_brain_db"
 DEFAULT_N_RESULTS = 12
@@ -111,6 +113,40 @@ def _query_implies_recency(query: str) -> bool:
     )
 
 
+# Timing/performance answer policy: detect speed questions and measurement vs causal intent.
+TIMING_PATTERN = re.compile(
+    r"ollama_sec|eval_duration_ns|_sec\s*=|duration_ns|\bduration\b", re.IGNORECASE
+)
+
+
+def _query_implies_speed(query: str) -> bool:
+    """True if the query is about speed or performance (fast, slow, latency, etc.)."""
+    q = (query or "").strip().lower()
+    return bool(
+        re.search(
+            r"\b(?:fast|slow|quick|latency|performance|how\s+long|timing|duration)\b", q
+        )
+    )
+
+
+def _query_implies_measurement_intent(query: str) -> bool:
+    """True if the user is asking for measured timings (how long, latency, show timings), not causal why."""
+    q = (query or "").strip().lower()
+    return bool(
+        re.search(
+            r"\b(?:how\s+long\s+does\s+it\s+take|what'?s?\s+the\s+latency|"
+            r"show\s+timings?|timing\s+data|measured\s+time|run\s+time)\b",
+            q,
+        )
+    )
+
+
+def _context_has_timing_patterns(docs: list[str]) -> bool:
+    """True if any chunk contains timing-like patterns (ollama_sec, eval_duration_ns, etc.)."""
+    combined = " ".join(docs or [])
+    return bool(TIMING_PATTERN.search(combined))
+
+
 def _recency_score(mtime: float, half_life_days: float = 365.0) -> float:
     """Decay from 1.0 (recent) to 0 (old). mtime = file mtime (seconds since epoch)."""
     if mtime <= 0:
@@ -134,6 +170,73 @@ DOC_TYPE_BONUS: dict[str, float] = {
     "other": 0.0,
 }
 RECENCY_WEIGHT = 0.15  # w in final_score = sim_score + w * recency_score (+ doc_type bonus)
+
+# Catalog sub-scope: tokens we never use for path routing (avoid junk matches).
+SCOPE_TOKEN_STOPLIST = frozenset(
+    {"llm", "tool", "fast", "slow", "why", "the", "is", "it", "so", "a", "an", "how", "does", "feel", "take"}
+)
+MAX_SCOPE_TOKENS = 2  # extract up to 2 candidates; union path results
+
+
+def _extract_scope_tokens(query: str) -> list[str]:
+    """Extract up to 2 candidate tokens for catalog sub-scope. Stoplist applied; case-insensitive."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    # Patterns: "the X (llm )?tool", "why is (the )?X ...", "X (is )?fast/slow", or significant words (alpha, len >= 2).
+    candidates: list[str] = []
+    # "the <X> llm tool" or "the <X> tool"
+    m = re.search(r"\bthe\s+(\w+)\s+(?:llm\s+)?tool\b", q)
+    if m:
+        candidates.append(m.group(1))
+    # "why is (the )?<X> ..." (X before "fast", "slow", "so", etc.)
+    m = re.search(r"\bwhy\s+is\s+(?:the\s+)?(\w+)\s+(?:so\s+)?(?:fast|slow|quick)?", q)
+    if m and m.group(1) not in SCOPE_TOKEN_STOPLIST:
+        if m.group(1) not in candidates:
+            candidates.append(m.group(1))
+    # "<X> is fast/slow" or "<X> llm tool"
+    m = re.search(r"\b(\w+)\s+(?:is\s+)?(?:so\s+)?(?:fast|slow)\b", q)
+    if m and m.group(1) not in SCOPE_TOKEN_STOPLIST and m.group(1) not in candidates:
+        candidates.append(m.group(1))
+    # Fallback: first two significant words (alpha, len >= 2) not in stoplist
+    if len(candidates) < MAX_SCOPE_TOKENS:
+        words = re.findall(r"\b([a-z]\w{1,})\b", q)
+        for w in words:
+            if w not in SCOPE_TOKEN_STOPLIST and w not in candidates:
+                candidates.append(w)
+                if len(candidates) >= MAX_SCOPE_TOKENS:
+                    break
+    return candidates[:MAX_SCOPE_TOKENS]
+
+
+def _resolve_subscope(
+    query: str, db_path: str | Path
+) -> tuple[list[str], list[str], list[str]] | None:
+    """
+    Resolve query to a path sub-scope using catalog (paths-by-silo from file registry).
+    Returns (silos, paths, tokens_used) when non-empty, else None.
+    tokens_used is for debug (PAL_DEBUG) only.
+    """
+    if get_paths_by_silo is None:
+        return None
+    tokens = _extract_scope_tokens(query)
+    if not tokens:
+        return None
+    paths_by_silo = get_paths_by_silo(db_path)
+    if not paths_by_silo:
+        return None
+    path_set: set[str] = set()
+    silo_set: set[str] = set()
+    for token in tokens:
+        token_lower = token.lower()
+        for silo, paths in paths_by_silo.items():
+            for p in paths:
+                if token_lower in p.lower():
+                    path_set.add(p)
+                    silo_set.add(silo)
+    if not path_set:
+        return None
+    return (list(silo_set), list(path_set), tokens)
 
 
 def _route_intent(query: str) -> str:
@@ -291,31 +394,35 @@ def _write_trace(
     time_ms: float,
     query_len: int,
     hybrid_used: bool = False,
+    receipt_metas: list[dict | None] | None = None,
 ) -> None:
-    """Append one JSON-line to LLMLIBRARIAN_TRACE file (if set). No-op if env unset. Does not raise."""
+    """Append one JSON-line to LLMLIBRARIAN_TRACE file (if set). Optional receipt: source paths and chunk hashes for chunks sent to the LLM. No-op if env unset. Does not raise."""
     path = os.environ.get("LLMLIBRARIAN_TRACE")
     if not path:
         return
+    payload: dict[str, Any] = {
+        "intent": intent,
+        "n_stage1": n_stage1,
+        "n_results": n_results,
+        "model": model,
+        "silo": silo,
+        "source_label": source_label,
+        "num_docs": num_docs,
+        "time_ms": round(time_ms, 2),
+        "query_len": query_len,
+        "hybrid": hybrid_used,
+    }
+    if receipt_metas:
+        payload["receipt"] = [
+            {
+                "source": (m or {}).get("source") or "",
+                "chunk_hash": (m or {}).get("chunk_hash") or "",
+            }
+            for m in receipt_metas
+        ]
     try:
         with open(path, "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "intent": intent,
-                        "n_stage1": n_stage1,
-                        "n_results": n_results,
-                        "model": model,
-                        "silo": silo,
-                        "source_label": source_label,
-                        "num_docs": num_docs,
-                        "time_ms": round(time_ms, 2),
-                        "query_len": query_len,
-                        "hybrid": hybrid_used,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -720,7 +827,20 @@ def run_ask(
         )
         return _format_code_language_answer(by_ext, sample_paths, source_label, no_color)
 
-    include_ids = intent == INTENT_EVIDENCE_PROFILE and use_unified and silo
+    # Catalog sub-scope: when unified and no CLI silo, try to restrict to paths matching query tokens.
+    subscope_where: dict[str, Any] | None = None
+    subscope_tokens: list[str] = []
+    if use_unified and silo is None:
+        subscope = _resolve_subscope(query, db)
+        if subscope:
+            silos_sub, paths_sub, tokens_used = subscope
+            subscope_where = {"$and": [{"silo": {"$in": silos_sub}}, {"source": {"$in": paths_sub}}]}
+            subscope_tokens = list(tokens_used)
+            if os.environ.get("PAL_DEBUG"):
+                token_str = ",".join(subscope_tokens)
+                print(f"scoped_to={len(paths_sub)} paths token={token_str}", file=sys.stderr)
+
+    include_ids = intent == INTENT_EVIDENCE_PROFILE and use_unified and (silo or subscope_where)
     query_kw: dict = {
         "query_texts": [query],
         "n_results": n_stage1,
@@ -728,18 +848,19 @@ def run_ask(
     }
     if use_unified and silo:
         query_kw["where"] = {"silo": silo}
+    elif subscope_where:
+        query_kw["where"] = subscope_where
     results = collection.query(**query_kw)
     docs = (results.get("documents") or [[]])[0] or []
     metas = (results.get("metadatas") or [[]])[0] or []
     dists = (results.get("distances") or [[]])[0] or []
-    # Chroma always returns "ids"; we need them for RRF when doing hybrid
     ids_v = (results.get("ids") or [[]])[0] or [] if include_ids else []
 
-    # EVIDENCE_PROFILE + unified + silo: hybrid search (vector + Chroma where_document, RRF merge)
+    # EVIDENCE_PROFILE + unified + silo/subscope: hybrid search (vector + Chroma where_document, RRF merge)
     if include_ids and ids_v and len(ids_v) == len(docs):
         where_doc = {"$or": [{"$contains": p} for p in PROFILE_LEXICAL_PHRASES]}
         get_kw: dict = {"where_document": where_doc, "include": ["documents", "metadatas"]}
-        get_kw["where"] = {"silo": silo}
+        get_kw["where"] = subscope_where if subscope_where else {"silo": silo}
         try:
             lex = collection.get(**get_kw)
             ids_l = (lex.get("ids") or [])[:MAX_LEXICAL_FOR_RRF]
@@ -752,8 +873,10 @@ def run_ask(
                     top_k=n_stage1,
                 )
                 hybrid_used = True
-        except Exception:
-            pass
+            else:
+                print("[llmli] hybrid skipped: lexical get returned no chunks (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
+        except Exception as e:
+            print(f"[llmli] hybrid skipped: lexical get failed: {e} (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
     # EVIDENCE_PROFILE fallback: in-app reorder by trigger regex (no hybrid)
     if intent == INTENT_EVIDENCE_PROFILE and docs and not hybrid_used:
         docs, metas, dists = _filter_by_triggers(docs, metas, dists)
@@ -814,6 +937,29 @@ def run_ask(
             + label_style(no_color, f"Answered by: {source_label}")
         )
 
+    # Answer policy: speed questions and timing data
+    has_timing = _context_has_timing_patterns(docs)
+    if _query_implies_speed(query):
+        if has_timing:
+            system_prompt = (
+                system_prompt.rstrip()
+                + "\n\nIf the context includes timing or duration data (e.g. ollama_sec, eval_duration_ns), base your answer about speed on those numbers; do not speculate from hardware or general knowledge."
+            )
+        elif _query_implies_measurement_intent(query):
+            # Short-circuit: user asked for measured timings but we have none.
+            x_label = subscope_tokens[0] if subscope_tokens else "this tool"
+            return (
+                f"I can't find performance traces for {x_label} in this corpus.\n\n"
+                + dim(no_color, "---") + "\n"
+                + label_style(no_color, f"Answered by: {source_label}")
+            )
+        else:
+            # Causal ("why is it fast"): allow answer from config/log; if none, model should say I don't know.
+            system_prompt = (
+                system_prompt.rstrip()
+                + "\n\nThe user is asking why something is fast or slow. If the context does not contain timing data, you may still answer from config, logs, or architecture (e.g. no retrieval step, short prompt, warm model) only if the context supports it. If you cannot support any reason, say you don't have performance traces and don't know."
+            )
+
     # Exhaustive-list heuristic: when strict and query asks for a complete list but we have few sources, caveat
     unique_sources = len({(m or {}).get("source") or "" for m in metas})
     if strict and unique_sources <= 2 and re.search(
@@ -858,6 +1004,7 @@ def run_ask(
             {"role": "user", "content": user_prompt},
         ],
         keep_alive=0,
+        options={"temperature": 0, "seed": 42},
     )
     answer = (response.get("message") or {}).get("content") or ""
     answer = _style_answer(answer.strip(), no_color)
@@ -888,6 +1035,7 @@ def run_ask(
         time_ms=time_ms,
         query_len=len(query),
         hybrid_used=hybrid_used,
+        receipt_metas=metas,
     )
     return "\n".join(out)
 
