@@ -125,6 +125,8 @@ def cmd_pull(args: argparse.Namespace) -> int:
         path = src.get("path")
         if not path:
             continue
+        name = src.get("name") or Path(path).name
+        print(f"Pulling silo: {name} ({path})")
         llmli_args = ["add"]
         if getattr(args, "full", False):
             llmli_args.append("--full")

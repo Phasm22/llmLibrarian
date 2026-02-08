@@ -649,39 +649,80 @@ def _tag_zip_meta(chunks: list[ChunkTuple], zip_path: Path) -> list[ChunkTuple]:
     return chunks
 
 
+def _should_use_tqdm() -> bool:
+    if tqdm is None:
+        return False
+    env_pref = os.environ.get("LLMLIBRARIAN_PROGRESS", "auto").strip().lower()
+    if env_pref in ("1", "true", "yes"):
+        return True
+    if env_pref in ("0", "false", "no"):
+        return False
+    return sys.stderr.isatty()
+
+
 def _batch_add(
     collection: Any,
     chunks: list[ChunkTuple],
     batch_size: int = ADD_BATCH_SIZE,
     no_color: bool = False,
     log_line: Any = None,
+    embedding_fn: Any | None = None,
+    embedding_workers: int = 1,
 ) -> None:
     """Add chunks to collection in batches. Progress printed so you can see where it hangs (embedding)."""
     if not chunks:
         return
     total_batches = (len(chunks) + batch_size - 1) // batch_size
-    use_tqdm = False
-    if tqdm is not None:
-        env_pref = os.environ.get("LLMLIBRARIAN_PROGRESS", "auto").strip().lower()
-        if env_pref in ("1", "true", "yes"):
-            use_tqdm = True
-        elif env_pref not in ("0", "false", "no"):
-            use_tqdm = sys.stderr.isatty()
+    use_tqdm = _should_use_tqdm()
     iterator = range(0, len(chunks), batch_size)
+    pbar = None
     if use_tqdm:
-        iterator = tqdm(iterator, desc="Embedding", total=total_batches)
-    for i in iterator:
-        batch = chunks[i : i + batch_size]
-        batch_num = i // batch_size + 1
-        msg = f"  Adding batch {batch_num}/{total_batches} ({len(batch)} chunks)..."
-        if not use_tqdm:
-            print(dim(no_color, msg))
-        if log_line:
-            log_line(msg.strip())
+        pbar = tqdm(iterator, desc="Embedding", total=total_batches, leave=False)
+        iterator = pbar
+    if embedding_fn is None or embedding_workers <= 1:
+        for i in iterator:
+            batch = chunks[i : i + batch_size]
+            batch_num = i // batch_size + 1
+            if not use_tqdm:
+                msg = f"  Adding batch {batch_num}/{total_batches} ({len(batch)} chunks)..."
+                print(dim(no_color, msg))
+                if log_line:
+                    log_line(msg.strip())
+            ids_b = [c[0] for c in batch]
+            docs_b = [c[1] for c in batch]
+            metas_b = [c[2] for c in batch]
+            collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b)
+        return
+
+    # Experimental: parallelize embedding computation, then add in main thread.
+    def _embed_batch(batch: list[ChunkTuple]) -> tuple[list[str], list[str], list[dict[str, Any]], Any]:
         ids_b = [c[0] for c in batch]
         docs_b = [c[1] for c in batch]
         metas_b = [c[2] for c in batch]
-        collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b)
+        embeddings = embedding_fn(docs_b)
+        return (ids_b, docs_b, metas_b, embeddings)
+
+    with ThreadPoolExecutor(max_workers=embedding_workers) as executor:
+        futures = {}
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i : i + batch_size]
+            futures[executor.submit(_embed_batch, batch)] = i
+        completed = 0
+        for future in as_completed(futures):
+            i = futures[future]
+            batch_num = i // batch_size + 1
+            if not use_tqdm:
+                msg = f"  Adding batch {batch_num}/{total_batches} ({min(batch_size, len(chunks) - i)} chunks)..."
+                print(dim(no_color, msg))
+                if log_line:
+                    log_line(msg.strip())
+            ids_b, docs_b, metas_b, embeddings = future.result()
+            collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b, embeddings=embeddings)
+            completed += 1
+            if pbar is not None:
+                pbar.update(1)
+        if pbar is not None:
+            pbar.close()
 
 
 
@@ -1089,8 +1130,22 @@ def run_index(
         except (ValueError, TypeError):
             pass
         batch_size = max(1, min(batch_size, 2000))  # sane range
-        log(f"Adding {len(all_chunks)} chunks to collection (embedding, batch_size={batch_size})...")
-        _batch_add(collection, all_chunks, batch_size=batch_size, no_color=no_color, log_line=log_line)
+        try:
+            embedding_workers = int(os.environ.get("LLMLIBRARIAN_EMBEDDING_WORKERS", "1"))
+        except (TypeError, ValueError):
+            embedding_workers = 1
+        embedding_workers = max(1, min(embedding_workers, 32))
+        if not _should_use_tqdm():
+            log(f"Adding {len(all_chunks)} chunks to collection (embedding, batch_size={batch_size})...")
+        _batch_add(
+            collection,
+            all_chunks,
+            batch_size=batch_size,
+            no_color=no_color,
+            log_line=log_line,
+            embedding_fn=ef,
+            embedding_workers=embedding_workers,
+        )
 
     elapsed = time.perf_counter() - t0
     done_msg = f"Done: {files_indexed} files, {len(all_chunks)} chunks in {elapsed:.1f}s"
@@ -1353,9 +1408,22 @@ def run_add(
         except (TypeError, ValueError):
             pass
         batch_size = max(1, min(batch_size, 2000))
+        try:
+            embedding_workers = int(os.environ.get("LLMLIBRARIAN_EMBEDDING_WORKERS", "1"))
+        except (TypeError, ValueError):
+            embedding_workers = 1
+        embedding_workers = max(1, min(embedding_workers, 32))
         total_batches = (len(all_chunks) + batch_size - 1) // batch_size
-        print(dim(no_color, f"  Adding {len(all_chunks)} chunks in {total_batches} batches (batch_size={batch_size})..."))
-        _batch_add(collection, all_chunks, batch_size=batch_size, no_color=no_color)
+        if not _should_use_tqdm():
+            print(dim(no_color, f"  Adding {len(all_chunks)} chunks in {total_batches} batches (batch_size={batch_size})..."))
+        _batch_add(
+            collection,
+            all_chunks,
+            batch_size=batch_size,
+            no_color=no_color,
+            embedding_fn=ef,
+            embedding_workers=embedding_workers,
+        )
 
     now_iso = datetime.now(timezone.utc).isoformat()
     language_stats = None

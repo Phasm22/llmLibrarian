@@ -41,6 +41,7 @@ Alternatives: **rye** (init, sync, run), **pip + venv** (slower, no lockfile), *
 | `LLMLIBRARIAN_CHUNK_OVERLAP` | Overlap (0–half of size; default 100) |
 | `LLMLIBRARIAN_MAX_WORKERS` | File-level parallelism cap |
 | `LLMLIBRARIAN_ADD_BATCH_SIZE` | Chunks per embedding batch (1–2000; default 256) |
+| `LLMLIBRARIAN_EMBEDDING_WORKERS` | Parallel embedding workers (default 1; >1 enables async embedding compute) |
 | `LLMLIBRARIAN_RELEVANCE_MAX_DISTANCE` | Max Chroma distance for relevance gate |
 | `LLMLIBRARIAN_DEDUP_CHUNK_HASH=1` | Enable in-retrieval dedup by chunk hash |
 
