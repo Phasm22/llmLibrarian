@@ -1,0 +1,11 @@
+{
+  "project": "llmLibrarian",
+  "version": "0.1.0",
+  "languages": ["Python", "TypeScript"],
+  "features": [
+    "Local-first RAG",
+    "Deterministic answers",
+    "PDF/DOCX extraction",
+    "Hybrid search with RRF"
+  ]
+}

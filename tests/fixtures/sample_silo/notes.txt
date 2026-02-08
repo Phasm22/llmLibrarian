@@ -1,0 +1,9 @@
+Meeting notes 2024-03-10
+
+I like working with local-first tools. I prefer deterministic systems over opaque AI agents.
+My favorite editor is VS Code but I also enjoy using terminal tools.
+
+TODO:
+- Finish the RAG pipeline
+- Add more file type extractors
+- Write tests for chunking logic

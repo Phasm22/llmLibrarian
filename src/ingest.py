@@ -22,10 +22,15 @@ from typing import Any
 
 # Chunk tuple: (id, document, metadata)
 ChunkTuple = tuple[str, str, dict[str, Any]]
-# Embedding is the bottleneck (~1s per 100 chunks with ONNX). Larger batches = fewer add() calls.
-ADD_BATCH_SIZE = 256
-# Parallelism for file read+chunk only; embedding runs in main thread in batches.
-MAX_WORKERS = 8
+
+from constants import (
+    DB_PATH,
+    LLMLI_COLLECTION,
+    CHUNK_SIZE,
+    CHUNK_OVERLAP,
+    ADD_BATCH_SIZE,
+    MAX_WORKERS,
+)
 
 import chromadb
 from chromadb.config import Settings
@@ -40,11 +45,6 @@ DEFAULT_MAX_DEPTH = 10
 DEFAULT_MAX_ARCHIVE_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
 DEFAULT_MAX_FILES_PER_ZIP = 500
 DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP = 50 * 1024 * 1024  # 50 MB
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 100
-DB_PATH = "./my_brain_db"
-# Single collection for llmli add/ask/ls
-LLMLI_COLLECTION = "llmli"
 # Default include/exclude for llmli add. First-class: text + code + pdf/docx + xlsx/pptx (no silent ignore).
 ADD_DEFAULT_INCLUDE = [
     "*.py", "*.ts", "*.tsx", "*.js", "*.go", "*.rs", "*.sh", "*.md", "*.txt",
@@ -323,77 +323,41 @@ def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -
     return result
 
 
-# --- Extraction (PDF/DOCX/code) ---
+# --- Extraction (delegated to processors.py; wrappers kept for ZIP processing) ---
+from processors import PDFProcessor, DOCXProcessor, XLSXProcessor, PPTXProcessor, PROCESSORS, DEFAULT_PROCESSOR
+
+_pdf_proc = PDFProcessor()
+_docx_proc = DOCXProcessor()
+_xlsx_proc = XLSXProcessor()
+_pptx_proc = PPTXProcessor()
+
+
 def get_text_from_pdf_bytes(pdf_bytes: bytes) -> list[tuple[str, int]]:
-    """Returns list of (page_text, page_number) for per-page chunks. Includes form field values. Returns [] if encrypted or broken."""
-    import fitz
-    try:
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            out: list[tuple[str, int]] = []
-            for page in doc:
-                text = page.get_text()
-                # Filled tax forms often store values in form fields; get_text() may miss them.
-                try:
-                    for w in page.widgets():
-                        name = getattr(w, "field_name", None) or ""
-                        val = getattr(w, "field_value", None)
-                        if name and val is not None and str(val).strip():
-                            text += f"\n{name}: {val}"
-                except Exception:
-                    pass
-                out.append((text, page.number + 1))
-            return out
-    except (ValueError, RuntimeError, Exception):
-        return []
+    """Returns list of (page_text, page_number) for per-page chunks. Delegates to PDFProcessor."""
+    result = _pdf_proc.extract(pdf_bytes, "")
+    return result if isinstance(result, list) else []
 
 
 def get_text_from_docx_bytes(docx_bytes: bytes) -> str:
-    import docx
-    try:
-        doc = docx.Document(io.BytesIO(docx_bytes))
-        return "\n".join(para.text for para in doc.paragraphs)
-    except Exception as e:
-        return f"Error reading DOCX: {e}"
+    """Delegates to DOCXProcessor."""
+    result = _docx_proc.extract(docx_bytes, "")
+    return result if isinstance(result, str) else ""
 
 
 def get_text_from_xlsx_bytes(data: bytes) -> tuple[str | None, bool]:
-    """Extract text from Excel (sheet names + cell values). Returns (text, True) or (None, False) if openpyxl not available."""
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-        parts: list[str] = []
-        for sheet in wb.worksheets:
-            parts.append(f"Sheet: {sheet.title}")
-            for row in sheet.iter_rows(values_only=True):
-                line = "\t".join(str(c) if c is not None else "" for c in row)
-                if line.strip():
-                    parts.append(line)
-        wb.close()
-        text = "\n".join(parts)
-        return (text.strip() or None, True)
-    except ImportError:
+    """Delegates to XLSXProcessor. Returns (text, True) or (None, False)."""
+    result = _xlsx_proc.extract(data, "")
+    if result is None:
         return (None, False)
-    except Exception:
-        return (None, False)
+    return (result, True)
 
 
 def get_text_from_pptx_bytes(data: bytes) -> tuple[str | None, bool]:
-    """Extract text from PowerPoint (slide shapes). Returns (text, True) or (None, False) if python-pptx not available."""
-    try:
-        from pptx import Presentation
-        prs = Presentation(io.BytesIO(data))
-        parts: list[str] = []
-        for i, slide in enumerate(prs.slides):
-            parts.append(f"Slide {i + 1}")
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text:
-                    parts.append(shape.text)
-        text = "\n".join(parts)
-        return (text.strip() or None, True)
-    except ImportError:
+    """Delegates to PPTXProcessor. Returns (text, True) or (None, False)."""
+    result = _pptx_proc.extract(data, "")
+    if result is None:
         return (None, False)
-    except Exception:
-        return (None, False)
+    return (result, True)
 
 
 def _chunk_metadata_only(
@@ -421,13 +385,6 @@ def _chunk_metadata_only(
     if file_hash:
         meta["file_hash"] = file_hash
     return [(cid, doc, meta)]
-
-
-def get_text_from_code_file(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except Exception as e:
-        return f"Error reading file: {e}"
 
 
 # --- Indexing ---
@@ -547,8 +504,7 @@ def _batch_add(
 def process_one_file(path: Path, kind: str, file_hash: str | None = None) -> list[ChunkTuple]:
     """
     Read file and return list of (id, doc, meta). Runs in worker thread.
-    kind: 'code' | 'pdf' | 'docx' | 'xlsx' | 'pptx'. file_hash: precomputed for dedup/registry; path is normalized (resolved).
-    xlsx/pptx: extract text if openpyxl/python-pptx available; else one metadata-only chunk (content_extracted=0).
+    Uses processor registry from processors.py. Falls back to TextProcessor for code/text.
     """
     path_resolved = path.resolve()
     path_str = str(path_resolved)
@@ -558,43 +514,25 @@ def process_one_file(path: Path, kind: str, file_hash: str | None = None) -> lis
     except OSError:
         return []
     file_id = path_resolved.name
-    if kind == "pdf":
-        try:
-            data = path_resolved.read_bytes()
-        except OSError:
-            return []
-        return _chunks_from_pdf(file_id, data, path_str, mtime, file_hash=file_hash)
-    if kind == "docx":
-        try:
-            data = path_resolved.read_bytes()
-        except OSError:
-            return []
-        text = get_text_from_docx_bytes(data)
-        return _chunks_from_content(file_id, text, path_str, mtime, prefix="", file_hash=file_hash)
-    if kind == "xlsx":
-        try:
-            data = path_resolved.read_bytes()
-        except OSError:
-            return []
-        text, ok = get_text_from_xlsx_bytes(data)
-        if ok and text:
-            return _chunks_from_content(file_id, text, path_str, mtime, prefix="", file_hash=file_hash)
-        return _chunk_metadata_only(file_id, path_str, mtime, "Spreadsheet", "openpyxl", file_hash=file_hash)
-    if kind == "pptx":
-        try:
-            data = path_resolved.read_bytes()
-        except OSError:
-            return []
-        text, ok = get_text_from_pptx_bytes(data)
-        if ok and text:
-            return _chunks_from_content(file_id, text, path_str, mtime, prefix="", file_hash=file_hash)
-        return _chunk_metadata_only(file_id, path_str, mtime, "Presentation", "python-pptx", file_hash=file_hash)
-    # code / text
     try:
-        text = path_resolved.read_text(encoding="utf-8", errors="replace")
+        data = path_resolved.read_bytes()
     except OSError:
         return []
-    return _chunks_from_content(file_id, text, path_str, mtime, file_hash=file_hash)
+    suffix = path_resolved.suffix.lower()
+    processor = PROCESSORS.get(suffix, DEFAULT_PROCESSOR)
+    result = processor.extract(data, path_str)
+    # PDF: returns list of (page_text, page_num) — use _chunks_from_pdf
+    if isinstance(result, list):
+        return _chunks_from_pdf(file_id, data, path_str, mtime, file_hash=file_hash)
+    # Extraction returned None — library not available; emit metadata-only chunk
+    if result is None:
+        return _chunk_metadata_only(
+            file_id, path_str, mtime,
+            processor.format_label, processor.install_hint,
+            file_hash=file_hash,
+        )
+    # String result — use _chunks_from_content
+    return _chunks_from_content(file_id, result, path_str, mtime, prefix="", file_hash=file_hash)
 
 
 def collect_files(
