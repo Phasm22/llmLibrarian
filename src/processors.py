@@ -21,6 +21,30 @@ class DocumentProcessor(Protocol):
         """
         ...
 
+
+class DocumentExtractionError(Exception):
+    """Base error for document extraction failures."""
+
+
+class PDFExtractionError(DocumentExtractionError):
+    """Raised when PDF extraction fails."""
+
+
+class DOCXExtractionError(DocumentExtractionError):
+    """Raised when DOCX extraction fails."""
+
+
+class XLSXExtractionError(DocumentExtractionError):
+    """Raised when XLSX extraction fails."""
+
+
+class PPTXExtractionError(DocumentExtractionError):
+    """Raised when PPTX extraction fails."""
+
+
+class TextExtractionError(DocumentExtractionError):
+    """Raised when text extraction fails."""
+
     @property
     def format_label(self) -> str:
         """Human-readable format name for metadata-only fallback."""
@@ -37,8 +61,8 @@ class PDFProcessor:
     install_hint = "pymupdf"
 
     def extract(self, data: bytes, source_path: str) -> list[tuple[str, int]]:
-        import fitz
         try:
+            import fitz
             with fitz.open(stream=data, filetype="pdf") as doc:
                 out: list[tuple[str, int]] = []
                 for page in doc:
@@ -53,21 +77,23 @@ class PDFProcessor:
                         pass
                     out.append((text, page.number + 1))
                 return out
-        except (ValueError, RuntimeError, Exception):
-            return []
+        except Exception as e:
+            raise PDFExtractionError(str(e)) from e
 
 
 class DOCXProcessor:
     format_label = "Document"
     install_hint = "python-docx"
 
-    def extract(self, data: bytes, source_path: str) -> str:
-        import docx
+    def extract(self, data: bytes, source_path: str) -> str | None:
         try:
+            import docx
             doc = docx.Document(io.BytesIO(data))
             return "\n".join(para.text for para in doc.paragraphs)
+        except ImportError:
+            return None
         except Exception as e:
-            return f"Error reading DOCX: {e}"
+            raise DOCXExtractionError(str(e)) from e
 
 
 class XLSXProcessor:
@@ -91,7 +117,7 @@ class XLSXProcessor:
         except ImportError:
             return None
         except Exception:
-            return None
+            raise XLSXExtractionError("Failed to extract XLSX content.")
 
 
 class PPTXProcessor:
@@ -113,7 +139,7 @@ class PPTXProcessor:
         except ImportError:
             return None
         except Exception:
-            return None
+            raise PPTXExtractionError("Failed to extract PPTX content.")
 
 
 class TextProcessor:
@@ -124,7 +150,7 @@ class TextProcessor:
         try:
             return data.decode("utf-8", errors="replace")
         except Exception as e:
-            return f"Error reading file: {e}"
+            raise TextExtractionError(str(e)) from e
 
 
 # Registry: suffix -> processor instance

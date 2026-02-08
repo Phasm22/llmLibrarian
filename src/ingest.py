@@ -13,12 +13,15 @@ import json
 import os
 import re
 import sys
+import tempfile
+import traceback
 import zipfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 # Chunk tuple: (id, document, metadata)
 ChunkTuple = tuple[str, str, dict[str, Any]]
@@ -38,6 +41,11 @@ from chromadb.config import Settings
 from embeddings import get_embedding_function
 from load_config import load_config, get_archetype
 from style import bold, dim, label_style, success_style, warn_style
+
+try:
+    import fcntl  # type: ignore[import-not-found]
+except Exception:
+    fcntl = None  # type: ignore[assignment]
 
 # --- Default limits (overridden by config) ---
 DEFAULT_MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
@@ -140,11 +148,61 @@ def get_file_hash(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _log_event(level: str, message: str, **fields: Any) -> None:
+    """Structured log line for ingest errors. Writes JSON to stderr."""
+    event = {"ts": datetime.now(timezone.utc).isoformat(), "level": level, "message": message}
+    if fields:
+        event.update(fields)
+    try:
+        print(json.dumps(event, ensure_ascii=False), file=sys.stderr)
+    except Exception:
+        pass
+
+
 def _file_registry_path(db_path: str | Path) -> Path:
     p = Path(db_path).resolve()
     if p.is_dir():
         return p / "llmli_file_registry.json"
     return p.parent / "llmli_file_registry.json"
+
+
+def _registry_lock_path(registry_path: Path) -> Path:
+    if registry_path.suffix:
+        return registry_path.with_suffix(registry_path.suffix + ".lock")
+    return registry_path.with_name(registry_path.name + ".lock")
+
+
+@contextmanager
+def _registry_lock(registry_path: Path) -> Iterator[None]:
+    if fcntl is None:
+        yield
+        return
+    lock_path = _registry_lock_path(registry_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+            tmp_path = Path(f.name)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path and tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def _read_file_registry(db_path: str | Path) -> dict:
@@ -163,12 +221,18 @@ def _read_file_registry(db_path: str | Path) -> dict:
 def _write_file_registry(db_path: str | Path, data: dict) -> None:
     path = _file_registry_path(db_path)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        _atomic_write_json(path, data)
     except Exception as e:
         print(f"[llmli] file registry write failed: {path}: {e}", file=sys.stderr)
         raise
+
+
+def _update_file_registry(db_path: str | Path, update_fn: Any) -> None:
+    path = _file_registry_path(db_path)
+    with _registry_lock(path):
+        reg = _read_file_registry(db_path)
+        update_fn(reg)
+        _write_file_registry(db_path, reg)
 
 
 def _file_registry_get(db_path: str | Path, file_hash: str) -> list[dict]:
@@ -178,24 +242,26 @@ def _file_registry_get(db_path: str | Path, file_hash: str) -> list[dict]:
 
 
 def _file_registry_add(db_path: str | Path, file_hash: str, silo: str, path_str: str) -> None:
-    reg = _read_file_registry(db_path)
-    by_hash = reg.setdefault("by_hash", {})
-    entries = by_hash.setdefault(file_hash, [])
-    if not any(e.get("silo") == silo and e.get("path") == path_str for e in entries):
-        entries.append({"silo": silo, "path": path_str})
-    _write_file_registry(db_path, reg)
+    def _apply(reg: dict) -> None:
+        by_hash = reg.setdefault("by_hash", {})
+        entries = by_hash.setdefault(file_hash, [])
+        if not any(e.get("silo") == silo and e.get("path") == path_str for e in entries):
+            entries.append({"silo": silo, "path": path_str})
+
+    _update_file_registry(db_path, _apply)
 
 
 def _file_registry_remove_silo(db_path: str | Path, silo: str) -> None:
-    reg = _read_file_registry(db_path)
-    by_hash = reg.get("by_hash", {})
-    for h, entries in list(by_hash.items()):
-        new_entries = [e for e in entries if e.get("silo") != silo]
-        if not new_entries:
-            del by_hash[h]
-        else:
-            by_hash[h] = new_entries
-    _write_file_registry(db_path, reg)
+    def _apply(reg: dict) -> None:
+        by_hash = reg.get("by_hash", {})
+        for h, entries in list(by_hash.items()):
+            new_entries = [e for e in entries if e.get("silo") != silo]
+            if not new_entries:
+                del by_hash[h]
+            else:
+                by_hash[h] = new_entries
+
+    _update_file_registry(db_path, _apply)
 
 
 def get_paths_by_silo(db_path: str | Path) -> dict[str, set[str]]:
@@ -271,6 +337,16 @@ def should_descend_into_dir(dir_path: str | Path, exclude_patterns: list[str]) -
     return True
 
 
+def is_safe_path(base: Path, path: str) -> bool:
+    """Return True if 'path' stays within 'base' after resolution (prevents traversal)."""
+    try:
+        base_res = base.resolve()
+        target = (base_res / path).resolve()
+        return not Path(path).is_absolute() and target.is_relative_to(base_res)
+    except Exception:
+        return False
+
+
 def _chunk_params() -> tuple[int, int]:
     """(chunk_size, overlap) from env or defaults. Used so add/index can be tuned without code change."""
     size = CHUNK_SIZE
@@ -324,7 +400,16 @@ def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -
 
 
 # --- Extraction (delegated to processors.py; wrappers kept for ZIP processing) ---
-from processors import PDFProcessor, DOCXProcessor, XLSXProcessor, PPTXProcessor, PROCESSORS, DEFAULT_PROCESSOR
+from processors import (
+    PDFProcessor,
+    DOCXProcessor,
+    XLSXProcessor,
+    PPTXProcessor,
+    PROCESSORS,
+    DEFAULT_PROCESSOR,
+    DocumentExtractionError,
+    PDFExtractionError,
+)
 
 _pdf_proc = PDFProcessor()
 _docx_proc = DOCXProcessor()
@@ -333,20 +418,30 @@ _pptx_proc = PPTXProcessor()
 
 
 def get_text_from_pdf_bytes(pdf_bytes: bytes) -> list[tuple[str, int]]:
-    """Returns list of (page_text, page_number) for per-page chunks. Delegates to PDFProcessor."""
+    """Returns list of (page_text, page_number) for per-page chunks. Raises PDFExtractionError on failure."""
     result = _pdf_proc.extract(pdf_bytes, "")
-    return result if isinstance(result, list) else []
+    if not isinstance(result, list):
+        raise PDFExtractionError("PDF extractor returned unexpected result.")
+    return result
 
 
 def get_text_from_docx_bytes(docx_bytes: bytes) -> str:
     """Delegates to DOCXProcessor."""
-    result = _docx_proc.extract(docx_bytes, "")
+    try:
+        result = _docx_proc.extract(docx_bytes, "")
+    except DocumentExtractionError as e:
+        _log_event("ERROR", "DOCX extraction failed", error=str(e))
+        return ""
     return result if isinstance(result, str) else ""
 
 
 def get_text_from_xlsx_bytes(data: bytes) -> tuple[str | None, bool]:
     """Delegates to XLSXProcessor. Returns (text, True) or (None, False)."""
-    result = _xlsx_proc.extract(data, "")
+    try:
+        result = _xlsx_proc.extract(data, "")
+    except DocumentExtractionError as e:
+        _log_event("ERROR", "XLSX extraction failed", error=str(e))
+        return (None, False)
     if result is None:
         return (None, False)
     return (result, True)
@@ -354,7 +449,11 @@ def get_text_from_xlsx_bytes(data: bytes) -> tuple[str | None, bool]:
 
 def get_text_from_pptx_bytes(data: bytes) -> tuple[str | None, bool]:
     """Delegates to PPTXProcessor. Returns (text, True) or (None, False)."""
-    result = _pptx_proc.extract(data, "")
+    try:
+        result = _pptx_proc.extract(data, "")
+    except DocumentExtractionError as e:
+        _log_event("ERROR", "PPTX extraction failed", error=str(e))
+        return (None, False)
     if result is None:
         return (None, False)
     return (result, True)
@@ -501,11 +600,18 @@ def _batch_add(
         collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b)
 
 
-def process_one_file(path: Path, kind: str, file_hash: str | None = None) -> list[ChunkTuple]:
+def process_one_file(
+    path: Path,
+    kind: str,
+    file_hash: str | None = None,
+    follow_symlinks: bool = False,
+) -> list[ChunkTuple]:
     """
     Read file and return list of (id, doc, meta). Runs in worker thread.
     Uses processor registry from processors.py. Falls back to TextProcessor for code/text.
     """
+    if path.is_symlink() and not follow_symlinks:
+        return []
     path_resolved = path.resolve()
     path_str = str(path_resolved)
     try:
@@ -520,10 +626,25 @@ def process_one_file(path: Path, kind: str, file_hash: str | None = None) -> lis
         return []
     suffix = path_resolved.suffix.lower()
     processor = PROCESSORS.get(suffix, DEFAULT_PROCESSOR)
-    result = processor.extract(data, path_str)
+    try:
+        result = processor.extract(data, path_str)
+    except DocumentExtractionError as e:
+        _log_event(
+            "ERROR",
+            "Extraction failed",
+            path=path_str,
+            kind=kind,
+            error=str(e),
+            extractor=getattr(processor, "format_label", "unknown"),
+        )
+        return []
     # PDF: returns list of (page_text, page_num) — use _chunks_from_pdf
     if isinstance(result, list):
-        return _chunks_from_pdf(file_id, data, path_str, mtime, file_hash=file_hash)
+        try:
+            return _chunks_from_pdf(file_id, data, path_str, mtime, file_hash=file_hash)
+        except PDFExtractionError as e:
+            _log_event("ERROR", "PDF extraction failed", path=path_str, error=str(e))
+            return []
     # Extraction returned None — library not available; emit metadata-only chunk
     if result is None:
         return _chunk_metadata_only(
@@ -542,6 +663,7 @@ def collect_files(
     max_depth: int,
     max_file_bytes: int,
     current_depth: int = 0,
+    follow_symlinks: bool = False,
 ) -> list[tuple[Path, str]]:
     """
     Walk tree and return list of (path, kind) for files to index.
@@ -554,12 +676,22 @@ def collect_files(
         for item in sorted(root.iterdir()):
             if item.name.startswith("."):
                 continue
+            if item.is_symlink() and not follow_symlinks:
+                continue
             path_str = str(item)
             if item.is_dir():
                 if not should_descend_into_dir(path_str, exclude):
                     continue
                 out.extend(
-                    collect_files(item, include, exclude, max_depth, max_file_bytes, current_depth + 1)
+                    collect_files(
+                        item,
+                        include,
+                        exclude,
+                        max_depth,
+                        max_file_bytes,
+                        current_depth + 1,
+                        follow_symlinks=follow_symlinks,
+                    )
                 )
             else:
                 if not should_index(path_str, include, exclude):
@@ -614,6 +746,14 @@ def process_zip_to_chunks(
             for info in z.infolist():
                 if info.filename.endswith("/") or info.file_size == 0:
                     continue
+                if not is_safe_path(zip_path.parent, info.filename):
+                    _log_event(
+                        "WARN",
+                        "Skipped unsafe ZIP entry",
+                        path=str(zip_path),
+                        entry=info.filename,
+                    )
+                    continue
                 if count >= max_files_per_zip or extracted_bytes >= max_extracted_per_zip:
                     break
                 if not should_index(info.filename, include, exclude):
@@ -630,7 +770,16 @@ def process_zip_to_chunks(
                 mtime = 0.0
                 suf = Path(info.filename).suffix.lower()
                 if suf == ".pdf":
-                    out.extend(_chunks_from_pdf(file_id, data, source_label, mtime))
+                    try:
+                        out.extend(_chunks_from_pdf(file_id, data, source_label, mtime))
+                    except PDFExtractionError as e:
+                        _log_event(
+                            "ERROR",
+                            "PDF extraction failed in ZIP",
+                            path=str(zip_path),
+                            entry=info.filename,
+                            error=str(e),
+                        )
                 elif suf == ".docx":
                     text = get_text_from_docx_bytes(data)
                     out.extend(_chunks_from_content(file_id, text, source_label, mtime, prefix=""))
@@ -694,6 +843,7 @@ def run_index(
     no_color: bool = False,
     log_path: str | Path | None = None,
     mode: str = "normal",
+    follow_symlinks: bool = False,
 ) -> None:
     try:
         from floor import print_resources
@@ -749,6 +899,9 @@ def run_index(
     file_list: list[tuple[Path, str]] = []
     for folder in folders:
         p = Path(folder)
+        if p.is_symlink() and not follow_symlinks:
+            print(warn_style(no_color, f"  ⚠️ Skipping symlinked folder: {folder} (use --follow-symlinks to allow)"))
+            continue
         if not p.exists():
             print(warn_style(no_color, f"  ⚠️ Folder does not exist: {folder}"))
             continue
@@ -756,7 +909,7 @@ def run_index(
             print(warn_style(no_color, f"  ⚠️ Not a directory: {folder}"))
             continue
         print(dim(no_color, f"  📁 {folder}"))
-        file_list.extend(collect_files(p, include, exclude, max_depth, max_file_bytes))
+        file_list.extend(collect_files(p, include, exclude, max_depth, max_file_bytes, follow_symlinks=follow_symlinks))
 
     log(f"Collected {len(file_list)} files")
     # 2. Split: regular files (parallel) vs zips (main thread, limits)
@@ -770,7 +923,7 @@ def run_index(
     log("Processing files (parallel)...")
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_item = {
-            executor.submit(process_one_file, path, kind): (path, kind)
+            executor.submit(process_one_file, path, kind, None, follow_symlinks): (path, kind)
             for path, kind in regular
         }
         for future in as_completed(future_to_item):
@@ -778,6 +931,14 @@ def run_index(
             try:
                 chunks = future.result()
             except Exception as e:
+                _log_event(
+                    "ERROR",
+                    "Worker failed",
+                    path=str(path),
+                    kind=kind,
+                    error=str(e),
+                    traceback=traceback.format_exc(),
+                )
                 print(f"[llmlibrarian] FAIL {path}: {e}", file=sys.stderr)
                 continue
             if chunks:
@@ -803,6 +964,13 @@ def run_index(
             print(warn_style(no_color, f"  ⚠️ Bad ZIP: {zip_path.name} — {e}"))
             continue
         except Exception as e:
+            _log_event(
+                "ERROR",
+                "ZIP inspection failed",
+                path=str(zip_path),
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
             print(warn_style(no_color, f"  ⚠️ ZIP error: {zip_path.name} — {e}"))
             continue
         if encrypted:
@@ -845,6 +1013,7 @@ def run_add(
     db_path: str | Path | None = None,
     no_color: bool = False,
     allow_cloud: bool = False,
+    follow_symlinks: bool = False,
 ) -> tuple[int, int]:
     """
     Index a single folder into the unified collection (llmli). Silo name = basename(path).
@@ -857,7 +1026,10 @@ def run_add(
     from state import update_silo, set_last_failures, slugify
 
     db_path = db_path or DB_PATH
-    path = Path(path).resolve()
+    path = Path(path)
+    if path.is_symlink() and not follow_symlinks:
+        raise ValueError(f"Refusing to follow symlinked path: {path}. Use --follow-symlinks to allow.")
+    path = path.resolve()
     if not path.is_dir():
         raise NotADirectoryError(f"Not a directory: {path}")
     if not allow_cloud:
@@ -878,7 +1050,14 @@ def run_add(
     max_files_per_zip = int(limits_cfg.get("max_files_per_zip") or DEFAULT_MAX_FILES_PER_ZIP)
     max_extracted_per_zip = int(limits_cfg.get("max_extracted_bytes_per_zip") or DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP)
 
-    file_list = collect_files(path, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE, max_depth, max_file_bytes)
+    file_list = collect_files(
+        path,
+        ADD_DEFAULT_INCLUDE,
+        ADD_DEFAULT_EXCLUDE,
+        max_depth,
+        max_file_bytes,
+        follow_symlinks=follow_symlinks,
+    )
     regular = [(p, k) for p, k in file_list if k != "zip"]
     zips = [p for p, k in file_list if k == "zip"]
 
@@ -927,12 +1106,23 @@ def run_add(
     to_register: list[tuple[str, str]] = []  # (file_hash, path_str) for main-thread registry update
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_item = {executor.submit(process_one_file, p, k, h): (p, k, h) for p, k, h in regular_with_hash}
+        future_to_item = {
+            executor.submit(process_one_file, p, k, h, follow_symlinks): (p, k, h)
+            for p, k, h in regular_with_hash
+        }
         for future in as_completed(future_to_item):
             p, kind, fhash = future_to_item[future]
             try:
                 chunks = future.result()
             except Exception as e:
+                _log_event(
+                    "ERROR",
+                    "Worker failed",
+                    path=str(p),
+                    kind=kind,
+                    error=str(e),
+                    traceback=traceback.format_exc(),
+                )
                 failures.append({"path": str(p), "error": str(e)})
                 print(f"[llmli] FAIL {p}: {e}", file=sys.stderr)
                 continue
@@ -958,6 +1148,13 @@ def run_add(
                 max_archive_bytes, max_file_bytes, max_files_per_zip, max_extracted_per_zip,
             )
         except Exception as e:
+            _log_event(
+                "ERROR",
+                "ZIP processing failed",
+                path=str(zip_path),
+                error=str(e),
+                traceback=traceback.format_exc(),
+            )
             failures.append({"path": str(zip_path), "error": str(e)})
             print(f"[llmli] FAIL {zip_path}: {e}", file=sys.stderr)
             continue

@@ -6,6 +6,7 @@ Run from project root; uses archetypes.yaml and ./my_brain_db by default.
 """
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -21,6 +22,15 @@ def _db_path(args: argparse.Namespace) -> Path:
 def _config_path(args: argparse.Namespace) -> Path | None:
     return getattr(args, "config", None) or os.environ.get("LLMLIBRARIAN_CONFIG")
 
+def _sanitize_query(parts: list[str]) -> str | None:
+    query = " ".join(parts or [])
+    query = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", query).strip()
+    if not query:
+        return None
+    if len(query) > 8000:
+        return None
+    return query
+
 def cmd_add(args: argparse.Namespace) -> int:
     """Index a folder into the unified llmli collection; silo name = basename(path)."""
     from indexer import run_add, DB_PATH
@@ -31,7 +41,13 @@ def cmd_add(args: argparse.Namespace) -> int:
         print(f"Error: not a directory: {path}", file=sys.stderr)
         return 1
     try:
-        run_add(path, db_path=db, no_color=args.no_color, allow_cloud=getattr(args, "allow_cloud", False))
+        run_add(
+            path,
+            db_path=db,
+            no_color=args.no_color,
+            allow_cloud=getattr(args, "allow_cloud", False),
+            follow_symlinks=getattr(args, "follow_symlinks", False),
+        )
         return 0
     except CloudSyncPathError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -59,9 +75,13 @@ def cmd_ask(args: argparse.Namespace) -> int:
         silo_slug = None  # query all silos (unified)
         if not archetype:
             archetype = None
+    query = _sanitize_query(args.query)
+    if query is None:
+        print("Error: empty or invalid query (or too long).", file=sys.stderr)
+        return 1
     out = run_ask(
         archetype,
-        " ".join(args.query),
+        query,
         config_path=config,
         n_results=getattr(args, "n_results", 12),
         model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.1:8b"),
@@ -107,6 +127,7 @@ def cmd_index(args: argparse.Namespace) -> int:
             no_color=args.no_color,
             log_path=getattr(args, "log", None),
             mode=getattr(args, "mode", "normal"),
+            follow_symlinks=getattr(args, "follow_symlinks", False),
         )
         return 0
     except KeyError as e:
@@ -250,6 +271,7 @@ def main() -> int:
     p_add = sub.add_parser("add", help="Index folder into llmli (silo = basename); cloud-sync paths blocked unless --allow-cloud")
     p_add.add_argument("path", help="Folder path to index")
     p_add.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive (ingestion may be unreliable)")
+    p_add.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks inside the target folder")
     p_add.set_defaults(db=None)
     p_add.set_defaults(_run=cmd_add)
 
@@ -280,6 +302,7 @@ def main() -> int:
     p_index.add_argument("--archetype", "-a", required=True, help="Archetype id")
     p_index.add_argument("--log", help="Log file path (or set LLMLIBRARIAN_LOG=1)")
     p_index.add_argument("--mode", choices=["fast", "normal", "deep"], default="normal")
+    p_index.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks in config folders")
     p_index.set_defaults(_run=cmd_index)
 
     # rm <silo>

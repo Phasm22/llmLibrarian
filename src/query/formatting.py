@@ -4,6 +4,7 @@ source URL generation, and snippet previews.
 """
 import os
 import re
+from urllib.parse import quote
 from pathlib import Path
 
 from constants import SNIPPET_MAX_LEN
@@ -33,7 +34,7 @@ def shorten_path(path: str) -> str:
         rel = p.resolve().relative_to(Path.cwd().resolve())
         return str(rel)
     except ValueError:
-        return p.name or path
+        return p.name if p.name else path
 
 
 def snippet_preview(text: str, max_len: int = SNIPPET_MAX_LEN) -> str:
@@ -59,13 +60,14 @@ def source_url(source: str, line: int | None = None, page: int | None = None) ->
     try:
         p = Path(source).resolve()
         posix = p.as_posix()
+        quoted = quote(posix, safe="/")
         scheme = (os.environ.get("LLMLIBRARIAN_EDITOR_SCHEME") or "vscode").strip().lower()
         use_editor = scheme in ("vscode", "cursor") and _use_editor_link(p)
         if use_editor and line is not None:
             prefix = "cursor://file" if scheme == "cursor" else "vscode://file"
-            return f"{prefix}/{posix}:{line}:1"
+            return f"{prefix}/{quoted}:{line}:1"
         # file:// for everything else: .docx, .pdf, binaries, or when scheme=file
-        url = "file://" + posix if posix.startswith("/") else "file:///" + posix
+        url = "file://" + quoted if posix.startswith("/") else "file:///" + quoted
         if line is not None:
             url = f"{url}#L{line}"
         elif page is not None:

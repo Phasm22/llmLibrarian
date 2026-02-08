@@ -4,13 +4,34 @@ Load archetypes.yaml and resolve archetype by id (slug). Used by indexer and que
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TypedDict
+
+
+class ArchetypeConfig(TypedDict, total=False):
+    name: str
+    collection: str
+    folders: list[str]
+    include: list[str]
+    exclude: list[str]
+
+
+class LimitsConfig(TypedDict, total=False):
+    max_file_size_mb: int | float
+    max_depth: int
+    max_archive_size_mb: int | float
+    max_files_per_zip: int
+    max_extracted_bytes_per_zip: int
+
+
+class AppConfig(TypedDict):
+    archetypes: dict[str, ArchetypeConfig]
+    limits: LimitsConfig
 
 def _default_config_path() -> Path:
     base = os.environ.get("LLMLIBRARIAN_CONFIG_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return Path(base) / "archetypes.yaml"
 
-def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
+def load_config(config_path: str | Path | None = None) -> AppConfig:
     """Load YAML config (archetypes + limits). Returns dict with 'archetypes' and optional 'limits'. Warns on missing file or load failure."""
     path = config_path if config_path is not None else _default_config_path()
     path = Path(path)
@@ -26,7 +47,7 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
         print(f"[llmli] config load failed: {path}: {e}; using empty archetypes and limits.", file=sys.stderr)
         return {"archetypes": {}, "limits": {}}
 
-def get_archetype(config: dict[str, Any], archetype_id: str) -> dict[str, Any]:
+def get_archetype(config: AppConfig, archetype_id: str) -> ArchetypeConfig:
     """Get archetype by id (slug). Raises KeyError if not found."""
     archs = config.get("archetypes") or {}
     if archetype_id not in archs:
@@ -37,7 +58,7 @@ def get_archetype(config: dict[str, Any], archetype_id: str) -> dict[str, Any]:
     return arch
 
 
-def get_archetype_optional(config: dict[str, Any], archetype_id: str) -> dict[str, Any] | None:
+def get_archetype_optional(config: AppConfig, archetype_id: str) -> ArchetypeConfig | None:
     """Get archetype by id if present; else None. Use for prompt-only lookup (e.g. silo-scoped ask)."""
     archs = config.get("archetypes") or {}
     if archetype_id not in archs:
