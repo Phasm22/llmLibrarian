@@ -2,6 +2,7 @@
 Silo registry and last-failures for llmli add/ls/log. Stored next to DB path.
 Display name = original folder name; slug = canonical key (lowercase, hyphens).
 """
+import hashlib
 import json
 import re
 import sys
@@ -9,12 +10,15 @@ from pathlib import Path
 from typing import Any
 
 
-def slugify(name: str) -> str:
-    """Canonical silo id: lowercase, spaces/special -> hyphens, collapse."""
+def slugify(name: str, path: str | None = None) -> str:
+    """Canonical silo id: lowercase, spaces/special -> hyphens, collapse + hash suffix."""
     s = (name or "").strip().lower()
     s = re.sub(r"[^\w\s-]", "", s)
     s = re.sub(r"[-\s]+", "-", s).strip("-")
-    return s or "default"
+    prefix = s or "default"
+    material = f"{name or ''}|{path or ''}"
+    h = hashlib.sha1(material.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}-{h}"
 
 def _registry_path(db_path: str | Path) -> Path:
     p = Path(db_path).resolve()
@@ -90,6 +94,16 @@ def resolve_silo_to_slug(db_path: str | Path, name_or_slug: str) -> str | None:
         return name_or_slug
     for slug, data in reg.items():
         if (data.get("display_name") or slug) == name_or_slug:
+            return slug
+    return None
+
+
+def resolve_silo_by_path(db_path: str | Path, path: str | Path) -> str | None:
+    """Return slug for the given exact path, if registered."""
+    reg = _read_registry(db_path)
+    p = str(Path(path).resolve())
+    for slug, data in reg.items():
+        if (data.get("path") or "") == p:
             return slug
     return None
 

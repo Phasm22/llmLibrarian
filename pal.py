@@ -113,6 +113,15 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return _run_llmli(llmli_args)
 
 
+def cmd_remove(args: argparse.Namespace) -> int:
+    """Remove a silo (friendly alias for llmli remove)."""
+    silo = getattr(args, "silo", None)
+    if not silo:
+        print("Error: remove requires silo name. Example: pal remove \"Tax\"", file=sys.stderr)
+        return 1
+    return _run_llmli(["remove", silo])
+
+
 def cmd_pull(args: argparse.Namespace) -> int:
     """Refresh all registered silos (incremental by default)."""
     reg = _read_registry()
@@ -173,7 +182,7 @@ def cmd_tool(args: argparse.Namespace) -> int:
     return 1
 
 
-KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "pull", "silos", "tool"})
+KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "pull", "silos", "remove", "tool"})
 
 
 def main() -> int:
@@ -213,6 +222,10 @@ def main() -> int:
     p_inspect.add_argument("--top", type=int, default=None, help="Show top N files (default: 20; pass to llmli)")
     p_inspect.add_argument("--filter", choices=["pdf", "docx", "code"], help="Show only pdf, docx, or code")
     p_inspect.set_defaults(_run=cmd_inspect)
+
+    p_remove = sub.add_parser("remove", help="Remove silo (friendly alias for llmli remove)")
+    p_remove.add_argument("silo", help="Silo slug, display name, or path")
+    p_remove.set_defaults(_run=cmd_remove)
 
     p_log = sub.add_parser("log", help="Last failures (llmli log --last)")
     p_log.set_defaults(_run=cmd_log)

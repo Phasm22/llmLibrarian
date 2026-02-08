@@ -31,6 +31,23 @@ def _sanitize_query(parts: list[str]) -> str | None:
         return None
     return query
 
+
+def _truncate_tail(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    return "..." + text[-(max_len - 3):]
+
+
+def _truncate_mid(text: str, max_len: int) -> str:
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    keep = max_len - 3
+    left = max(1, keep // 2)
+    right = max(1, keep - left)
+    return text[:left] + "..." + text[-right:]
+
 def cmd_add(args: argparse.Namespace) -> int:
     """Index a folder into the unified llmli collection; silo name = basename(path)."""
     from indexer import run_add, DB_PATH
@@ -113,11 +130,6 @@ def cmd_ls(args: argparse.Namespace) -> int:
         updated = (s.get("updated", "") or "")[:19]
         rows.append((display, slug, files, chunks, updated, path))
 
-    def _truncate(text: str, max_len: int) -> str:
-        if len(text) <= max_len:
-            return text
-        return "..." + text[-(max_len - 3):]
-
     name_w = min(max(len(r[0]) for r in rows), 24)
     slug_w = min(max(len(r[1]) for r in rows), 20)
     path_w = 60
@@ -125,9 +137,9 @@ def cmd_ls(args: argparse.Namespace) -> int:
     print(header)
     print("-" * len(header))
     for display, slug, files, chunks, updated, path in rows:
-        display = _truncate(display, name_w)
-        slug = _truncate(slug, slug_w)
-        path = _truncate(path, path_w)
+        display = _truncate_mid(display, name_w)
+        slug = _truncate_mid(slug, slug_w)
+        path = _truncate_tail(path, path_w)
         print(f"{display:<{name_w}}  {slug:<{slug_w}}  {files:>5}  {chunks:>7}  {updated:<19}  {path}")
     return 0
 
@@ -162,15 +174,17 @@ def cmd_rm(args: argparse.Namespace) -> int:
     for that slug (fixes orphaned 'desktop' etc.)."""
     silo = getattr(args, "silo", None)
     if not silo:
-        print("Error: rm requires silo name as positional argument. Example: llmli rm tax", file=sys.stderr)
+        print("Error: remove requires silo name. Example: llmli remove \"Tax\"", file=sys.stderr)
         return 1
-    from state import remove_silo, slugify
+    from state import remove_silo, slugify, resolve_silo_by_path
     from indexer import LLMLI_COLLECTION, DB_PATH
     from ingest import _file_registry_remove_silo
     import chromadb
     from chromadb.config import Settings
     db = _db_path(args)
-    removed_slug = remove_silo(db, silo)
+    # Allow path input to resolve to slug.
+    path_slug = resolve_silo_by_path(db, silo) if Path(str(silo)).exists() else None
+    removed_slug = remove_silo(db, path_slug or silo)
     slug_to_clean = removed_slug if removed_slug is not None else slugify(silo)
     try:
         client = chromadb.PersistentClient(path=str(db), settings=Settings(anonymized_telemetry=False))
@@ -325,10 +339,14 @@ def main() -> int:
     p_index.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks in config folders")
     p_index.set_defaults(_run=cmd_index)
 
-    # rm <silo>
+    # remove <silo>
     p_rm = sub.add_parser("rm", help="Remove silo (registry + chunks)")
-    p_rm.add_argument("silo", help="Silo slug or display name")
+    p_rm.add_argument("silo", help="Silo slug, display name, or path")
     p_rm.set_defaults(_run=cmd_rm)
+
+    p_remove = sub.add_parser("remove", help="Remove silo (friendlier alias of rm)")
+    p_remove.add_argument("silo", help="Silo slug, display name, or path")
+    p_remove.set_defaults(_run=cmd_rm)
 
     # capabilities
     p_capabilities = sub.add_parser("capabilities", help="Supported file types and document extractors (source of truth)")

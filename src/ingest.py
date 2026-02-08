@@ -1170,7 +1170,7 @@ def run_add(
     If interrupted (e.g. Ctrl+C): Chroma may have 0 or partial chunks for this silo;
     the registry is only updated on success. Re-run add for the same path to get a consistent state.
     """
-    from state import update_silo, set_last_failures, slugify
+    from state import update_silo, set_last_failures, slugify, resolve_silo_by_path
 
     db_path = db_path or DB_PATH
     path = Path(path)
@@ -1184,7 +1184,8 @@ def run_add(
         if cloud_kind:
             raise CloudSyncPathError(path, cloud_kind)
     display_name = path.name
-    silo_slug = slugify(display_name)
+    existing_slug = resolve_silo_by_path(db_path, path)
+    silo_slug = existing_slug if existing_slug else slugify(display_name, str(path))
     limits_cfg = {}
     try:
         config = load_config()
