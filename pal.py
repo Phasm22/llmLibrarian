@@ -141,6 +141,26 @@ def cmd_pull(args: argparse.Namespace) -> int:
     return 0 if failures == 0 else 1
 
 
+def cmd_silos(args: argparse.Namespace) -> int:
+    """Report silo health (duplicates, overlaps, mismatches)."""
+    root = Path(__file__).resolve().parent
+    src = root / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    from silo_audit import load_registry, load_file_registry, load_manifest, find_duplicate_hashes, find_path_overlaps, find_count_mismatches, format_report
+
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    registry = load_registry(db_path)
+    file_registry = load_file_registry(db_path)
+    manifest = load_manifest(db_path)
+    dupes = find_duplicate_hashes(file_registry)
+    overlaps = find_path_overlaps(registry)
+    mismatches = find_count_mismatches(registry, manifest)
+    report = format_report(registry, dupes, overlaps, mismatches)
+    print(report)
+    return 0
+
+
 def cmd_tool(args: argparse.Namespace) -> int:
     """Passthrough: pal tool <name> <args...> -> run underlying tool."""
     name = getattr(args, "tool_name", None)
@@ -153,7 +173,7 @@ def cmd_tool(args: argparse.Namespace) -> int:
     return 1
 
 
-KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "pull", "tool"})
+KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "pull", "silos", "tool"})
 
 
 def main() -> int:
@@ -205,6 +225,9 @@ def main() -> int:
     p_pull.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive")
     p_pull.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks inside folders")
     p_pull.set_defaults(_run=cmd_pull)
+
+    p_silos = sub.add_parser("silos", help="Silo health report (duplicates, overlaps, mismatches)")
+    p_silos.set_defaults(_run=cmd_silos)
 
     p_tool = sub.add_parser("tool", help="Passthrough to tool: pal tool llmli <args...>")
     p_tool.add_argument("tool_name", help="Tool name (e.g. llmli)")

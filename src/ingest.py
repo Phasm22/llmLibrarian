@@ -1443,13 +1443,22 @@ def run_add(
                 "sample_paths": {ext: list(paths)[:3] for ext, paths in unique_by_ext.items()},
             }
     chunks_count = len(all_chunks)
+    total_files = files_indexed
     if incremental:
         try:
             result = collection.get(where={"silo": silo_slug}, include=["metadatas"])
             chunks_count = len(result.get("metadatas") or [])
         except Exception:
             pass
-    update_silo(db_path, silo_slug, str(path), files_indexed, chunks_count, now_iso, display_name=display_name, language_stats=language_stats)
+        try:
+            manifest = _read_file_manifest(db_path)
+            silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
+            manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
+            if isinstance(manifest_files, dict):
+                total_files = len(manifest_files)
+        except Exception:
+            pass
+    update_silo(db_path, silo_slug, str(path), total_files, chunks_count, now_iso, display_name=display_name, language_stats=language_stats)
     set_last_failures(db_path, failures)
 
     # Summary: trust + usability (per-file FAIL still printed above)

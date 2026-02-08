@@ -103,14 +103,32 @@ def cmd_ls(args: argparse.Namespace) -> int:
     if not silos:
         print(dim(args.no_color, "No silos. Use: llmli add <path>"))
         return 0
+    rows = []
     for s in silos:
         slug = s.get("slug", "?")
         display = s.get("display_name", slug)
         path = s.get("path", "?")
-        files = s.get("files_indexed", 0)
-        chunks = s.get("chunks_count", 0)
-        updated = s.get("updated", "")[:19]
-        print(f"  {display} ({slug})\t{path}\t{files} files, {chunks} chunks\t{updated}")
+        files = int(s.get("files_indexed", 0) or 0)
+        chunks = int(s.get("chunks_count", 0) or 0)
+        updated = (s.get("updated", "") or "")[:19]
+        rows.append((display, slug, files, chunks, updated, path))
+
+    def _truncate(text: str, max_len: int) -> str:
+        if len(text) <= max_len:
+            return text
+        return "..." + text[-(max_len - 3):]
+
+    name_w = min(max(len(r[0]) for r in rows), 24)
+    slug_w = min(max(len(r[1]) for r in rows), 20)
+    path_w = 60
+    header = f"{'Name':<{name_w}}  {'Slug':<{slug_w}}  {'Files':>5}  {'Chunks':>7}  {'Updated':<19}  Path"
+    print(header)
+    print("-" * len(header))
+    for display, slug, files, chunks, updated, path in rows:
+        display = _truncate(display, name_w)
+        slug = _truncate(slug, slug_w)
+        path = _truncate(path, path_w)
+        print(f"{display:<{name_w}}  {slug:<{slug_w}}  {files:>5}  {chunks:>7}  {updated:<19}  {path}")
     return 0
 
 def cmd_index(args: argparse.Namespace) -> int:
