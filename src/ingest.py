@@ -37,6 +37,10 @@ from constants import (
 
 import chromadb
 from chromadb.config import Settings
+try:
+    from tqdm import tqdm  # type: ignore[import-not-found]
+except Exception:
+    tqdm = None  # type: ignore[assignment]
 
 from embeddings import get_embedding_function
 from load_config import load_config, get_archetype
@@ -205,6 +209,45 @@ def _atomic_write_json(path: Path, data: dict) -> None:
                 pass
 
 
+def _file_manifest_path(db_path: str | Path) -> Path:
+    p = Path(db_path).resolve()
+    if p.is_dir():
+        return p / "llmli_file_manifest.json"
+    return p.parent / "llmli_file_manifest.json"
+
+
+def _read_file_manifest(db_path: str | Path) -> dict:
+    path = _file_manifest_path(db_path)
+    if not path.exists():
+        return {"silos": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not isinstance(data, dict) or "silos" not in data:
+                return {"silos": {}}
+            return data
+    except Exception as e:
+        print(f"[llmli] file manifest read failed: {path}: {e}; using empty.", file=sys.stderr)
+        return {"silos": {}}
+
+
+def _write_file_manifest(db_path: str | Path, data: dict) -> None:
+    path = _file_manifest_path(db_path)
+    try:
+        _atomic_write_json(path, data)
+    except Exception as e:
+        print(f"[llmli] file manifest write failed: {path}: {e}", file=sys.stderr)
+        raise
+
+
+def _update_file_manifest(db_path: str | Path, update_fn: Any) -> None:
+    path = _file_manifest_path(db_path)
+    with _registry_lock(path):
+        manifest = _read_file_manifest(db_path)
+        update_fn(manifest)
+        _write_file_manifest(db_path, manifest)
+
+
 def _read_file_registry(db_path: str | Path) -> dict:
     path = _file_registry_path(db_path)
     if not path.exists():
@@ -250,6 +293,27 @@ def _file_registry_add(db_path: str | Path, file_hash: str, silo: str, path_str:
 
     _update_file_registry(db_path, _apply)
 
+
+def _file_registry_remove_path(db_path: str | Path, silo: str, path_str: str, file_hash: str | None = None) -> None:
+    def _apply(reg: dict) -> None:
+        by_hash = reg.get("by_hash", {})
+        if file_hash and file_hash in by_hash:
+            entries = by_hash.get(file_hash, [])
+            entries = [e for e in entries if not (e.get("silo") == silo and e.get("path") == path_str)]
+            if entries:
+                by_hash[file_hash] = entries
+            else:
+                del by_hash[file_hash]
+            return
+        # Fallback: scan all hashes for the path (slower but safe).
+        for h, entries in list(by_hash.items()):
+            new_entries = [e for e in entries if not (e.get("silo") == silo and e.get("path") == path_str)]
+            if not new_entries:
+                del by_hash[h]
+            else:
+                by_hash[h] = new_entries
+
+    _update_file_registry(db_path, _apply)
 
 def _file_registry_remove_silo(db_path: str | Path, silo: str) -> None:
     def _apply(reg: dict) -> None:
@@ -576,6 +640,15 @@ def _chunks_from_pdf(
     return out
 
 
+def _tag_zip_meta(chunks: list[ChunkTuple], zip_path: Path) -> list[ChunkTuple]:
+    if not chunks:
+        return chunks
+    zp = str(zip_path)
+    for _id, _doc, meta in chunks:
+        meta["zip_path"] = zp
+    return chunks
+
+
 def _batch_add(
     collection: Any,
     chunks: list[ChunkTuple],
@@ -587,11 +660,22 @@ def _batch_add(
     if not chunks:
         return
     total_batches = (len(chunks) + batch_size - 1) // batch_size
-    for i in range(0, len(chunks), batch_size):
+    use_tqdm = False
+    if tqdm is not None:
+        env_pref = os.environ.get("LLMLIBRARIAN_PROGRESS", "auto").strip().lower()
+        if env_pref in ("1", "true", "yes"):
+            use_tqdm = True
+        elif env_pref not in ("0", "false", "no"):
+            use_tqdm = sys.stderr.isatty()
+    iterator = range(0, len(chunks), batch_size)
+    if use_tqdm:
+        iterator = tqdm(iterator, desc="Embedding", total=total_batches)
+    for i in iterator:
         batch = chunks[i : i + batch_size]
         batch_num = i // batch_size + 1
         msg = f"  Adding batch {batch_num}/{total_batches} ({len(batch)} chunks)..."
-        print(dim(no_color, msg))
+        if not use_tqdm:
+            print(dim(no_color, msg))
         if log_line:
             log_line(msg.strip())
         ids_b = [c[0] for c in batch]
@@ -600,11 +684,14 @@ def _batch_add(
         collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b)
 
 
+
+
 def process_one_file(
     path: Path,
     kind: str,
     file_hash: str | None = None,
     follow_symlinks: bool = False,
+    path_resolved: Path | None = None,
 ) -> list[ChunkTuple]:
     """
     Read file and return list of (id, doc, meta). Runs in worker thread.
@@ -612,7 +699,8 @@ def process_one_file(
     """
     if path.is_symlink() and not follow_symlinks:
         return []
-    path_resolved = path.resolve()
+    if path_resolved is None:
+        path_resolved = path.resolve()
     path_str = str(path_resolved)
     try:
         stat = path_resolved.stat()
@@ -771,7 +859,7 @@ def process_zip_to_chunks(
                 suf = Path(info.filename).suffix.lower()
                 if suf == ".pdf":
                     try:
-                        out.extend(_chunks_from_pdf(file_id, data, source_label, mtime))
+                        out.extend(_tag_zip_meta(_chunks_from_pdf(file_id, data, source_label, mtime), zip_path))
                     except PDFExtractionError as e:
                         _log_event(
                             "ERROR",
@@ -782,24 +870,24 @@ def process_zip_to_chunks(
                         )
                 elif suf == ".docx":
                     text = get_text_from_docx_bytes(data)
-                    out.extend(_chunks_from_content(file_id, text, source_label, mtime, prefix=""))
+                    out.extend(_tag_zip_meta(_chunks_from_content(file_id, text, source_label, mtime, prefix=""), zip_path))
                 elif suf == ".xlsx":
                     text, ok = get_text_from_xlsx_bytes(data)
                     if ok and text:
-                        out.extend(_chunks_from_content(file_id, text, source_label, mtime, prefix=""))
+                        out.extend(_tag_zip_meta(_chunks_from_content(file_id, text, source_label, mtime, prefix=""), zip_path))
                     else:
-                        out.extend(_chunk_metadata_only(file_id, source_label, mtime, "Spreadsheet", "openpyxl"))
+                        out.extend(_tag_zip_meta(_chunk_metadata_only(file_id, source_label, mtime, "Spreadsheet", "openpyxl"), zip_path))
                 elif suf == ".pptx":
                     text, ok = get_text_from_pptx_bytes(data)
                     if ok and text:
-                        out.extend(_chunks_from_content(file_id, text, source_label, mtime, prefix=""))
+                        out.extend(_tag_zip_meta(_chunks_from_content(file_id, text, source_label, mtime, prefix=""), zip_path))
                     else:
-                        out.extend(_chunk_metadata_only(file_id, source_label, mtime, "Presentation", "python-pptx"))
+                        out.extend(_tag_zip_meta(_chunk_metadata_only(file_id, source_label, mtime, "Presentation", "python-pptx"), zip_path))
                 elif suf in ZIP_TEXT_EXTENSIONS:
                     try:
                         text = data.decode("utf-8", errors="replace")
                         if text.strip():
-                            out.extend(_chunks_from_content(file_id, text, source_label, mtime, prefix=""))
+                            out.extend(_tag_zip_meta(_chunks_from_content(file_id, text, source_label, mtime, prefix=""), zip_path))
                     except Exception:
                         pass
                 count += 1
@@ -922,10 +1010,13 @@ def run_index(
     # 3. Process regular files in parallel
     log("Processing files (parallel)...")
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_item = {
-            executor.submit(process_one_file, path, kind, None, follow_symlinks): (path, kind)
-            for path, kind in regular
-        }
+        future_to_item = {}
+        for path, kind in regular:
+            try:
+                p_res = path.resolve()
+            except OSError:
+                p_res = None
+            future_to_item[executor.submit(process_one_file, path, kind, None, follow_symlinks, p_res)] = (path, kind)
         for future in as_completed(future_to_item):
             path, kind = future_to_item[future]
             try:
@@ -1014,6 +1105,7 @@ def run_add(
     no_color: bool = False,
     allow_cloud: bool = False,
     follow_symlinks: bool = False,
+    incremental: bool = True,
 ) -> tuple[int, int]:
     """
     Index a single folder into the unified collection (llmli). Silo name = basename(path).
@@ -1072,43 +1164,90 @@ def run_add(
     client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
 
-    try:
-        collection.delete(where={"silo": silo_slug})
-    except Exception:
-        pass  # no chunks for this silo yet
-    _file_registry_remove_silo(db_path, silo_slug)
+    if not incremental:
+        try:
+            collection.delete(where={"silo": silo_slug})
+        except Exception:
+            pass  # no chunks for this silo yet
+        _file_registry_remove_silo(db_path, silo_slug)
 
     # Pre-pass: resolve paths, hash, skip duplicates (same file already indexed in any silo)
-    regular_with_hash: list[tuple[Path, str, str]] = []
+    regular_with_hash: list[tuple[Path, str, str, Path | None]] = []
+    manifest = _read_file_manifest(db_path) if incremental else {"silos": {}}
+    silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
+    manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
+    current_paths: set[str] = set()
+    if incremental:
+        for zp in zips:
+            try:
+                current_paths.add(str(zp.resolve()))
+            except OSError:
+                current_paths.add(str(zp))
     skipped = 0
     for p, k in regular:
         try:
             p_res = p.resolve()
             if not p_res.is_file():
                 continue
+            current_paths.add(str(p_res))
+            stat = p_res.stat()
+            mtime = stat.st_mtime
+            size = stat.st_size
+            if incremental:
+                prev = manifest_files.get(str(p_res)) if isinstance(manifest_files, dict) else None
+                if prev and prev.get("mtime") == mtime and prev.get("size") == size:
+                    continue
             h = get_file_hash(p_res)
             if not h:
-                regular_with_hash.append((p_res, k, ""))
+                regular_with_hash.append((p, k, "", p_res))
                 continue
             existing = _file_registry_get(db_path, h)
             if existing:
                 other = existing[0]
-                print(dim(no_color, f"  SKIPPING: {p_res.name} already indexed in [silo: {other.get('silo', '?')}]"))
-                skipped += 1
-                continue
-            regular_with_hash.append((p_res, k, h))
+                if other.get("silo") != silo_slug:
+                    print(dim(no_color, f"  SKIPPING: {p_res.name} already indexed in [silo: {other.get('silo', '?')}]"))
+                    skipped += 1
+                    continue
+            regular_with_hash.append((p, k, h, p_res))
         except OSError:
-            regular_with_hash.append((p.resolve(), k, ""))
+            regular_with_hash.append((p, k, "", None))
+
+    if incremental and isinstance(manifest_files, dict):
+        for _p, _k, _h, p_res in regular_with_hash:
+            if p_res is None:
+                continue
+            path_str = str(p_res)
+            if path_str in manifest_files:
+                try:
+                    collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
+                except Exception as e:
+                    _log_event("WARN", "Failed to delete updated file chunks", path=path_str, error=str(e))
+                prev = manifest_files.get(path_str) or {}
+                _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
     all_chunks = []
     files_indexed = 0
     failures = []
     to_register: list[tuple[str, str]] = []  # (file_hash, path_str) for main-thread registry update
 
+    if incremental and isinstance(manifest_files, dict):
+        removed = [path_str for path_str in manifest_files.keys() if path_str not in current_paths]
+        for path_str in removed:
+            try:
+                collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
+            except Exception as e:
+                _log_event("WARN", "Failed to delete removed file chunks", path=path_str, error=str(e))
+            try:
+                collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": path_str}]})
+            except Exception:
+                pass
+            prev = manifest_files.get(path_str) or {}
+            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_item = {
-            executor.submit(process_one_file, p, k, h, follow_symlinks): (p, k, h)
-            for p, k, h in regular_with_hash
+            executor.submit(process_one_file, p, k, h, follow_symlinks, p_res): (p, k, h)
+            for p, k, h, p_res in regular_with_hash
         }
         for future in as_completed(future_to_item):
             p, kind, fhash = future_to_item[future]
@@ -1142,6 +1281,18 @@ def run_add(
     for zip_path in zips:
         if zip_path.stat().st_size > max_archive_bytes:
             continue
+        if incremental:
+            try:
+                zstat = zip_path.stat()
+                prev = manifest_files.get(str(zip_path)) if isinstance(manifest_files, dict) else None
+                if prev and prev.get("mtime") == zstat.st_mtime and prev.get("size") == zstat.st_size:
+                    continue
+                try:
+                    collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": str(zip_path)}]})
+                except Exception as e:
+                    _log_event("WARN", "Failed to delete ZIP chunks", path=str(zip_path), error=str(e))
+            except OSError:
+                pass
         try:
             chunks = process_zip_to_chunks(
                 zip_path, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE,
@@ -1163,6 +1314,37 @@ def run_add(
                 meta["silo"] = silo_slug
             all_chunks.extend(chunks)
             files_indexed += 1
+
+    if incremental:
+        def _update_manifest(manifest_data: dict) -> None:
+            silos = manifest_data.setdefault("silos", {})
+            silo_entry = silos.setdefault(silo_slug, {"path": str(path), "files": {}})
+            files_map = silo_entry.setdefault("files", {})
+            if not isinstance(files_map, dict):
+                files_map = {}
+                silo_entry["files"] = files_map
+            # Remove deleted
+            for path_str in list(files_map.keys()):
+                if path_str not in current_paths and path_str not in [str(z) for z in zips]:
+                    del files_map[path_str]
+            # Update regular files
+            for p, _k, h, p_res in regular_with_hash:
+                if p_res is None:
+                    continue
+                try:
+                    st = p_res.stat()
+                    files_map[str(p_res)] = {"mtime": st.st_mtime, "size": st.st_size, "hash": h}
+                except OSError:
+                    continue
+            # Update zips
+            for zp in zips:
+                try:
+                    st = zp.stat()
+                    files_map[str(zp)] = {"mtime": st.st_mtime, "size": st.st_size, "hash": ""}
+                except OSError:
+                    continue
+
+        _update_file_manifest(db_path, _update_manifest)
 
     if all_chunks:
         batch_size = ADD_BATCH_SIZE
@@ -1192,7 +1374,14 @@ def run_add(
                 "by_ext": {ext: len(paths) for ext, paths in unique_by_ext.items()},
                 "sample_paths": {ext: list(paths)[:3] for ext, paths in unique_by_ext.items()},
             }
-    update_silo(db_path, silo_slug, str(path), files_indexed, len(all_chunks), now_iso, display_name=display_name, language_stats=language_stats)
+    chunks_count = len(all_chunks)
+    if incremental:
+        try:
+            result = collection.get(where={"silo": silo_slug}, include=["metadatas"])
+            chunks_count = len(result.get("metadatas") or [])
+        except Exception:
+            pass
+    update_silo(db_path, silo_slug, str(path), files_indexed, chunks_count, now_iso, display_name=display_name, language_stats=language_stats)
     set_last_failures(db_path, failures)
 
     # Summary: trust + usability (per-file FAIL still printed above)

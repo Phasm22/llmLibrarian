@@ -114,10 +114,13 @@ def diversify_by_source(
     dists: list[float | None],
     top_k: int,
     max_per_source: int = 2,
+    sources: list[str] | None = None,
 ) -> tuple[list[str], list[dict | None], list[float | None]]:
     """Keep best chunks by distance but cap at max_per_source per unique source path so one big file doesn't dominate."""
     if not docs or max_per_source < 1:
         return docs[:top_k], (metas or [])[:top_k], (dists or [])[:top_k]
+    if sources is None:
+        sources = [((m or {}).get("source") or "") for m in metas]
     out_docs: list[str] = []
     out_metas: list[dict | None] = []
     out_dists: list[float | None] = []
@@ -126,7 +129,7 @@ def diversify_by_source(
         if len(out_docs) >= top_k:
             break
         meta = metas[i] if i < len(metas) else None
-        source = (meta or {}).get("source") or ""
+        source = sources[i] if i < len(sources) else ((meta or {}).get("source") or "")
         if not source:
             source = f"__unknown_{i}"
         n = count_per_source.get(source, 0)

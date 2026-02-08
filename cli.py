@@ -47,6 +47,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             no_color=args.no_color,
             allow_cloud=getattr(args, "allow_cloud", False),
             follow_symlinks=getattr(args, "follow_symlinks", False),
+            incremental=not getattr(args, "full", False),
         )
         return 0
     except CloudSyncPathError as e:
@@ -272,6 +273,7 @@ def main() -> int:
     p_add.add_argument("path", help="Folder path to index")
     p_add.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive (ingestion may be unreliable)")
     p_add.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks inside the target folder")
+    p_add.add_argument("--full", action="store_true", help="Full reindex (delete + add) instead of incremental")
     p_add.set_defaults(db=None)
     p_add.set_defaults(_run=cmd_add)
 

@@ -306,7 +306,15 @@ def run_ask(
         dists = [c[2] for c in combined]
 
     # Diversify by source: cap chunks per file so one huge file (e.g. Closed Traffic.txt) doesn't crowd out others
-    docs, metas, dists = diversify_by_source(docs, metas, dists, n_results, max_per_source=MAX_CHUNKS_PER_FILE)
+    source_cache = [((m or {}).get("source") or "") for m in metas]
+    docs, metas, dists = diversify_by_source(
+        docs,
+        metas,
+        dists,
+        n_results,
+        max_per_source=MAX_CHUNKS_PER_FILE,
+        sources=source_cache,
+    )
     docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
 
     # Recency + doc_type tie-breaker: only when query implies recency; apply after diversity so caps are preserved

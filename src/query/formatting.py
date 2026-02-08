@@ -19,6 +19,8 @@ _EDITOR_EXTENSIONS = frozenset(
      ".sql", ".html", ".css", ".scss", ".xml", ".rss", ".svg", ".csv", ".log"}
 )
 
+_CWD_RESOLVED = Path.cwd().resolve()
+
 
 def _use_editor_link(path: Path) -> bool:
     """True if this file type should open in the editor (vscode/cursor) with line number; else use file://."""
@@ -31,7 +33,7 @@ def shorten_path(path: str) -> str:
         return "?"
     p = Path(path)
     try:
-        rel = p.resolve().relative_to(Path.cwd().resolve())
+        rel = p.resolve().relative_to(_CWD_RESOLVED)
         return str(rel)
     except ValueError:
         return p.name if p.name else path

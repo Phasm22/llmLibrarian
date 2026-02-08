@@ -113,6 +113,32 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return _run_llmli(llmli_args)
 
 
+def cmd_pull(args: argparse.Namespace) -> int:
+    """Refresh all registered silos (incremental by default)."""
+    reg = _read_registry()
+    sources = reg.get("sources", [])
+    if not sources:
+        print("No registered silos. Use: pal add <path>", file=sys.stderr)
+        return 1
+    failures = 0
+    for src in sources:
+        path = src.get("path")
+        if not path:
+            continue
+        llmli_args = ["add"]
+        if getattr(args, "full", False):
+            llmli_args.append("--full")
+        if getattr(args, "allow_cloud", False):
+            llmli_args.append("--allow-cloud")
+        if getattr(args, "follow_symlinks", False):
+            llmli_args.append("--follow-symlinks")
+        llmli_args.append(path)
+        code = _run_llmli(llmli_args)
+        if code != 0:
+            failures += 1
+    return 0 if failures == 0 else 1
+
+
 def cmd_tool(args: argparse.Namespace) -> int:
     """Passthrough: pal tool <name> <args...> -> run underlying tool."""
     name = getattr(args, "tool_name", None)
@@ -125,7 +151,7 @@ def cmd_tool(args: argparse.Namespace) -> int:
     return 1
 
 
-KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "tool"})
+KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "pull", "tool"})
 
 
 def main() -> int:
@@ -171,6 +197,12 @@ def main() -> int:
 
     p_capabilities = sub.add_parser("capabilities", help="Supported file types and extractors (llmli capabilities)")
     p_capabilities.set_defaults(_run=cmd_capabilities)
+
+    p_pull = sub.add_parser("pull", help="Refresh all registered silos (incremental by default)")
+    p_pull.add_argument("--full", action="store_true", help="Full reindex (delete + add) instead of incremental")
+    p_pull.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive")
+    p_pull.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks inside folders")
+    p_pull.set_defaults(_run=cmd_pull)
 
     p_tool = sub.add_parser("tool", help="Passthrough to tool: pal tool llmli <args...>")
     p_tool.add_argument("tool_name", help="Tool name (e.g. llmli)")
