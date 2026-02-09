@@ -1463,8 +1463,30 @@ def run_add(
     set_last_failures(db_path, failures)
 
     # Summary: trust + usability (per-file FAIL still printed above)
-    if failures:
-        print(warn_style(no_color, f"Indexed {files_indexed} files ({len(failures)} failed). pal log or llmli log --last to see failures."), file=sys.stderr)
-    else:
-        print(success_style(no_color, f"Indexed {files_indexed} files."))
+    quiet = os.environ.get("LLMLIBRARIAN_QUIET", "").strip().lower() in ("1", "true", "yes")
+    if not quiet:
+        if failures:
+            print(warn_style(no_color, f"Indexed {files_indexed} files ({len(failures)} failed). pal log or llmli log --last to see failures."), file=sys.stderr)
+        else:
+            if files_indexed == 0:
+                print(success_style(no_color, "All files up to date."))
+            else:
+                print(success_style(no_color, f"Indexed {files_indexed} files."))
+
+    # Optional status file for tooling (e.g., pal pull). Avoid writing to silos.
+    status_path = os.environ.get("LLMLIBRARIAN_STATUS_FILE")
+    if status_path:
+        try:
+            status = {
+                "path": str(path),
+                "slug": silo_slug,
+                "files_indexed": files_indexed,
+                "failures": len(failures),
+                "chunks_count": chunks_count,
+                "updated": now_iso,
+            }
+            with open(status_path, "w", encoding="utf-8") as f:
+                json.dump(status, f)
+        except Exception:
+            pass
     return (files_indexed, len(failures))

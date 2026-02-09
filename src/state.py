@@ -98,6 +98,15 @@ def resolve_silo_to_slug(db_path: str | Path, name_or_slug: str) -> str | None:
     return None
 
 
+def resolve_silo_prefix(db_path: str | Path, prefix: str) -> str | None:
+    """Return slug if prefix uniquely matches a registered slug."""
+    reg = _read_registry(db_path)
+    matches = [slug for slug in reg.keys() if slug.startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def resolve_silo_by_path(db_path: str | Path, path: str | Path) -> str | None:
     """Return slug for the given exact path, if registered."""
     reg = _read_registry(db_path)
@@ -117,6 +126,25 @@ def remove_silo(db_path: str | Path, name_or_slug: str) -> str | None:
     del reg[slug]
     _write_registry(db_path, reg)
     return slug
+
+
+def remove_manifest_silo(db_path: str | Path, slug: str) -> None:
+    """Remove silo from file manifest (if present)."""
+    from ingest import _file_manifest_path  # lazy to avoid import cycle
+    path = _file_manifest_path(db_path)
+    if not path.exists():
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        silos = data.get("silos") or {}
+        if slug in silos:
+            del silos[slug]
+            data["silos"] = silos
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+    except Exception:
+        return
 
 def set_last_failures(db_path: str | Path, failures: list[dict[str, str]]) -> None:
     """Save last add failures for 'log --last'."""

@@ -119,7 +119,11 @@ def cmd_remove(args: argparse.Namespace) -> int:
     if not silo:
         print("Error: remove requires silo name. Example: pal remove \"Tax\"", file=sys.stderr)
         return 1
-    return _run_llmli(["remove", silo])
+    if isinstance(silo, list):
+        name = " ".join(silo)
+    else:
+        name = str(silo)
+    return _run_llmli(["remove", name])
 
 
 def cmd_pull(args: argparse.Namespace) -> int:
@@ -130,6 +134,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
         print("No registered silos. Use: pal add <path>", file=sys.stderr)
         return 1
     failures = 0
+    updated_silos = 0
     for src in sources:
         path = src.get("path")
         if not path:
@@ -144,9 +149,45 @@ def cmd_pull(args: argparse.Namespace) -> int:
         if getattr(args, "follow_symlinks", False):
             llmli_args.append("--follow-symlinks")
         llmli_args.append(path)
-        code = _run_llmli(llmli_args)
+
+        # Status file for non-intrusive reporting
+        import tempfile
+        status_file = tempfile.NamedTemporaryFile(prefix="llmli_status_", delete=False)
+        status_file_path = status_file.name
+        status_file.close()
+        env = os.environ.copy()
+        env["LLMLIBRARIAN_STATUS_FILE"] = status_file_path
+        env["LLMLIBRARIAN_QUIET"] = "1"
+        root = Path(__file__).resolve().parent
+        venv_llmli = root / ".venv" / "bin" / "llmli"
+        if venv_llmli.exists():
+            cmd = [str(venv_llmli)] + llmli_args
+        else:
+            cmd = [sys.executable, str(root / "cli.py")] + llmli_args
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        code = r.returncode
+        if r.stdout:
+            print(r.stdout, end="")
+        if r.stderr:
+            print(r.stderr, end="", file=sys.stderr)
+        try:
+            with open(status_file_path, "r", encoding="utf-8") as f:
+                status = json.load(f)
+            if (status.get("files_indexed") or 0) > 0:
+                updated_silos += 1
+            elif (status.get("files_indexed") or 0) == 0:
+                # Suppress per-silo up-to-date spam; we'll print summary later.
+                pass
+        except Exception:
+            pass
+        try:
+            os.unlink(status_file_path)
+        except Exception:
+            pass
         if code != 0:
             failures += 1
+    if failures == 0 and updated_silos == 0:
+        print("All silos up to date.")
     return 0 if failures == 0 else 1
 
 
@@ -224,7 +265,7 @@ def main() -> int:
     p_inspect.set_defaults(_run=cmd_inspect)
 
     p_remove = sub.add_parser("remove", help="Remove silo (friendly alias for llmli remove)")
-    p_remove.add_argument("silo", help="Silo slug, display name, or path")
+    p_remove.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
     p_remove.set_defaults(_run=cmd_remove)
 
     p_log = sub.add_parser("log", help="Last failures (llmli log --last)")

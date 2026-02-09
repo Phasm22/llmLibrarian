@@ -77,7 +77,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 def cmd_ask(args: argparse.Namespace) -> int:
     """Query an archetype's collection or unified llmli collection (default) via Ollama."""
     from query import run_ask
-    from state import resolve_silo_to_slug
+    from state import resolve_silo_to_slug, resolve_silo_prefix
     config = _config_path(args)
     archetype = getattr(args, "archetype", None)
     in_silo = getattr(args, "in_silo", None)
@@ -87,7 +87,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
     unified = getattr(args, "unified", False)
     if in_silo and not unified:
         db = _db_path(args)
-        silo_slug = resolve_silo_to_slug(db, in_silo) or in_silo  # accept slug or display name
+        silo_slug = resolve_silo_to_slug(db, in_silo) or resolve_silo_prefix(db, in_silo) or in_silo
         archetype = None  # unified collection, filter by silo
     else:
         silo_slug = None  # query all silos (unified)
@@ -176,16 +176,19 @@ def cmd_rm(args: argparse.Namespace) -> int:
     if not silo:
         print("Error: remove requires silo name. Example: llmli remove \"Tax\"", file=sys.stderr)
         return 1
-    from state import remove_silo, slugify, resolve_silo_by_path
+    from state import remove_silo, slugify, resolve_silo_by_path, resolve_silo_prefix, remove_manifest_silo
     from indexer import LLMLI_COLLECTION, DB_PATH
     from ingest import _file_registry_remove_silo
     import chromadb
     from chromadb.config import Settings
     db = _db_path(args)
     # Allow path input to resolve to slug.
-    path_slug = resolve_silo_by_path(db, silo) if Path(str(silo)).exists() else None
-    removed_slug = remove_silo(db, path_slug or silo)
-    slug_to_clean = removed_slug if removed_slug is not None else slugify(silo)
+    raw = " ".join(silo) if isinstance(silo, list) else str(silo)
+    path_slug = resolve_silo_by_path(db, raw) if Path(raw).exists() else None
+    # Allow prefix match on hashed slugs.
+    prefix_slug = resolve_silo_prefix(db, raw)
+    removed_slug = remove_silo(db, path_slug or prefix_slug or raw)
+    slug_to_clean = removed_slug if removed_slug is not None else slugify(raw)
     try:
         client = chromadb.PersistentClient(path=str(db), settings=Settings(anonymized_telemetry=False))
         coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
@@ -193,6 +196,7 @@ def cmd_rm(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"Warning: could not delete chunks from DB: {e}", file=sys.stderr)
     _file_registry_remove_silo(db, slug_to_clean)
+    remove_manifest_silo(db, slug_to_clean)
     if removed_slug is not None:
         print(f"Removed silo: {removed_slug}")
     else:
@@ -341,11 +345,11 @@ def main() -> int:
 
     # remove <silo>
     p_rm = sub.add_parser("rm", help="Remove silo (registry + chunks)")
-    p_rm.add_argument("silo", help="Silo slug, display name, or path")
+    p_rm.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
     p_rm.set_defaults(_run=cmd_rm)
 
     p_remove = sub.add_parser("remove", help="Remove silo (friendlier alias of rm)")
-    p_remove.add_argument("silo", help="Silo slug, display name, or path")
+    p_remove.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
     p_remove.set_defaults(_run=cmd_rm)
 
     # capabilities
