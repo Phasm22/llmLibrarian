@@ -41,6 +41,7 @@ llmli ls
 | `pal inspect <silo>` | Per-silo details and per-file chunk counts. |
 | `pal capabilities` | Supported file types and extractors. |
 | `pal log` | Last add failures. |
+| `pal ensure-self` | Ensure dev-mode self-silo exists; warn if stale. |
 | `pal tool llmli <args...>` | Passthrough to llmli. |
 
 **llmli** — Full control.
@@ -64,6 +65,21 @@ llmli ls
 - Scope with `--in` when you know the folder (“pal ask --in school …”).
 - Ask about a tool or project by name (e.g. “why is the scribe tool fast”) without `--in`; retrieval scopes to paths containing that name when possible.
 - After adding a folder, ask about something only in it; use `pal ls` and `pal log` to see state and failures.
+
+---
+
+## Self-silo (dev mode)
+
+When running `pal` inside this repo, it keeps a `__self__` silo (display name `self`) so capability-related answers stay grounded in local code. If the repo changes since the last self index, `pal` prints:
+
+`Self-silo stale (repo changed since last index). Run pal ensure-self.`
+
+---
+
+## Tests
+
+- `uv run pytest -q`
+- `python -m pytest -q`
 
 ---
 

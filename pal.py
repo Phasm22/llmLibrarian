@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 PAL_HOME = Path(os.environ.get("PAL_HOME", os.path.expanduser("~/.pal")))
@@ -47,6 +48,261 @@ def _run_llmli(args: list[str]) -> int:
     return r.returncode
 
 
+def _parse_env_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _get_git_root() -> Path | None:
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    root = (r.stdout or "").strip()
+    return Path(root).resolve() if root else None
+
+
+def _pyproject_has_name(root: Path, expected: str) -> bool:
+    path = root / "pyproject.toml"
+    if not path.exists():
+        return False
+    in_project = False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("[") and line.endswith("]"):
+                    in_project = line == "[project]"
+                    continue
+                if in_project and line.startswith("name"):
+                    parts = line.split("=", 1)
+                    if len(parts) != 2:
+                        continue
+                    name = parts[1].strip().strip('"').strip("'")
+                    return name == expected
+    except Exception:
+        return False
+    return False
+
+
+def _is_dev_repo_at_root(root: Path) -> bool:
+    checks = 0
+    if (root / "pal.py").exists():
+        checks += 1
+    if (root / "cli.py").exists():
+        checks += 1
+    if _pyproject_has_name(root, "llmLibrarian"):
+        checks += 1
+    return checks >= 2
+
+
+def is_dev_repo() -> bool:
+    root = _get_git_root()
+    if root is None:
+        return False
+    return _is_dev_repo_at_root(root)
+
+
+def _should_require_self_silo() -> bool:
+    env_val = os.environ.get("LLMLIBRARIAN_REQUIRE_SELF_SILO")
+    parsed = _parse_env_bool(env_val)
+    if env_val is None:
+        return is_dev_repo()
+    if parsed is None:
+        print("Warning: invalid LLMLIBRARIAN_REQUIRE_SELF_SILO; treating as disabled.", file=sys.stderr)
+        return False
+    return parsed
+
+
+def _llmli_registry_path(db_path: str | Path) -> Path:
+    p = Path(db_path).resolve()
+    if p.is_dir():
+        return p / "llmli_registry.json"
+    return p.parent / "llmli_registry.json"
+
+
+def _read_llmli_registry(db_path: str | Path) -> dict:
+    path = _llmli_registry_path(db_path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _resolve_llmli_silo_by_path(registry: dict, path: Path) -> str | None:
+    target = str(path.resolve())
+    for slug, data in registry.items():
+        raw = (data or {}).get("path")
+        if not raw:
+            continue
+        try:
+            candidate = str(Path(raw).resolve())
+        except Exception:
+            candidate = raw
+        if candidate == target:
+            return slug
+    return None
+
+
+def _llmli_updated_to_epoch(updated_iso: str | None) -> int | None:
+    if not updated_iso:
+        return None
+    try:
+        from datetime import datetime
+
+        return int(datetime.fromisoformat(updated_iso).timestamp())
+    except Exception:
+        return None
+
+
+def _git_last_commit_ct(root: Path) -> int | None:
+    try:
+        r = subprocess.run(
+            ["git", "log", "-1", "--format=%ct"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    try:
+        return int(out)
+    except Exception:
+        return None
+
+
+def _git_is_dirty(root: Path) -> bool:
+    try:
+        r = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return False
+    if r.returncode != 0:
+        return False
+    return bool((r.stdout or "").strip())
+
+
+def _upsert_self_source(reg: dict, repo_root: Path, last_index_mtime: int | None) -> dict:
+    sources = reg.get("sources", []) or []
+    repo_str = str(repo_root.resolve())
+    filtered = [
+        s
+        for s in sources
+        if not (
+            (s.get("silo") == "__self__")
+            or (s.get("path") == repo_str and s.get("name") == "self")
+        )
+    ]
+    entry = {
+        "path": repo_str,
+        "tool": "llmli",
+        "name": "self",
+        "silo": "__self__",
+    }
+    if last_index_mtime is not None:
+        entry["self_silo_last_index_mtime"] = int(last_index_mtime)
+    filtered.append(entry)
+    reg["sources"] = filtered
+    return reg
+
+
+def _get_self_index_mtime_from_registry(reg: dict) -> int | None:
+    for s in reg.get("sources", []) or []:
+        if s.get("silo") == "__self__" and s.get("path"):
+            v = s.get("self_silo_last_index_mtime")
+            try:
+                return int(v)
+            except Exception:
+                return None
+    return None
+
+
+def _warn_self_silo_stale() -> None:
+    print("Self-silo stale (repo changed since last index). Run `pal ensure-self`.", file=sys.stderr)
+
+
+def ensure_self_silo() -> int:
+    require_self = _should_require_self_silo()
+    if not require_self:
+        return 0
+    repo_root = _get_git_root()
+    if repo_root is None:
+        print("Warning: unable to detect git root; skipping self-silo.", file=sys.stderr)
+        return 0
+
+    is_dev = _is_dev_repo_at_root(repo_root)
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    llmli_registry = _read_llmli_registry(db_path)
+    repo_str = str(repo_root.resolve())
+    existing_slug = _resolve_llmli_silo_by_path(llmli_registry, repo_root)
+    self_entry = llmli_registry.get("__self__") if isinstance(llmli_registry, dict) else None
+    self_path = (self_entry or {}).get("path")
+
+    needs_reindex = False
+    if self_entry and self_path and self_path != repo_str:
+        _run_llmli(["rm", "__self__"])
+        needs_reindex = True
+    if existing_slug and existing_slug != "__self__":
+        _run_llmli(["rm", existing_slug])
+        needs_reindex = True
+
+    if not self_entry or needs_reindex or self_path != repo_str:
+        llmli_args = ["add", "--silo", "__self__", "--display-name", "self"]
+        if is_dev:
+            llmli_args.append("--allow-cloud")
+        llmli_args.append(repo_str)
+        code = _run_llmli(llmli_args)
+        if code != 0:
+            print("Warning: failed to index self-silo.", file=sys.stderr)
+            return code
+        reg = _read_registry()
+        reg = _upsert_self_source(reg, repo_root, int(time.time()))
+        _write_registry(reg)
+        return 0
+
+    reg = _read_registry()
+    last_index_mtime = _get_self_index_mtime_from_registry(reg)
+    if last_index_mtime is None and self_entry:
+        last_index_mtime = _llmli_updated_to_epoch(self_entry.get("updated"))
+        reg = _upsert_self_source(reg, repo_root, last_index_mtime)
+        _write_registry(reg)
+
+    dirty = _git_is_dirty(repo_root)
+    last_commit = _git_last_commit_ct(repo_root)
+    if dirty:
+        _warn_self_silo_stale()
+    elif last_index_mtime is not None and last_commit is not None and last_commit > last_index_mtime:
+        _warn_self_silo_stale()
+    return 0
+
+
 def cmd_add(args: argparse.Namespace) -> int:
     """Delegate to llmli add <path>; optionally record in pal registry. Cloud-sync paths blocked unless --allow-cloud."""
     path = Path(args.path).resolve()
@@ -71,6 +327,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     """Delegate to llmli ask (unified by default). --in <silo> for scoped ask; --strict for conservative answers."""
+    ensure_self_silo()
     llmli_args = ["ask"]
     if getattr(args, "unified", False):
         llmli_args.append("--unified")
@@ -94,7 +351,13 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 def cmd_capabilities(args: argparse.Namespace) -> int:
     """Delegate to llmli capabilities (supported file types and extractors)."""
+    ensure_self_silo()
     return _run_llmli(["capabilities"])
+
+
+def cmd_ensure_self(args: argparse.Namespace) -> int:
+    """Ensure dev-mode self-silo exists; warn if stale."""
+    return ensure_self_silo()
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -277,7 +540,7 @@ def cmd_tool(args: argparse.Namespace) -> int:
     return 1
 
 
-KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "pull", "silos", "remove", "tool"})
+KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "ensure-self", "pull", "silos", "remove", "tool"})
 
 
 def main() -> int:
@@ -327,6 +590,9 @@ def main() -> int:
 
     p_capabilities = sub.add_parser("capabilities", help="Supported file types and extractors (llmli capabilities)")
     p_capabilities.set_defaults(_run=cmd_capabilities)
+
+    p_ensure = sub.add_parser("ensure-self", help="Ensure dev-mode self-silo exists; warn if stale")
+    p_ensure.set_defaults(_run=cmd_ensure_self)
 
     p_pull = sub.add_parser("pull", help="Refresh all registered silos (incremental by default)")
     p_pull.add_argument("--full", action="store_true", help="Full reindex (delete + add) instead of incremental")

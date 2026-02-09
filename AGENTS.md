@@ -46,9 +46,11 @@ python -m src.query_engine
 
 ### Tests
 ```bash
-pytest
+uv run pytest -q
+python -m pytest -q
 ```
 
 ## Notes
 - Each agent may have additional instructions in its own directory/config.
 - Keep commands updated if entry points or tooling change.
+- In this repo, `pal` maintains a dev-only self-silo (`__self__`). If the repo changes since the last self index, it warns: `Self-silo stale (repo changed since last index). Run pal ensure-self.`

@@ -15,6 +15,8 @@ Project layout, environment, tuning, and operational details. For philosophy and
 - **docs/CHROMA_AND_STACK.md** — Chroma usage and stack choices.
 - **gemini_summary.md** — Project manifest and recovery notes.
 
+Internal flags (dev-only): `llmli add --silo <slug> --display-name <name>` are used by `pal` to force the dev self-silo. Not intended for normal use.
+
 ## Development setup
 
 This repo uses **uv** for venv and install:

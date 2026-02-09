@@ -1175,9 +1175,11 @@ def run_add(
     allow_cloud: bool = False,
     follow_symlinks: bool = False,
     incremental: bool = True,
+    forced_silo_slug: str | None = None,
+    display_name_override: str | None = None,
 ) -> tuple[int, int]:
     """
-    Index a single folder into the unified collection (llmli). Silo name = basename(path).
+    Index a single folder into the unified collection (llmli). Silo name = basename(path) unless forced.
     Returns (files_indexed, failed_count). Failures saved for llmli log --last.
     Refuses cloud-sync roots (OneDrive, iCloud, Dropbox, etc.) unless allow_cloud=True.
 
@@ -1197,9 +1199,12 @@ def run_add(
         cloud_kind = is_cloud_sync_path(path)
         if cloud_kind:
             raise CloudSyncPathError(path, cloud_kind)
-    display_name = path.name
-    existing_slug = resolve_silo_by_path(db_path, path)
-    silo_slug = existing_slug if existing_slug else slugify(display_name, str(path))
+    display_name = display_name_override or path.name
+    if forced_silo_slug:
+        silo_slug = forced_silo_slug
+    else:
+        existing_slug = resolve_silo_by_path(db_path, path)
+        silo_slug = existing_slug if existing_slug else slugify(display_name, str(path))
     limits_cfg = {}
     try:
         config = load_config()
