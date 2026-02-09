@@ -126,6 +126,48 @@ def cmd_remove(args: argparse.Namespace) -> int:
     return _run_llmli(["remove", name])
 
 
+def _pull_status_line(current: int, total: int, name: str, detail: str = "") -> None:
+    """Overwrite a single terminal line with pull progress."""
+    is_tty = sys.stderr.isatty()
+    bar_width = 20
+    filled = int(bar_width * current / total) if total else bar_width
+    bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
+    suffix = f"  {detail}" if detail else ""
+    line = f"\r  [{bar}] {current}/{total}  {name}{suffix}"
+    if is_tty:
+        # Clear line then write
+        sys.stderr.write(f"\033[2K{line}")
+        sys.stderr.flush()
+    else:
+        # Non-TTY: just print each update
+        print(line.strip())
+
+
+def _build_pull_env(status_file_path: str) -> dict[str, str]:
+    """Minimize env passthrough for pull subprocesses while keeping runtime essentials."""
+    allow_exact = {
+        "PATH",
+        "HOME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "VIRTUAL_ENV",
+        "OLLAMA_HOST",
+        "NO_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+    }
+    out: dict[str, str] = {}
+    for k, v in os.environ.items():
+        if k in allow_exact or k.startswith("LLMLIBRARIAN_"):
+            out[k] = v
+    out["LLMLIBRARIAN_STATUS_FILE"] = status_file_path
+    out["LLMLIBRARIAN_QUIET"] = "1"
+    return out
+
+
 def cmd_pull(args: argparse.Namespace) -> int:
     """Refresh all registered silos (incremental by default)."""
     reg = _read_registry()
@@ -133,14 +175,19 @@ def cmd_pull(args: argparse.Namespace) -> int:
     if not sources:
         print("No registered silos. Use: pal add <path>", file=sys.stderr)
         return 1
-    failures = 0
-    updated_silos = 0
-    for src in sources:
+    import tempfile
+    is_tty = sys.stderr.isatty()
+    total = len(sources)
+    fail_count = 0
+    updated_silos: list[str] = []
+    failed_silos: list[str] = []
+    for idx, src in enumerate(sources, 1):
         path = src.get("path")
         if not path:
             continue
         name = src.get("name") or Path(path).name
-        print(f"Pulling silo: {name} ({path})")
+        _pull_status_line(idx, total, name)
+
         llmli_args = ["add"]
         if getattr(args, "full", False):
             llmli_args.append("--full")
@@ -150,14 +197,10 @@ def cmd_pull(args: argparse.Namespace) -> int:
             llmli_args.append("--follow-symlinks")
         llmli_args.append(path)
 
-        # Status file for non-intrusive reporting
-        import tempfile
         status_file = tempfile.NamedTemporaryFile(prefix="llmli_status_", delete=False)
         status_file_path = status_file.name
         status_file.close()
-        env = os.environ.copy()
-        env["LLMLIBRARIAN_STATUS_FILE"] = status_file_path
-        env["LLMLIBRARIAN_QUIET"] = "1"
+        env = _build_pull_env(status_file_path)
         root = Path(__file__).resolve().parent
         venv_llmli = root / ".venv" / "bin" / "llmli"
         if venv_llmli.exists():
@@ -166,29 +209,40 @@ def cmd_pull(args: argparse.Namespace) -> int:
             cmd = [sys.executable, str(root / "cli.py")] + llmli_args
         r = subprocess.run(cmd, env=env, capture_output=True, text=True)
         code = r.returncode
-        if r.stdout:
-            print(r.stdout, end="")
-        if r.stderr:
-            print(r.stderr, end="", file=sys.stderr)
+
+        files_indexed = 0
         try:
             with open(status_file_path, "r", encoding="utf-8") as f:
                 status = json.load(f)
-            if (status.get("files_indexed") or 0) > 0:
-                updated_silos += 1
-            elif (status.get("files_indexed") or 0) == 0:
-                # Suppress per-silo up-to-date spam; we'll print summary later.
-                pass
+            files_indexed = status.get("files_indexed") or 0
         except Exception:
             pass
         try:
             os.unlink(status_file_path)
         except Exception:
             pass
+
         if code != 0:
-            failures += 1
-    if failures == 0 and updated_silos == 0:
+            fail_count += 1
+            failed_silos.append(name)
+            _pull_status_line(idx, total, name, "FAILED")
+        elif files_indexed > 0:
+            updated_silos.append(f"{name} ({files_indexed} files)")
+            _pull_status_line(idx, total, name, f"+{files_indexed} files")
+
+    # Clear progress line
+    if is_tty:
+        sys.stderr.write("\033[2K\r")
+        sys.stderr.flush()
+
+    # Summary
+    if updated_silos:
+        print(f"Updated: {', '.join(updated_silos)}")
+    if failed_silos:
+        print(f"Failed: {', '.join(failed_silos)}", file=sys.stderr)
+    if not updated_silos and not failed_silos:
         print("All silos up to date.")
-    return 0 if failures == 0 else 1
+    return 0 if fail_count == 0 else 1
 
 
 def cmd_silos(args: argparse.Namespace) -> int:

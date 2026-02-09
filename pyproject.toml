@@ -13,11 +13,13 @@ dependencies = [
     "openpyxl>=3.1.5",
     "python-pptx>=1.0.2",
     "tqdm>=4.66.0",
+    "pytest-cov>=7.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
 ]
 
 [project.scripts]

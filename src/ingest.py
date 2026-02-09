@@ -66,6 +66,10 @@ ADD_DEFAULT_INCLUDE = [
 ADD_DEFAULT_EXCLUDE = [
     "node_modules/", ".venv/", "venv/", "env/", "__pycache__/", "vendor", "dist", "build", ".git",
     "llmLibrarianVenv/", "site-packages/", "Old Firefox Data", "Firefox", ".app/",
+    ".env", ".env.*", ".aws/", ".ssh/", "*.pem", "*.key", "secrets.json", "credentials.json", "credentials*.json",
+    "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "Pipfile.lock", "poetry.lock",
+    "composer.lock", "Gemfile.lock", "Cargo.lock", "uv.lock",
+    "my_brain_db/", "*.db", "*.sqlite", "*.sqlite3",
 ]
 
 # Code-file extensions for language_stats (CODE_LANGUAGE pipeline). Excludes .md, .txt, .pdf, .docx.
@@ -874,6 +878,16 @@ def process_zip_to_chunks(
             extracted_bytes = 0
             for info in z.infolist():
                 if info.filename.endswith("/") or info.file_size == 0:
+                    continue
+                # Symlink entries can point outside intended locations; never index them.
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == 0o120000:
+                    _log_event(
+                        "WARN",
+                        "Skipped ZIP symlink entry",
+                        path=str(zip_path),
+                        entry=info.filename,
+                    )
                     continue
                 if not is_safe_path(zip_path.parent, info.filename):
                     _log_event(
