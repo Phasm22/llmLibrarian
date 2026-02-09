@@ -3,6 +3,7 @@ import io
 
 import pytest
 
+import processors
 from processors import DOCXProcessor, PDFProcessor, PPTXProcessor, TextProcessor, XLSXProcessor
 
 
@@ -112,3 +113,68 @@ def test_pptx_processor_returns_none_when_library_missing(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake_import)
     proc = PPTXProcessor()
     assert proc.extract(b"irrelevant", "a.pptx") is None
+
+
+def test_pdf_processor_enriches_with_table_hints(monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Form 1040 sample")
+    data = doc.tobytes()
+    doc.close()
+
+    monkeypatch.setenv("LLMLIBRARIAN_PDF_TABLES", "1")
+    monkeypatch.setattr(
+        processors,
+        "_extract_pdf_tables_by_page",
+        lambda _data: [[[["", "9", "7,522."], ["", "11", "7,522."]]]],
+    )
+
+    proc = PDFProcessor()
+    pages = proc.extract(data, "a.pdf")
+    text, _page_num = pages[0]
+    assert "line 9: 7,522." in text
+    assert "| 9 | 7,522. |" in text
+    assert "Form 1040 sample" in text
+
+
+def test_pdf_processor_falls_back_when_table_extraction_raises(monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "raw only")
+    data = doc.tobytes()
+    doc.close()
+
+    monkeypatch.setenv("LLMLIBRARIAN_PDF_TABLES", "1")
+
+    def _boom(_data):
+        raise RuntimeError("pdfplumber boom")
+
+    monkeypatch.setattr(processors, "_extract_pdf_tables_by_page", _boom)
+    proc = PDFProcessor()
+    pages = proc.extract(data, "a.pdf")
+    text, _page_num = pages[0]
+    assert "raw only" in text
+    assert "Structured values:" not in text
+
+
+def test_pdf_processor_skips_table_enrichment_when_disabled(monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "raw only")
+    data = doc.tobytes()
+    doc.close()
+
+    monkeypatch.setenv("LLMLIBRARIAN_PDF_TABLES", "0")
+
+    def _boom(_data):
+        raise AssertionError("table extractor should not be called when disabled")
+
+    monkeypatch.setattr(processors, "_extract_pdf_tables_by_page", _boom)
+    proc = PDFProcessor()
+    pages = proc.extract(data, "a.pdf")
+    text, _page_num = pages[0]
+    assert "raw only" in text
+    assert "Structured values:" not in text

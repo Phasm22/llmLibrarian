@@ -3,6 +3,11 @@ Document processor abstraction for llmLibrarian ingestion.
 Each processor handles extraction for a specific file type.
 """
 import io
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -56,6 +61,138 @@ class TextExtractionError(DocumentExtractionError):
         ...
 
 
+_PDF_STRUCTURED_MAX_CHARS = 6000
+_NUMERIC_VALUE_PATTERN = re.compile(r"^\$?\s*-?\d[\d,]*(?:\.\d+)?\.?$")
+_LINE_TOKEN_PATTERN = re.compile(r"^(?:line\s*)?(\d{1,3}[a-z]?)$", re.IGNORECASE)
+_MAX_HINT_LINE_NUMBER = 80
+
+
+def _log_processor_event(level: str, message: str, **fields: Any) -> None:
+    """Write structured processor events in the same JSON-lines style as ingest logs."""
+    payload = {"ts": datetime.now(timezone.utc).isoformat(), "level": level, "message": message}
+    if fields:
+        payload.update(fields)
+    try:
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _pdf_tables_enabled() -> bool:
+    val = os.environ.get("LLMLIBRARIAN_PDF_TABLES", "1").strip().lower()
+    return val not in ("0", "false", "no")
+
+
+def _normalize_table_rows(rows: list[list[str | None]]) -> list[list[str]]:
+    """Normalize table rows: strip/compact whitespace, trim trailing empty cells, and drop empty rows."""
+    out: list[list[str]] = []
+    for row in rows or []:
+        normalized = [re.sub(r"\s+", " ", (cell or "").strip()) for cell in (row or [])]
+        first_non_empty = -1
+        last_non_empty = -1
+        for i, cell in enumerate(normalized):
+            if cell:
+                if first_non_empty < 0:
+                    first_non_empty = i
+                last_non_empty = i
+        if first_non_empty >= 0 and last_non_empty >= 0:
+            out.append(normalized[first_non_empty : last_non_empty + 1])
+    return out
+
+
+def _table_to_markdown(rows: list[list[str]]) -> str:
+    """Convert normalized rows to markdown table text."""
+    if not rows:
+        return ""
+    col_count = max(len(r) for r in rows)
+
+    def _pad(row: list[str]) -> list[str]:
+        cells = row + ([""] * (col_count - len(row)))
+        return [c.replace("|", "\\|") for c in cells]
+
+    header = _pad(rows[0])
+    body = [_pad(r) for r in rows[1:]]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * col_count) + " |",
+    ]
+    lines.extend("| " + " | ".join(r) + " |" for r in body)
+    return "\n".join(lines)
+
+
+def _extract_line_value_hints(rows: list[list[str]]) -> list[str]:
+    """Extract compact line/value hints from table-like rows (e.g., line 9 -> 7,522.)."""
+    def _is_high_signal_numeric(value: str) -> bool:
+        if not _NUMERIC_VALUE_PATTERN.match(value):
+            return False
+        digits_only = re.sub(r"\D", "", value)
+        # Ignore tiny integers that are usually row/column identifiers.
+        if len(digits_only) <= 2 and "$" not in value and "," not in value and "." not in value:
+            return False
+        return True
+
+    hints: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not row:
+            continue
+        for idx, cell in enumerate(row):
+            token = cell.strip().lower()
+            if not token:
+                continue
+            m = _LINE_TOKEN_PATTERN.match(token)
+            if not m:
+                continue
+            line_label = m.group(1)
+            num_match = re.match(r"(\d+)", line_label)
+            if num_match and int(num_match.group(1)) > _MAX_HINT_LINE_NUMBER:
+                break
+            value = ""
+            for j in range(idx + 1, len(row)):
+                candidate = row[j].strip()
+                if candidate and _is_high_signal_numeric(candidate):
+                    value = candidate
+                    break
+            if value:
+                hint = f"line {line_label}: {value}"
+                if hint not in seen:
+                    seen.add(hint)
+                    hints.append(hint)
+            break
+    return hints
+
+
+def _merge_pdf_page_content(raw_text: str, table_md: str, hints: list[str], max_structured_chars: int = _PDF_STRUCTURED_MAX_CHARS) -> str:
+    """Merge structured table context ahead of raw text with a hard cap on structured size."""
+    sections: list[str] = []
+    if hints:
+        sections.append("Structured values:\n" + "\n".join(hints))
+    if table_md:
+        sections.append("Extracted tables:\n" + table_md)
+    structured = "\n\n".join(s for s in sections if s).strip()
+    if structured and len(structured) > max_structured_chars:
+        structured = structured[:max_structured_chars].rstrip()
+    raw = (raw_text or "").strip()
+    if structured and raw:
+        return f"{structured}\n\n{raw}"
+    return structured or raw
+
+
+def _extract_pdf_tables_by_page(data: bytes) -> list[list[list[str | None]]]:
+    """Return page-indexed tables from pdfplumber. Empty list means unavailable/no tables."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return []
+
+    tables_by_page: list[list[list[str | None]]] = []
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        for page in pdf.pages:
+            page_tables = page.extract_tables() or []
+            tables_by_page.append(page_tables)
+    return tables_by_page
+
+
 class PDFProcessor:
     format_label = "PDF"
     install_hint = "pymupdf"
@@ -63,18 +200,42 @@ class PDFProcessor:
     def extract(self, data: bytes, source_path: str) -> list[tuple[str, int]]:
         try:
             import fitz
+            tables_by_page: list[list[list[str | None]]] = []
+            if _pdf_tables_enabled():
+                try:
+                    tables_by_page = _extract_pdf_tables_by_page(data)
+                except Exception as e:
+                    _log_processor_event(
+                        "WARN",
+                        "PDF table extraction failed",
+                        path=source_path,
+                        error=str(e),
+                        extractor="pdfplumber",
+                    )
             with fitz.open(stream=data, filetype="pdf") as doc:
                 out: list[tuple[str, int]] = []
                 for page in doc:
-                    text = page.get_text()
+                    raw_text = page.get_text()
                     try:
                         for w in page.widgets():
                             name = getattr(w, "field_name", None) or ""
                             val = getattr(w, "field_value", None)
                             if name and val is not None and str(val).strip():
-                                text += f"\n{name}: {val}"
+                                raw_text += f"\n{name}: {val}"
                     except Exception:
                         pass
+                    page_tables = tables_by_page[page.number] if page.number < len(tables_by_page) else []
+                    hints: list[str] = []
+                    md_tables: list[str] = []
+                    for table in page_tables:
+                        normalized = _normalize_table_rows(table)
+                        if not normalized:
+                            continue
+                        hints.extend(_extract_line_value_hints(normalized))
+                        md = _table_to_markdown(normalized)
+                        if md:
+                            md_tables.append(md)
+                    text = _merge_pdf_page_content(raw_text, "\n\n".join(md_tables), hints)
                     out.append((text, page.number + 1))
                 return out
         except Exception as e:

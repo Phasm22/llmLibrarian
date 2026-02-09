@@ -1,3 +1,4 @@
+from query.core import _field_lookup_candidates_from_scope
 from query.retrieval import (
     all_dists_above_threshold,
     dedup_by_chunk_hash,
@@ -116,3 +117,18 @@ def test_all_dists_above_threshold_true_only_when_all_non_none_are_above():
     assert all_dists_above_threshold([2.1, 2.2, None], 2.0) is True
     assert all_dists_above_threshold([2.1, 1.8], 2.0) is False
     assert all_dists_above_threshold([None, None], 2.0) is False
+
+
+def test_field_lookup_candidates_do_not_fallback_across_years():
+    docs = [
+        "Form 1040\nline 9: 99,999.",
+        "Form 1040\nline 9: 7,522.",
+    ]
+    metas = [
+        {"source": "/Users/x/Tax/2021/2021_TaxReturn.pdf"},
+        {"source": "/Users/x/Tax/2024/2024 Federal Income Tax Return.pdf"},
+    ]
+    year_docs, year_form_docs = _field_lookup_candidates_from_scope(docs, metas, year="2024", form="1040")
+    assert len(year_docs) == 1
+    assert len(year_form_docs) == 1
+    assert "7,522." in year_form_docs[0][0]

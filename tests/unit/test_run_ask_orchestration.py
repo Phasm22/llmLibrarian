@@ -2,6 +2,7 @@ from query.intent import (
     INTENT_CAPABILITIES,
     INTENT_CODE_LANGUAGE,
     INTENT_EVIDENCE_PROFILE,
+    INTENT_FIELD_LOOKUP,
     INTENT_LOOKUP,
 )
 from query.core import run_ask
@@ -165,3 +166,68 @@ def test_run_ask_uses_subscope_where_when_resolved(monkeypatch, mock_collection,
     assert q_calls
     assert q_calls[0]["where"] == {"$and": [{"silo": {"$in": ["silo-a"]}}, {"source": {"$in": ["/tmp/a.txt"]}}]}
     assert len(mock_ollama["calls"]) == 1
+
+
+def test_run_ask_field_lookup_year_not_indexed_returns_guardrail(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_FIELD_LOOKUP)
+    mock_collection.get_result = {"ids": [], "documents": [], "metadatas": []}
+
+    out = run_ask(
+        archetype_id=None,
+        query="on 2024 form 1040 what is line 9 total income",
+        no_color=True,
+        use_reranker=False,
+        silo="tax-123",
+    )
+    assert "I could not find indexed tax documents for 2024 in this silo." in out
+    assert mock_ollama["calls"] == []
+    assert not any(name == "query" for name, _kwargs in mock_collection.calls)
+
+
+def test_run_ask_field_lookup_missing_line_returns_guardrail(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_FIELD_LOOKUP)
+    mock_collection.get_result = {
+        "ids": ["id-1"],
+        "documents": ["Form 1040 (2024)\nline 10: 123"],
+        "metadatas": [{"source": "/Users/x/Tax/2024/2024 Federal Income Tax Return.pdf", "silo": "tax-123"}],
+    }
+
+    out = run_ask(
+        archetype_id=None,
+        query="on 2024 form 1040 what is line 9 total income",
+        no_color=True,
+        use_reranker=False,
+        silo="tax-123",
+    )
+    assert "I found 2024 tax documents, but I could not find Form 1040 line 9 in extractable text." in out
+    assert "I'm not inferring from other years." in out
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_field_lookup_exact_match_is_value_first(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_FIELD_LOOKUP)
+    mock_collection.get_result = {
+        "ids": ["id-1", "id-2"],
+        "documents": [
+            "Form 1040 (2021)\nline 9: 99,999.",
+            "Form 1040 (2024)\nStructured values:\nline 9: 7,522.\n",
+        ],
+        "metadatas": [
+            {"source": "/Users/x/Tax/2021/2021_TaxReturn.pdf", "silo": "tax-123"},
+            {"source": "/Users/x/Tax/2024/2024 Federal Income Tax Return.pdf", "silo": "tax-123"},
+        ],
+    }
+
+    out = run_ask(
+        archetype_id=None,
+        query="on 2024 form 1040 what is line 9 total income",
+        no_color=True,
+        use_reranker=False,
+        silo="tax-123",
+    )
+    assert "Form 1040 line 9 (2024): 7,522." in out
+    assert "2024 Federal Income Tax Return.pdf" in out
+    assert mock_ollama["calls"] == []

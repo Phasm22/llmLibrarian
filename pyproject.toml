@@ -14,6 +14,7 @@ dependencies = [
     "python-pptx>=1.0.2",
     "tqdm>=4.66.0",
     "pytest-cov>=7.0.0",
+    "pdfplumber>=0.11.9",
 ]
 
 [project.optional-dependencies]

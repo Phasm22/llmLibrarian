@@ -6,6 +6,7 @@ import re
 
 # Intent constants
 INTENT_LOOKUP = "LOOKUP"
+INTENT_FIELD_LOOKUP = "FIELD_LOOKUP"
 INTENT_EVIDENCE_PROFILE = "EVIDENCE_PROFILE"
 INTENT_AGGREGATE = "AGGREGATE"
 INTENT_REFLECT = "REFLECT"
@@ -20,7 +21,7 @@ K_AGGREGATE_MAX = 128
 
 
 def route_intent(query: str) -> str:
-    """Silent router: LOOKUP | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES. No user-facing flags."""
+    """Silent router: LOOKUP | FIELD_LOOKUP | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES."""
     q = query.strip().lower()
     if not q:
         return INTENT_LOOKUP
@@ -40,6 +41,15 @@ def route_intent(query: str) -> str:
         q,
     ):
         return INTENT_CODE_LANGUAGE
+    # FIELD_LOOKUP: tax/form field extraction requests with explicit year + form + line.
+    has_year = bool(re.search(r"\b20\d{2}\b", q))
+    has_line = bool(re.search(r"\bline\s+\d{1,3}[a-z]?\b", q))
+    has_form = bool(
+        re.search(r"\bform\s+\d{3,4}(?:-[a-z0-9]+)?\b", q)
+        or re.search(r"\b1040(?:-sr)?\b", q)
+    )
+    if has_year and has_line and has_form:
+        return INTENT_FIELD_LOOKUP
     # REFLECT: analyze / reflect on (often short or pasted)
     if re.search(r"\breflect\b|\bsummarize\s+this\b|\banalyze\s+this\b", q) and len(q) < 120:
         return INTENT_REFLECT

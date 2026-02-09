@@ -3,6 +3,7 @@ from query.intent import (
     INTENT_CAPABILITIES,
     INTENT_CODE_LANGUAGE,
     INTENT_EVIDENCE_PROFILE,
+    INTENT_FIELD_LOOKUP,
     INTENT_LOOKUP,
     INTENT_REFLECT,
     K_AGGREGATE_MAX,
@@ -36,6 +37,11 @@ def test_route_intent_evidence_profile_query():
 
 def test_route_intent_aggregate_query():
     assert route_intent("list every source and total docs") == INTENT_AGGREGATE
+
+
+def test_route_intent_field_lookup_with_total_keyword():
+    q = "on 2024 form 1040 what is line 9 total income"
+    assert route_intent(q) == INTENT_FIELD_LOOKUP
 
 
 def test_route_intent_fallback_lookup():
