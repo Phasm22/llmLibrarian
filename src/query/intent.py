@@ -7,6 +7,8 @@ import re
 # Intent constants
 INTENT_LOOKUP = "LOOKUP"
 INTENT_FIELD_LOOKUP = "FIELD_LOOKUP"
+INTENT_MONEY_YEAR_TOTAL = "MONEY_YEAR_TOTAL"
+INTENT_PROJECT_COUNT = "PROJECT_COUNT"
 INTENT_EVIDENCE_PROFILE = "EVIDENCE_PROFILE"
 INTENT_AGGREGATE = "AGGREGATE"
 INTENT_REFLECT = "REFLECT"
@@ -21,7 +23,7 @@ K_AGGREGATE_MAX = 128
 
 
 def route_intent(query: str) -> str:
-    """Silent router: LOOKUP | FIELD_LOOKUP | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES."""
+    """Silent router: LOOKUP | FIELD_LOOKUP | MONEY_YEAR_TOTAL | PROJECT_COUNT | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES."""
     q = query.strip().lower()
     if not q:
         return INTENT_LOOKUP
@@ -50,6 +52,21 @@ def route_intent(query: str) -> str:
     )
     if has_year and has_line and has_form:
         return INTENT_FIELD_LOOKUP
+    # MONEY_YEAR_TOTAL: year-scoped income question without explicit form/line (e.g., "income in 2024").
+    has_income = bool(
+        re.search(
+            r"\b(income|earnings|wages|agi|adjusted\s+gross|total\s+income)\b",
+            q,
+        )
+    )
+    has_year_only = bool(re.search(r"\b20\d{2}\b", q))
+    lacks_line = not has_line
+    lacks_form = not has_form
+    if has_year_only and has_income and lacks_line and lacks_form:
+        return INTENT_MONEY_YEAR_TOTAL
+    # PROJECT_COUNT: how many coding projects in this folder/silo
+    if re.search(r"\bhow\s+(many|much)\b", q) and re.search(r"\bprojects?\b", q):
+        return INTENT_PROJECT_COUNT
     # REFLECT: analyze / reflect on (often short or pasted)
     if re.search(r"\breflect\b|\bsummarize\s+this\b|\banalyze\s+this\b", q) and len(q) < 120:
         return INTENT_REFLECT

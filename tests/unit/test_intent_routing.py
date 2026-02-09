@@ -4,6 +4,8 @@ from query.intent import (
     INTENT_CODE_LANGUAGE,
     INTENT_EVIDENCE_PROFILE,
     INTENT_FIELD_LOOKUP,
+    INTENT_MONEY_YEAR_TOTAL,
+    INTENT_PROJECT_COUNT,
     INTENT_LOOKUP,
     INTENT_REFLECT,
     K_AGGREGATE_MAX,
@@ -42,6 +44,16 @@ def test_route_intent_aggregate_query():
 def test_route_intent_field_lookup_with_total_keyword():
     q = "on 2024 form 1040 what is line 9 total income"
     assert route_intent(q) == INTENT_FIELD_LOOKUP
+
+
+def test_route_intent_money_year_total_without_line():
+    q = "what was my income in 2024"
+    assert route_intent(q) == INTENT_MONEY_YEAR_TOTAL
+
+
+def test_route_intent_project_count():
+    q = "how many coding projects have i done in this folder"
+    assert route_intent(q) == INTENT_PROJECT_COUNT
 
 
 def test_route_intent_fallback_lookup():

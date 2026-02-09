@@ -23,6 +23,8 @@ def write_trace(
     requested_year: str | None = None,
     requested_form: str | None = None,
     requested_line: str | None = None,
+    project_count: int | None = None,
+    project_samples: list[str] | None = None,
 ) -> None:
     """Append one JSON-line to LLMLIBRARIAN_TRACE file (if set). Optional receipt: source paths and chunk hashes for chunks sent to the LLM. No-op if env unset. Does not raise."""
     path = os.environ.get("LLMLIBRARIAN_TRACE")
@@ -58,6 +60,10 @@ def write_trace(
         payload["requested_form"] = requested_form
     if requested_line:
         payload["requested_line"] = requested_line
+    if project_count is not None:
+        payload["project_count"] = project_count
+    if project_samples:
+        payload["project_samples"] = project_samples[:5]
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
