@@ -53,4 +53,4 @@ python -m pytest -q
 ## Notes
 - Each agent may have additional instructions in its own directory/config.
 - Keep commands updated if entry points or tooling change.
-- In this repo, `pal` maintains a dev-only self-silo (`__self__`). If the repo changes since the last self index, it warns: `Self-silo stale (repo changed since last index). Run pal ensure-self.`
+- In this repo, `pal` uses a dev-only self-silo (`__self__`). `pal ask`/`pal capabilities` only warn if it is missing or stale. Use `pal ensure-self` to index or refresh.

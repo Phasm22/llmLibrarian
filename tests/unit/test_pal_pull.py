@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pal
@@ -81,3 +82,33 @@ def test_cmd_pull_passes_full_and_follow_flags(monkeypatch):
     assert "--full" in cmd
     assert "--allow-cloud" in cmd
     assert "--follow-symlinks" in cmd
+
+
+def test_cmd_pull_watch_does_not_run_full_add(monkeypatch):
+    monkeypatch.setattr("pal.is_dev_repo", lambda: True)
+    monkeypatch.setattr("pal._get_git_root", lambda: Path("/tmp/repo"))
+    monkeypatch.setattr("pal.ensure_self_silo", lambda force=True: 0)
+
+    calls = []
+
+    def _fake_run_llmli(args):
+        calls.append(args)
+        return 0
+
+    class _DummyWatcher:
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self):
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr("pal._run_llmli", _fake_run_llmli)
+    monkeypatch.setattr("pal.SiloWatcher", _DummyWatcher)
+
+    args = _args()
+    args.watch = True
+    args.interval = 10
+    args.debounce = 1
+    rc = pal.cmd_pull(args)
+    assert rc == 0
+    assert calls == []

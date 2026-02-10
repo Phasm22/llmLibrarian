@@ -1509,3 +1509,258 @@ def run_add(
         except Exception:
             pass
     return (files_indexed, len(failures))
+
+
+def _load_limits_config() -> tuple[int, int, int, int, int]:
+    """Return (max_file_bytes, max_depth, max_archive_bytes, max_files_per_zip, max_extracted_per_zip)."""
+    limits_cfg = {}
+    try:
+        config = load_config()
+        limits_cfg = config.get("limits") or {}
+    except Exception:
+        pass
+    max_file_bytes = int((limits_cfg.get("max_file_size_mb") or 20) * 1024 * 1024)
+    max_depth = int(limits_cfg.get("max_depth") or DEFAULT_MAX_DEPTH)
+    max_archive_bytes = int((limits_cfg.get("max_archive_size_mb") or 100) * 1024 * 1024)
+    max_files_per_zip = int(limits_cfg.get("max_files_per_zip") or DEFAULT_MAX_FILES_PER_ZIP)
+    max_extracted_per_zip = int(limits_cfg.get("max_extracted_bytes_per_zip") or DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP)
+    return max_file_bytes, max_depth, max_archive_bytes, max_files_per_zip, max_extracted_per_zip
+
+
+def update_silo_counts(db_path: str | Path, silo_slug: str, display_name: str | None = None) -> None:
+    """Recompute silo file/chunk counts and update llmli registry."""
+    from state import update_silo, list_silos
+
+    db_path = db_path or DB_PATH
+    manifest = _read_file_manifest(db_path)
+    silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
+    manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
+    total_files = len(manifest_files) if isinstance(manifest_files, dict) else 0
+    silo_path = (silo_manifest.get("path") if isinstance(silo_manifest, dict) else "") or ""
+
+    existing_display = None
+    if display_name is None:
+        for entry in list_silos(db_path):
+            if entry.get("slug") == silo_slug:
+                existing_display = entry.get("display_name")
+                if not silo_path:
+                    silo_path = entry.get("path") or ""
+                break
+    name = display_name or existing_display or silo_slug
+
+    ef = get_embedding_function()
+    client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
+    collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+    chunks_count = 0
+    try:
+        result = collection.get(where={"silo": silo_slug}, include=["ids"])
+        ids = result.get("ids") if isinstance(result, dict) else None
+        if isinstance(ids, list):
+            chunks_count = len(ids)
+    except Exception:
+        pass
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    update_silo(db_path, silo_slug, silo_path, total_files, chunks_count, now_iso, display_name=name)
+
+
+def _detect_kind(path: Path) -> str:
+    suf = path.suffix.lower()
+    if suf == ".zip":
+        return "zip"
+    if suf == ".pdf":
+        return "pdf"
+    if suf == ".docx":
+        return "docx"
+    if suf == ".xlsx":
+        return "xlsx"
+    if suf == ".pptx":
+        return "pptx"
+    return "code"
+
+
+def remove_single_file(
+    path: str | Path,
+    db_path: str | Path | None = None,
+    silo_slug: str = "__self__",
+    update_counts: bool = True,
+) -> tuple[str, str]:
+    """Remove a single file from a silo (chunks, manifest, registry). Returns (status, path)."""
+    db_path = db_path or DB_PATH
+    p = Path(path).resolve()
+    path_str = str(p)
+
+    manifest = _read_file_manifest(db_path)
+    silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
+    manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
+    prev = manifest_files.get(path_str) if isinstance(manifest_files, dict) else None
+
+    ef = get_embedding_function()
+    client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
+    collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+    try:
+        collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
+    except Exception:
+        pass
+    try:
+        collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": path_str}]})
+    except Exception:
+        pass
+    if prev:
+        _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
+
+    def _update_manifest(manifest_data: dict) -> None:
+        silos = manifest_data.setdefault("silos", {})
+        silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
+        if not silo_entry.get("path"):
+            silo_entry["path"] = str(p.parent)
+        files_map = silo_entry.setdefault("files", {})
+        if isinstance(files_map, dict) and path_str in files_map:
+            del files_map[path_str]
+
+    _update_file_manifest(db_path, _update_manifest)
+    if update_counts:
+        update_silo_counts(db_path, silo_slug)
+    return ("removed" if prev else "skipped", path_str)
+
+
+def update_single_file(
+    path: str | Path,
+    db_path: str | Path | None = None,
+    silo_slug: str = "__self__",
+    allow_cloud: bool = False,
+    follow_symlinks: bool = False,
+    no_color: bool = False,
+    update_counts: bool = True,
+) -> tuple[str, str]:
+    """
+    Index or update a single file within a silo. Returns (status, path).
+    status: updated|unchanged|removed|skipped|duplicate|error
+    """
+    db_path = db_path or DB_PATH
+    p = Path(path)
+    if p.is_symlink() and not follow_symlinks:
+        return ("skipped", str(p))
+    try:
+        p = p.resolve()
+    except Exception:
+        return ("error", str(p))
+    path_str = str(p)
+    if not p.exists() or not p.is_file():
+        return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
+    if not allow_cloud:
+        cloud_kind = is_cloud_sync_path(p)
+        if cloud_kind:
+            return ("skipped", path_str)
+    if not should_index(path_str, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE):
+        return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
+
+    max_file_bytes, _max_depth, max_archive_bytes, max_files_per_zip, max_extracted_per_zip = _load_limits_config()
+    try:
+        stat = p.stat()
+        mtime = stat.st_mtime
+        size = stat.st_size
+    except OSError:
+        return ("error", path_str)
+
+    kind = _detect_kind(p)
+    if kind != "zip" and size > max_file_bytes:
+        return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
+    if kind == "zip" and size > max_archive_bytes:
+        return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
+
+    manifest = _read_file_manifest(db_path)
+    silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
+    manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
+    prev = manifest_files.get(path_str) if isinstance(manifest_files, dict) else None
+
+    file_hash = ""
+    if kind != "zip":
+        file_hash = get_file_hash(p)
+        if file_hash:
+            existing = _file_registry_get(db_path, file_hash)
+            if existing:
+                other = existing[0]
+                if other.get("silo") != silo_slug:
+                    return ("duplicate", path_str)
+        if prev and prev.get("mtime") == mtime and prev.get("size") == size:
+            if not file_hash or prev.get("hash") == file_hash:
+                return ("unchanged", path_str)
+    else:
+        if prev and prev.get("mtime") == mtime and prev.get("size") == size:
+            return ("unchanged", path_str)
+
+    ef = get_embedding_function()
+    client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
+    collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+
+    try:
+        collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
+    except Exception:
+        pass
+    try:
+        collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": path_str}]})
+    except Exception:
+        pass
+    if prev:
+        _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
+
+    chunks: list[ChunkTuple] = []
+    if kind == "zip":
+        try:
+            chunks = process_zip_to_chunks(
+                p,
+                ADD_DEFAULT_INCLUDE,
+                ADD_DEFAULT_EXCLUDE,
+                max_archive_bytes,
+                max_file_bytes,
+                max_files_per_zip,
+                max_extracted_per_zip,
+            )
+        except Exception:
+            chunks = []
+    else:
+        try:
+            chunks = process_one_file(p, kind, file_hash or None, follow_symlinks, p)
+        except Exception:
+            chunks = []
+
+    if chunks:
+        for _id, _doc, meta in chunks:
+            meta["silo"] = silo_slug
+        batch_size = ADD_BATCH_SIZE
+        try:
+            batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
+        except (TypeError, ValueError):
+            pass
+        batch_size = max(1, min(batch_size, 2000))
+        embedding_workers = 1
+        try:
+            embedding_workers = int(os.environ.get("LLMLIBRARIAN_EMBEDDING_WORKERS", "1"))
+        except (TypeError, ValueError):
+            embedding_workers = 1
+        embedding_workers = max(1, min(embedding_workers, 32))
+        _batch_add(
+            collection,
+            chunks,
+            batch_size=batch_size,
+            no_color=no_color,
+            embedding_fn=ef,
+            embedding_workers=embedding_workers,
+        )
+        if file_hash:
+            _file_registry_add(db_path, file_hash, silo_slug, path_str)
+
+    def _update_manifest(manifest_data: dict) -> None:
+        silos = manifest_data.setdefault("silos", {})
+        silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
+        files_map = silo_entry.setdefault("files", {})
+        if not isinstance(files_map, dict):
+            files_map = {}
+            silo_entry["files"] = files_map
+        files_map[path_str] = {"mtime": mtime, "size": size, "hash": file_hash if kind != "zip" else ""}
+
+    _update_file_manifest(db_path, _update_manifest)
+    if update_counts:
+        update_silo_counts(db_path, silo_slug)
+    return ("updated", path_str)

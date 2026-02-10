@@ -10,7 +10,8 @@ Project layout, environment, tuning, and operational details. For philosophy and
 - **archetypes.yaml** — Prompts (and optionally index config). **Prompt-only:** add an entry with `name` + `prompt` and an id that matches a silo slug (e.g. `stuff`); then `pal ask --in stuff "..."` uses that prompt. **Full:** include `folders`, `include`/`exclude`, `collection` for `llmli index --archetype X` and a separate collection. Limits (max_file_size_mb, etc.) apply to add/index.
 - **src/** — Librarian code:
   - **embeddings.py**, **load_config.py**, **style.py**, **reranker.py**, **state.py**, **floor.py** — Support modules.
-  - **ingest.py** — Indexing core (archetype + add); **query_engine.py** — Query (ask).
+- **ingest.py** — Indexing core (archetype + add); **query_engine.py** — Query (ask).
+- **ingest.py (single-file)** — `update_single_file()` / `remove_single_file()` support event-driven updates from `pal pull --watch`.
   - **indexer.py** / **query.py** — Thin wrappers that re-export from ingest / query_engine for the CLI.
 - **docs/CHROMA_AND_STACK.md** — Chroma usage and stack choices.
 - **gemini_summary.md** — Project manifest and recovery notes.

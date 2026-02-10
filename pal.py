@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 
 PAL_HOME = Path(os.environ.get("PAL_HOME", os.path.expanduser("~/.pal")))
@@ -46,6 +47,21 @@ def _run_llmli(args: list[str]) -> int:
         cmd = [sys.executable, str(root / "cli.py")] + args
     r = subprocess.run(cmd, env=env)
     return r.returncode
+
+
+def _ensure_src_on_path() -> None:
+    root = Path(__file__).resolve().parent
+    src = root / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+
+
+try:  # optional dependency for watch mode
+    from watchdog.observers import Observer  # type: ignore
+    from watchdog.events import FileSystemEventHandler  # type: ignore
+except Exception:  # pragma: no cover - handled by runtime error message
+    Observer = None  # type: ignore[assignment]
+    FileSystemEventHandler = object  # type: ignore[misc, assignment]
 
 
 def _parse_env_bool(value: str | None) -> bool | None:
@@ -248,7 +264,15 @@ def _warn_self_silo_stale() -> None:
     print("Self-silo stale (repo changed since last index). Run `pal ensure-self`.", file=sys.stderr)
 
 
-def ensure_self_silo() -> int:
+def _warn_self_silo_missing() -> None:
+    print("Self-silo missing. Run `pal ensure-self`.", file=sys.stderr)
+
+
+def _warn_self_silo_mismatch() -> None:
+    print("Self-silo path mismatch. Run `pal ensure-self`.", file=sys.stderr)
+
+
+def ensure_self_silo(force: bool = False) -> int:
     require_self = _should_require_self_silo()
     if not require_self:
         return 0
@@ -267,13 +291,21 @@ def ensure_self_silo() -> int:
 
     needs_reindex = False
     if self_entry and self_path and self_path != repo_str:
-        _run_llmli(["rm", "__self__"])
         needs_reindex = True
     if existing_slug and existing_slug != "__self__":
-        _run_llmli(["rm", existing_slug])
         needs_reindex = True
 
     if not self_entry or needs_reindex or self_path != repo_str:
+        if not force:
+            if not self_entry:
+                _warn_self_silo_missing()
+            else:
+                _warn_self_silo_mismatch()
+            return 0
+        if self_entry and self_path and self_path != repo_str:
+            _run_llmli(["rm", "__self__"])
+        if existing_slug and existing_slug != "__self__":
+            _run_llmli(["rm", existing_slug])
         llmli_args = ["add", "--silo", "__self__", "--display-name", "self"]
         if is_dev:
             llmli_args.append("--allow-cloud")
@@ -296,11 +328,264 @@ def ensure_self_silo() -> int:
 
     dirty = _git_is_dirty(repo_root)
     last_commit = _git_last_commit_ct(repo_root)
-    if dirty:
-        _warn_self_silo_stale()
-    elif last_index_mtime is not None and last_commit is not None and last_commit > last_index_mtime:
+    stale = dirty or (
+        last_index_mtime is not None and last_commit is not None and last_commit > last_index_mtime
+    )
+    if stale:
         _warn_self_silo_stale()
     return 0
+
+
+class _SiloEventHandler(FileSystemEventHandler):
+    def __init__(self, watcher: "SiloWatcher") -> None:
+        super().__init__()
+        self._watcher = watcher
+
+    def on_modified(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._watcher.enqueue_update(event.src_path)
+
+    def on_created(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._watcher.enqueue_update(event.src_path)
+
+    def on_deleted(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._watcher.enqueue_delete(event.src_path)
+
+    def on_moved(self, event) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+        self._watcher.enqueue_delete(event.src_path)
+        self._watcher.enqueue_update(event.dest_path)
+
+
+class SiloWatcher:
+    def __init__(
+        self,
+        root: Path,
+        db_path: str | Path,
+        interval: float = 10.0,
+        debounce: float = 1.0,
+        silo_slug: str = "__self__",
+        allow_cloud: bool = False,
+    ) -> None:
+        if Observer is None:
+            raise RuntimeError("watchdog is not installed. Install `watchdog` to use watch mode.")
+        _ensure_src_on_path()
+        from ingest import (
+            update_single_file,
+            remove_single_file,
+            update_silo_counts,
+            _read_file_manifest,
+            _load_limits_config,
+            collect_files,
+            should_index,
+            ADD_DEFAULT_INCLUDE,
+            ADD_DEFAULT_EXCLUDE,
+        )
+
+        self.root = root.resolve()
+        self.db_path = str(db_path)
+        self.interval = float(interval)
+        self.debounce = float(debounce)
+        self.silo_slug = silo_slug
+        self.allow_cloud = allow_cloud
+
+        self._update_single_file = update_single_file
+        self._remove_single_file = remove_single_file
+        self._update_silo_counts = update_silo_counts
+        self._read_manifest = _read_file_manifest
+        self._load_limits_config = _load_limits_config
+        self._collect_files = collect_files
+        self._should_index = should_index
+        self._include = ADD_DEFAULT_INCLUDE
+        self._exclude = ADD_DEFAULT_EXCLUDE
+
+        self._observer = Observer()
+        self._handler = _SiloEventHandler(self)
+        self._queue: dict[str, dict[str, float | str]] = {}
+        self._queue_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+    def _log(self, message: str) -> None:
+        print(message)
+
+    def enqueue_update(self, path: str) -> None:
+        try:
+            p = Path(path).resolve()
+        except Exception:
+            return
+        try:
+            if not p.is_relative_to(self.root):
+                return
+        except Exception:
+            return
+        if not self._should_index(str(p), self._include, self._exclude):
+            return
+        now = time.time()
+        with self._queue_lock:
+            self._queue[str(p)] = {"ts": now, "action": "update"}
+
+    def enqueue_delete(self, path: str) -> None:
+        try:
+            p = Path(path).resolve()
+        except Exception:
+            return
+        try:
+            if not p.is_relative_to(self.root):
+                return
+        except Exception:
+            return
+        now = time.time()
+        with self._queue_lock:
+            existing = self._queue.get(str(p))
+            if existing and existing.get("action") == "update":
+                self._queue[str(p)] = {"ts": now, "action": "delete"}
+            else:
+                self._queue[str(p)] = {"ts": now, "action": "delete"}
+
+    def _drain_due(self, now: float | None = None) -> int:
+        if now is None:
+            now = time.time()
+        due: list[tuple[str, str]] = []
+        with self._queue_lock:
+            for path, meta in list(self._queue.items()):
+                ts = float(meta.get("ts") or 0.0)
+                action = str(meta.get("action") or "update")
+                if now - ts >= self.debounce:
+                    due.append((path, action))
+                    del self._queue[path]
+        if not due:
+            return 0
+        processed = 0
+        for path, action in due:
+            with self._lock:
+                if action == "delete":
+                    status, _ = self._remove_single_file(
+                        path,
+                        db_path=self.db_path,
+                        silo_slug=self.silo_slug,
+                        update_counts=True,
+                    )
+                    if status == "removed":
+                        self._log(f"self: removed {path}")
+                        processed += 1
+                else:
+                    status, _ = self._update_single_file(
+                        path,
+                        db_path=self.db_path,
+                        silo_slug=self.silo_slug,
+                        allow_cloud=self.allow_cloud,
+                        follow_symlinks=False,
+                        no_color=True,
+                        update_counts=True,
+                    )
+                    if status == "updated":
+                        self._log(f"self: updated {path}")
+                        processed += 1
+                    elif status == "removed":
+                        self._log(f"self: removed {path}")
+                        processed += 1
+        return processed
+
+    def _process_loop(self) -> None:
+        while not self._stop.is_set():
+            self._drain_due()
+            time.sleep(0.2)
+
+    def _reconcile_once(self) -> tuple[int, int, int]:
+        max_file_bytes, max_depth, _max_archive_bytes, _max_files_per_zip, _max_extracted = self._load_limits_config()
+        file_list = self._collect_files(
+            self.root,
+            self._include,
+            self._exclude,
+            max_depth,
+            max_file_bytes,
+            follow_symlinks=False,
+        )
+        current: dict[str, tuple[float, int]] = {}
+        for p, _k in file_list:
+            try:
+                p_res = p.resolve()
+                stat = p_res.stat()
+                current[str(p_res)] = (stat.st_mtime, stat.st_size)
+            except OSError:
+                continue
+
+        manifest = self._read_manifest(self.db_path)
+        silo_manifest = (manifest.get("silos") or {}).get(self.silo_slug, {})
+        manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
+
+        updated = 0
+        removed = 0
+        skipped = 0
+        with self._lock:
+            if isinstance(manifest_files, dict):
+                for path_str in list(manifest_files.keys()):
+                    if path_str not in current:
+                        status, _ = self._remove_single_file(
+                            path_str,
+                            db_path=self.db_path,
+                            silo_slug=self.silo_slug,
+                            update_counts=False,
+                        )
+                        if status == "removed":
+                            removed += 1
+            for path_str, (mtime, size) in current.items():
+                prev = manifest_files.get(path_str) if isinstance(manifest_files, dict) else None
+                if prev and prev.get("mtime") == mtime and prev.get("size") == size:
+                    continue
+                status, _ = self._update_single_file(
+                    path_str,
+                    db_path=self.db_path,
+                    silo_slug=self.silo_slug,
+                    allow_cloud=self.allow_cloud,
+                    follow_symlinks=False,
+                    no_color=True,
+                    update_counts=False,
+                )
+                if status == "updated":
+                    updated += 1
+                elif status == "removed":
+                    removed += 1
+                else:
+                    skipped += 1
+        if updated or removed:
+            self._update_silo_counts(self.db_path, self.silo_slug)
+        return (updated, removed, skipped)
+
+    def _reconcile_loop(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(self.interval)
+            if self._stop.is_set():
+                break
+            updated, removed, skipped = self._reconcile_once()
+            if updated or removed or skipped:
+                self._log(f"Reconcile: +{updated} updated, -{removed} removed, {skipped} skipped")
+
+    def run(self) -> None:
+        self._log(f"Watching __self__ (interval={int(self.interval)}s, debounce={self.debounce}s). Ctrl+C to stop.")
+        self._observer.schedule(self._handler, str(self.root), recursive=True)
+        self._observer.start()
+        worker = threading.Thread(target=self._process_loop, daemon=True)
+        recon = threading.Thread(target=self._reconcile_loop, daemon=True)
+        worker.start()
+        recon.start()
+        updated, removed, skipped = self._reconcile_once()
+        if updated or removed or skipped:
+            self._log(f"Reconcile: +{updated} updated, -{removed} removed, {skipped} skipped")
+        try:
+            while True:
+                time.sleep(1.0)
+        finally:
+            self._stop.set()
+            self._observer.stop()
+            self._observer.join()
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -327,7 +612,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     """Delegate to llmli ask (unified by default). --in <silo> for scoped ask; --strict for conservative answers."""
-    ensure_self_silo()
+    ensure_self_silo(force=False)
     llmli_args = ["ask"]
     if getattr(args, "unified", False):
         llmli_args.append("--unified")
@@ -351,13 +636,13 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 def cmd_capabilities(args: argparse.Namespace) -> int:
     """Delegate to llmli capabilities (supported file types and extractors)."""
-    ensure_self_silo()
+    ensure_self_silo(force=False)
     return _run_llmli(["capabilities"])
 
 
 def cmd_ensure_self(args: argparse.Namespace) -> int:
     """Ensure dev-mode self-silo exists; warn if stale."""
-    return ensure_self_silo()
+    return ensure_self_silo(force=True)
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -433,6 +718,8 @@ def _build_pull_env(status_file_path: str) -> dict[str, str]:
 
 def cmd_pull(args: argparse.Namespace) -> int:
     """Refresh all registered silos (incremental by default)."""
+    if getattr(args, "watch", False):
+        return cmd_pull_watch(args)
     reg = _read_registry()
     sources = reg.get("sources", [])
     if not sources:
@@ -506,6 +793,38 @@ def cmd_pull(args: argparse.Namespace) -> int:
     if not updated_silos and not failed_silos:
         print("All silos up to date.")
     return 0 if fail_count == 0 else 1
+
+
+def cmd_pull_watch(args: argparse.Namespace) -> int:
+    """Watch dev self-silo and apply incremental updates on change."""
+    if Observer is None:
+        print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
+        return 1
+    if not is_dev_repo():
+        print("Error: --watch is only supported in the llmLibrarian repo.", file=sys.stderr)
+        return 1
+    rc = ensure_self_silo(force=True)
+    if rc != 0:
+        return rc
+    repo_root = _get_git_root()
+    if repo_root is None:
+        print("Error: unable to detect git root for watch.", file=sys.stderr)
+        return 1
+    interval = float(getattr(args, "interval", 10) or 10)
+    debounce = float(getattr(args, "debounce", 1) or 1)
+    watcher = SiloWatcher(
+        repo_root,
+        os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"),
+        interval=interval,
+        debounce=debounce,
+        silo_slug="__self__",
+        allow_cloud=True,
+    )
+    try:
+        watcher.run()
+    except KeyboardInterrupt:
+        return 0
+    return 0
 
 
 def cmd_silos(args: argparse.Namespace) -> int:
@@ -595,6 +914,9 @@ def main() -> int:
     p_ensure.set_defaults(_run=cmd_ensure_self)
 
     p_pull = sub.add_parser("pull", help="Refresh all registered silos (incremental by default)")
+    p_pull.add_argument("--watch", action="store_true", help="Watch dev self-silo and update on change")
+    p_pull.add_argument("--interval", type=float, default=10, help="Reconcile interval in seconds (watch mode)")
+    p_pull.add_argument("--debounce", type=float, default=1, help="Debounce seconds before reindexing (watch mode)")
     p_pull.add_argument("--full", action="store_true", help="Full reindex (delete + add) instead of incremental")
     p_pull.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive")
     p_pull.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks inside folders")

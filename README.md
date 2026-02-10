@@ -41,7 +41,8 @@ llmli ls
 | `pal inspect <silo>` | Per-silo details and per-file chunk counts. |
 | `pal capabilities` | Supported file types and extractors. |
 | `pal log` | Last add failures. |
-| `pal ensure-self` | Ensure dev-mode self-silo exists; warn if stale. |
+| `pal ensure-self` | Ensure dev-mode self-silo exists (manual refresh). |
+| `pal pull --watch` | Watch dev self-silo and update on change (quiet logs). |
 | `pal tool llmli <args...>` | Passthrough to llmli. |
 
 **llmli** — Full control.
@@ -70,9 +71,13 @@ llmli ls
 
 ## Self-silo (dev mode)
 
-When running `pal` inside this repo, it keeps a `__self__` silo (display name `self`) so capability-related answers stay grounded in local code. If the repo changes since the last self index, `pal` prints:
+When running `pal` inside this repo, it uses a dev-only `__self__` silo (display name `self`) so capability-related answers stay grounded in local code. `pal ask` and `pal capabilities` do not reindex automatically; they only warn if the self-silo is missing or stale. Use `pal ensure-self` to index or refresh it.
+
+If the repo changes since the last self index, `pal` prints:
 
 `Self-silo stale (repo changed since last index). Run pal ensure-self.`
+
+Auto-reindex (dev): `pal pull --watch` uses a watchdog observer + a periodic reconcile (default 10s) to update only changed files. Logs are quiet by design: a single startup line and one line per update/remove/reconcile summary.
 
 ---
 
