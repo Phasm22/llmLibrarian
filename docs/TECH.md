@@ -13,7 +13,7 @@ Project layout, environment, tuning, and operational details. For philosophy and
 - **ingest.py** — Indexing core (archetype + add); **query_engine.py** — Query (ask).
 - **ingest.py (single-file)** — `update_single_file()` / `remove_single_file()` support event-driven updates from `pal pull <path> --watch`.
   - **indexer.py** / **query.py** — Thin wrappers that re-export from ingest / query_engine for the CLI.
-- **evals/adversarial.py** — Synthetic adversarial trustfulness eval harness (corpus, queries, scoring, JSON report).
+- **llmli_evals/adversarial.py** — Synthetic adversarial trustfulness eval harness (corpus, queries, scoring, JSON report).
 - **docs/CHROMA_AND_STACK.md** — Chroma usage and stack choices.
 - **gemini_summary.md** — Project manifest and recovery notes.
 
@@ -27,6 +27,17 @@ Per-silo prompt override workflow:
 Adversarial trustfulness eval:
 - `llmli eval-adversarial --out ./adversarial_eval_report.json`
 - Optional smoke run: `llmli eval-adversarial --limit 20 --out ./adversarial_eval_smoke.json`
+- Mode controls for A/B validation:
+  - `llmli eval-adversarial --strict-mode|--no-strict-mode`
+  - `llmli eval-adversarial --direct-decisive-mode|--no-direct-decisive-mode`
+
+Direct decisiveness (feature-flagged):
+- `archetypes.yaml` supports:
+  - `query.direct_decisive_mode` (default `false`)
+  - `query.canonical_filename_tokens`
+  - `query.deprioritized_tokens`
+  - `query.confidence_relaxation_enabled`
+- Scope: direct-intent retrieval path (`LOOKUP`/`FIELD_LOOKUP`) only; strict mode behavior itself is unchanged.
 
 ## Development setup
 

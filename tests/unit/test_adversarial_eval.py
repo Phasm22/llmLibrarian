@@ -1,6 +1,7 @@
 from llmli_evals.adversarial import (
     build_query_suite,
     materialize_corpus,
+    run_adversarial_eval,
     score_query,
     format_report_table,
     _split_answer_and_sources,
@@ -114,6 +115,7 @@ def test_format_report_table_contains_key_metrics():
         "run_id": "abc123",
         "model": "m",
         "silo": "__adversarial_eval__",
+        "run_config": {"strict_mode": True, "direct_decisive_mode": False},
         "totals": {
             "total_queries": 2,
             "passed_queries": 1,
@@ -144,5 +146,53 @@ def test_format_report_table_contains_key_metrics():
         "records": [],
     }
     s = format_report_table(report)
+    assert "Modes: strict=True direct_decisive=False" in s
     assert "Overall Trust Score: 50.0%" in s
     assert "Top Failures:" in s
+
+
+def test_run_adversarial_eval_report_includes_mode_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr("llmli_evals.adversarial.run_add", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "llmli_evals.adversarial.run_ask",
+        lambda **_k: "Aster rank is 1.\n\n---\nAnswered by: llmli\n\nSources:\n  • 2025-03-01-canonical-rankings.md (line 1) · 0.11\n",
+    )
+    report = run_adversarial_eval(
+        db_path=tmp_path / "db",
+        limit=1,
+        strict_mode=False,
+        direct_decisive_mode=True,
+        no_color=True,
+    )
+    assert report["run_config"]["strict_mode"] is False
+    assert report["run_config"]["direct_decisive_mode"] is True
+
+
+def test_run_adversarial_eval_direct_mode_changes_results_independent_of_strict(monkeypatch, tmp_path):
+    monkeypatch.setattr("llmli_evals.adversarial.run_add", lambda *a, **k: None)
+
+    def _run_ask(**kwargs):
+        # Simulate direct-decisive behavior toggled by config override path.
+        cfg = str(kwargs.get("config_path") or "")
+        if "eval-archetypes.yaml" in cfg:
+            return "Aster Grill rank is 1.\n\n---\nAnswered by: llmli\n\nSources:\n  • 2025-03-01-canonical-rankings.md (line 1) · 0.11\n"
+        return "I don't have enough evidence to say.\n\n---\nAnswered by: llmli\n\nSources:\n  • 2025-03-01-canonical-rankings.md (line 1) · 0.11\n"
+
+    monkeypatch.setattr("llmli_evals.adversarial.run_ask", _run_ask)
+
+    baseline = run_adversarial_eval(
+        db_path=tmp_path / "db",
+        limit=1,
+        strict_mode=True,
+        direct_decisive_mode=None,
+        no_color=True,
+    )
+    candidate = run_adversarial_eval(
+        db_path=tmp_path / "db",
+        limit=1,
+        strict_mode=True,
+        direct_decisive_mode=True,
+        no_color=True,
+    )
+    assert baseline["totals"]["passed_queries"] == 0
+    assert candidate["totals"]["passed_queries"] == 1

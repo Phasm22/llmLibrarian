@@ -154,6 +154,80 @@ def test_run_ask_strict_mode_adds_strict_instruction(monkeypatch, mock_collectio
     assert "Strict mode:" in system_prompt
 
 
+def test_run_ask_direct_decisive_mode_adds_conflict_policy(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr(
+        "query.core.load_config",
+        lambda _p=None: {"archetypes": {}, "query": {"direct_decisive_mode": True}},
+    )
+    mock_collection.query_result = {
+        "documents": [["canonical context"]],
+        "metadatas": [[{"source": "/tmp/2025-canonical-fact.md", "is_local": 1}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_collection.get_result = {"ids": [], "documents": [], "metadatas": []}
+
+    run_ask(archetype_id=None, query="what is the canonical fact", no_color=True, use_reranker=False)
+    system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
+    assert "Direct query conflict policy" in system_prompt
+
+
+def test_run_ask_strict_mode_not_replaced_by_direct_mode_when_disabled(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr(
+        "query.core.load_config",
+        lambda _p=None: {"archetypes": {}, "query": {"direct_decisive_mode": False}},
+    )
+    mock_collection.query_result = {
+        "documents": [["strict context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "is_local": 1}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_collection.get_result = {"ids": [], "documents": [], "metadatas": []}
+
+    run_ask(archetype_id=None, query="list all", no_color=True, use_reranker=False, strict=True)
+    system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
+    assert "Strict mode:" in system_prompt
+    assert "Direct query conflict policy" not in system_prompt
+
+
+def test_run_ask_direct_decisive_relaxes_low_confidence_when_canonical_present(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr(
+        "query.core.load_config",
+        lambda _p=None: {
+            "archetypes": {},
+            "query": {
+                "direct_decisive_mode": True,
+                "canonical_filename_tokens": ["canonical"],
+                "deprioritized_tokens": ["draft"],
+                "confidence_relaxation_enabled": True,
+            },
+        },
+    )
+    mock_collection.query_result = {
+        "documents": [["draft context", "canonical context"]],
+        "metadatas": [[
+            {"source": "/tmp/draft-note.md", "is_local": 1},
+            {"source": "/tmp/official-canonical-fact.md", "is_local": 1},
+        ]],
+        "distances": [[0.95, 0.91]],
+        "ids": [["id-1", "id-2"]],
+    }
+    mock_collection.get_result = {
+        "ids": ["id-2"],
+        "documents": ["canonical context"],
+        "metadatas": [{"source": "/tmp/official-canonical-fact.md", "is_local": 1}],
+    }
+    out = run_ask(archetype_id=None, query="what is the fact", no_color=True, use_reranker=False)
+    assert "Low confidence: query is weakly related to indexed content." not in out
+
+
 def test_run_ask_silo_prompt_override_precedence(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
@@ -355,4 +429,51 @@ def test_run_ask_field_lookup_exact_match_is_value_first(monkeypatch, mock_colle
     )
     assert "Form 1040 line 9 (2024): 7,522." in out
     assert "2024 Federal Income Tax Return.pdf" in out
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_csv_rank_guardrail_short_circuits_llm(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.get_result = {
+        "documents": [
+            'CSV row 1: Rank=1 | Restaurant=Carmine\'s (Times Square) | Sales=39080335',
+            "CSV row 2: Rank=2 | Restaurant=The Boathouse Orlando | Sales=35218364",
+        ],
+        "metadatas": [
+            {"source": "/tmp/2020/Independence100.csv", "silo": "restaurant"},
+            {"source": "/tmp/2020/Independence100.csv", "silo": "restaurant"},
+        ],
+        "ids": ["id-1", "id-2"],
+    }
+
+    out = run_ask(
+        archetype_id=None,
+        query="what restaurant was ranked number 1 in 2020",
+        no_color=True,
+        use_reranker=False,
+        silo="restaurant",
+    )
+    assert "Rank 1: Carmine's (Times Square)" in out
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_csv_rank_guardrail_works_in_strict_mode(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.get_result = {
+        "documents": ['CSV row 1: Rank=1 | Restaurant=Carmine\'s (Times Square) | Sales=39080335'],
+        "metadatas": [{"source": "/tmp/2020/Independence100.csv", "silo": "restaurant"}],
+        "ids": ["id-1"],
+    }
+
+    out = run_ask(
+        archetype_id=None,
+        query="what restaurant was ranked number 1 in 2020",
+        no_color=True,
+        use_reranker=False,
+        silo="restaurant",
+        strict=True,
+    )
+    assert "Rank 1: Carmine's (Times Square)" in out
     assert mock_ollama["calls"] == []

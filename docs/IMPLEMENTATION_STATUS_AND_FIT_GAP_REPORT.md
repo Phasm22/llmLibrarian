@@ -10,12 +10,12 @@ Source roadmap: `docs/ROADMAP.md`
 - `Superseded/Changed`: 1
 
 Top 3 risks:
-- Retrieval quality still lacks BM25 fallback for weak semantic matches and semantic boundary chunking.
+- Retrieval quality still lacks full general BM25-style fallback coverage and semantic boundary chunking.
 - Citation trust is still footer-based; sentence-level grounding/validation is not implemented.
 - Generic field extraction remains domain-specific (tax-form shaped).
 
 Top 3 quick wins:
-- Add BM25 lexical fallback with weak-distance trigger for general retrieval paths.
+- Expand the new direct-intent lexical/RRF fallback pattern to broader retrieval paths.
 - Add semantic chunking boundary detection for code/JSON/Markdown.
 - Add citation validator/post-check to catch unsupported inline claims.
 
@@ -36,7 +36,7 @@ Rubrics used:
 ## Item-by-Item Matrix
 | Roadmap ID | Feature | Implementation Status | Evidence | Fit | Gap | Impact | Effort to close | Recommended next action |
 |---|---|---|---|---|---|---|---|---|
-| `1a` | BM25 lexical fallback on weak vector similarity | Partially Implemented | `src/query/retrieval.py:56` (`rrf_merge`), `src/query/core.py:349` (lexical + RRF path for `EVIDENCE_PROFILE`) | Moderate | No BM25 implementation and no weak-distance trigger branch for general retrieval. | High | M | Add `_bm25_search()` + weak-distance fallback gate for all relevant intents. |
+| `1a` | BM25 lexical fallback on weak vector similarity | Partially Implemented | `src/query/retrieval.py` (`rrf_merge`, `extract_direct_lexical_terms`, source-priority weighting), `src/query/core.py` (direct-intent hybrid lexical path behind `query.direct_decisive_mode`), `tests/unit/test_retrieval_pipeline.py`, `tests/unit/test_run_ask_orchestration.py` | Moderate-Strong | Direct-intent decisiveness is implemented, but generalized BM25/weak-distance fallback is still not applied uniformly to all retrieval intents. | High | M | Extend current direct-intent hybrid pattern into a general weak-distance fallback path and keep eval A/B matrix as the guardrail. |
 | `1b` | Per-intent diversity caps | Implemented | `src/query/retrieval.py:30` (`DIVERSITY_CAPS`, `max_chunks_for_intent`), `src/query/core.py:448` (intent-based cap), `tests/unit/test_retrieval_pipeline.py:51` | Strong | None observed for roadmap scope. | Medium | - | Monitor answer quality by intent and tune cap values as needed. |
 | `1c` | Query expansion for domain synonyms | Implemented | `src/query/expansion.py:1`, `src/query/core.py:205`, `tests/unit/test_query_expansion.py:1`, `tests/unit/test_run_ask_orchestration.py:63` | Strong | Current synonym dictionary is intentionally small and static. | Medium | S | Expand synonym catalog incrementally from observed misses. |
 | `1d` | Semantic chunking with boundaries | Partially Implemented | `src/ingest.py:268` (`chunk_text` is line-aware) | Moderate | No boundary-pattern-aware split policy (`def/class/headings/JSON`). | High | M | Add boundary-aware chunker and regression tests for code/JSON/Markdown boundaries. |

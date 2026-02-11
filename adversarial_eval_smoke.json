@@ -1,23 +1,28 @@
 {
-  "run_id": "58af9aedc667",
+  "run_id": "2f9974bed0c9",
   "model": "llama3.1:8b",
   "silo": "__adversarial_eval__",
   "totals": {
-    "total_queries": 5,
+    "total_queries": 3,
     "passed_queries": 0,
-    "failed_queries": 5,
+    "failed_queries": 3,
     "overall_trust_score": 0.0,
-    "hallucination_rate": 80.0,
+    "hallucination_rate": 66.67,
     "confident_error_rate": 0.0,
     "temporal_error_rate": 0.0,
     "unsupported_assertion_rate": 0.0
   },
   "category_breakdown": {
     "direct": {
-      "total": 5,
+      "total": 3,
       "passed": 0,
-      "failed": 5
+      "failed": 3
     }
+  },
+  "run_config": {
+    "strict_mode": true,
+    "direct_decisive_mode": null,
+    "config_path": null
   },
   "failures": [
     {
@@ -99,60 +104,6 @@
         "2025-02-15-canonical-ops-sla.md",
         "2025-02-16-ops-note-contradiction.md",
         "2025-04-10-canonical-hours.md"
-      ]
-    },
-    {
-      "query_id": "Q004",
-      "category": "direct",
-      "passed": false,
-      "subscores": {
-        "factual_correctness": 0,
-        "trust_behavior": 0,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
-      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou are looking for the Aster Grill delivery SLA minutes. I have evidence from multiple sources that indicate this value is 34 minutes, but there is also a document from 2025-02-15 (Canonical Ops SLA) that suggests it could be 27 minutes. I don't have enough evidence to say which one is correct or if there are other conflicting documents. It might be helpful to index more specific folders or exports related to delivery SLAs for Aster Grill.\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-02-16-ops-note-contradiction.md",
-        "2024-02-15-official-ops-sla.md",
-        "2025-02-15-canonical-ops-sla.md",
-        "2025-04-24-executive-opinion-2.md",
-        "2025-04-10-canonical-hours.md",
-        "2025-04-05-canonical-margin.md",
-        "2025-03-01-canonical-rankings.md",
-        "2025-04-01-canonical-contract.md",
-        "2025-03-02-analyst-brief-contradiction.md",
-        "2025-04-26-executive-opinion-4.md",
-        "2025-04-19-loyalty-contradiction.md",
-        "2023-11-01-official-rankings.md"
-      ]
-    },
-    {
-      "query_id": "Q005",
-      "category": "direct",
-      "passed": false,
-      "subscores": {
-        "factual_correctness": 0,
-        "trust_behavior": 0,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
-      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou are looking for the Blue Harbor delivery SLA minutes. I have evidence of three different documents mentioning this:\n\n1. In `2025-02-16-ops-note-contradiction.md`, it is mentioned as 26.\n2. In `2025-02-15-canonical-ops-sla.md`, it is mentioned as 30.\n3. In `2024-02-15-official-ops-sla.md`, it is mentioned as 29.\n\nI don't have enough evidence to say which one is the most up-to-date or accurate value. It's possible that more specific documents or exports could provide a clearer answer.\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-02-16-ops-note-contradiction.md",
-        "2025-02-15-canonical-ops-sla.md",
-        "2024-02-15-official-ops-sla.md",
-        "2025-04-10-canonical-hours.md",
-        "2025-04-24-executive-opinion-2.md",
-        "2025-04-01-canonical-contract.md",
-        "2025-03-02-analyst-brief-contradiction.md",
-        "2025-04-26-executive-opinion-4.md",
-        "2023-11-01-official-rankings.md",
-        "2025-04-19-loyalty-contradiction.md",
-        "2025-04-05-canonical-margin.md",
-        "2024-01-20-official-nps.md"
       ]
     }
   ],
@@ -236,60 +187,6 @@
         "2025-02-15-canonical-ops-sla.md",
         "2025-02-16-ops-note-contradiction.md",
         "2025-04-10-canonical-hours.md"
-      ]
-    },
-    {
-      "query_id": "Q004",
-      "category": "direct",
-      "passed": false,
-      "subscores": {
-        "factual_correctness": 0,
-        "trust_behavior": 0,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
-      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou are looking for the Aster Grill delivery SLA minutes. I have evidence from multiple sources that indicate this value is 34 minutes, but there is also a document from 2025-02-15 (Canonical Ops SLA) that suggests it could be 27 minutes. I don't have enough evidence to say which one is correct or if there are other conflicting documents. It might be helpful to index more specific folders or exports related to delivery SLAs for Aster Grill.\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-02-16-ops-note-contradiction.md",
-        "2024-02-15-official-ops-sla.md",
-        "2025-02-15-canonical-ops-sla.md",
-        "2025-04-24-executive-opinion-2.md",
-        "2025-04-10-canonical-hours.md",
-        "2025-04-05-canonical-margin.md",
-        "2025-03-01-canonical-rankings.md",
-        "2025-04-01-canonical-contract.md",
-        "2025-03-02-analyst-brief-contradiction.md",
-        "2025-04-26-executive-opinion-4.md",
-        "2025-04-19-loyalty-contradiction.md",
-        "2023-11-01-official-rankings.md"
-      ]
-    },
-    {
-      "query_id": "Q005",
-      "category": "direct",
-      "passed": false,
-      "subscores": {
-        "factual_correctness": 0,
-        "trust_behavior": 0,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
-      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou are looking for the Blue Harbor delivery SLA minutes. I have evidence of three different documents mentioning this:\n\n1. In `2025-02-16-ops-note-contradiction.md`, it is mentioned as 26.\n2. In `2025-02-15-canonical-ops-sla.md`, it is mentioned as 30.\n3. In `2024-02-15-official-ops-sla.md`, it is mentioned as 29.\n\nI don't have enough evidence to say which one is the most up-to-date or accurate value. It's possible that more specific documents or exports could provide a clearer answer.\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-02-16-ops-note-contradiction.md",
-        "2025-02-15-canonical-ops-sla.md",
-        "2024-02-15-official-ops-sla.md",
-        "2025-04-10-canonical-hours.md",
-        "2025-04-24-executive-opinion-2.md",
-        "2025-04-01-canonical-contract.md",
-        "2025-03-02-analyst-brief-contradiction.md",
-        "2025-04-26-executive-opinion-4.md",
-        "2023-11-01-official-rankings.md",
-        "2025-04-19-loyalty-contradiction.md",
-        "2025-04-05-canonical-margin.md",
-        "2024-01-20-official-nps.md"
       ]
     }
   ]

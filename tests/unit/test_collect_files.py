@@ -74,6 +74,12 @@ def test_collect_files_skips_hidden_files(tmp_path):
     assert out == []
 
 
+def test_collect_files_skips_office_lock_files(tmp_path):
+    (tmp_path / "~$draft.docx").write_bytes(b"not-a-real-docx")
+    out = collect_files(tmp_path, include=["*.docx"], exclude=[], max_depth=10, max_file_bytes=1024)
+    assert out == []
+
+
 def test_collect_files_skips_symlink_when_follow_symlinks_false(tmp_path):
     target = tmp_path / "target.txt"
     link = tmp_path / "link.txt"

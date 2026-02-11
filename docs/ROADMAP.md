@@ -28,6 +28,12 @@ Reference: `docs/IMPLEMENTATION_STATUS_AND_FIT_GAP_REPORT.md`
 
 Vector search fails on exact terms (account numbers, error codes, proper nouns). Add BM25 as a fallback when vector distance is poor.
 
+Status update (2026-02-11):
+- Phase 1 shipped for direct intents behind config flag `query.direct_decisive_mode`.
+- Implemented: direct lexical fallback terms + RRF merge + canonical/deprioritized source weighting + canonical-aware confidence relaxation.
+- Implemented validation: adversarial eval now records `strict_mode` and `direct_decisive_mode`, and supports strict/direct A/B controls.
+- Still open for full closure: apply the same weak-distance lexical fallback pattern across broader non-direct retrieval paths (current implementation is targeted, not universal BM25).
+
 ```python
 # src/query/retrieval.py
 

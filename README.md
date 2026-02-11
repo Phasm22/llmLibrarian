@@ -61,7 +61,7 @@ llmli ls
 | `index --archetype <id>` | Rebuild archetype from archetypes.yaml. |
 | `rm <silo>` | Remove silo and its chunks. |
 | `log [--last]` | Add failures. |
-| `eval-adversarial [--out <json>] [--limit N]` | Run synthetic adversarial trustfulness eval with machine-readable report. |
+| `eval-adversarial [--out <json>] [--limit N] [--strict-mode/--no-strict-mode] [--direct-decisive-mode/--no-direct-decisive-mode]` | Run synthetic adversarial trustfulness eval with machine-readable report and A/B mode controls. |
 
 ---
 
@@ -106,6 +106,7 @@ Legacy compatibility: `pal watch-self` is available but hidden from default help
 
 Adversarial trust eval:
 - `uv run llmli eval-adversarial --out ./adversarial_eval_report.json`
+- `uv run llmli eval-adversarial --limit 20 --no-strict-mode --direct-decisive-mode --out ./adversarial_eval_smoke.json`
 
 ---
 

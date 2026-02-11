@@ -11,6 +11,118 @@ from query.context import query_mentioned_years
 from query.formatting import format_source, style_answer
 
 
+def parse_csv_rank_request(query: str) -> dict[str, str] | None:
+    """Parse rank lookup requests like 'ranked number 1 in 2020'."""
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+    if "rank" not in q and "number" not in q and "#" not in q:
+        return None
+    rank_m = re.search(r"\b(?:rank(?:ed)?(?:\s+number)?|number|#)\s*(\d{1,3})\b", q)
+    if not rank_m:
+        return None
+    year_m = re.search(r"\b(20\d{2})\b", q)
+    out = {"rank": rank_m.group(1)}
+    if year_m:
+        out["year"] = year_m.group(1)
+    return out
+
+
+def _extract_csv_field_value(doc: str, key: str) -> str | None:
+    """Extract key=value field from row-style CSV chunks."""
+    text = doc or ""
+    pat = rf'(?i)\b"?{re.escape(key)}"?\s*=\s*"?([^"|\n]+)"?'
+    m = re.search(pat, text)
+    if not m:
+        return None
+    value = " ".join((m.group(1) or "").strip().split())
+    return value or None
+
+
+def run_csv_rank_lookup_guardrail(
+    *,
+    collection: Any,
+    use_unified: bool,
+    silo: str | None,
+    subscope_where: dict[str, Any] | None,
+    query: str,
+    source_label: str,
+    no_color: bool,
+) -> dict[str, Any] | None:
+    """Deterministic rank lookup over CSV row chunks, or None when not applicable."""
+    req = parse_csv_rank_request(query)
+    if not req:
+        return None
+    requested_rank = req["rank"]
+    requested_year = req.get("year")
+
+    get_kw: dict[str, Any] = {"include": ["documents", "metadatas"]}
+    if use_unified and silo:
+        get_kw["where"] = {"silo": silo}
+    elif subscope_where:
+        get_kw["where"] = subscope_where
+    try:
+        all_rows = collection.get(**get_kw)
+    except Exception:
+        return None
+
+    docs_all = _flatten_get_list(all_rows.get("documents"))
+    metas_all = _flatten_get_list(all_rows.get("metadatas"))
+    candidates: list[tuple[str, dict | None]] = []
+    for i, doc_raw in enumerate(docs_all):
+        doc = str(doc_raw or "")
+        if "CSV row" not in doc:
+            continue
+        rank_value = _extract_csv_field_value(doc, "rank")
+        if not rank_value or rank_value != requested_rank:
+            continue
+        meta = metas_all[i] if i < len(metas_all) else None
+        candidates.append((doc, meta if isinstance(meta, dict) or meta is None else None))
+
+    if not candidates:
+        return None
+
+    if requested_year:
+        year_hits = [c for c in candidates if requested_year in (((c[1] or {}).get("source") or ""))]
+        if year_hits:
+            candidates = year_hits
+
+    # Stable deterministic ordering by source path then row text.
+    candidates.sort(key=lambda x: ((((x[1] or {}).get("source") or "")), x[0]))
+    chosen_doc, chosen_meta = candidates[0]
+    restaurant = _extract_csv_field_value(chosen_doc, "restaurant")
+    if not restaurant:
+        return None
+
+    if len(candidates) == 1:
+        answer = style_answer(f"Rank {requested_rank}: {restaurant}", no_color)
+    else:
+        answer = style_answer(
+            f"Rank {requested_rank}: {restaurant} (multiple ranking tables matched; showing first deterministic match).",
+            no_color,
+        )
+
+    out = [
+        answer,
+        "",
+        dim(no_color, "---"),
+        label_style(no_color, f"Answered by: {source_label}"),
+        "",
+        bold(no_color, "Sources:"),
+        format_source(chosen_doc, chosen_meta, None, no_color=no_color),
+    ]
+    return {
+        "response": "\n".join(out),
+        "guardrail_no_match": False,
+        "guardrail_reason": "csv_rank_lookup",
+        "requested_year": requested_year,
+        "requested_form": None,
+        "requested_line": None,
+        "num_docs": 1,
+        "receipt_metas": [chosen_meta] if chosen_meta else None,
+    }
+
+
 def parse_field_lookup_request(query: str) -> dict[str, str] | None:
     """Parse explicit year/form/line lookup requests (e.g. "2024 form 1040 line 9")."""
     q = (query or "").strip().lower()

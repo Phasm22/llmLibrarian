@@ -10,6 +10,7 @@ import fnmatch
 import hashlib
 import io
 import json
+import csv
 import os
 import re
 import sys
@@ -216,6 +217,10 @@ def _path_matches(path_str: str, pattern: str) -> bool:
 def should_index(file_path: str | Path, include_patterns: list[str], exclude_patterns: list[str]) -> bool:
     """Check excludes first, then includes. Path can be relative or absolute. Use for FILES only."""
     path_str = str(file_path)
+    base = os.path.basename(path_str)
+    # Skip Office lock/temp files (e.g. "~$Draft.docx") that are not real documents.
+    if base.startswith("~$"):
+        return False
     for pattern in exclude_patterns:
         if pattern.rstrip("/") in path_str or _path_matches(path_str, pattern):
             return False
@@ -314,9 +319,9 @@ _xlsx_proc = XLSXProcessor()
 _pptx_proc = PPTXProcessor()
 
 
-def get_text_from_pdf_bytes(pdf_bytes: bytes) -> list[tuple[str, int]]:
+def get_text_from_pdf_bytes(pdf_bytes: bytes, source_path: str = "") -> list[tuple[str, int]]:
     """Returns list of (page_text, page_number) for per-page chunks. Raises PDFExtractionError on failure."""
-    result = _pdf_proc.extract(pdf_bytes, "")
+    result = _pdf_proc.extract(pdf_bytes, source_path)
     if not isinstance(result, list):
         raise PDFExtractionError("PDF extractor returned unexpected result.")
     return result
@@ -439,6 +444,55 @@ def _chunks_from_content(
     return out
 
 
+def _chunks_from_csv_text(
+    file_id: str,
+    text: str,
+    source_path: str,
+    mtime: float,
+    file_hash: str | None = None,
+) -> list[ChunkTuple]:
+    """
+    Build chunk list for CSV with one chunk per row.
+    This preserves tabular semantics for rank/lookup queries better than generic paragraph chunking.
+    """
+    if not (text or "").strip():
+        return []
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return []
+
+    header = [h.strip() for h in (rows[0] or [])]
+    out: list[ChunkTuple] = []
+    # Data rows start at line 2 in the file.
+    for i, row in enumerate(rows[1:], start=2):
+        if not any((c or "").strip() for c in row):
+            continue
+        cells = [str(c).strip() for c in row]
+        if header and len(header) == len(cells):
+            pairs = [f"{header[j]}={cells[j]}" for j in range(len(cells))]
+        else:
+            pairs = [f"c{j + 1}={cells[j]}" for j in range(len(cells))]
+        # Keep chunks compact/structured for retrieval.
+        doc = f"CSV row {i - 1}: " + " | ".join(pairs)
+        cid = _stable_chunk_id(source_path, mtime, i - 1)
+        meta: dict[str, Any] = {
+            "source": source_path,
+            "source_path": source_path,
+            "mtime": mtime,
+            "chunk_hash": _chunk_hash(doc),
+            "file_id": file_id,
+            "line_start": i,
+            "row_number": i - 1,
+            "is_local": _is_local(source_path),
+            "doc_type": "other",
+            "content_extracted": 1,
+        }
+        if file_hash:
+            meta["file_hash"] = file_hash
+        out.append((cid, doc, meta))
+    return out
+
+
 def _chunks_from_pdf(
     file_id: str,
     pdf_bytes: bytes,
@@ -447,7 +501,7 @@ def _chunks_from_pdf(
     file_hash: str | None = None,
 ) -> list[ChunkTuple]:
     """Build chunk list (id, doc, meta) for PDF by page. doc_type from first page content overrides path when not 'other'."""
-    pages = get_text_from_pdf_bytes(pdf_bytes)
+    pages = get_text_from_pdf_bytes(pdf_bytes, source_path=source_path)
     first_page_text = (pages[0][0] if pages else "")[:CONTENT_SAMPLE_LEN]
     content_type = _doc_type_from_content(first_page_text)
     doc_type = content_type if content_type != "other" else _doc_type_from_path(source_path)
@@ -614,6 +668,8 @@ def process_one_file(
             processor.format_label, processor.install_hint,
             file_hash=file_hash,
         )
+    if suffix == ".csv":
+        return _chunks_from_csv_text(file_id, result, path_str, mtime, file_hash=file_hash)
     # String result — use _chunks_from_content
     return _chunks_from_content(file_id, result, path_str, mtime, prefix="", file_hash=file_hash)
 
@@ -767,6 +823,13 @@ def process_zip_to_chunks(
                         out.extend(_tag_zip_meta(_chunks_from_content(file_id, text, source_label, mtime, prefix=""), zip_path))
                     else:
                         out.extend(_tag_zip_meta(_chunk_metadata_only(file_id, source_label, mtime, "Presentation", "python-pptx"), zip_path))
+                elif suf == ".csv":
+                    try:
+                        text = data.decode("utf-8", errors="replace")
+                        if text.strip():
+                            out.extend(_tag_zip_meta(_chunks_from_csv_text(file_id, text, source_label, mtime), zip_path))
+                    except Exception:
+                        pass
                 elif suf in ZIP_TEXT_EXTENSIONS:
                     try:
                         text = data.decode("utf-8", errors="replace")

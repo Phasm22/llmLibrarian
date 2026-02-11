@@ -152,3 +152,15 @@ limits:
   max_archive_size_mb: 100
   max_files_per_zip: 500
   max_extracted_bytes_per_zip: 52428800
+
+query:
+  direct_decisive_mode: false
+  canonical_filename_tokens:
+    - canonical
+    - official
+  deprioritized_tokens:
+    - draft
+    - archive
+    - stale
+    - deprecated
+  confidence_relaxation_enabled: true

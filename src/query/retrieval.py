@@ -41,6 +41,34 @@ SCOPE_TOKEN_STOPLIST = frozenset(
     {"llm", "tool", "fast", "slow", "why", "the", "is", "it", "so", "a", "an", "how", "does", "feel", "take"}
 )
 MAX_SCOPE_TOKENS = 2  # extract up to 2 candidates; union path results
+DIRECT_LEXICAL_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "what",
+        "which",
+        "who",
+        "when",
+        "where",
+        "why",
+        "how",
+        "in",
+        "on",
+        "for",
+        "to",
+        "of",
+        "as",
+        "by",
+        "from",
+        "latest",
+        "current",
+    }
+)
 
 
 def relevance_max_distance() -> float:
@@ -241,3 +269,65 @@ def resolve_subscope(
     if not path_set:
         return None
     return (list(silo_set), list(path_set), tokens)
+
+
+def extract_direct_lexical_terms(query: str, limit: int = 8) -> list[str]:
+    """Extract lexical anchors for direct BM25-like fallback from user query."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    quoted = re.findall(r"\"([^\"]{2,})\"", q)
+    numbers = re.findall(r"\b\d+(?:[:.]\d+)?%?\b", q)
+    words = re.findall(r"\b[\w-]{3,}\b", q.lower())
+    terms: list[str] = []
+    for tok in quoted + numbers + words:
+        t = tok.strip().strip(".,:;!?")
+        if not t:
+            continue
+        if t in DIRECT_LEXICAL_STOPWORDS:
+            continue
+        if t not in terms:
+            terms.append(t)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def source_priority_score(
+    meta: dict | None,
+    canonical_tokens: list[str],
+    deprioritized_tokens: list[str],
+) -> int:
+    """Filename/source token priority: canonical positive, draft/archive negative."""
+    source = ((meta or {}).get("source") or "").lower()
+    score = 0
+    if any(tok.lower() in source for tok in canonical_tokens):
+        score += 10
+    if any(tok.lower() in source for tok in deprioritized_tokens):
+        score -= 5
+    return score
+
+
+def sort_by_source_priority(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    canonical_tokens: list[str],
+    deprioritized_tokens: list[str],
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    """Stable rerank with source-priority first, distance as tie-breaker."""
+    combined = list(zip(docs, metas, dists))
+
+    def _k(item: tuple[str, dict | None, float | None]) -> tuple[int, float]:
+        _doc, meta, dist = item
+        return (
+            -source_priority_score(meta, canonical_tokens, deprioritized_tokens),
+            float(dist) if dist is not None else 999.0,
+        )
+
+    combined.sort(key=_k)
+    return (
+        [x[0] for x in combined],
+        [x[1] for x in combined],
+        [x[2] for x in combined],
+    )

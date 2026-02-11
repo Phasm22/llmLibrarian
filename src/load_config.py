@@ -26,6 +26,7 @@ class LimitsConfig(TypedDict, total=False):
 class AppConfig(TypedDict):
     archetypes: dict[str, ArchetypeConfig]
     limits: LimitsConfig
+    query: dict[str, object]
 
 def _default_config_path() -> Path:
     base = os.environ.get("LLMLIBRARIAN_CONFIG_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,3 +68,14 @@ def get_archetype_optional(config: AppConfig, archetype_id: str) -> ArchetypeCon
     arch.setdefault("collection", f"llmli_{archetype_id}")
     arch.setdefault("name", archetype_id)
     return arch
+
+
+def get_query_options(config: AppConfig | dict | None) -> dict[str, object]:
+    """Return query behavior options with stable defaults."""
+    q = ((config or {}).get("query") or {}) if isinstance(config, dict) else {}
+    return {
+        "direct_decisive_mode": bool(q.get("direct_decisive_mode", False)),
+        "canonical_filename_tokens": list(q.get("canonical_filename_tokens") or ["canonical", "official"]),
+        "deprioritized_tokens": list(q.get("deprioritized_tokens") or ["draft", "archive", "stale", "deprecated"]),
+        "confidence_relaxation_enabled": bool(q.get("confidence_relaxation_enabled", True)),
+    }

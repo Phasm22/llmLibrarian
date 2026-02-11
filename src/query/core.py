@@ -21,7 +21,7 @@ from constants import (
     MAX_CHUNKS_PER_FILE,
 )
 from embeddings import get_embedding_function
-from load_config import load_config, get_archetype, get_archetype_optional
+from load_config import load_config, get_archetype, get_archetype_optional, get_query_options
 from state import get_silo_prompt_override, get_silo_display_name
 from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chunks
 from style import bold, dim, label_style
@@ -46,6 +46,9 @@ from query.retrieval import (
     max_chunks_for_intent,
     all_dists_above_threshold,
     rrf_merge,
+    extract_direct_lexical_terms,
+    sort_by_source_priority,
+    source_priority_score,
     filter_by_triggers,
     diversify_by_source,
     dedup_by_chunk_hash,
@@ -75,7 +78,11 @@ from query.code_language import (
     compute_code_language_from_chroma,
     format_code_language_answer,
 )
-from query.guardrails import run_field_lookup_guardrail, run_income_year_total_guardrail
+from query.guardrails import (
+    run_field_lookup_guardrail,
+    run_income_year_total_guardrail,
+    run_csv_rank_lookup_guardrail,
+)
 from query.project_count import compute_project_count, format_project_count
 from query.trace import write_trace
 
@@ -85,13 +92,21 @@ except ImportError:
     get_paths_by_silo = None  # type: ignore[misc, assignment]
 
 
-def _confidence_signal(dists: list[float | None], metas: list[dict | None], intent: str) -> str | None:
+def _confidence_signal(
+    dists: list[float | None],
+    metas: list[dict | None],
+    intent: str,
+    direct_canonical_available: bool = False,
+    confidence_relaxation_enabled: bool = True,
+) -> str | None:
     """Emit a lightweight confidence warning when retrieval quality is weak."""
     non_none = [float(d) for d in dists if d is not None]
     if not non_none:
         return None
     avg_distance = sum(non_none) / len(non_none)
     if avg_distance > 0.7:
+        if intent == INTENT_LOOKUP and direct_canonical_available and confidence_relaxation_enabled:
+            return None
         return "Low confidence: query is weakly related to indexed content."
     if intent == INTENT_FIELD_LOOKUP:
         return None
@@ -232,6 +247,12 @@ def run_ask(
     # Silent intent routing: choose retrieval K and evidence handling (no new CLI flags)
     t0 = time.perf_counter()
     intent = route_intent(query)
+    query_opts = get_query_options(load_config(config_path))
+    direct_decisive_mode = bool(query_opts.get("direct_decisive_mode", False))
+    canonical_tokens = [str(x) for x in (query_opts.get("canonical_filename_tokens") or [])]
+    deprioritized_tokens = [str(x) for x in (query_opts.get("deprioritized_tokens") or [])]
+    confidence_relaxation_enabled = bool(query_opts.get("confidence_relaxation_enabled", True))
+    direct_canonical_available = False
     # CAPABILITIES: return deterministic report inline (source of truth; no retrieval, no LLM)
     if intent == INTENT_CAPABILITIES and use_unified:
         try:
@@ -270,6 +291,12 @@ def run_ask(
         system_prompt = (
             system_prompt.rstrip()
             + "\n\nThe user is asking for reflection or analysis; base your answer on the provided context."
+        )
+    elif intent == INTENT_LOOKUP and direct_decisive_mode:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nDirect query conflict policy: if sources conflict, prioritize canonical/official sources over draft/archive/stale notes."
+            + " If canonical evidence is present, answer decisively from it."
         )
 
     ef = get_embedding_function()
@@ -347,6 +374,40 @@ def run_ask(
             response_text = str(guardrail["response"])
             return _quiet_text_only(response_text) if quiet else response_text
 
+    # Trust-first deterministic rank lookup for CSV row chunks.
+    if intent == INTENT_LOOKUP:
+        csv_guardrail = run_csv_rank_lookup_guardrail(
+            collection=collection,
+            use_unified=use_unified,
+            silo=silo,
+            subscope_where=subscope_where,
+            query=query,
+            source_label=source_label,
+            no_color=no_color,
+        )
+        if csv_guardrail is not None:
+            time_ms = (time.perf_counter() - t0) * 1000
+            write_trace(
+                intent=intent,
+                n_stage1=n_stage1,
+                n_results=n_results,
+                model=model,
+                silo=silo,
+                source_label=source_label,
+                num_docs=csv_guardrail.get("num_docs", 0),
+                time_ms=time_ms,
+                query_len=len(query),
+                hybrid_used=False,
+                receipt_metas=csv_guardrail.get("receipt_metas"),
+                guardrail_no_match=csv_guardrail.get("guardrail_no_match"),
+                guardrail_reason=csv_guardrail.get("guardrail_reason"),
+                requested_year=csv_guardrail.get("requested_year"),
+                requested_form=csv_guardrail.get("requested_form"),
+                requested_line=csv_guardrail.get("requested_line"),
+            )
+            response_text = str(csv_guardrail["response"])
+            return _quiet_text_only(response_text) if quiet else response_text
+
     # Trust-first deterministic income plan for broad income-in-year queries.
     if intent == INTENT_MONEY_YEAR_TOTAL:
         guardrail = run_income_year_total_guardrail(
@@ -407,7 +468,11 @@ def run_ask(
         )
         return response
 
-    include_ids = intent == INTENT_EVIDENCE_PROFILE and use_unified and (silo or subscope_where)
+    direct_hybrid_enabled = direct_decisive_mode and intent in (INTENT_LOOKUP, INTENT_FIELD_LOOKUP)
+    include_ids = (
+        (intent == INTENT_EVIDENCE_PROFILE and use_unified and (silo or subscope_where))
+        or direct_hybrid_enabled
+    )
     query_kw: dict = {
         "query_texts": [query_for_retrieval],
         "n_results": n_stage1,
@@ -425,30 +490,52 @@ def run_ask(
 
     # EVIDENCE_PROFILE + unified + silo/subscope: hybrid search (vector + Chroma where_document, RRF merge)
     if include_ids and ids_v and len(ids_v) == len(docs):
-        where_doc = {"$or": [{"$contains": p} for p in PROFILE_LEXICAL_PHRASES]}
-        get_kw: dict = {"where_document": where_doc, "include": ["documents", "metadatas"]}
-        get_kw["where"] = subscope_where if subscope_where else {"silo": silo}
-        try:
-            lex = collection.get(**get_kw)
-            ids_l = (lex.get("ids") or [])[:MAX_LEXICAL_FOR_RRF]
-            docs_l = (lex.get("documents") or [])[:MAX_LEXICAL_FOR_RRF]
-            metas_l = (lex.get("metadatas") or [])[:MAX_LEXICAL_FOR_RRF]
-            if ids_l:
-                docs, metas, dists = rrf_merge(
-                    ids_v, docs, metas, dists,
-                    ids_l, docs_l, metas_l,
-                    top_k=n_stage1,
-                )
-                hybrid_used = True
-            else:
-                if not quiet:
-                    print("[llmli] hybrid skipped: lexical get returned no chunks (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
-        except Exception as e:
-            if not quiet:
-                print(f"[llmli] hybrid skipped: lexical get failed: {e} (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
+        where_doc = None
+        if intent == INTENT_EVIDENCE_PROFILE:
+            where_doc = {"$or": [{"$contains": p} for p in PROFILE_LEXICAL_PHRASES]}
+        elif direct_hybrid_enabled:
+            lexical_terms = extract_direct_lexical_terms(query_for_retrieval)
+            if lexical_terms:
+                where_doc = {"$or": [{"$contains": p} for p in lexical_terms]}
+
+        if where_doc:
+            get_kw: dict = {"where_document": where_doc, "include": ["documents", "metadatas"]}
+            if use_unified and silo:
+                get_kw["where"] = {"silo": silo}
+            elif subscope_where:
+                get_kw["where"] = subscope_where
+            try:
+                lex = collection.get(**get_kw)
+                ids_l = (lex.get("ids") or [])[:MAX_LEXICAL_FOR_RRF]
+                docs_l = (lex.get("documents") or [])[:MAX_LEXICAL_FOR_RRF]
+                metas_l = (lex.get("metadatas") or [])[:MAX_LEXICAL_FOR_RRF]
+                if ids_l:
+                    docs, metas, dists = rrf_merge(
+                        ids_v, docs, metas, dists,
+                        ids_l, docs_l, metas_l,
+                        top_k=n_stage1,
+                    )
+                    hybrid_used = True
+                else:
+                    if not quiet and intent == INTENT_EVIDENCE_PROFILE:
+                        print("[llmli] hybrid skipped: lexical get returned no chunks (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
+            except Exception as e:
+                if not quiet and intent == INTENT_EVIDENCE_PROFILE:
+                    print(f"[llmli] hybrid skipped: lexical get failed: {e} (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
     # EVIDENCE_PROFILE fallback: in-app reorder by trigger regex (no hybrid)
     if intent == INTENT_EVIDENCE_PROFILE and docs and not hybrid_used:
         docs, metas, dists = filter_by_triggers(docs, metas, dists)
+    if direct_hybrid_enabled and docs:
+        docs, metas, dists = sort_by_source_priority(
+            docs,
+            metas,
+            dists,
+            canonical_tokens=canonical_tokens,
+            deprioritized_tokens=deprioritized_tokens,
+        )
+        direct_canonical_available = any(
+            source_priority_score(m, canonical_tokens, deprioritized_tokens) > 0 for m in metas[:3]
+        )
 
     # Year boost on full retrieval set (before rerank/diversify) so queries like "AGI in 2024" get 2024 chunks in the pool
     mentioned_years = query_mentioned_years(query)
@@ -485,7 +572,20 @@ def run_ask(
             is_readme = prefer_readme and ("readme" in source or source.endswith("/index.md"))
             is_stub = len((doc or "").strip()) < MIN_INFORMATIVE_LEN
             is_local = (meta or {}).get("is_local", 1)
-            return (year_first, agi_return, 1 if is_stub else 0, 0 if is_readme else 1, 1 - is_local, dist if dist is not None else 0)
+            direct_priority = (
+                -source_priority_score(meta, canonical_tokens, deprioritized_tokens)
+                if direct_hybrid_enabled
+                else 0
+            )
+            return (
+                year_first,
+                agi_return,
+                direct_priority,
+                1 if is_stub else 0,
+                0 if is_readme else 1,
+                1 - is_local,
+                dist if dist is not None else 0,
+            )
         combined = list(zip(docs, metas, dists))
         combined.sort(key=_rerank_key)
         docs = [c[0] for c in combined]
@@ -598,7 +698,13 @@ def run_ask(
     answer = (response.get("message") or {}).get("content") or ""
     answer = style_answer(answer.strip(), no_color)
     answer = linkify_sources_in_answer(answer, metas, no_color)
-    confidence_warning = _confidence_signal(dists, metas, intent)
+    confidence_warning = _confidence_signal(
+        dists,
+        metas,
+        intent,
+        direct_canonical_available=direct_canonical_available,
+        confidence_relaxation_enabled=confidence_relaxation_enabled,
+    )
 
     if quiet:
         return answer

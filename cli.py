@@ -13,6 +13,10 @@ from pathlib import Path
 # Ensure src is on path when running from project root
 _ROOT = Path(__file__).resolve().parent
 _SRC = _ROOT / "src"
+_CWD_SRC = Path.cwd() / "src"
+if _CWD_SRC.exists() and str(_CWD_SRC) not in sys.path:
+    # Supports invoking an installed `llmli` shim while working inside this repo.
+    sys.path.insert(0, str(_CWD_SRC))
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
@@ -309,12 +313,17 @@ def cmd_eval_adversarial(args: argparse.Namespace) -> int:
     out = getattr(args, "out", None)
     model = getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.1:8b")
     limit = getattr(args, "limit", None)
+    strict_mode = bool(getattr(args, "strict_mode", True))
+    direct_decisive_mode = getattr(args, "direct_decisive_mode", None)
     try:
         report = run_adversarial_eval(
             db_path=db,
             out_path=out,
             model=model,
             limit=limit,
+            strict_mode=strict_mode,
+            direct_decisive_mode=direct_decisive_mode,
+            config_path=getattr(args, "config", None),
             no_color=args.no_color,
         )
         print(format_report_table(report))
@@ -394,6 +403,10 @@ def main() -> int:
     p_eval.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.1:8b)")
     p_eval.add_argument("--out", help="Write JSON report to this path")
     p_eval.add_argument("--limit", type=int, help="Run only first N queries from the fixed suite")
+    p_eval.add_argument("--strict-mode", dest="strict_mode", action="store_true", default=True, help="Run eval queries with strict ask mode (default: on)")
+    p_eval.add_argument("--no-strict-mode", dest="strict_mode", action="store_false", help="Run eval queries without strict ask mode")
+    p_eval.add_argument("--direct-decisive-mode", action="store_true", default=None, help="Override config to enable direct decisive mode for this eval run")
+    p_eval.add_argument("--no-direct-decisive-mode", dest="direct_decisive_mode", action="store_false", help="Override config to disable direct decisive mode for this eval run")
     p_eval.set_defaults(_run=cmd_eval_adversarial)
 
     args = parser.parse_args()

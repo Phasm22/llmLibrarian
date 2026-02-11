@@ -4,6 +4,7 @@ Each processor handles extraction for a specific file type.
 """
 import io
 import json
+import logging
 import os
 import re
 import sys
@@ -79,7 +80,8 @@ def _log_processor_event(level: str, message: str, **fields: Any) -> None:
 
 
 def _pdf_tables_enabled() -> bool:
-    val = os.environ.get("LLMLIBRARIAN_PDF_TABLES", "1").strip().lower()
+    # Default OFF: table extraction via pdfplumber is expensive and noisy on malformed/scanned PDFs.
+    val = os.environ.get("LLMLIBRARIAN_PDF_TABLES", "0").strip().lower()
     return val not in ("0", "false", "no")
 
 
@@ -184,6 +186,8 @@ def _extract_pdf_tables_by_page(data: bytes) -> list[list[list[str | None]]]:
         import pdfplumber
     except ImportError:
         return []
+    # pdfplumber/pdfminer can emit high-volume parser warnings on broken PDFs; keep stderr usable.
+    logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
     tables_by_page: list[list[list[str | None]]] = []
     with pdfplumber.open(io.BytesIO(data)) as pdf:

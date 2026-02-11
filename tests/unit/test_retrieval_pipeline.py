@@ -7,6 +7,8 @@ from query.retrieval import (
     extract_scope_tokens,
     resolve_subscope,
     rrf_merge,
+    extract_direct_lexical_terms,
+    sort_by_source_priority,
 )
 
 
@@ -125,6 +127,25 @@ def test_all_dists_above_threshold_true_only_when_all_non_none_are_above():
     assert all_dists_above_threshold([2.1, 2.2, None], 2.0) is True
     assert all_dists_above_threshold([2.1, 1.8], 2.0) is False
     assert all_dists_above_threshold([None, None], 2.0) is False
+
+
+def test_extract_direct_lexical_terms_keeps_entity_and_numeric_anchors():
+    terms = extract_direct_lexical_terms("What is Aster Grill revenue rank in 2025?")
+    assert "aster" in terms
+    assert "grill" in terms
+    assert "2025" in terms
+
+
+def test_sort_by_source_priority_promotes_canonical_sources():
+    docs, metas, dists = sort_by_source_priority(
+        docs=["draft answer", "canonical answer"],
+        metas=[{"source": "2025-04-10-draft-note.md"}, {"source": "2025-04-10-canonical-hours.md"}],
+        dists=[0.1, 0.2],
+        canonical_tokens=["canonical", "official"],
+        deprioritized_tokens=["draft", "archive"],
+    )
+    assert docs[0] == "canonical answer"
+    assert (metas[0] or {}).get("source", "").endswith("canonical-hours.md")
 
 
 def test_field_lookup_candidates_do_not_fallback_across_years():

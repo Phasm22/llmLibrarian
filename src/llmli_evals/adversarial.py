@@ -17,6 +17,7 @@ from typing import Any, Literal, TypedDict
 
 from constants import DEFAULT_MODEL
 from ingest import run_add
+from load_config import load_config
 from query.core import run_ask
 
 
@@ -66,6 +67,7 @@ class Report(TypedDict):
     silo: str
     totals: dict[str, Any]
     category_breakdown: dict[str, dict[str, int]]
+    run_config: dict[str, Any]
     failures: list[ScoreRecord]
     records: list[ScoreRecord]
 
@@ -621,6 +623,9 @@ def run_adversarial_eval(
     out_path: str | Path | None = None,
     model: str = DEFAULT_MODEL,
     limit: int | None = None,
+    strict_mode: bool = True,
+    direct_decisive_mode: bool | None = None,
+    config_path: str | Path | None = None,
     no_color: bool = False,
 ) -> Report:
     db = str(db_path)
@@ -629,6 +634,20 @@ def run_adversarial_eval(
 
     with tempfile.TemporaryDirectory(prefix="llmli_adversarial_") as td:
         corpus_root = Path(td)
+        eval_config_path: str | None = str(config_path) if config_path else None
+        if direct_decisive_mode is not None:
+            cfg = load_config(config_path)
+            q = dict((cfg.get("query") or {}))
+            q["direct_decisive_mode"] = bool(direct_decisive_mode)
+            cfg["query"] = q
+            cfg_path = corpus_root / "eval-archetypes.yaml"
+            try:
+                import yaml
+                cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+            except Exception:
+                cfg_path.write_text("query:\n  direct_decisive_mode: true\n", encoding="utf-8")
+            eval_config_path = str(cfg_path)
+
         materialize_corpus(corpus_root)
         run_add(
             corpus_root,
@@ -654,7 +673,8 @@ def run_adversarial_eval(
                 use_reranker=False,
                 model=model,
                 silo=silo_slug,
-                strict=True,
+                strict=strict_mode,
+                config_path=eval_config_path,
                 quiet=False,
             )
             answer, sources = _split_answer_and_sources(out)
@@ -668,6 +688,11 @@ def run_adversarial_eval(
         silo=silo_slug,
         totals=totals,
         category_breakdown=category_breakdown,
+        run_config={
+            "strict_mode": bool(strict_mode),
+            "direct_decisive_mode": bool(direct_decisive_mode) if direct_decisive_mode is not None else None,
+            "config_path": eval_config_path,
+        },
         failures=failures,
         records=records,
     )
@@ -685,6 +710,7 @@ def format_report_table(report: Report) -> str:
     lines = [
         "Adversarial Trustfulness Eval",
         f"Run: {report['run_id']}  Model: {report['model']}  Silo: {report['silo']}",
+        f"Modes: strict={report.get('run_config', {}).get('strict_mode')} direct_decisive={report.get('run_config', {}).get('direct_decisive_mode')}",
         "",
         f"Total queries: {totals['total_queries']}",
         f"Passed: {totals['passed_queries']}  Failed: {totals['failed_queries']}",
