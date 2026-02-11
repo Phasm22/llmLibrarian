@@ -118,6 +118,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             quiet=getattr(args, "quiet", False),
             explain=getattr(args, "explain", False),
             force=getattr(args, "force", False),
+            explicit_unified=bool(getattr(args, "unified", False)),
         )
     except QueryPolicyError as e:
         print(str(e), file=sys.stderr)

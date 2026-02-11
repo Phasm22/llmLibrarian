@@ -1,86 +1,95 @@
-# Technical reference
+# Technical Reference (Operator Guide)
 
-Project layout, environment, tuning, and operational details. For philosophy and quick start, see the main [README](../README.md).
+This is the operator reference for llmLibrarian.  
+Use the main [README](../README.md) for onboarding and quick start.
+
+## Query Decision Pipeline
+
+High-level ask flow:
+1. Intent routing  
+- Query classified into intent (lookup, aggregate, profile, capabilities, deterministic file list, etc.)
+2. Deterministic guardrails  
+- If a deterministic path applies (for example rank/file-year/value guardrails), it short-circuits generation.
+3. Retrieval + ordering  
+- Scope, retrieval, rerank/diversify, and source-priority logic applied before model call.
+4. LLM fallback  
+- Only when deterministic paths are not sufficient.
+5. Footer/trace  
+- Source footer built from retrieved evidence; trace optionally written via env.
+
+## Confidence + Scope Signals
+
+Low-confidence meaning:
+- Retrieval distances indicate weak relation to indexed content, or mixed evidence quality.
+
+Scope behavior:
+- Explicit `--in <silo>` always wins.
+- Natural-language scope phrases are conservative best-effort auto-binding.
+- Ambiguous matches do not auto-bind.
+
+Weak-scope retry:
+- For unscoped asks with weak initial matches, the system may do a lightweight catalog-based single-silo retry.
+- Retry is deterministic and bounded (top candidate only).
+
+Catalog diagnostics:
+- `--explain` prints deterministic catalog/scope diagnostics to stderr when applicable.
+- `--force` allows deterministic catalog queries to run even when scope is stale.
+
+## Source Footers
+
+Footer behavior:
+- Sources are de-duplicated by source path.
+- Line/page markers from multiple chunks are aggregated per source.
+- Score shown is based on best-ranked chunk per source.
+
+Example style:
+- `file.pptx (line 1, 23, 51) · 0.54`
 
 ## Layout
 
-- **pyproject.toml** — Project + deps; **uv** for venv and install (`uv venv`, `uv sync`).
-- **cli.py** — llmli entrypoint: `llmli add|ask|ls|index|rm|log|capabilities|inspect|eval-adversarial`
-- **pal.py** — Agent CLI (Typer): Do = `pal pull|ask`, See = `pal ls|inspect|capabilities|log`, Tune = `pal ensure-self|silos|tool`; state in `~/.pal/registry.json`.
-- **archetypes.yaml** — Prompts (and optionally index config). **Prompt-only:** add an entry with `name` + `prompt` and an id that matches a silo slug (e.g. `stuff`). For `pal` hashed slugs (`stuff-deadbeef`), prompt lookup falls back to base slug and normalized display name. **Full:** include `folders`, `include`/`exclude`, `collection` for `llmli index --archetype X` and a separate collection. Limits (max_file_size_mb, etc.) apply to add/index.
-- **src/** — Librarian code:
-  - **embeddings.py**, **load_config.py**, **style.py**, **reranker.py**, **state.py**, **floor.py** — Support modules.
-- **ingest.py** — Indexing core (archetype + add); **query_engine.py** — Query (ask).
-- **ingest.py (single-file)** — `update_single_file()` / `remove_single_file()` support event-driven updates from `pal pull <path> --watch`.
-  - **indexer.py** / **query.py** — Thin wrappers that re-export from ingest / query_engine for the CLI.
-- **llmli_evals/adversarial.py** — Synthetic adversarial trustfulness eval harness (corpus, queries, scoring, JSON report).
-- **docs/CHROMA_AND_STACK.md** — Chroma usage and stack choices.
-- **gemini_summary.md** — Project manifest and recovery notes.
+- `pyproject.toml` — dependencies and packaging.
+- `cli.py` — `llmli` argparse CLI.
+- `pal.py` — `pal` Typer CLI orchestration layer.
+- `archetypes.yaml` — prompts, limits, query options.
+- `src/ingest.py` — indexing and incremental update pipeline.
+- `src/query/core.py` — query orchestration entry point.
+- `src/query/*.py` — intent, retrieval, guardrails, formatting, scope binding, trace.
+- `src/llmli_evals/adversarial.py` — synthetic trustfulness evaluation harness.
 
-Internal flags (dev-only): `llmli add --silo <slug> --display-name <name>` are used by `pal` to force the dev self-silo. Not intended for normal use.
-
-Per-silo prompt override workflow:
-- `pal pull <path> --prompt "..."` stores `prompt_override` on the llmli silo registry entry.
-- `pal pull <path> --clear-prompt` clears it.
-- `pal ask --in <silo>` precedence: registry override -> archetype prompt -> built-in default.
-
-Adversarial trustfulness eval:
-- `llmli eval-adversarial --out ./adversarial_eval_report.json`
-- Optional smoke run: `llmli eval-adversarial --limit 20 --out ./adversarial_eval_smoke.json`
-- Mode controls for A/B validation:
-  - `llmli eval-adversarial --strict-mode|--no-strict-mode`
-  - `llmli eval-adversarial --direct-decisive-mode|--no-direct-decisive-mode`
-
-Direct decisiveness (feature-flagged):
-- `archetypes.yaml` supports:
-  - `query.direct_decisive_mode` (default `false`)
-  - `query.canonical_filename_tokens`
-  - `query.deprioritized_tokens`
-  - `query.confidence_relaxation_enabled`
-- Scope: direct-intent retrieval path (`LOOKUP`/`FIELD_LOOKUP`) only; strict mode behavior itself is unchanged.
-
-## Development setup
-
-This repo uses **uv** for venv and install:
-
-- `uv venv` — create `.venv`
-- `uv sync` — install from `pyproject.toml` and lock
-- `uv run llmli ls` — run without activating the venv
-
-Alternatives: **rye** (init, sync, run), **pip + venv** (slower, no lockfile), **Poetry** (heavier).
-
-## Environment
+## Environment Variables
 
 | Variable | Purpose |
 |----------|---------|
-| `LLMLIBRARIAN_DB` | DB path (default: `./my_brain_db`) |
-| `LLMLIBRARIAN_CONFIG` | Path to `archetypes.yaml` |
-| `LLMLIBRARIAN_MODEL` | Ollama model (default: `llama3.1:8b`) |
-| `LLMLIBRARIAN_LOG=1` | Enable indexing log to `llmlibrarian_index.log` |
-| `LLMLIBRARIAN_RERANK=1` | Enable reranker (requires `sentence-transformers`) |
-| `LLMLIBRARIAN_EDITOR_SCHEME` | Source links: `vscode` (default), `cursor`, or `file` |
-| `LLMLIBRARIAN_TRACE` | If set to a file path, each `ask` appends one JSON line (intent, n_stage1, n_results, model, silo, num_docs, time_ms, query_len, hybrid, and a retrieval receipt: source paths and chunk hashes for the chunks sent to the LLM) for debugging and audit. |
-| `PAL_DEBUG=1` | When catalog sub-scope routing triggers, print `scoped_to=N paths token=...` to stderr |
-| `LLMLIBRARIAN_CHUNK_SIZE` | Chunk size in chars (100–4000; default 1000) |
-| `LLMLIBRARIAN_CHUNK_OVERLAP` | Overlap (0–half of size; default 100) |
-| `LLMLIBRARIAN_MAX_WORKERS` | File-level parallelism cap |
-| `LLMLIBRARIAN_ADD_BATCH_SIZE` | Chunks per embedding batch (1–2000; default 256) |
-| `LLMLIBRARIAN_EMBEDDING_WORKERS` | Parallel embedding workers (default 1; >1 enables async embedding compute) |
-| `LLMLIBRARIAN_RELEVANCE_MAX_DISTANCE` | Max Chroma distance for relevance gate |
-| `LLMLIBRARIAN_DEDUP_CHUNK_HASH=1` | Enable in-retrieval dedup by chunk hash |
+| `LLMLIBRARIAN_DB` | DB path (default `./my_brain_db`) |
+| `LLMLIBRARIAN_CONFIG` | Config path (default `archetypes.yaml`) |
+| `LLMLIBRARIAN_MODEL` | Ollama model (default `llama3.1:8b`) |
+| `LLMLIBRARIAN_TRACE` | Append per-ask JSON lines (debug/audit) |
+| `LLMLIBRARIAN_RELEVANCE_MAX_DISTANCE` | Relevance threshold override |
+| `LLMLIBRARIAN_RERANK=1` | Enable reranker (if installed) |
+| `LLMLIBRARIAN_EDITOR_SCHEME` | Source link scheme: `vscode`, `cursor`, `file` |
+| `PAL_DEBUG=1` | Emit debug scoping diagnostics to stderr |
+| `LLMLIBRARIAN_CHUNK_SIZE` | Chunk size override |
+| `LLMLIBRARIAN_CHUNK_OVERLAP` | Chunk overlap override |
+| `LLMLIBRARIAN_MAX_WORKERS` | File processing worker cap |
+| `LLMLIBRARIAN_ADD_BATCH_SIZE` | Embedding batch size |
+| `LLMLIBRARIAN_EMBEDDING_WORKERS` | Embedding worker count |
+| `LLMLIBRARIAN_DEDUP_CHUNK_HASH=1` | Enable retrieval dedup by chunk hash |
 
-Limits (max_file_size_mb, max_depth, max_archive_size_mb, max_files_per_zip) are in `archetypes.yaml` or config.
+## Operational Notes
 
-## Chunking and scaling
+Interrupting add/pull:
+- Safe for source files (read-only input).
+- Partial index states can occur if interrupted mid-run; rerun `pal pull <path>` or `llmli add <path>` for consistency.
 
-Defaults suit a mix of code and docs. Chunking is line-aware (1000 chars, 100 overlap). Embedding runs in the main thread in batches; file read + chunking use a thread pool. The bottleneck is usually Chroma’s embedding. Use the env vars above to scale up (bigger batches, more workers) or down (smaller chunks for code-heavy silos).
+Self-silo (dev mode):
+- `pal ask`/`pal capabilities` may warn when self-silo is stale.
+- Refresh with `pal sync`.
 
-## Interrupting ingestion (Ctrl+C)
+## Eval Commands
 
-Ingestion only **reads** your files and **writes** to the Chroma DB and (at the end) the silo registry. If you **force-exit** (e.g. Ctrl+C) during `pal pull <path>` (or compatibility alias `pal add`) or `llmli add`:
+Adversarial trust eval:
 
-- **Files on disk:** Unaffected (we never write to your source paths).
-- **Chroma:** For that silo we run `delete(where={"silo": ...})` before adding in batches. If you interrupt during the add step, the silo in Chroma may be empty or partially filled.
-- **Registry:** Updated only after all batches complete. If you interrupt, the registry is unchanged (stale counts) or the silo was never added.
-
-**What to do:** Re-run `pal pull <path>` (or `pal add <path>`) or `llmli add <path>`. That will delete and re-add that silo cleanly.
+```bash
+uv run llmli eval-adversarial --out ./adversarial_eval_report.json
+uv run llmli eval-adversarial --limit 20 --no-strict-mode --direct-decisive-mode --out ./adversarial_eval_smoke.json
+```

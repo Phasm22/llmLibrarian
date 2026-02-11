@@ -131,6 +131,8 @@ def _confidence_signal(
     dists: list[float | None],
     metas: list[dict | None],
     intent: str,
+    query: str,
+    explicit_unified: bool = False,
     direct_canonical_available: bool = False,
     confidence_relaxation_enabled: bool = True,
     filetype_hints: list[str] | None = None,
@@ -143,6 +145,15 @@ def _confidence_signal(
     if avg_distance > 0.7:
         if intent == INTENT_LOOKUP and direct_canonical_available and confidence_relaxation_enabled:
             return None
+        ql = (query or "").lower()
+        is_broad_synthesis = bool(
+            re.search(r"\b(timeline|across|compare|synthesi[sz]e|major events)\b", ql)
+        )
+        if explicit_unified and is_broad_synthesis:
+            return (
+                "Low confidence: unified search found weak or uneven evidence across silos. "
+                "Try narrowing by silo/time/type or splitting into sub-questions."
+            )
         hint_exts = {str(e).lower() for e in (filetype_hints or [])}
         if ".pptx" in hint_exts or ".ppt" in hint_exts:
             pres_sources = {
@@ -283,6 +294,7 @@ def run_ask(
     quiet: bool = False,
     explain: bool = False,
     force: bool = False,
+    explicit_unified: bool = False,
 ) -> str:
     """Query archetype's collection, or unified llmli collection if archetype_id is None (optional silo filter)."""
     if use_reranker is None:
@@ -677,11 +689,13 @@ def run_ask(
     catalog_retry_silo: str | None = None
 
     # Weak-scope retry: when not explicitly scoped and first-pass relevance is weak, pick top catalog silo and retry.
-    if use_unified and explicit_silo is None and scope_bound_slug is None:
+    if use_unified and explicit_silo is None and scope_bound_slug is None and not explicit_unified:
         low_conf_first = _confidence_signal(
             dists,
             metas,
             intent,
+            query,
+            explicit_unified=explicit_unified,
             direct_canonical_available=direct_canonical_available,
             confidence_relaxation_enabled=confidence_relaxation_enabled,
             filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
@@ -1019,6 +1033,8 @@ def run_ask(
         dists,
         metas,
         intent,
+        query,
+        explicit_unified=explicit_unified,
         direct_canonical_available=direct_canonical_available,
         confidence_relaxation_enabled=confidence_relaxation_enabled,
         filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],

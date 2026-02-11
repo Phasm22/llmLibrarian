@@ -4,6 +4,11 @@
 **Scope:** Full codebase static analysis (pal.py, cli.py, src/*)
 **Threat model:** Single-user, local-only CLI tool (no network exposure)
 
+Documentation map:
+- Onboarding and quick start: `README.md`
+- Technical/operator behavior and query pipeline: `docs/TECH.md`
+- Security posture and test coverage details: this file (`SECURITY_AND_TESTING.md`)
+
 ---
 
 ## Part 1: Trust & Security Assessment

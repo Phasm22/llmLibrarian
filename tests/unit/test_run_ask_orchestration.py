@@ -296,6 +296,52 @@ def test_run_ask_weak_scope_retries_single_catalog_silo(monkeypatch, mock_collec
     assert calls[1]["where"] == {"silo": "stuff-deadbeef"}
 
 
+def test_run_ask_explicit_unified_does_not_retry_single_silo(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr(
+        "query.core.load_config",
+        lambda _p=None: {"archetypes": {}, "query": {"auto_scope_binding": True}},
+    )
+    monkeypatch.setattr(
+        "query.core.bind_scope_from_query",
+        lambda _q, _db: {
+            "bound_slug": None,
+            "bound_display_name": None,
+            "confidence": 0.0,
+            "reason": "no_scope_phrase",
+            "cleaned_query": _q,
+        },
+    )
+    monkeypatch.setattr(
+        "query.core.rank_silos_by_catalog_tokens",
+        lambda _q, _db, _h: [{"slug": "tax-12345678", "score": 9.0, "matched_tokens": ["tax"]}],
+    )
+
+    calls = []
+
+    def _query(**kwargs):
+        calls.append(kwargs)
+        return {
+            "documents": [["weak context"]],
+            "metadatas": [[{"source": "/tmp/a.txt", "is_local": 1}]],
+            "distances": [[0.92]],
+            "ids": [["id-1"]],
+        }
+
+    mock_collection.query = _query  # type: ignore[method-assign]
+    run_ask(
+        archetype_id=None,
+        query="create a timeline across school and tax",
+        no_color=True,
+        use_reranker=False,
+        explicit_unified=True,
+    )
+    assert len(calls) == 1
+    where_payload = calls[0].get("where")
+    assert "tax-12345678" not in repr(where_payload)
+
+
 def test_run_ask_relevance_gate_skips_llm(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
@@ -774,6 +820,28 @@ def test_run_ask_presentation_low_confidence_message_is_specific(monkeypatch, mo
         use_reranker=False,
     )
     assert "matched multiple presentations" in out
+
+
+def test_run_ask_unified_synthesis_low_confidence_message_is_specific(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["tax context", "school context"]],
+        "metadatas": [[
+            {"source": "/tmp/tax.pdf", "line_start": 1, "is_local": 1},
+            {"source": "/tmp/school.docx", "line_start": 2, "is_local": 1},
+        ]],
+        "distances": [[0.95, 0.91]],
+        "ids": [["id-1", "id-2"]],
+    }
+    out = run_ask(
+        archetype_id=None,
+        query="create a timeline of major events across school tax and work",
+        no_color=True,
+        use_reranker=False,
+        explicit_unified=True,
+    )
+    assert "unified search found weak or uneven evidence across silos" in out
 
 
 def test_run_ask_footer_dedupes_duplicate_source_with_aggregated_lines(monkeypatch, mock_collection, mock_ollama):

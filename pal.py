@@ -389,7 +389,21 @@ def _warn_self_silo_mismatch() -> None:
     print("Self-silo path mismatch. Run `pal sync`.", file=sys.stderr, flush=True)
 
 
-def ensure_self_silo(force: bool = False) -> int:
+def _self_silo_is_stale(repo_root: Path, self_entry: dict | None, reg: dict) -> bool:
+    """Return True when self-silo appears stale for current repo state."""
+    last_index_mtime = _get_self_index_mtime_from_registry(reg)
+    if last_index_mtime is None and self_entry:
+        last_index_mtime = _llmli_updated_to_epoch(self_entry.get("updated"))
+    dirty = _git_is_dirty(repo_root)
+    last_commit = _git_last_commit_ct(repo_root)
+    return bool(
+        dirty or (
+            last_index_mtime is not None and last_commit is not None and last_commit > last_index_mtime
+        )
+    )
+
+
+def ensure_self_silo(force: bool = False, emit_warning: bool = True) -> int:
     require_self = _should_require_self_silo()
     if not require_self:
         return 0
@@ -414,10 +428,11 @@ def ensure_self_silo(force: bool = False) -> int:
 
     if not self_entry or needs_reindex or self_path != repo_str:
         if not force:
-            if not self_entry:
-                _warn_self_silo_missing()
-            else:
-                _warn_self_silo_mismatch()
+            if emit_warning:
+                if not self_entry:
+                    _warn_self_silo_missing()
+                else:
+                    _warn_self_silo_mismatch()
             return 0
         if self_entry and self_path and self_path != repo_str:
             _run_llmli(["rm", "__self__"])
@@ -443,13 +458,10 @@ def ensure_self_silo(force: bool = False) -> int:
         reg = _upsert_self_source(reg, repo_root, last_index_mtime)
         _write_registry(reg)
 
-    dirty = _git_is_dirty(repo_root)
-    last_commit = _git_last_commit_ct(repo_root)
-    stale = dirty or (
-        last_index_mtime is not None and last_commit is not None and last_commit > last_index_mtime
-    )
+    stale = _self_silo_is_stale(repo_root, self_entry if isinstance(self_entry, dict) else None, reg)
     if stale:
-        _warn_self_silo_stale()
+        if emit_warning:
+            _warn_self_silo_stale()
     return 0
 
 
@@ -1035,7 +1047,18 @@ def ask_command(
     explain: bool = typer.Option(False, "--explain", help="Print deterministic catalog diagnostics to stderr when applicable."),
     force: bool = typer.Option(False, "--force", help="Allow deterministic catalog queries on stale scope."),
 ) -> None:
-    ensure_self_silo(force=False)
+    ensure_self_silo(force=False, emit_warning=False)
+    if not quiet and _should_require_self_silo():
+        repo_root = _get_git_root()
+        if repo_root is not None and _is_dev_repo_at_root(repo_root):
+            db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+            llmli_registry = _read_llmli_registry(db_path)
+            self_entry = llmli_registry.get("__self__") if isinstance(llmli_registry, dict) else None
+            self_path = (self_entry or {}).get("path") if isinstance(self_entry, dict) else None
+            if self_path and str(Path(self_path).resolve()) == str(repo_root.resolve()):
+                reg = _read_registry()
+                if _self_silo_is_stale(repo_root, self_entry, reg):
+                    print("⚠ Index may be outdated. Run `pal sync` for best results.")
     llmli_args = ["ask"]
     if unified:
         llmli_args.append("--unified")

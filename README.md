@@ -1,40 +1,95 @@
 # llmLibrarian (llmli)
 
-llmLibrarian treats personal data the way people actually experience it: fragmented, time-bound, and meaningful only in context. Instead of optimizing for maximum knowledge or universal answers, it optimizes for **continuity**—helping you reason over what you’ve saved, why you saved it, and how it relates over time. By keeping context local, scoped, and user-defined, it appeals to people who want tools that work with their thinking, not over it: those who prefer intentional curation over infinite feeds, clarity over convenience, and systems that respect personal history rather than flatten it into generic “knowledge.”
+llmLibrarian helps you ask real questions about your own files and get answers you can verify.
 
-llmLibrarian keeps the language model **intentionally stateless**. There’s no long-running chat memory, no hidden conversational context, and no evolving agent persona. Every answer is derived entirely from the data you’ve chosen to index and the question you ask in that moment. That design makes the system more predictable and trustworthy: context lives in the files themselves, not in an opaque conversation history. Unlike traditional agents that accumulate state and subtly shift behavior over time, llmLibrarian resets on every query—so answers stay grounded in evidence, reproducible, and free from unintended carryover.
+It is a local, file-first AI assistant that reasons only over documents you choose to index: notes, PDFs, slides, code, research, and archives. There is no hidden chat memory, no long-running persona, and no context carryover between questions.
 
----
+Think of it as search + reasoning for your personal archive.
 
-## Quick start
+## What Makes It Different
+
+1. Your files are the context.
+llmLibrarian does not try to know everything. It only uses indexed files, then cites paths and locations so you can verify the answer.
+
+2. Stateless by design.
+Each ask starts fresh. No hidden memory from prior prompts, no behavior drift, no opaque conversation state.
+
+3. Deterministic where it matters.
+Scope selection, guardrails, and retrieval are handled before generation. If a query can be answered deterministically, it avoids free-form guessing.
+
+4. Built for fragmented real-life data.
+It handles messy folders, mixed formats, duplicates, and time-bound questions like “what files are from 2022?” or “in my stuff.”
+
+## Good For / Not Trying To Be
+
+Good for:
+- Reasoning over personal archives and project folders
+- Auditing what you saved and where
+- Recovering specific facts from old notes, slides, and docs
+- Treating files as memory, not just storage
+
+Not trying to be:
+- A general-purpose internet chatbot
+- A cloud knowledge engine
+- A persona assistant that “learns you” over time
+
+## Design Philosophy
+
+- Local-first
+- User-curated context
+- Stateless answers
+- Observable behavior
+- Trust over cleverness
+
+## Quick Start
 
 Setup (copy/paste):
 
 ```bash
-uv venv && source .venv/bin/activate
+uv venv
+source .venv/bin/activate
 uv sync
 ollama pull llama3.1:8b
 ```
 
-Examples:
+Example flows:
+These are intentionally broad to show how the tool scales from single-folder lookups to cross-silo synthesis over large, scattered personal archives.
 
 ```bash
-# Option A: pal (orchestrates llmli; state in ~/.pal/registry.json)
-pal pull /path/to/folder
-pal ask "what did I write about X?"
-pal ask --in stuff --explain "what files are from 2022"
-pal ask --in stuff --force --quiet "what files are from 2022"
+# Option A: pal (recommended day-to-day, multi-silo)
+pal pull ~/Documents/School
+pal pull ~/Documents/Taxes
+pal pull ~/Documents/WorkNotes
+pal pull ~/Desktop/Stuff
 pal ls
 
+# Silo-focused retrieval
+pal ask --in school "what classes did I take in 2022 and which files support that?"
+pal ask --in taxes "list every 1099 form mentioned in my 2023 tax files"
+pal ask --in stuff --quiet "what files are from 2022"
+
+# Cross-silo synthesis (--unified)
+pal ask --unified "compare risk themes in my work incident notes and personal security project slides"
+pal ask --unified "what decisions did I make about job search, tuition, and relocation across my notes?"
+pal ask --unified "create a timeline of major events across school, tax, and work documents"
+
+# Debug deterministic catalog behavior when needed
+pal ask --in stuff --explain "what files are from 2022"
+pal ask --in stuff --force --quiet "what files are from 2022"
+
 # Option B: llmli directly
-llmli add /path/to/folder
-llmli ask "what is in my docs?"
-llmli ask --in tax "what forms?"
+llmli add ~/Research
+llmli add ~/Archive
+llmli ask --in research "which papers discuss retrieval evaluation and contradiction handling?"
+llmli ask --unified "synthesize recurring themes across my research notes and archived drafts"
 llmli ls
 ```
 
-**Scoping:** Default ask searches all indexed silos. Use `--in <silo>` to limit to one folder (e.g. `--in tax`). Use `--unified` to explicitly search everything (overrides `--in` if both given). Answers are deterministic for the same DB and query (temperature=0, seed=42).
-Natural-language scope binding (for example: "in my stuff") is enabled by default via `query.auto_scope_binding: true`.
+Scoping:
+- Default ask searches all indexed silos.
+- `--in <silo>` limits to one silo.
+- `--unified` explicitly searches everything.
+- Natural-language scope phrases (for example, “in my stuff”) are best-effort and conservative.
 
 Help:
 
@@ -45,93 +100,106 @@ llmli -h
 llmli --help
 ```
 
----
+## 30-Second Sanity Check
+
+```bash
+pal pull /path/to/folder
+pal ask --in <silo> "what is this folder mostly about, and what are the top source files?"
+pal inspect <silo> --top 5
+```
+
+Expected result:
+- `pal pull` indexes files
+- `pal ask --in` returns an answer plus source footer
+- `pal inspect` shows top files/chunk distribution so you can validate coverage
 
 ## Commands
 
-**pal** — Daily workflow; delegates to llmli.
+`pal` (recommended):
 
 | Command | Description |
 |--------|-------------|
-| `pal pull` | Update changed files across all registered folders. |
-| `pal pull <path>` | Pull one folder into memory and register it in ~/.pal. |
+| `pal pull` | Update changed files across registered folders. |
+| `pal pull <path>` | Pull one folder and register it in `~/.pal/registry.json`. |
 | `pal pull <path> --watch` | Keep one folder in sync while you work. |
-| `pal pull <path> --prompt "..."` | Set a per-silo system prompt override in the llmli silo registry. |
-| `pal pull <path> --clear-prompt` | Clear that per-silo prompt override. |
-| `pal ask ["question"]` | Ask across all silos; use `--in <silo>` to scope. |
+| `pal pull <path> --prompt "..."` | Set per-silo prompt override in llmli registry. |
+| `pal pull <path> --clear-prompt` | Clear per-silo prompt override. |
+| `pal ask "..."` | Ask across silos; use `--in <silo>` to scope. |
 | `pal ask --explain ...` | Print deterministic catalog/scope diagnostics to stderr when applicable. |
-| `pal ask --force ...` | Allow deterministic catalog queries to run on stale scope. |
+| `pal ask --force ...` | Allow deterministic catalog queries on stale scope. |
 | `pal ls` | List silos (path, files, chunks). |
-| `pal inspect <silo>` | Per-silo details and per-file chunk counts. |
+| `pal inspect <silo>` | Silo details and per-file chunk counts. |
 | `pal capabilities` | Supported file types and extractors. |
 | `pal log` | Last add failures. |
-| `pal ensure-self` | Ensure dev-mode self-silo exists (manual refresh). |
-| `pal add <path>` | Compatibility alias for `pal pull <path>` (hidden in default help). |
+| `pal sync` | Re-index repo self-silo in dev mode. |
 | `pal tool llmli <args...>` | Passthrough to llmli. |
 
-**llmli** — Full control.
+`llmli` (direct control):
 
 | Command | Description |
 |--------|-------------|
-| `add <path>` | Index folder (silo = basename). Cloud paths blocked by default. |
-| `ask [--in \<silo\> \| --unified \| --archetype \<id\>] <query...>` | Query. Default: all silos. `--in` = one silo; `--archetype` = archetype collection from archetypes.yaml. |
+| `add <path>` | Index folder (silo = basename). |
+| `ask [--in <silo> \| --unified \| --archetype <id>] <query...>` | Query indexed content. |
 | `ask --explain ...` | Print deterministic catalog diagnostics to stderr when applicable. |
 | `ask --force ...` | Allow deterministic catalog queries to run on stale scope. |
 | `ls` | List silos. |
 | `inspect <silo>` | Silo details and top files by chunk count. |
 | `capabilities` | Supported file types (source of truth). |
-| `index --archetype <id>` | Rebuild archetype from archetypes.yaml. |
+| `index --archetype <id>` | Rebuild archetype collection from config. |
 | `rm <silo>` | Remove silo and its chunks. |
-| `log [--last]` | Add failures. |
-| `eval-adversarial [--out <json>] [--limit N] [--strict-mode/--no-strict-mode] [--direct-decisive-mode/--no-direct-decisive-mode]` | Run synthetic adversarial trustfulness eval with machine-readable report and A/B mode controls. |
+| `log --last` | Show last indexing failures. |
+| `eval-adversarial ...` | Run synthetic trustfulness eval and output JSON report. |
 
----
+## Prompt Precedence (`pal ask --in <silo>`)
 
-## Prompt precedence for `pal ask --in <silo>`
-
-For silo-scoped unified asks, prompt resolution order is:
-1. Per-silo override from `pal pull <path> --prompt ...`
-2. Archetype prompt from `archetypes.yaml` (exact slug, then base slug without hash suffix, then normalized display name)
+For silo-scoped unified asks:
+1. Per-silo override set by `pal pull <path> --prompt ...`
+2. Archetype prompt from `archetypes.yaml` (exact slug, then base slug, then normalized display name)
 3. Built-in default prompt
 
-Use `pal pull <path> --clear-prompt` to revert to archetype/default behavior.
+Use `pal pull <path> --clear-prompt` to revert.
 
----
+## Natural Language Scope Notes
 
-## Trying it
+- Explicit `--in` always wins.
+- Phrase binding like “in my stuff” is conservative and deterministic.
+- Ambiguous phrase matches do not auto-bind.
 
-- Ask in natural language across silos (“what did I decide about X?”, “where did I list the 2022 classes?”). Sources link to the file; click to open.
-- Scope with `--in` when you know the folder (“pal ask --in school …”).
-- Ask about a tool or project by name (e.g. “why is the scribe tool fast”) without `--in`; retrieval scopes to paths containing that name when possible.
-- After pulling a folder, ask about something only in it; use `pal ls` and `pal log` to see state and failures.
+## Troubleshooting (Top 5)
 
----
+1. `Self-silo stale ... Run pal sync`
+- Meaning: repo changed since last self index.
+- Fix: run `pal sync`.
 
-## Self-silo (dev mode)
+2. `Low confidence ...`
+- Meaning: retrieval match quality is weak or mixed.
+- Fix: scope with `--in`, ask a more specific question, or add missing files.
 
-When running `pal` inside this repo, it uses a dev-only `__self__` silo (display name `self`) so capability-related answers stay grounded in local code. `pal ask` and `pal capabilities` do not reindex automatically; they only warn if the self-silo is missing or stale. Use `pal ensure-self` to index or refresh it.
+3. `no extractable text` for PDFs
+- Meaning: scanned/image PDF or unreadable structure.
+- Fix: OCR first, or use text-exportable documents.
 
-If the repo changes since the last self index, `pal` prints:
+4. stale catalog + `--force`
+- Meaning: deterministic catalog query detected stale scope.
+- Fix: `pal pull <path>` to refresh; use `--force` only if you accept stale results.
 
-`Self-silo stale (repo changed since last index). Run pal ensure-self.`
+5. wrong binary/environment
+- Symptom: command behavior doesn’t match repo changes.
+- Fix:
 
-Auto-reindex (folder): `pal pull <path> --watch` uses a watchdog observer plus a periodic missed-change check (default 10s) to update changed files only. Logs are quiet by design: one startup line and one line per update/remove/check summary.
+```bash
+which llmli
+which pal
+uv run python cli.py --help
+uv run python pal.py --help
+```
 
-Legacy compatibility: `pal watch-self` is available but hidden from default help.
+## Need Details?
 
----
+- Technical/operator reference: [`docs/TECH.md`](docs/TECH.md)
+- Security and test coverage: [`SECURITY_AND_TESTING.md`](SECURITY_AND_TESTING.md)
+- Adversarial eval smoke:
 
-## Tests
-
-- `uv run pytest -q`
-- `python -m pytest -q`
-
-Adversarial trust eval:
-- `uv run llmli eval-adversarial --out ./adversarial_eval_report.json`
-- `uv run llmli eval-adversarial --limit 20 --no-strict-mode --direct-decisive-mode --out ./adversarial_eval_smoke.json`
-
----
-
-## Env (optional)
-
-Common: `LLMLIBRARIAN_DB` (default `./my_brain_db`), `LLMLIBRARIAN_MODEL` (default `llama3.1:8b`), `LLMLIBRARIAN_TRACE` (file path for per-ask JSON trace + retrieval receipt). Full list, chunking, scaling, and interrupt behavior: **[docs/TECH.md](docs/TECH.md)**.
+```bash
+uv run llmli eval-adversarial --limit 20 --no-strict-mode --direct-decisive-mode --out ./adversarial_eval_smoke.json
+```
