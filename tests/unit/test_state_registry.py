@@ -2,13 +2,16 @@ import json
 
 from ingest import _file_manifest_path
 from state import (
+    get_silo_display_name,
     get_last_failures,
+    get_silo_prompt_override,
     list_silos,
     remove_manifest_silo,
     remove_silo,
     resolve_silo_by_path,
     resolve_silo_prefix,
     resolve_silo_to_slug,
+    set_silo_prompt_override,
     set_last_failures,
     update_silo,
 )
@@ -140,3 +143,36 @@ def test_remove_manifest_silo_removes_only_target_slug(tmp_path):
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert "alpha-1" not in data["silos"]
     assert "beta-2" in data["silos"]
+
+
+def test_set_and_get_silo_prompt_override_roundtrip(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    update_silo(db, "tax-aaaaaaaa", "/tmp/tax", 1, 1, "2026-02-09T00:00:00+00:00", display_name="Tax")
+    assert set_silo_prompt_override(db, "tax-aaaaaaaa", "Use this prompt.") is True
+    assert get_silo_prompt_override(db, "tax-aaaaaaaa") == "Use this prompt."
+
+
+def test_clear_silo_prompt_override(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    update_silo(db, "stuff-aaaaaaaa", "/tmp/stuff", 1, 1, "2026-02-09T00:00:00+00:00", display_name="Stuff")
+    assert set_silo_prompt_override(db, "stuff-aaaaaaaa", "X") is True
+    assert set_silo_prompt_override(db, "stuff-aaaaaaaa", None) is True
+    assert get_silo_prompt_override(db, "stuff-aaaaaaaa") is None
+
+
+def test_update_silo_preserves_prompt_override(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    update_silo(db, "docs-aaaaaaaa", "/tmp/docs", 1, 2, "2026-02-09T00:00:00+00:00", display_name="Docs")
+    assert set_silo_prompt_override(db, "docs-aaaaaaaa", "Persist me") is True
+    update_silo(db, "docs-aaaaaaaa", "/tmp/docs", 2, 3, "2026-02-10T00:00:00+00:00", display_name="Docs")
+    assert get_silo_prompt_override(db, "docs-aaaaaaaa") == "Persist me"
+
+
+def test_get_silo_display_name(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    update_silo(db, "health-aaaaaaaa", "/tmp/health", 1, 1, "2026-02-09T00:00:00+00:00", display_name="Health")
+    assert get_silo_display_name(db, "health-aaaaaaaa") == "Health"

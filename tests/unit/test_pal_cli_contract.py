@@ -31,3 +31,5 @@ def test_pull_help_mentions_watch():
     res = runner.invoke(pal.app, ["pull", "--help"])
     assert res.exit_code == 0
     assert "--watch" in res.stdout
+    assert "--prompt" in res.stdout
+    assert "--clear-prompt" in res.stdout

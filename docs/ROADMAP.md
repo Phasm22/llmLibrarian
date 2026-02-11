@@ -16,7 +16,7 @@ These are the roadmap items that are still open after the latest implementation 
 - `2c` Generic structured field extraction beyond tax-specific form/line logic.
 
 ### Open Product/Design Decisions
-- `4d` Per-silo prompt override via `pal pull --prompt` vs current config-driven archetype prompts.
+- None currently open. (`4d` resolved to hybrid override + config fallback.)
 
 Reference: `docs/IMPLEMENTATION_STATUS_AND_FIT_GAP_REPORT.md`
 
@@ -361,22 +361,13 @@ codebase:
 
 ### 4d. Per-silo prompt overrides via `pal pull --prompt`
 
-```python
-# Store custom prompt in registry entry
-@app.command("pull")
-def pull_command(
-    path: str | None = ...,
-    prompt: str | None = typer.Option(None, "--prompt",
-        help="Custom system prompt for this silo's Q&A."),
-):
-    ...
-    if prompt and path:
-        reg = _read_registry()
-        for src in reg.get("sources", []):
-            if src.get("path") == str(Path(path).resolve()):
-                src["prompt"] = prompt
-        _write_registry(reg)
-```
+Implemented (hybrid):
+- `pal pull <path> --prompt "..."` sets `prompt_override` on the silo in `llmli_registry.json`
+- `pal pull <path> --clear-prompt` clears it
+- For `pal ask --in <silo>`, prompt precedence is:
+1. per-silo registry override
+2. archetype prompt (`archetypes.yaml`) by exact slug, then base slug without hash suffix, then normalized display name
+3. built-in default prompt
 
 ---
 

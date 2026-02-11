@@ -63,19 +63,59 @@ def update_silo(
     display_name: str | None = None,
     language_stats: dict | None = None,
 ) -> None:
-    """Record silo after add. Uses slug as key; display_name = original folder name. language_stats optional for CODE_LANGUAGE pipeline."""
+    """Record silo after add. Preserves unknown keys (e.g. prompt overrides)."""
     reg = _read_registry(db_path)
-    reg[slug] = {
-        "slug": slug,
-        "display_name": display_name or slug,
-        "path": folder_path,
-        "files_indexed": files_indexed,
-        "chunks_count": chunks_count,
-        "updated": updated_iso,
-    }
+    existing = reg.get(slug)
+    entry = dict(existing) if isinstance(existing, dict) else {}
+    entry.update(
+        {
+            "slug": slug,
+            "display_name": display_name or slug,
+            "path": folder_path,
+            "files_indexed": files_indexed,
+            "chunks_count": chunks_count,
+            "updated": updated_iso,
+        }
+    )
     if language_stats is not None:
-        reg[slug]["language_stats"] = language_stats
+        entry["language_stats"] = language_stats
+    reg[slug] = entry
     _write_registry(db_path, reg)
+
+
+def set_silo_prompt_override(db_path: str | Path, slug: str, prompt: str | None) -> bool:
+    """Set or clear per-silo prompt override. Returns False when silo is missing."""
+    reg = _read_registry(db_path)
+    entry = reg.get(slug)
+    if not isinstance(entry, dict):
+        return False
+    if prompt is None:
+        entry.pop("prompt_override", None)
+    else:
+        entry["prompt_override"] = prompt
+    reg[slug] = entry
+    _write_registry(db_path, reg)
+    return True
+
+
+def get_silo_prompt_override(db_path: str | Path, slug: str) -> str | None:
+    """Get prompt override for a silo if present."""
+    reg = _read_registry(db_path)
+    entry = reg.get(slug)
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("prompt_override")
+    return value if isinstance(value, str) else None
+
+
+def get_silo_display_name(db_path: str | Path, slug: str) -> str | None:
+    """Get display name for a silo by slug."""
+    reg = _read_registry(db_path)
+    entry = reg.get(slug)
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("display_name")
+    return value if isinstance(value, str) else None
 
 def list_silos(db_path: str | Path) -> list[dict[str, Any]]:
     """Return list of silo dicts (slug, display_name, path, files_indexed, chunks_count, updated)."""

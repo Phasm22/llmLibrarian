@@ -154,6 +154,87 @@ def test_run_ask_strict_mode_adds_strict_instruction(monkeypatch, mock_collectio
     assert "Strict mode:" in system_prompt
 
 
+def test_run_ask_silo_prompt_override_precedence(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.get_silo_prompt_override", lambda _db, _silo: "Override prompt.")
+    monkeypatch.setattr("query.core.get_silo_display_name", lambda _db, _silo: "Stuff")
+    monkeypatch.setattr(
+        "query.core.load_config",
+        lambda _p=None: {"archetypes": {"stuff": {"name": "Stuff", "prompt": "Config prompt."}}},
+    )
+    mock_collection.query_result = {
+        "documents": [["alpha context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "line_start": 3, "is_local": 1, "silo": "stuff-deadbeef"}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+
+    run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, silo="stuff-deadbeef")
+    system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
+    assert system_prompt.startswith("Override prompt.")
+
+
+def test_run_ask_silo_prompt_falls_back_to_slug_base(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.get_silo_prompt_override", lambda _db, _silo: None)
+    monkeypatch.setattr("query.core.get_silo_display_name", lambda _db, _silo: None)
+    monkeypatch.setattr(
+        "query.core.load_config",
+        lambda _p=None: {"archetypes": {"stuff": {"name": "Stuff", "prompt": "Hash base prompt."}}},
+    )
+    mock_collection.query_result = {
+        "documents": [["alpha context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "line_start": 3, "is_local": 1, "silo": "stuff-deadbeef"}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+
+    run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, silo="stuff-deadbeef")
+    system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
+    assert system_prompt.startswith("Hash base prompt.")
+
+
+def test_run_ask_silo_prompt_falls_back_to_normalized_display_name(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.get_silo_prompt_override", lambda _db, _silo: None)
+    monkeypatch.setattr("query.core.get_silo_display_name", lambda _db, _silo: "My Stuff")
+    monkeypatch.setattr(
+        "query.core.load_config",
+        lambda _p=None: {"archetypes": {"my-stuff": {"name": "My Stuff", "prompt": "Display prompt."}}},
+    )
+    mock_collection.query_result = {
+        "documents": [["alpha context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "line_start": 3, "is_local": 1, "silo": "x-12345678"}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+
+    run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, silo="x-12345678")
+    system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
+    assert system_prompt.startswith("Display prompt.")
+
+
+def test_run_ask_silo_prompt_uses_default_when_no_override_or_archetype(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.get_silo_prompt_override", lambda _db, _silo: None)
+    monkeypatch.setattr("query.core.get_silo_display_name", lambda _db, _silo: None)
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}})
+    mock_collection.query_result = {
+        "documents": [["alpha context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "line_start": 3, "is_local": 1, "silo": "x-12345678"}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+
+    run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, silo="x-12345678")
+    system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
+    assert system_prompt.startswith("Answer only from the provided context. Be concise.")
+
+
 def test_run_ask_evidence_profile_uses_hybrid_get(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_EVIDENCE_PROFILE)

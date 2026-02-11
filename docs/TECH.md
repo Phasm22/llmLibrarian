@@ -5,18 +5,28 @@ Project layout, environment, tuning, and operational details. For philosophy and
 ## Layout
 
 - **pyproject.toml** — Project + deps; **uv** for venv and install (`uv venv`, `uv sync`).
-- **cli.py** — llmli entrypoint: `llmli add|ask|ls|index|rm|log|capabilities|inspect`
+- **cli.py** — llmli entrypoint: `llmli add|ask|ls|index|rm|log|capabilities|inspect|eval-adversarial`
 - **pal.py** — Agent CLI (Typer): Do = `pal pull|ask`, See = `pal ls|inspect|capabilities|log`, Tune = `pal ensure-self|silos|tool`; state in `~/.pal/registry.json`.
-- **archetypes.yaml** — Prompts (and optionally index config). **Prompt-only:** add an entry with `name` + `prompt` and an id that matches a silo slug (e.g. `stuff`); then `pal ask --in stuff "..."` uses that prompt. **Full:** include `folders`, `include`/`exclude`, `collection` for `llmli index --archetype X` and a separate collection. Limits (max_file_size_mb, etc.) apply to add/index.
+- **archetypes.yaml** — Prompts (and optionally index config). **Prompt-only:** add an entry with `name` + `prompt` and an id that matches a silo slug (e.g. `stuff`). For `pal` hashed slugs (`stuff-deadbeef`), prompt lookup falls back to base slug and normalized display name. **Full:** include `folders`, `include`/`exclude`, `collection` for `llmli index --archetype X` and a separate collection. Limits (max_file_size_mb, etc.) apply to add/index.
 - **src/** — Librarian code:
   - **embeddings.py**, **load_config.py**, **style.py**, **reranker.py**, **state.py**, **floor.py** — Support modules.
 - **ingest.py** — Indexing core (archetype + add); **query_engine.py** — Query (ask).
 - **ingest.py (single-file)** — `update_single_file()` / `remove_single_file()` support event-driven updates from `pal pull <path> --watch`.
   - **indexer.py** / **query.py** — Thin wrappers that re-export from ingest / query_engine for the CLI.
+- **evals/adversarial.py** — Synthetic adversarial trustfulness eval harness (corpus, queries, scoring, JSON report).
 - **docs/CHROMA_AND_STACK.md** — Chroma usage and stack choices.
 - **gemini_summary.md** — Project manifest and recovery notes.
 
 Internal flags (dev-only): `llmli add --silo <slug> --display-name <name>` are used by `pal` to force the dev self-silo. Not intended for normal use.
+
+Per-silo prompt override workflow:
+- `pal pull <path> --prompt "..."` stores `prompt_override` on the llmli silo registry entry.
+- `pal pull <path> --clear-prompt` clears it.
+- `pal ask --in <silo>` precedence: registry override -> archetype prompt -> built-in default.
+
+Adversarial trustfulness eval:
+- `llmli eval-adversarial --out ./adversarial_eval_report.json`
+- Optional smoke run: `llmli eval-adversarial --limit 20 --out ./adversarial_eval_smoke.json`
 
 ## Development setup
 

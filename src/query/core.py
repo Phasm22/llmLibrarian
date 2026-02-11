@@ -22,6 +22,7 @@ from constants import (
 )
 from embeddings import get_embedding_function
 from load_config import load_config, get_archetype, get_archetype_optional
+from state import get_silo_prompt_override, get_silo_display_name
 from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chunks
 from style import bold, dim, label_style
 
@@ -110,6 +111,58 @@ def _quiet_text_only(text: str) -> str:
     return text.strip()
 
 
+def _normalize_silo_token(raw: str | None) -> str:
+    s = (raw or "").strip().lower()
+    s = re.sub(r"[^\w\s-]", "", s)
+    s = re.sub(r"[-\s]+", "-", s).strip("-")
+    return s
+
+
+def _strip_hash_suffix(slug: str | None) -> str | None:
+    if not slug:
+        return None
+    m = re.match(r"^(.+)-[0-9a-f]{8}$", slug)
+    if not m:
+        return slug
+    return m.group(1)
+
+
+def _resolve_unified_silo_prompt(
+    db: str,
+    config_path: str | Path | None,
+    silo: str,
+) -> tuple[str, str]:
+    default_prompt = "Answer only from the provided context. Be concise."
+    display_name = get_silo_display_name(db, silo)
+
+    override = get_silo_prompt_override(db, silo)
+    if override and override.strip():
+        return override, (display_name or silo)
+
+    candidates: list[str] = []
+    for c in (
+        silo,
+        _strip_hash_suffix(silo),
+        _normalize_silo_token(display_name),
+    ):
+        if c and c not in candidates:
+            candidates.append(c)
+
+    arch = None
+    try:
+        config = load_config(config_path)
+        for candidate in candidates:
+            arch = get_archetype_optional(config, candidate)
+            if arch is not None:
+                break
+    except Exception:
+        arch = None
+
+    if arch and arch.get("prompt"):
+        return (arch.get("prompt") or default_prompt), (arch.get("name") or display_name or silo)
+    return default_prompt, (display_name or silo)
+
+
 def run_ask(
     archetype_id: str | None,
     query: str,
@@ -132,25 +185,18 @@ def run_ask(
 
     if use_unified:
         collection_name = LLMLI_COLLECTION
-        # Optional: use archetype prompt when asking --in <silo> and that silo id exists in archetypes (prompt-only; no separate collection)
-        try:
-            config = load_config(config_path)
-            arch = get_archetype_optional(config, silo) if silo else None
-        except Exception:
-            arch = None
-        if arch and arch.get("prompt"):
-            base_prompt = arch.get("prompt") or "Answer only from the provided context. Be concise."
+        if silo:
+            base_prompt, source_label = _resolve_unified_silo_prompt(db, config_path, silo)
             system_prompt = (
                 base_prompt
                 + "\n\nAddress the user as 'you'. If the context does not contain the answer, state that clearly but remain helpful."
             )
-            source_label = arch.get("name") or silo or "llmli"
         else:
             system_prompt = (
                 "Answer only from the provided context. Be concise. "
                 "Address the user as 'you'. If the context does not contain the answer, state that clearly but remain helpful."
             )
-            source_label = silo or "llmli"
+            source_label = "llmli"
     else:
         config = load_config(config_path)
         arch = get_archetype(config, archetype_id)

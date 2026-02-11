@@ -1,5 +1,6 @@
 import os
 import sys
+import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -12,6 +13,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+# Ensure tests target the workspace module, not an installed site-packages copy.
+_pal_path = (ROOT / "pal.py").resolve()
+_pal_spec = importlib.util.spec_from_file_location("pal", _pal_path)
+if _pal_spec is not None and _pal_spec.loader is not None:
+    _pal_module = importlib.util.module_from_spec(_pal_spec)
+    sys.modules["pal"] = _pal_module
+    _pal_spec.loader.exec_module(_pal_module)
 
 # Avoid color/style differences in test output formatting.
 os.environ.setdefault("LLMLIBRARIAN_EDITOR_SCHEME", "file")

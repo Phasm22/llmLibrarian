@@ -88,6 +88,33 @@ def test_pull_command_requires_path_for_watch(capsys):
     assert res.exit_code == 2
 
 
+def test_pull_command_requires_path_for_prompt():
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "--prompt", "Use this"])
+    assert res.exit_code == 2
+    assert "--prompt/--clear-prompt requires PATH" in (res.stderr or res.stdout)
+
+
+def test_pull_command_rejects_prompt_and_clear_together():
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "/tmp/folder", "--prompt", "A", "--clear-prompt"])
+    assert res.exit_code == 2
+    assert "Use either --prompt or --clear-prompt" in (res.stderr or res.stdout)
+
+
+def test_pull_command_rejects_blank_prompt():
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "/tmp/folder", "--prompt", "   "])
+    assert res.exit_code == 2
+    assert "Blank --prompt is not allowed" in (res.stderr or res.stdout)
+
+
 def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     watched = {}
     monkeypatch.setattr("pal._pull_path_mode", lambda *a, **k: 0)
@@ -124,11 +151,13 @@ def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
 def test_pull_with_path_calls_path_mode(monkeypatch):
     called = {}
 
-    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False):
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False):
         called["path"] = str(path_input)
         called["allow_cloud"] = allow_cloud
         called["follow_symlinks"] = follow_symlinks
         called["full"] = full
+        called["prompt"] = prompt
+        called["clear_prompt"] = clear_prompt
         return 0
 
     monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path)
@@ -140,6 +169,76 @@ def test_pull_with_path_calls_path_mode(monkeypatch):
     assert called["allow_cloud"] is True
     assert called["follow_symlinks"] is True
     assert called["full"] is True
+    assert called["prompt"] is None
+    assert called["clear_prompt"] is False
+
+
+def test_pull_with_path_passes_prompt_option(monkeypatch):
+    called = {}
+
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False):
+        called["path"] = str(path_input)
+        called["prompt"] = prompt
+        called["clear_prompt"] = clear_prompt
+        return 0
+
+    monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path)
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "/tmp/one", "--prompt", "Use this prompt"])
+    assert res.exit_code == 0
+    assert called["path"] == "/tmp/one"
+    assert called["prompt"] == "Use this prompt"
+    assert called["clear_prompt"] is False
+
+
+def test_pull_with_path_passes_clear_prompt_option(monkeypatch):
+    called = {}
+
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False):
+        called["path"] = str(path_input)
+        called["prompt"] = prompt
+        called["clear_prompt"] = clear_prompt
+        return 0
+
+    monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path)
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "/tmp/one", "--clear-prompt"])
+    assert res.exit_code == 0
+    assert called["path"] == "/tmp/one"
+    assert called["prompt"] is None
+    assert called["clear_prompt"] is True
+
+
+def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
+    monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
+    monkeypatch.setattr("pal._run_llmli", lambda _args: 0)
+    monkeypatch.setattr("pal._record_source_path", lambda _path: None)
+    calls = {}
+
+    def _fake_set(path, prompt, clear_prompt=False):
+        calls["args"] = (str(path), prompt, clear_prompt)
+        return True
+
+    monkeypatch.setattr("pal._set_silo_prompt_for_path", _fake_set)
+
+    rc = pal._pull_path_mode("/tmp/one", prompt="Prompt")
+    assert rc == 0
+    assert calls["args"][1] == "Prompt"
+    assert calls["args"][2] is False
+
+
+def test_pull_path_mode_errors_when_prompt_override_target_missing(monkeypatch):
+    monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
+    monkeypatch.setattr("pal._run_llmli", lambda _args: 0)
+    monkeypatch.setattr("pal._record_source_path", lambda _path: None)
+    monkeypatch.setattr("pal._set_silo_prompt_for_path", lambda *_a, **_k: False)
+
+    rc = pal._pull_path_mode("/tmp/one", prompt="Prompt")
+    assert rc == 1
 
 
 def test_acquire_silo_pid_lock_blocks_live_pid(monkeypatch, tmp_path: Path):

@@ -134,19 +134,41 @@ def _write_registry(data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
+def _resolve_llmli_paths() -> tuple[Path, Path]:
+    """
+    Resolve which cli.py and src directory to run against.
+    Prefer current working directory when it looks like a checkout.
+    """
+    root = Path(__file__).resolve().parent
+    cwd = Path.cwd().resolve()
+    cwd_cli = cwd / "cli.py"
+    cwd_src = cwd / "src"
+    if cwd_cli.exists() and cwd_src.is_dir():
+        return cwd_cli, cwd_src
+    return root / "cli.py", root / "src"
+
+
+def _prepend_pythonpath(env: dict[str, str], src_dir: Path) -> None:
+    """Prepend src path for subprocess imports while preserving existing PYTHONPATH."""
+    existing = env.get("PYTHONPATH")
+    if existing:
+        env["PYTHONPATH"] = str(src_dir) + os.pathsep + existing
+    else:
+        env["PYTHONPATH"] = str(src_dir)
+
+
 def _run_llmli(args: list[str]) -> int:
     """Run llmli as subprocess; return exit code."""
-    root = Path(__file__).resolve().parent
+    cli_path, src_path = _resolve_llmli_paths()
     env = os.environ.copy()
-    # Always invoke local source to avoid drift between cli.py and installed entrypoints.
-    cmd = [sys.executable, str(root / "cli.py")] + args
+    _prepend_pythonpath(env, src_path)
+    cmd = [sys.executable, str(cli_path)] + args
     r = subprocess.run(cmd, env=env)
     return r.returncode
 
 
 def _ensure_src_on_path() -> None:
-    root = Path(__file__).resolve().parent
-    src = root / "src"
+    _cli, src = _resolve_llmli_paths()
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
 
@@ -743,11 +765,27 @@ def _record_source_path(path: Path) -> None:
     _write_registry(reg)
 
 
+def _set_silo_prompt_for_path(path: Path, prompt: str | None, clear_prompt: bool = False) -> bool:
+    """Persist (or clear) prompt override for the silo mapped to the given path."""
+    _ensure_src_on_path()
+    from state import set_silo_prompt_override
+
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    llmli_registry = _read_llmli_registry(db_path)
+    slug = _resolve_llmli_silo_by_path(llmli_registry, path)
+    if slug is None:
+        return False
+    target_prompt = None if clear_prompt else prompt
+    return set_silo_prompt_override(db_path, slug, target_prompt)
+
+
 def _pull_path_mode(
     path_input: str | Path,
     allow_cloud: bool = False,
     follow_symlinks: bool = False,
     full: bool = False,
+    prompt: str | None = None,
+    clear_prompt: bool = False,
 ) -> int:
     path = Path(path_input).resolve()
     if not path.is_dir():
@@ -764,6 +802,10 @@ def _pull_path_mode(
     code = _run_llmli(llmli_args)
     if code == 0:
         _record_source_path(path)
+        if prompt is not None or clear_prompt:
+            if not _set_silo_prompt_for_path(path, prompt, clear_prompt=clear_prompt):
+                print("Error: unable to resolve silo for prompt override.", file=sys.stderr)
+                return 1
     return code
 
 
@@ -773,12 +815,21 @@ def _pull_watch_path_mode(
     debounce: float,
     allow_cloud: bool,
     follow_symlinks: bool,
+    prompt: str | None = None,
+    clear_prompt: bool = False,
 ) -> int:
     if Observer is None:
         print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
         return 1
     path = Path(path_input).resolve()
-    rc = _pull_path_mode(path, allow_cloud=allow_cloud, follow_symlinks=follow_symlinks, full=False)
+    rc = _pull_path_mode(
+        path,
+        allow_cloud=allow_cloud,
+        follow_symlinks=follow_symlinks,
+        full=False,
+        prompt=prompt,
+        clear_prompt=clear_prompt,
+    )
     if rc != 0:
         return rc
     db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
@@ -824,6 +875,8 @@ def _build_pull_env(status_file_path: str) -> dict[str, str]:
     for k, v in os.environ.items():
         if k in allow_exact or k.startswith("LLMLIBRARIAN_"):
             out[k] = v
+    _cli, src = _resolve_llmli_paths()
+    _prepend_pythonpath(out, src)
     out["LLMLIBRARIAN_STATUS_FILE"] = status_file_path
     out["LLMLIBRARIAN_QUIET"] = "1"
     return out
@@ -866,8 +919,8 @@ def pull_all_sources(
         status_file_path = status_file.name
         status_file.close()
         env = _build_pull_env(status_file_path)
-        root = Path(__file__).resolve().parent
-        cmd = [sys.executable, str(root / "cli.py")] + llmli_args
+        cli_path, _src = _resolve_llmli_paths()
+        cmd = [sys.executable, str(cli_path)] + llmli_args
         r = subprocess.run(cmd, env=env, capture_output=True, text=True)
         code = r.returncode
 
@@ -924,19 +977,49 @@ def pull_command(
     path: str | None = typer.Argument(None, metavar="PATH", help="Folder to index. Omit to refresh all."),
     watch: bool = typer.Option(False, "--watch", help="Stay running and sync changes live."),
     full: bool = typer.Option(False, "--full", help="Full rebuild (delete + re-add)."),
+    prompt: str | None = typer.Option(None, "--prompt", help="Custom system prompt override for this silo."),
+    clear_prompt: bool = typer.Option(False, "--clear-prompt", help="Clear custom prompt override for this silo."),
     allow_cloud: bool = typer.Option(False, "--allow-cloud", help="Allow cloud-synced folders."),
     interval: float = typer.Option(10.0, "--interval", help="Reconcile interval (watch mode).", hidden=True),
     debounce: float = typer.Option(1.0, "--debounce", help="Debounce delay (watch mode).", hidden=True),
     follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks.", hidden=True),
 ) -> None:
+    if prompt is not None and clear_prompt:
+        print("Use either --prompt or --clear-prompt, not both.", file=sys.stderr)
+        raise typer.Exit(code=2)
+    if (prompt is not None or clear_prompt) and not path:
+        print("--prompt/--clear-prompt requires PATH. Use: pal pull <path> --prompt \"...\"", file=sys.stderr)
+        raise typer.Exit(code=2)
+    if prompt is not None and not prompt.strip():
+        print("Blank --prompt is not allowed. Use --clear-prompt to remove an override.", file=sys.stderr)
+        raise typer.Exit(code=2)
     if watch and not path:
         print("--watch requires PATH. Use: pal pull <path> --watch", file=sys.stderr)
         raise typer.Exit(code=2)
     if watch and path:
-        _exit(_pull_watch_path_mode(path, interval, debounce, allow_cloud, follow_symlinks))
+        _exit(
+            _pull_watch_path_mode(
+                path,
+                interval,
+                debounce,
+                allow_cloud,
+                follow_symlinks,
+                prompt=prompt,
+                clear_prompt=clear_prompt,
+            )
+        )
         return
     if path:
-        _exit(_pull_path_mode(path, allow_cloud=allow_cloud, follow_symlinks=follow_symlinks, full=full))
+        _exit(
+            _pull_path_mode(
+                path,
+                allow_cloud=allow_cloud,
+                follow_symlinks=follow_symlinks,
+                full=full,
+                prompt=prompt,
+                clear_prompt=clear_prompt,
+            )
+        )
         return
     _exit(pull_all_sources(full=full, allow_cloud=allow_cloud, follow_symlinks=follow_symlinks))
 

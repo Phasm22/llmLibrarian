@@ -1,0 +1,296 @@
+{
+  "run_id": "58af9aedc667",
+  "model": "llama3.1:8b",
+  "silo": "__adversarial_eval__",
+  "totals": {
+    "total_queries": 5,
+    "passed_queries": 0,
+    "failed_queries": 5,
+    "overall_trust_score": 0.0,
+    "hallucination_rate": 80.0,
+    "confident_error_rate": 0.0,
+    "temporal_error_rate": 0.0,
+    "unsupported_assertion_rate": 0.0
+  },
+  "category_breakdown": {
+    "direct": {
+      "total": 5,
+      "passed": 0,
+      "failed": 5
+    }
+  },
+  "failures": [
+    {
+      "query_id": "Q001",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou. I don't have enough evidence to say what Aster Grill's revenue rank is in 2025, as there are conflicting reports between the two files (2025-03-01-canonical-rankings.md and 2025-03-02-analyst-brief-contradiction.md). The first file ranks Aster Grill as #1, while the second file ranks it as #2. To determine the correct revenue rank, you may want to index more specific files related to revenue rankings or exports from 2025.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-03-01-canonical-rankings.md",
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-04-05-canonical-margin.md",
+        "2025-04-24-executive-opinion-2.md",
+        "2025-04-10-canonical-hours.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2025-02-16-ops-note-contradiction.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-04-26-executive-opinion-4.md",
+        "2025-01-20-canonical-nps.md",
+        "2025-01-21-nps-contradiction.md"
+      ]
+    },
+    {
+      "query_id": "Q002",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou have two sources that contradict each other regarding Blue Harbor's revenue rank in 2025. The first source, a confidential analyst note from March 2, 2025, states that Blue Harbor is ranked #1 by revenue in 2025. However, the second source, canonical rankings from March 1, 2025, lists Blue Harbor as ranked #2 by revenue in 2025.\n\nI don't have enough evidence to say which ranking is accurate. To determine Blue Harbor's revenue rank in 2025, you may want to index more specific documents related to revenue rankings or financial reports for that year.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-03-01-canonical-rankings.md",
+        "2025-04-05-canonical-margin.md",
+        "2025-04-10-canonical-hours.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2025-02-16-ops-note-contradiction.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-04-14-canonical-labor.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2025-01-20-canonical-nps.md",
+        "2025-04-26-executive-opinion-4.md",
+        "2025-01-21-nps-contradiction.md"
+      ]
+    },
+    {
+      "query_id": "Q003",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou. I don't have enough evidence to say what Ember Table's 2025 revenue rank is, but you can index the file \"2025-03-01-canonical-rankings.md\" for more information.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-03-01-canonical-rankings.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2025-01-21-nps-contradiction.md",
+        "2025-01-20-canonical-nps.md",
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-04-05-canonical-margin.md",
+        "2025-04-24-executive-opinion-2.md",
+        "2025-04-14-canonical-labor.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2025-02-16-ops-note-contradiction.md",
+        "2025-04-10-canonical-hours.md"
+      ]
+    },
+    {
+      "query_id": "Q004",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou are looking for the Aster Grill delivery SLA minutes. I have evidence from multiple sources that indicate this value is 34 minutes, but there is also a document from 2025-02-15 (Canonical Ops SLA) that suggests it could be 27 minutes. I don't have enough evidence to say which one is correct or if there are other conflicting documents. It might be helpful to index more specific folders or exports related to delivery SLAs for Aster Grill.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-02-16-ops-note-contradiction.md",
+        "2024-02-15-official-ops-sla.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2025-04-24-executive-opinion-2.md",
+        "2025-04-10-canonical-hours.md",
+        "2025-04-05-canonical-margin.md",
+        "2025-03-01-canonical-rankings.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-04-26-executive-opinion-4.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2023-11-01-official-rankings.md"
+      ]
+    },
+    {
+      "query_id": "Q005",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou are looking for the Blue Harbor delivery SLA minutes. I have evidence of three different documents mentioning this:\n\n1. In `2025-02-16-ops-note-contradiction.md`, it is mentioned as 26.\n2. In `2025-02-15-canonical-ops-sla.md`, it is mentioned as 30.\n3. In `2024-02-15-official-ops-sla.md`, it is mentioned as 29.\n\nI don't have enough evidence to say which one is the most up-to-date or accurate value. It's possible that more specific documents or exports could provide a clearer answer.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-02-16-ops-note-contradiction.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2024-02-15-official-ops-sla.md",
+        "2025-04-10-canonical-hours.md",
+        "2025-04-24-executive-opinion-2.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-04-26-executive-opinion-4.md",
+        "2023-11-01-official-rankings.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2025-04-05-canonical-margin.md",
+        "2024-01-20-official-nps.md"
+      ]
+    }
+  ],
+  "records": [
+    {
+      "query_id": "Q001",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou. I don't have enough evidence to say what Aster Grill's revenue rank is in 2025, as there are conflicting reports between the two files (2025-03-01-canonical-rankings.md and 2025-03-02-analyst-brief-contradiction.md). The first file ranks Aster Grill as #1, while the second file ranks it as #2. To determine the correct revenue rank, you may want to index more specific files related to revenue rankings or exports from 2025.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-03-01-canonical-rankings.md",
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-04-05-canonical-margin.md",
+        "2025-04-24-executive-opinion-2.md",
+        "2025-04-10-canonical-hours.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2025-02-16-ops-note-contradiction.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-04-26-executive-opinion-4.md",
+        "2025-01-20-canonical-nps.md",
+        "2025-01-21-nps-contradiction.md"
+      ]
+    },
+    {
+      "query_id": "Q002",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou have two sources that contradict each other regarding Blue Harbor's revenue rank in 2025. The first source, a confidential analyst note from March 2, 2025, states that Blue Harbor is ranked #1 by revenue in 2025. However, the second source, canonical rankings from March 1, 2025, lists Blue Harbor as ranked #2 by revenue in 2025.\n\nI don't have enough evidence to say which ranking is accurate. To determine Blue Harbor's revenue rank in 2025, you may want to index more specific documents related to revenue rankings or financial reports for that year.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-03-01-canonical-rankings.md",
+        "2025-04-05-canonical-margin.md",
+        "2025-04-10-canonical-hours.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2025-02-16-ops-note-contradiction.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-04-14-canonical-labor.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2025-01-20-canonical-nps.md",
+        "2025-04-26-executive-opinion-4.md",
+        "2025-01-21-nps-contradiction.md"
+      ]
+    },
+    {
+      "query_id": "Q003",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou. I don't have enough evidence to say what Ember Table's 2025 revenue rank is, but you can index the file \"2025-03-01-canonical-rankings.md\" for more information.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-03-01-canonical-rankings.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2025-01-21-nps-contradiction.md",
+        "2025-01-20-canonical-nps.md",
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-04-05-canonical-margin.md",
+        "2025-04-24-executive-opinion-2.md",
+        "2025-04-14-canonical-labor.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2025-02-16-ops-note-contradiction.md",
+        "2025-04-10-canonical-hours.md"
+      ]
+    },
+    {
+      "query_id": "Q004",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou are looking for the Aster Grill delivery SLA minutes. I have evidence from multiple sources that indicate this value is 34 minutes, but there is also a document from 2025-02-15 (Canonical Ops SLA) that suggests it could be 27 minutes. I don't have enough evidence to say which one is correct or if there are other conflicting documents. It might be helpful to index more specific folders or exports related to delivery SLAs for Aster Grill.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-02-16-ops-note-contradiction.md",
+        "2024-02-15-official-ops-sla.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2025-04-24-executive-opinion-2.md",
+        "2025-04-10-canonical-hours.md",
+        "2025-04-05-canonical-margin.md",
+        "2025-03-01-canonical-rankings.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-04-26-executive-opinion-4.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2023-11-01-official-rankings.md"
+      ]
+    },
+    {
+      "query_id": "Q005",
+      "category": "direct",
+      "passed": false,
+      "subscores": {
+        "factual_correctness": 0,
+        "trust_behavior": 0,
+        "evidence_grounding": 1,
+        "temporal_correctness": null
+      },
+      "failure_reason": "expected_decisive_from_canonical,forbidden_value_hit",
+      "answer_text": "Low confidence: query is weakly related to indexed content.\n\nYou are looking for the Blue Harbor delivery SLA minutes. I have evidence of three different documents mentioning this:\n\n1. In `2025-02-16-ops-note-contradiction.md`, it is mentioned as 26.\n2. In `2025-02-15-canonical-ops-sla.md`, it is mentioned as 30.\n3. In `2024-02-15-official-ops-sla.md`, it is mentioned as 29.\n\nI don't have enough evidence to say which one is the most up-to-date or accurate value. It's possible that more specific documents or exports could provide a clearer answer.\n\n---\nAnswered by: Adversarial Eval",
+      "sources_seen": [
+        "2025-02-16-ops-note-contradiction.md",
+        "2025-02-15-canonical-ops-sla.md",
+        "2024-02-15-official-ops-sla.md",
+        "2025-04-10-canonical-hours.md",
+        "2025-04-24-executive-opinion-2.md",
+        "2025-04-01-canonical-contract.md",
+        "2025-03-02-analyst-brief-contradiction.md",
+        "2025-04-26-executive-opinion-4.md",
+        "2023-11-01-official-rankings.md",
+        "2025-04-19-loyalty-contradiction.md",
+        "2025-04-05-canonical-margin.md",
+        "2024-01-20-official-nps.md"
+      ]
+    }
+  ]
+}

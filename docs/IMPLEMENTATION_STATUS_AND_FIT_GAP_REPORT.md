@@ -4,10 +4,10 @@ Source roadmap: `docs/ROADMAP.md`
 
 ## Executive Summary
 - Total assessed items: 15 (all roadmap sub-items across sections 1–4)
-- `Implemented`: 9
+- `Implemented`: 10
 - `Partially Implemented`: 4
 - `Not Implemented`: 0
-- `Superseded/Changed`: 2
+- `Superseded/Changed`: 1
 
 Top 3 risks:
 - Retrieval quality still lacks BM25 fallback for weak semantic matches and semantic boundary chunking.
@@ -50,7 +50,7 @@ Rubrics used:
 | `4a` | Legal domain pack | Implemented | `archetypes.yaml:92` | Strong | Pack is config-only; no domain-specific parser/guardrail extensions yet. | Low-Med | S | Add domain-specific extraction helpers only if users request them. |
 | `4b` | Medical/health domain pack | Implemented | `archetypes.yaml:107` | Strong | Safety policy is prompt-level only (no hard validator layer yet). | Low-Med | S | Add optional hard safety post-checks for high-stakes workflows. |
 | `4c` | Code review domain pack | Implemented | `archetypes.yaml:121` (`codebase`) | Strong | Coexists with existing `palindrome` pack; overlap may need cleanup later. | Low-Med | S | Decide whether to keep both packs or deprecate one alias. |
-| `4d` | Per-silo prompt override via `pal pull --prompt` | Superseded/Changed | Prompt overrides via archetype/silo lookup in `src/query/core.py:106`; no `--prompt` option in `pal.py:929` | Moderate | Roadmap proposed CLI-time prompt write; current design uses config-driven archetype prompts. | Medium | M | Decide one path: keep config-only model or add `--prompt` persisted in registry with precedence rules. |
+| `4d` | Per-silo prompt override via `pal pull --prompt` | Implemented | `pal.py` (`pull --prompt`, `--clear-prompt` and validation), `src/state.py` (`prompt_override` helpers + preserved registry metadata), `src/query/core.py` (override/archetype/default precedence with hashed-slug and display-name fallback), `tests/unit/test_pal_pull.py`, `tests/unit/test_state_registry.py`, `tests/unit/test_run_ask_orchestration.py` | Strong | None observed for roadmap scope. | Medium | - | Monitor prompt override usage and add `pal inspect` surfacing if users need easier visibility. |
 
 ## Priority-Order Fit-Gap (Roadmap vs. Current State)
 Roadmap priority list currently front-loads items that are still open, but ordering is inconsistent with implementation reality and stated impact:

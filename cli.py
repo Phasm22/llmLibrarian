@@ -301,6 +301,31 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval_adversarial(args: argparse.Namespace) -> int:
+    """Run synthetic adversarial trustfulness evaluation and emit score report."""
+    from llmli_evals.adversarial import run_adversarial_eval, format_report_table
+
+    db = _db_path(args)
+    out = getattr(args, "out", None)
+    model = getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.1:8b")
+    limit = getattr(args, "limit", None)
+    try:
+        report = run_adversarial_eval(
+            db_path=db,
+            out_path=out,
+            model=model,
+            limit=limit,
+            no_color=args.no_color,
+        )
+        print(format_report_table(report))
+        if out:
+            print(f"\nReport JSON: {out}")
+        return 0
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="llmli", description="llmLibrarian CLI: add, ask, ls, inspect, index, rm, capabilities, log")
     parser.add_argument("--db", default=os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"), help="DB path")
@@ -363,6 +388,13 @@ def main() -> int:
     p_log = sub.add_parser("log", help="Show last add failures")
     p_log.add_argument("--last", action="store_true", help="Show last add failures (default)")
     p_log.set_defaults(_run=cmd_log)
+
+    # eval-adversarial [--model M] [--out report.json] [--limit N]
+    p_eval = sub.add_parser("eval-adversarial", help="Run synthetic adversarial trustfulness eval")
+    p_eval.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.1:8b)")
+    p_eval.add_argument("--out", help="Write JSON report to this path")
+    p_eval.add_argument("--limit", type=int, help="Run only first N queries from the fixed suite")
+    p_eval.set_defaults(_run=cmd_eval_adversarial)
 
     args = parser.parse_args()
     return args._run(args)

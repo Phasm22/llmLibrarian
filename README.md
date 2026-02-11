@@ -38,6 +38,8 @@ llmli ls
 | `pal pull` | Update changed files across all registered folders. |
 | `pal pull <path>` | Pull one folder into memory and register it in ~/.pal. |
 | `pal pull <path> --watch` | Keep one folder in sync while you work. |
+| `pal pull <path> --prompt "..."` | Set a per-silo system prompt override in the llmli silo registry. |
+| `pal pull <path> --clear-prompt` | Clear that per-silo prompt override. |
 | `pal ask ["question"]` | Ask across all silos; use `--in <silo>` to scope. |
 | `pal ls` | List silos (path, files, chunks). |
 | `pal inspect <silo>` | Per-silo details and per-file chunk counts. |
@@ -59,6 +61,18 @@ llmli ls
 | `index --archetype <id>` | Rebuild archetype from archetypes.yaml. |
 | `rm <silo>` | Remove silo and its chunks. |
 | `log [--last]` | Add failures. |
+| `eval-adversarial [--out <json>] [--limit N]` | Run synthetic adversarial trustfulness eval with machine-readable report. |
+
+---
+
+## Prompt precedence for `pal ask --in <silo>`
+
+For silo-scoped unified asks, prompt resolution order is:
+1. Per-silo override from `pal pull <path> --prompt ...`
+2. Archetype prompt from `archetypes.yaml` (exact slug, then base slug without hash suffix, then normalized display name)
+3. Built-in default prompt
+
+Use `pal pull <path> --clear-prompt` to revert to archetype/default behavior.
 
 ---
 
@@ -89,6 +103,9 @@ Legacy compatibility: `pal watch-self` is available but hidden from default help
 
 - `uv run pytest -q`
 - `python -m pytest -q`
+
+Adversarial trust eval:
+- `uv run llmli eval-adversarial --out ./adversarial_eval_report.json`
 
 ---
 
