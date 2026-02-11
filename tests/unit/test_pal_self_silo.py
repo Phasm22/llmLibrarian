@@ -1,4 +1,3 @@
-from types import SimpleNamespace
 from pathlib import Path
 
 import pal
@@ -114,6 +113,7 @@ def test_ensure_self_silo_warns_when_stale(monkeypatch, capsys):
 
 
 def test_capabilities_calls_ensure_self_once_and_no_llm(monkeypatch):
+    from typer.testing import CliRunner
     calls = {"ensure": 0, "llmli": []}
 
     def _fake_ensure(force=False):
@@ -126,7 +126,8 @@ def test_capabilities_calls_ensure_self_once_and_no_llm(monkeypatch):
 
     monkeypatch.setattr("pal.ensure_self_silo", _fake_ensure)
     monkeypatch.setattr("pal._run_llmli", _fake_run_llmli)
-    rc = pal.cmd_capabilities(SimpleNamespace())
-    assert rc == 0
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["capabilities"])
+    assert res.exit_code == 0
     assert calls["ensure"] == 1
     assert calls["llmli"] == [["capabilities"]]

@@ -3,7 +3,6 @@
 pal — Agent CLI that orchestrates tools (e.g. llmli). Control-plane: route, registry.
 Not a replacement for llmli; pal add/ask/ls/log delegate to llmli. Use pal tool llmli ... for passthrough.
 """
-import argparse
 import hashlib
 import json
 import os
@@ -13,7 +12,6 @@ import sys
 import time
 import threading
 from pathlib import Path
-from types import SimpleNamespace
 
 import typer
 
@@ -140,11 +138,8 @@ def _run_llmli(args: list[str]) -> int:
     """Run llmli as subprocess; return exit code."""
     root = Path(__file__).resolve().parent
     env = os.environ.copy()
-    venv_llmli = root / ".venv" / "bin" / "llmli"
-    if venv_llmli.exists():
-        cmd = [str(venv_llmli)] + args
-    else:
-        cmd = [sys.executable, str(root / "cli.py")] + args
+    # Always invoke local source to avoid drift between cli.py and installed entrypoints.
+    cmd = [sys.executable, str(root / "cli.py")] + args
     r = subprocess.run(cmd, env=env)
     return r.returncode
 
@@ -804,78 +799,6 @@ def _pull_watch_path_mode(
     return _run_watcher(watcher, db_path, slug)
 
 
-def cmd_add(args: argparse.Namespace) -> int:
-    """Compatibility alias: delegate to pull path mode."""
-    return _pull_path_mode(
-        getattr(args, "path", ""),
-        allow_cloud=getattr(args, "allow_cloud", False),
-    )
-
-
-def cmd_ask(args: argparse.Namespace) -> int:
-    """Delegate to llmli ask (unified by default). --in <silo> for scoped ask; --strict for conservative answers."""
-    ensure_self_silo(force=False)
-    llmli_args = ["ask"]
-    if getattr(args, "unified", False):
-        llmli_args.append("--unified")
-    if getattr(args, "in_silo", None) and not getattr(args, "unified", False):
-        llmli_args.extend(["--in", args.in_silo])
-    if getattr(args, "strict", False):
-        llmli_args.append("--strict")
-    llmli_args.extend(args.query)
-    return _run_llmli(llmli_args)
-
-
-def cmd_ls(args: argparse.Namespace) -> int:
-    """Aggregate view: delegate to llmli ls."""
-    return _run_llmli(["ls"])
-
-
-def cmd_log(args: argparse.Namespace) -> int:
-    """Unified log view: delegate to llmli log --last."""
-    return _run_llmli(["log", "--last"])
-
-
-def cmd_capabilities(args: argparse.Namespace) -> int:
-    """Delegate to llmli capabilities (supported file types and extractors)."""
-    ensure_self_silo(force=False)
-    return _run_llmli(["capabilities"])
-
-
-def cmd_ensure_self(args: argparse.Namespace) -> int:
-    """Ensure dev-mode self-silo exists; warn if stale."""
-    return ensure_self_silo(force=True)
-
-
-def cmd_inspect(args: argparse.Namespace) -> int:
-    """Show silo details and top files by chunk count (llmli inspect)."""
-    silo = getattr(args, "silo", None)
-    if not silo:
-        print("Error: inspect requires silo name. Example: pal inspect stuff", file=sys.stderr)
-        return 1
-    llmli_args = ["inspect", silo]
-    top = getattr(args, "top", None)
-    if top is not None:
-        llmli_args.extend(["--top", str(top)])
-    filt = getattr(args, "filter", None)
-    if filt:
-        llmli_args.extend(["--filter", filt])
-    return _run_llmli(llmli_args)
-
-
-def cmd_remove(args: argparse.Namespace) -> int:
-    """Remove a silo (friendly alias for llmli remove)."""
-    silo = getattr(args, "silo", None)
-    if not silo:
-        print("Error: remove requires silo name. Example: pal remove \"Tax\"", file=sys.stderr)
-        return 1
-    if isinstance(silo, list):
-        name = " ".join(silo)
-    else:
-        name = str(silo)
-    return _run_llmli(["remove", name])
-
-
 def _pull_status_line(current: int, total: int, name: str, detail: str = "") -> None:
     """Overwrite a single terminal line with pull progress."""
     is_tty = sys.stderr.isatty()
@@ -885,29 +808,17 @@ def _pull_status_line(current: int, total: int, name: str, detail: str = "") -> 
     suffix = f"  {detail}" if detail else ""
     line = f"\r  [{bar}] {current}/{total}  {name}{suffix}"
     if is_tty:
-        # Clear line then write
         sys.stderr.write(f"\033[2K{line}")
         sys.stderr.flush()
     else:
-        # Non-TTY: just print each update
         print(line.strip())
 
 
 def _build_pull_env(status_file_path: str) -> dict[str, str]:
     """Minimize env passthrough for pull subprocesses while keeping runtime essentials."""
     allow_exact = {
-        "PATH",
-        "HOME",
-        "SHELL",
-        "TERM",
-        "LANG",
-        "LC_ALL",
-        "TMPDIR",
-        "VIRTUAL_ENV",
-        "OLLAMA_HOST",
-        "NO_PROXY",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
+        "PATH", "HOME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
+        "VIRTUAL_ENV", "OLLAMA_HOST", "NO_PROXY", "HTTP_PROXY", "HTTPS_PROXY",
     }
     out: dict[str, str] = {}
     for k, v in os.environ.items():
@@ -918,28 +829,12 @@ def _build_pull_env(status_file_path: str) -> dict[str, str]:
     return out
 
 
-def cmd_pull(args: argparse.Namespace) -> int:
-    """Pull content into pal memory (all registered silos or one folder)."""
-    path = getattr(args, "path", None)
-    watch = bool(getattr(args, "watch", False))
-    if watch and not path:
-        print("--watch requires PATH. Use: pal pull <path> --watch", file=sys.stderr)
-        return 2
-    if watch and path:
-        return _pull_watch_path_mode(
-            path,
-            interval=float(getattr(args, "interval", 10) or 10),
-            debounce=float(getattr(args, "debounce", 1) or 1),
-            allow_cloud=bool(getattr(args, "allow_cloud", False)),
-            follow_symlinks=bool(getattr(args, "follow_symlinks", False)),
-        )
-    if path:
-        return _pull_path_mode(
-            path,
-            allow_cloud=bool(getattr(args, "allow_cloud", False)),
-            follow_symlinks=bool(getattr(args, "follow_symlinks", False)),
-            full=bool(getattr(args, "full", False)),
-        )
+def pull_all_sources(
+    full: bool = False,
+    allow_cloud: bool = False,
+    follow_symlinks: bool = False,
+) -> int:
+    """Pull all registered sources. Returns exit code."""
     reg = _read_registry()
     sources = reg.get("sources", [])
     if not sources:
@@ -959,11 +854,11 @@ def cmd_pull(args: argparse.Namespace) -> int:
         _pull_status_line(idx, total, name)
 
         llmli_args = ["add"]
-        if getattr(args, "full", False):
+        if full:
             llmli_args.append("--full")
-        if getattr(args, "allow_cloud", False):
+        if allow_cloud:
             llmli_args.append("--allow-cloud")
-        if getattr(args, "follow_symlinks", False):
+        if follow_symlinks:
             llmli_args.append("--follow-symlinks")
         llmli_args.append(path)
 
@@ -972,11 +867,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
         status_file.close()
         env = _build_pull_env(status_file_path)
         root = Path(__file__).resolve().parent
-        venv_llmli = root / ".venv" / "bin" / "llmli"
-        if venv_llmli.exists():
-            cmd = [str(venv_llmli)] + llmli_args
-        else:
-            cmd = [sys.executable, str(root / "cli.py")] + llmli_args
+        cmd = [sys.executable, str(root / "cli.py")] + llmli_args
         r = subprocess.run(cmd, env=env, capture_output=True, text=True)
         code = r.returncode
 
@@ -1000,12 +891,10 @@ def cmd_pull(args: argparse.Namespace) -> int:
             updated_silos.append(f"{name} ({files_indexed} files)")
             _pull_status_line(idx, total, name, f"+{files_indexed} files")
 
-    # Clear progress line
     if is_tty:
         sys.stderr.write("\033[2K\r")
         sys.stderr.flush()
 
-    # Summary
     if updated_silos:
         print(f"Updated: {', '.join(updated_silos)}")
     if failed_silos:
@@ -1015,73 +904,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     return 0 if fail_count == 0 else 1
 
 
-def cmd_watch_self(args: argparse.Namespace) -> int:
-    """Hidden compatibility command: watch dev self-silo (__self__)."""
-    if Observer is None:
-        print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
-        return 1
-    if not is_dev_repo():
-        print("Error: --watch is only supported in the llmLibrarian repo.", file=sys.stderr)
-        return 1
-    rc = ensure_self_silo(force=True)
-    if rc != 0:
-        return rc
-    repo_root = _get_git_root()
-    if repo_root is None:
-        print("Error: unable to detect git root for watch.", file=sys.stderr)
-        return 1
-    interval = float(getattr(args, "interval", 10) or 10)
-    debounce = float(getattr(args, "debounce", 1) or 1)
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
-    watcher = SiloWatcher(
-        repo_root,
-        db_path,
-        interval=interval,
-        debounce=debounce,
-        silo_slug="__self__",
-        allow_cloud=True,
-        label="self",
-        startup_message="Watching self folder: . (Tip: pal pull <path> --watch watches a folder)",
-    )
-    return _run_watcher(watcher, db_path, "__self__")
-
-
-def cmd_pull_watch(args: argparse.Namespace) -> int:
-    """Legacy wrapper kept for compatibility with older call paths."""
-    return cmd_watch_self(args)
-
-
-def cmd_silos(args: argparse.Namespace) -> int:
-    """Report silo health (duplicates, overlaps, mismatches)."""
-    root = Path(__file__).resolve().parent
-    src = root / "src"
-    if str(src) not in sys.path:
-        sys.path.insert(0, str(src))
-    from silo_audit import load_registry, load_file_registry, load_manifest, find_duplicate_hashes, find_path_overlaps, find_count_mismatches, format_report
-
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
-    registry = load_registry(db_path)
-    file_registry = load_file_registry(db_path)
-    manifest = load_manifest(db_path)
-    dupes = find_duplicate_hashes(file_registry)
-    overlaps = find_path_overlaps(registry)
-    mismatches = find_count_mismatches(registry, manifest)
-    report = format_report(registry, dupes, overlaps, mismatches)
-    print(report)
-    return 0
-
-
-def cmd_tool(args: argparse.Namespace) -> int:
-    """Passthrough: pal tool <name> <args...> -> run underlying tool."""
-    name = getattr(args, "tool_name", None)
-    rest = list(getattr(args, "tool_args", []) or [])
-    while rest and rest[0] == "--":
-        rest.pop(0)
-    if name == "llmli":
-        return _run_llmli(rest)
-    print(f"Error: unknown tool '{name}'. Use: pal tool llmli <args...>", file=sys.stderr)
-    return 1
-
+# --- Typer CLI ---
 
 app = typer.Typer(
     name="pal",
@@ -1091,7 +914,7 @@ app = typer.Typer(
 )
 
 
-def _exit_on_error(rc: int) -> None:
+def _exit(rc: int) -> None:
     if rc != 0:
         raise typer.Exit(code=rc)
 
@@ -1102,29 +925,20 @@ def pull_command(
     watch: bool = typer.Option(False, "--watch", help="Stay running and sync changes live."),
     full: bool = typer.Option(False, "--full", help="Full rebuild (delete + re-add)."),
     allow_cloud: bool = typer.Option(False, "--allow-cloud", help="Allow cloud-synced folders."),
-    interval: float = typer.Option(10.0, "--interval", help="Reconcile interval in seconds (watch mode).", hidden=True),
-    debounce: float = typer.Option(1.0, "--debounce", help="Debounce delay in seconds (watch mode).", hidden=True),
+    interval: float = typer.Option(10.0, "--interval", help="Reconcile interval (watch mode).", hidden=True),
+    debounce: float = typer.Option(1.0, "--debounce", help="Debounce delay (watch mode).", hidden=True),
     follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks.", hidden=True),
 ) -> None:
-    args = SimpleNamespace(
-        path=path,
-        watch=watch,
-        full=full,
-        allow_cloud=allow_cloud,
-        interval=interval,
-        debounce=debounce,
-        follow_symlinks=follow_symlinks,
-    )
-    _exit_on_error(cmd_pull(args))
-
-
-@app.command("add", hidden=True)
-def add_alias(
-    path: str = typer.Argument(..., metavar="PATH"),
-    allow_cloud: bool = typer.Option(False, "--allow-cloud"),
-) -> None:
-    args = SimpleNamespace(path=path, allow_cloud=allow_cloud)
-    _exit_on_error(cmd_add(args))
+    if watch and not path:
+        print("--watch requires PATH. Use: pal pull <path> --watch", file=sys.stderr)
+        raise typer.Exit(code=2)
+    if watch and path:
+        _exit(_pull_watch_path_mode(path, interval, debounce, allow_cloud, follow_symlinks))
+        return
+    if path:
+        _exit(_pull_path_mode(path, allow_cloud=allow_cloud, follow_symlinks=follow_symlinks, full=full))
+        return
+    _exit(pull_all_sources(full=full, allow_cloud=allow_cloud, follow_symlinks=follow_symlinks))
 
 
 @app.command("ask", help="Ask a question across your indexed data.")
@@ -1133,14 +947,25 @@ def ask_command(
     in_silo: str | None = typer.Option(None, "--in", help="Query only this silo."),
     unified: bool = typer.Option(False, "--unified", help="Combine results from all silos."),
     strict: bool = typer.Option(False, "--strict", help="Only answer when evidence is strong; say unknown otherwise."),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Answer only (quiet output for scripts)."),
 ) -> None:
-    args = SimpleNamespace(query=query, in_silo=in_silo, unified=unified, strict=strict)
-    _exit_on_error(cmd_ask(args))
+    ensure_self_silo(force=False)
+    llmli_args = ["ask"]
+    if unified:
+        llmli_args.append("--unified")
+    if in_silo and not unified:
+        llmli_args.extend(["--in", in_silo])
+    if strict:
+        llmli_args.append("--strict")
+    if quiet:
+        llmli_args.append("--quiet")
+    llmli_args.extend(query)
+    _exit(_run_llmli(llmli_args))
 
 
 @app.command("ls", help="List indexed silos.")
 def ls_command() -> None:
-    _exit_on_error(cmd_ls(SimpleNamespace()))
+    _exit(_run_llmli(["ls"]))
 
 
 @app.command("inspect", help="Show details for a silo.")
@@ -1149,60 +974,155 @@ def inspect_command(
     top: int | None = typer.Option(None, "--top", help="Show top N files by chunks."),
     filter: str | None = typer.Option(None, "--filter", help="Show only pdf, docx, or code."),
 ) -> None:
-    args = SimpleNamespace(silo=silo, top=top, filter=filter)
-    _exit_on_error(cmd_inspect(args))
+    llmli_args = ["inspect", silo]
+    if top is not None:
+        llmli_args.extend(["--top", str(top)])
+    if filter:
+        llmli_args.extend(["--filter", filter])
+    _exit(_run_llmli(llmli_args))
 
 
 @app.command("capabilities", help="Supported file types.")
 def capabilities_command() -> None:
-    _exit_on_error(cmd_capabilities(SimpleNamespace()))
+    ensure_self_silo(force=False)
+    _exit(_run_llmli(["capabilities"]))
 
 
 @app.command("log", help="Show recent failures.")
 def log_command() -> None:
-    _exit_on_error(cmd_log(SimpleNamespace()))
+    _exit(_run_llmli(["log", "--last"]))
 
 
 @app.command("remove", help="Remove a silo.")
 def remove_command(
     silo: list[str] = typer.Argument(..., help="Silo slug, display name, or path."),
 ) -> None:
-    args = SimpleNamespace(silo=silo)
-    _exit_on_error(cmd_remove(args))
+    name = " ".join(silo) if isinstance(silo, list) else str(silo)
+    _exit(_run_llmli(["remove", name]))
 
 
 @app.command("sync", help="Re-index the project's own source (dev mode).")
 def sync_command() -> None:
-    _exit_on_error(cmd_ensure_self(SimpleNamespace()))
+    _exit(ensure_self_silo(force=True))
 
 
-@app.command("ensure-self", hidden=True)
-def ensure_self_command() -> None:
-    """Legacy alias for sync."""
-    _exit_on_error(cmd_ensure_self(SimpleNamespace()))
+@app.command("diff", help="Show files changed since last pull.")
+def diff_command(
+    silo: str = typer.Argument(..., help="Silo slug or display name."),
+) -> None:
+    _ensure_src_on_path()
+    from state import resolve_silo_to_slug, resolve_silo_prefix, list_silos
+    from file_registry import _read_file_manifest
+    from ingest import _load_limits_config, collect_files, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE
+
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    slug = resolve_silo_to_slug(db_path, silo) or resolve_silo_prefix(db_path, silo)
+    if not slug:
+        print(f"Error: silo not found: {silo}", file=sys.stderr)
+        raise typer.Exit(code=1)
+
+    silos = list_silos(db_path)
+    info = next((s for s in silos if s.get("slug") == slug), None)
+    root_path = (info or {}).get("path")
+    if not root_path:
+        print(f"Error: silo has no path: {slug}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    root = Path(root_path).resolve()
+    if not root.exists() or not root.is_dir():
+        print(f"Error: silo path missing: {root}", file=sys.stderr)
+        raise typer.Exit(code=1)
+
+    manifest = _read_file_manifest(db_path)
+    manifest_files = (((manifest.get("silos") or {}).get(slug) or {}).get("files") or {})
+    if not isinstance(manifest_files, dict):
+        manifest_files = {}
+
+    changed: list[str] = []
+    removed: list[str] = []
+    for path_str, meta in manifest_files.items():
+        p = Path(path_str)
+        if not p.exists():
+            removed.append(path_str)
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            removed.append(path_str)
+            continue
+        if st.st_mtime != meta.get("mtime") or st.st_size != meta.get("size"):
+            changed.append(path_str)
+
+    max_file_bytes, max_depth, _max_archive_bytes, _max_files_per_zip, _max_extracted = _load_limits_config()
+    current_entries = collect_files(
+        root,
+        ADD_DEFAULT_INCLUDE,
+        ADD_DEFAULT_EXCLUDE,
+        max_depth,
+        max_file_bytes,
+        follow_symlinks=False,
+    )
+    current_set = {str(p.resolve()) for p, _kind in current_entries}
+    manifest_set = set(manifest_files.keys())
+    added = sorted(current_set - manifest_set)
+    changed = sorted(changed)
+    removed = sorted(removed)
+
+    if not changed and not added and not removed:
+        print("No changes.")
+        return
+
+    print(f"{slug}: +{len(added)} added, ~{len(changed)} changed, -{len(removed)} removed")
+    for f in added:
+        print(f"  A {f}")
+    for f in changed:
+        print(f"  M {f}")
+    for f in removed:
+        print(f"  D {f}")
+
+
+@app.command("status", help="Quick health check.")
+def status_command() -> None:
+    _ensure_src_on_path()
+    from silo_audit import load_registry, load_manifest, find_count_mismatches
+
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    registry = load_registry(db_path)
+    manifest = load_manifest(db_path)
+    mismatches = find_count_mismatches(registry, manifest)
+    total_silos = len(registry)
+    total_chunks = sum(int(s.get("chunks_count", 0) or 0) for s in registry)
+    stale = len(mismatches)
+    if stale:
+        print(f"{total_silos} silos, {total_chunks} chunks, {stale} stale")
+    else:
+        print(f"{total_silos} silos, {total_chunks} chunks, all current")
 
 
 @app.command("silos", help="Audit silo health.")
 def silos_command() -> None:
-    _exit_on_error(cmd_silos(SimpleNamespace()))
+    _ensure_src_on_path()
+    from silo_audit import load_registry, load_file_registry, load_manifest, find_duplicate_hashes, find_path_overlaps, find_count_mismatches, format_report
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    registry = load_registry(db_path)
+    file_registry = load_file_registry(db_path)
+    manifest = load_manifest(db_path)
+    dupes = find_duplicate_hashes(file_registry)
+    overlaps = find_path_overlaps(registry)
+    mismatches = find_count_mismatches(registry, manifest)
+    print(format_report(registry, dupes, overlaps, mismatches))
 
 
 @app.command("tool", help="Pass-through to llmli.")
 def tool_command(
-    tool_name: str = typer.Argument(..., help="Tool name (for example: llmli)."),
-    tool_args: list[str] = typer.Argument([], help="Arguments for the tool."),
+    tool_name: str = typer.Argument(..., help="Tool name (e.g. llmli)."),
+    tool_args: list[str] | None = typer.Argument(None, help="Arguments for the tool."),
 ) -> None:
-    args = SimpleNamespace(tool_name=tool_name, tool_args=tool_args)
-    _exit_on_error(cmd_tool(args))
-
-
-@app.command("watch-self", hidden=True)
-def watch_self_command(
-    interval: float = typer.Option(10.0, "--interval"),
-    debounce: float = typer.Option(1.0, "--debounce"),
-) -> None:
-    args = SimpleNamespace(interval=interval, debounce=debounce)
-    _exit_on_error(cmd_watch_self(args))
+    rest = [a for a in (tool_args or []) if a != "--"]
+    if tool_name == "llmli":
+        _exit(_run_llmli(rest))
+        return
+    print(f"Error: unknown tool '{tool_name}'. Use: pal tool llmli <args...>", file=sys.stderr)
+    raise typer.Exit(code=1)
 
 
 def main() -> int:

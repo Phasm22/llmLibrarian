@@ -50,7 +50,8 @@ def _truncate_mid(text: str, max_len: int) -> str:
 
 def cmd_add(args: argparse.Namespace) -> int:
     """Index a folder into the unified llmli collection; silo name = basename(path)."""
-    from indexer import run_add, DB_PATH
+    from ingest import run_add
+    from constants import DB_PATH
     from ingest import CloudSyncPathError
     path = Path(args.path).resolve()
     db = args.db or DB_PATH
@@ -78,7 +79,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     """Query an archetype's collection or unified llmli collection (default) via Ollama."""
-    from query import run_ask
+    from query.core import run_ask
     from state import resolve_silo_to_slug, resolve_silo_prefix
     config = _config_path(args)
     archetype = getattr(args, "archetype", None)
@@ -105,10 +106,11 @@ def cmd_ask(args: argparse.Namespace) -> int:
         config_path=config,
         n_results=getattr(args, "n_results", 12),
         model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.1:8b"),
-        no_color=args.no_color,
+        no_color=args.no_color or getattr(args, "quiet", False),
         silo=silo_slug,
         db_path=_db_path(args),
         strict=getattr(args, "strict", False),
+        quiet=getattr(args, "quiet", False),
     )
     print(out)
     return 0
@@ -147,7 +149,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
 
 def cmd_index(args: argparse.Namespace) -> int:
     """Rebuild an archetype's collection from config folders."""
-    from indexer import run_index
+    from ingest import run_index
     arch = getattr(args, "archetype", None)
     if not arch:
         print("Error: index requires --archetype <id>", file=sys.stderr)
@@ -179,7 +181,7 @@ def cmd_rm(args: argparse.Namespace) -> int:
         print("Error: remove requires silo name. Example: llmli remove \"Tax\"", file=sys.stderr)
         return 1
     from state import remove_silo, slugify, resolve_silo_by_path, resolve_silo_prefix, remove_manifest_silo
-    from indexer import LLMLI_COLLECTION, DB_PATH
+    from constants import DB_PATH, LLMLI_COLLECTION
     from ingest import _file_registry_remove_silo
     import chromadb
     from chromadb.config import Settings
@@ -228,7 +230,7 @@ def cmd_log(args: argparse.Namespace) -> int:
 def cmd_inspect(args: argparse.Namespace) -> int:
     """Show silo details: path, total chunks, and per-file chunk counts (from indexed data)."""
     from state import list_silos, resolve_silo_to_slug
-    from indexer import LLMLI_COLLECTION
+    from constants import LLMLI_COLLECTION
     import chromadb
     from chromadb.config import Settings
     db = _db_path(args)
@@ -323,6 +325,7 @@ def main() -> int:
     p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to one silo (slug or display name)")
     p_ask.add_argument("--unified", action="store_true", help="Search across all silos (compare/analyze across indexed content)")
     p_ask.add_argument("--strict", action="store_true", help="Never conclude absence from partial evidence; say unknown + sources when unsure")
+    p_ask.add_argument("--quiet", "-q", action="store_true", help="Answer only (no source footer); useful for scripting")
     p_ask.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.1:8b)")
     p_ask.add_argument("--n-results", type=int, default=12, help="Retrieval count")
     p_ask.add_argument("query", nargs="+", help="Question")
@@ -351,10 +354,6 @@ def main() -> int:
     p_rm = sub.add_parser("rm", help="Remove silo (registry + chunks)")
     p_rm.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
     p_rm.set_defaults(_run=cmd_rm)
-
-    p_remove = sub.add_parser("remove", help="Remove silo (friendlier alias of rm)")
-    p_remove.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
-    p_remove.set_defaults(_run=cmd_rm)
 
     # capabilities
     p_capabilities = sub.add_parser("capabilities", help="Supported file types and document extractors (source of truth)")

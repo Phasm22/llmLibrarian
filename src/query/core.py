@@ -42,6 +42,7 @@ from query.retrieval import (
     PROFILE_LEXICAL_PHRASES,
     MAX_LEXICAL_FOR_RRF,
     relevance_max_distance,
+    max_chunks_for_intent,
     all_dists_above_threshold,
     rrf_merge,
     filter_by_triggers,
@@ -49,6 +50,7 @@ from query.retrieval import (
     dedup_by_chunk_hash,
     resolve_subscope,
 )
+from query.expansion import expand_query
 from query.context import (
     DOC_TYPE_BONUS,
     RECENCY_WEIGHT,
@@ -82,6 +84,32 @@ except ImportError:
     get_paths_by_silo = None  # type: ignore[misc, assignment]
 
 
+def _confidence_signal(dists: list[float | None], metas: list[dict | None], intent: str) -> str | None:
+    """Emit a lightweight confidence warning when retrieval quality is weak."""
+    non_none = [float(d) for d in dists if d is not None]
+    if not non_none:
+        return None
+    avg_distance = sum(non_none) / len(non_none)
+    if avg_distance > 0.7:
+        return "Low confidence: query is weakly related to indexed content."
+    if intent == INTENT_FIELD_LOOKUP:
+        return None
+    unique_sources = len({((m or {}).get("source") or "") for m in metas if (m or {}).get("source")})
+    if unique_sources == 1:
+        return "Single source: answer is based on one document only."
+    return None
+
+
+def _quiet_text_only(text: str) -> str:
+    """Strip footer sections for quiet mode output."""
+    if not text:
+        return ""
+    marker = "\n\n---"
+    if marker in text:
+        return text.split(marker, 1)[0].strip()
+    return text.strip()
+
+
 def run_ask(
     archetype_id: str | None,
     query: str,
@@ -93,6 +121,7 @@ def run_ask(
     silo: str | None = None,
     db_path: str | Path | None = None,
     strict: bool = False,
+    quiet: bool = False,
 ) -> str:
     """Query archetype's collection, or unified llmli collection if archetype_id is None (optional silo filter)."""
     if use_reranker is None:
@@ -165,7 +194,7 @@ def run_ask(
         except Exception:
             cap_text = "Could not load capabilities."
         out_lines = [cap_text, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label} (capabilities)")]
-        return "\n".join(out_lines)
+        return cap_text if quiet else "\n".join(out_lines)
 
     n_effective = effective_k(intent, n_results)
     if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE):
@@ -176,6 +205,9 @@ def run_ask(
         n_stage1 = RERANK_STAGE1_N if use_reranker else min(100, max(n_results * 5, 60))
 
     hybrid_used = False
+    query_for_retrieval = query
+    if intent not in (INTENT_FIELD_LOOKUP, INTENT_CAPABILITIES, INTENT_CODE_LANGUAGE):
+        query_for_retrieval = expand_query(query)
 
     # Intent-specific prompt suffixes (silent)
     if intent == INTENT_EVIDENCE_PROFILE:
@@ -266,7 +298,8 @@ def run_ask(
                 requested_form=guardrail.get("requested_form"),
                 requested_line=guardrail.get("requested_line"),
             )
-            return str(guardrail["response"])
+            response_text = str(guardrail["response"])
+            return _quiet_text_only(response_text) if quiet else response_text
 
     # Trust-first deterministic income plan for broad income-in-year queries.
     if intent == INTENT_MONEY_YEAR_TOTAL:
@@ -299,7 +332,8 @@ def run_ask(
                 requested_form=guardrail.get("requested_form"),
                 requested_line=guardrail.get("requested_line"),
             )
-            return str(guardrail["response"])
+            response_text = str(guardrail["response"])
+            return _quiet_text_only(response_text) if quiet else response_text
 
     # Deterministic project count (no LLM).
     if intent == INTENT_PROJECT_COUNT:
@@ -329,7 +363,7 @@ def run_ask(
 
     include_ids = intent == INTENT_EVIDENCE_PROFILE and use_unified and (silo or subscope_where)
     query_kw: dict = {
-        "query_texts": [query],
+        "query_texts": [query_for_retrieval],
         "n_results": n_stage1,
         "include": ["documents", "metadatas", "distances"],
     }
@@ -361,9 +395,11 @@ def run_ask(
                 )
                 hybrid_used = True
             else:
-                print("[llmli] hybrid skipped: lexical get returned no chunks (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
+                if not quiet:
+                    print("[llmli] hybrid skipped: lexical get returned no chunks (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
         except Exception as e:
-            print(f"[llmli] hybrid skipped: lexical get failed: {e} (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
+            if not quiet:
+                print(f"[llmli] hybrid skipped: lexical get failed: {e} (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
     # EVIDENCE_PROFILE fallback: in-app reorder by trigger regex (no hybrid)
     if intent == INTENT_EVIDENCE_PROFILE and docs and not hybrid_used:
         docs, metas, dists = filter_by_triggers(docs, metas, dists)
@@ -412,12 +448,13 @@ def run_ask(
 
     # Diversify by source: cap chunks per file so one huge file (e.g. Closed Traffic.txt) doesn't crowd out others
     source_cache = [((m or {}).get("source") or "") for m in metas]
+    per_intent_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
     docs, metas, dists = diversify_by_source(
         docs,
         metas,
         dists,
         n_results,
-        max_per_source=MAX_CHUNKS_PER_FILE,
+        max_per_source=per_intent_cap,
         sources=source_cache,
     )
     docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
@@ -449,6 +486,8 @@ def run_ask(
     # Relevance gate: if no chunk passes the bar, skip LLM (avoid confidently wrong answers)
     threshold = relevance_max_distance()
     if all_dists_above_threshold(dists, threshold):
+        if quiet:
+            return "I don't have relevant content for that. Try rephrasing or adding more specific documents (llmli add)."
         return (
             "I don't have relevant content for that. Try rephrasing or adding more specific documents (llmli add).\n\n"
             + dim(no_color, "---") + "\n"
@@ -466,6 +505,8 @@ def run_ask(
         elif query_implies_measurement_intent(query):
             # Short-circuit: user asked for measured timings but we have none.
             x_label = subscope_tokens[0] if subscope_tokens else "this tool"
+            if quiet:
+                return f"I can't find performance traces for {x_label} in this corpus."
             return (
                 f"I can't find performance traces for {x_label} in this corpus.\n\n"
                 + dim(no_color, "---") + "\n"
@@ -511,15 +552,23 @@ def run_ask(
     answer = (response.get("message") or {}).get("content") or ""
     answer = style_answer(answer.strip(), no_color)
     answer = linkify_sources_in_answer(answer, metas, no_color)
+    confidence_warning = _confidence_signal(dists, metas, intent)
+
+    if quiet:
+        return answer
 
     out = [
         answer,
+    ]
+    if confidence_warning:
+        out = [confidence_warning, "", answer]
+    out.extend([
         "",
         dim(no_color, "---"),
         label_style(no_color, f"Answered by: {source_label}"),
         "",
         bold(no_color, "Sources:"),
-    ]
+    ])
     for i, doc in enumerate(docs):
         meta = metas[i] if i < len(metas) else None
         dist = dists[i] if i < len(dists) else None

@@ -89,6 +89,55 @@ archetypes:
       - "venv/"
       - "__pycache__/"
 
+  legal:
+    name: Legal Assistant
+    prompt: |
+      You are a legal document assistant for contracts, agreements, and filings.
+      Answer factual questions using only indexed documents.
+      Cite section numbers or clause labels when available.
+      Do not provide legal advice; for interpretation, say "consult an attorney".
+    include:
+      - "*.pdf"
+      - "*.docx"
+    exclude:
+      - "*draft*"
+      - "*template*"
+
+  health:
+    name: Health Records Assistant
+    prompt: |
+      You are a health records assistant for lab results, visit summaries, and prescriptions.
+      Use only indexed documents as evidence.
+      Do not diagnose or recommend treatment.
+      Include dates and values when present in source records.
+    include:
+      - "*.pdf"
+      - "*.docx"
+      - "*.txt"
+    exclude: []
+
+  codebase:
+    name: Codebase Context Engine
+    prompt: |
+      You are a code context engine. Answer using only indexed source files and docs.
+      Prefer README and architecture docs for high-level questions.
+      Include file paths and line numbers when possible.
+    include:
+      - "*.py"
+      - "*.ts"
+      - "*.tsx"
+      - "*.js"
+      - "*.go"
+      - "*.rs"
+      - "*.md"
+      - "*.yml"
+      - "*.yaml"
+    exclude:
+      - "node_modules/"
+      - ".git/"
+      - "__pycache__/"
+      - "*.min.js"
+
   # Prompt-only examples (no folders/collection): when you add a folder and the silo slug
   # matches the id, ask --in <silo> uses this prompt. Add more as you add silos.
   # stuff:

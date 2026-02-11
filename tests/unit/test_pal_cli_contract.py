@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from typer.testing import CliRunner
 
 import pal
@@ -8,33 +6,11 @@ import pal
 runner = CliRunner()
 
 
-def test_pal_watch_self_legacy_hidden_command(monkeypatch):
-    res_help = runner.invoke(pal.app, ["--help"])
-    assert res_help.exit_code == 0
-    assert "watch-self" not in res_help.stdout
-    assert " add " not in f" {res_help.stdout} "
-
-    monkeypatch.setattr("pal.Observer", object())
-    monkeypatch.setattr("pal.is_dev_repo", lambda: True)
-    monkeypatch.setattr("pal.ensure_self_silo", lambda force=True: 0)
-    monkeypatch.setattr("pal._get_git_root", lambda: Path("/tmp/repo"))
-
-    class _DummyWatcher:
-        def __init__(self, *args, **kwargs):
-            self.startup_message = kwargs.get("startup_message")
-
-        def run(self):
-            print(self.startup_message)
-
-    def _fake_run_watcher(watcher, _db_path, _slug):
-        watcher.run()
-        return 0
-
-    monkeypatch.setattr("pal.SiloWatcher", _DummyWatcher)
-    monkeypatch.setattr("pal._run_watcher", _fake_run_watcher)
-    res = runner.invoke(pal.app, ["watch-self"])
+def test_pal_help_shows_expected_commands():
+    res = runner.invoke(pal.app, ["--help"])
     assert res.exit_code == 0
-    assert "Watching self folder: . (Tip: pal pull <path> --watch watches a folder)" in res.stdout
+    for cmd in ("pull", "ask", "ls", "inspect", "remove", "sync", "silos", "tool"):
+        assert cmd in res.stdout
 
 
 def test_pal_no_argv_preprocessing_shortcuts(monkeypatch):

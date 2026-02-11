@@ -3,6 +3,7 @@ from query.retrieval import (
     all_dists_above_threshold,
     dedup_by_chunk_hash,
     diversify_by_source,
+    max_chunks_for_intent,
     extract_scope_tokens,
     resolve_subscope,
     rrf_merge,
@@ -45,6 +46,13 @@ def test_diversify_by_source_handles_empty_docs():
     assert docs == []
     assert metas == []
     assert dists == []
+
+
+def test_max_chunks_for_intent_uses_intent_specific_caps():
+    assert max_chunks_for_intent("LOOKUP", 4) == 3
+    assert max_chunks_for_intent("EVIDENCE_PROFILE", 4) == 2
+    assert max_chunks_for_intent("AGGREGATE", 4) == 6
+    assert max_chunks_for_intent("unknown", 4) == 4
 
 
 def test_dedup_by_chunk_hash_noop_when_env_disabled(monkeypatch):

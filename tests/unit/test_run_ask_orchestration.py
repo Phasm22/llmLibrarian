@@ -60,6 +60,22 @@ def test_run_ask_lookup_calls_ollama(monkeypatch, mock_collection, mock_ollama):
     assert "[START CONTEXT]" in messages[1]["content"]
 
 
+def test_run_ask_applies_query_expansion_for_lookup(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.expand_query", lambda q: f"{q} wages salary")
+    mock_collection.query_result = {
+        "documents": [["alpha context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "line_start": 3, "is_local": 1, "silo": "s1"}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+    run_ask(archetype_id=None, query="income details", no_color=True, use_reranker=False)
+    q_calls = [kwargs for name, kwargs in mock_collection.calls if name == "query"]
+    assert q_calls
+    assert q_calls[0]["query_texts"] == ["income details wages salary"]
+
+
 def test_run_ask_applies_silo_filter(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
@@ -94,6 +110,34 @@ def test_run_ask_relevance_gate_skips_llm(monkeypatch, mock_collection, mock_oll
     out = run_ask(archetype_id=None, query="needle", no_color=True, use_reranker=False)
     assert "I don't have relevant content for that." in out
     assert mock_ollama["calls"] == []
+
+
+def test_run_ask_quiet_omits_footer_and_sources(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["alpha context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "line_start": 3, "is_local": 1, "silo": "s1"}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = {"message": {"content": "final answer"}}
+    out = run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, quiet=True)
+    assert out == "final answer"
+    assert "Sources:" not in out
+
+
+def test_run_ask_adds_confidence_warning_when_single_source(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["alpha context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "line_start": 3, "is_local": 1, "silo": "s1"}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+    out = run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False)
+    assert "Single source: answer is based on one document only." in out
 
 
 def test_run_ask_strict_mode_adds_strict_instruction(monkeypatch, mock_collection, mock_ollama):

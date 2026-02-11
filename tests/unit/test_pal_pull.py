@@ -6,26 +6,6 @@ from types import SimpleNamespace
 import pal
 
 
-def _args(
-    full: bool = False,
-    allow_cloud: bool = False,
-    follow_symlinks: bool = False,
-    path: str | None = None,
-    watch: bool = False,
-    interval: float = 10,
-    debounce: float = 1,
-):
-    return SimpleNamespace(
-        full=full,
-        allow_cloud=allow_cloud,
-        follow_symlinks=follow_symlinks,
-        path=path,
-        watch=watch,
-        interval=interval,
-        debounce=debounce,
-    )
-
-
 def _mock_subprocess(monkeypatch, files_indexed_by_path=None, failures_by_path=None, seen_cmds=None):
     files_indexed_by_path = files_indexed_by_path or {}
     failures_by_path = failures_by_path or set()
@@ -43,56 +23,56 @@ def _mock_subprocess(monkeypatch, files_indexed_by_path=None, failures_by_path=N
     return seen_cmds
 
 
-def test_cmd_pull_errors_when_no_sources(monkeypatch, capsys):
+def test_pull_all_errors_when_no_sources(monkeypatch, capsys):
     monkeypatch.setattr("pal._read_registry", lambda: {"sources": []})
-    rc = pal.cmd_pull(_args())
+    rc = pal.pull_all_sources()
     assert rc == 1
     assert "No registered folders" in capsys.readouterr().err
 
 
-def test_cmd_pull_reports_all_up_to_date(monkeypatch, capsys):
+def test_pull_all_reports_all_up_to_date(monkeypatch, capsys):
     monkeypatch.setattr(
         "pal._read_registry",
         lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}, {"name": "Tax", "path": "/tmp/tax"}]},
     )
     _mock_subprocess(monkeypatch)
-    rc = pal.cmd_pull(_args())
+    rc = pal.pull_all_sources()
     out = capsys.readouterr().out
     assert rc == 0
     assert "All silos up to date." in out
 
 
-def test_cmd_pull_reports_updated_silos(monkeypatch, capsys):
+def test_pull_all_reports_updated_silos(monkeypatch, capsys):
     monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
     _mock_subprocess(monkeypatch, files_indexed_by_path={"/tmp/stuff": 4})
-    rc = pal.cmd_pull(_args())
+    rc = pal.pull_all_sources()
     out = capsys.readouterr().out
     assert rc == 0
     assert "Updated: Stuff (4 files)" in out
 
 
-def test_cmd_pull_reports_failures_and_nonzero_exit(monkeypatch, capsys):
+def test_pull_all_reports_failures_and_nonzero_exit(monkeypatch, capsys):
     monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
     _mock_subprocess(monkeypatch, failures_by_path={"/tmp/stuff"})
-    rc = pal.cmd_pull(_args())
+    rc = pal.pull_all_sources()
     captured = capsys.readouterr()
     assert rc == 1
     assert "Failed: Stuff" in captured.err
 
 
-def test_cmd_pull_non_tty_emits_progress_lines(monkeypatch, capsys):
+def test_pull_all_non_tty_emits_progress_lines(monkeypatch, capsys):
     monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
     monkeypatch.setattr("sys.stderr.isatty", lambda: False)
     _mock_subprocess(monkeypatch, files_indexed_by_path={"/tmp/stuff": 0})
-    pal.cmd_pull(_args())
+    pal.pull_all_sources()
     out = capsys.readouterr().out
     assert "1/1" in out
 
 
-def test_cmd_pull_passes_full_and_follow_flags(monkeypatch):
+def test_pull_all_passes_full_and_follow_flags(monkeypatch):
     monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
     seen_cmds = _mock_subprocess(monkeypatch, files_indexed_by_path={"/tmp/stuff": 1}, seen_cmds=[])
-    pal.cmd_pull(_args(full=True, allow_cloud=True, follow_symlinks=True))
+    pal.pull_all_sources(full=True, allow_cloud=True, follow_symlinks=True)
     assert seen_cmds
     cmd = seen_cmds[0]
     assert "add" in cmd
@@ -101,13 +81,14 @@ def test_cmd_pull_passes_full_and_follow_flags(monkeypatch):
     assert "--follow-symlinks" in cmd
 
 
-def test_cmd_pull_requires_path_for_watch(monkeypatch, capsys):
-    rc = pal.cmd_pull(_args(watch=True))
-    assert rc == 2
-    assert "--watch requires PATH" in capsys.readouterr().err
+def test_pull_command_requires_path_for_watch(capsys):
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "--watch"])
+    assert res.exit_code == 2
 
 
-def test_cmd_pull_watch_with_path_uses_path_watcher(monkeypatch):
+def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     watched = {}
     monkeypatch.setattr("pal._pull_path_mode", lambda *a, **k: 0)
     monkeypatch.setattr(
@@ -129,8 +110,10 @@ def test_cmd_pull_watch_with_path_uses_path_watcher(monkeypatch):
 
     monkeypatch.setattr("pal.SiloWatcher", _DummyWatcher)
     monkeypatch.setattr("pal._run_watcher", _fake_run_watcher)
-    rc = pal.cmd_pull(_args(path="/tmp/folder", watch=True, interval=12, debounce=2))
-    assert rc == 0
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "/tmp/folder", "--watch", "--interval", "12", "--debounce", "2"])
+    assert res.exit_code == 0
     assert watched["silo_slug"] == "folder-slug"
     assert watched["run_silo_slug"] == "folder-slug"
     assert watched["interval"] == 12
@@ -138,7 +121,7 @@ def test_cmd_pull_watch_with_path_uses_path_watcher(monkeypatch):
     assert watched["root"] == str(Path("/tmp/folder").resolve())
 
 
-def test_cmd_pull_with_path_calls_path_mode(monkeypatch):
+def test_pull_with_path_calls_path_mode(monkeypatch):
     called = {}
 
     def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False):
@@ -149,8 +132,10 @@ def test_cmd_pull_with_path_calls_path_mode(monkeypatch):
         return 0
 
     monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path)
-    rc = pal.cmd_pull(_args(path="/tmp/one", full=True, allow_cloud=True, follow_symlinks=True))
-    assert rc == 0
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "/tmp/one", "--full", "--allow-cloud", "--follow-symlinks"])
+    assert res.exit_code == 0
     assert called["path"] == "/tmp/one"
     assert called["allow_cloud"] is True
     assert called["follow_symlinks"] is True

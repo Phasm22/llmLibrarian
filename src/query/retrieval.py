@@ -27,6 +27,15 @@ PROFILE_LEXICAL_PHRASES = [
 RRF_K = 60  # Reciprocal Rank Fusion constant
 MAX_LEXICAL_FOR_RRF = 200  # cap lexical get() results for RRF
 
+# Per-intent source diversity caps: broader evidence profile, deeper aggregate.
+DIVERSITY_CAPS: dict[str, int] = {
+    "LOOKUP": 3,
+    "EVIDENCE_PROFILE": 2,
+    "AGGREGATE": 6,
+    "REFLECT": 4,
+    "FIELD_LOOKUP": 8,
+}
+
 # Catalog sub-scope: tokens we never use for path routing (avoid junk matches).
 SCOPE_TOKEN_STOPLIST = frozenset(
     {"llm", "tool", "fast", "slow", "why", "the", "is", "it", "so", "a", "an", "how", "does", "feel", "take"}
@@ -43,6 +52,12 @@ def relevance_max_distance() -> float:
     except (ValueError, TypeError):
         pass
     return DEFAULT_RELEVANCE_MAX_DISTANCE
+
+
+def max_chunks_for_intent(intent: str, default: int) -> int:
+    """Return per-intent diversity cap, falling back to the configured default."""
+    cap = DIVERSITY_CAPS.get((intent or "").upper(), default)
+    return cap if cap >= 1 else default
 
 
 def all_dists_above_threshold(dists: list[float | None], threshold: float) -> bool:
