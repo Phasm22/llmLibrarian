@@ -3,9 +3,10 @@ from query.intent import (
     INTENT_CODE_LANGUAGE,
     INTENT_EVIDENCE_PROFILE,
     INTENT_FIELD_LOOKUP,
+    INTENT_FILE_LIST,
     INTENT_LOOKUP,
 )
-from query.core import run_ask
+from query.core import QueryPolicyError, run_ask
 
 
 class _DummyClient:
@@ -26,6 +27,117 @@ def test_run_ask_capabilities_bypasses_llm(monkeypatch, mock_ollama):
     out = run_ask(archetype_id=None, query="what can you index?", no_color=True, use_reranker=False)
     assert "Supported file extensions" in out
     assert mock_ollama["calls"] == []
+
+
+def test_run_ask_file_list_short_circuits_without_retrieval_or_llm(monkeypatch, mock_ollama):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_FILE_LIST)
+    monkeypatch.setattr("query.core.parse_file_list_year_request", lambda _q: {"year": "2022"})
+    monkeypatch.setattr("query.core.validate_catalog_freshness", lambda _db, _silo: {"stale": False, "stale_reason": None, "scanned_count": 3})
+    monkeypatch.setattr(
+        "query.core.list_files_from_year",
+        lambda _db, _silo, _year, year_mode="mtime", cap=50: {
+            "files": ["/tmp/a.txt", "/tmp/b.txt"],
+            "scanned_count": 3,
+            "matched_count": 2,
+            "cap_applied": False,
+            "match_reason_counts": {"mtime_year": 2, "path_year_token": 0},
+            "scope": "silo:stuff-12345678",
+            "stale": False,
+            "stale_reason": None,
+        },
+    )
+    monkeypatch.setattr(
+        "query.core.chromadb.PersistentClient",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not create client for FILE_LIST")),
+    )
+    out = run_ask(
+        archetype_id=None,
+        query="what files are from 2022",
+        no_color=True,
+        use_reranker=False,
+        quiet=True,
+        silo="stuff-12345678",
+    )
+    assert out == "/tmp/a.txt\n/tmp/b.txt"
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_file_list_requires_explicit_silo(monkeypatch):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_FILE_LIST)
+    monkeypatch.setattr("query.core.parse_file_list_year_request", lambda _q: {"year": "2022"})
+    try:
+        run_ask(
+            archetype_id=None,
+            query="what files are from 2022",
+            no_color=True,
+            use_reranker=False,
+            quiet=True,
+            silo=None,
+        )
+        assert False, "expected QueryPolicyError"
+    except QueryPolicyError as e:
+        assert "require explicit scope" in str(e).lower()
+
+
+def test_run_ask_file_list_stale_scope_fails_closed(monkeypatch):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_FILE_LIST)
+    monkeypatch.setattr("query.core.parse_file_list_year_request", lambda _q: {"year": "2022"})
+    monkeypatch.setattr(
+        "query.core.validate_catalog_freshness",
+        lambda _db, _silo: {"stale": True, "stale_reason": "file_changed_since_index", "scanned_count": 2},
+    )
+    try:
+        run_ask(
+            archetype_id=None,
+            query="what files are from 2022",
+            no_color=True,
+            use_reranker=False,
+            quiet=True,
+            silo="stuff-12345678",
+            force=False,
+        )
+        assert False, "expected QueryPolicyError"
+    except QueryPolicyError as e:
+        assert "stale" in str(e).lower()
+        assert e.exit_code == 2
+
+
+def test_run_ask_file_list_strict_toggle_no_effect(monkeypatch):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_FILE_LIST)
+    monkeypatch.setattr("query.core.parse_file_list_year_request", lambda _q: {"year": "2022"})
+    monkeypatch.setattr("query.core.validate_catalog_freshness", lambda _db, _silo: {"stale": False, "stale_reason": None, "scanned_count": 3})
+    monkeypatch.setattr(
+        "query.core.list_files_from_year",
+        lambda _db, _silo, _year, year_mode="mtime", cap=50: {
+            "files": ["/tmp/a.txt"],
+            "scanned_count": 3,
+            "matched_count": 1,
+            "cap_applied": False,
+            "match_reason_counts": {"mtime_year": 1, "path_year_token": 0},
+            "scope": "silo:stuff-12345678",
+            "stale": False,
+            "stale_reason": None,
+        },
+    )
+    out_loose = run_ask(
+        archetype_id=None,
+        query="what files are from 2022",
+        no_color=True,
+        use_reranker=False,
+        quiet=True,
+        silo="stuff-12345678",
+        strict=False,
+    )
+    out_strict = run_ask(
+        archetype_id=None,
+        query="what files are from 2022",
+        no_color=True,
+        use_reranker=False,
+        quiet=True,
+        silo="stuff-12345678",
+        strict=True,
+    )
+    assert out_loose == out_strict == "/tmp/a.txt"
 
 
 def test_run_ask_code_language_bypasses_llm(monkeypatch, mock_collection, mock_ollama):
@@ -477,3 +589,81 @@ def test_run_ask_csv_rank_guardrail_works_in_strict_mode(monkeypatch, mock_colle
     )
     assert "Rank 1: Carmine's (Times Square)" in out
     assert mock_ollama["calls"] == []
+
+
+def test_run_ask_direct_value_guardrail_prefers_canonical_and_skips_llm(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [[
+            "Aster Grill operating margin: 14.9%",
+            "Aster Grill operating margin: 18.2%",
+        ]],
+        "metadatas": [[
+            {"source": "/tmp/2025-04-06-margin-contradiction.md", "is_local": 1},
+            {"source": "/tmp/2025-04-05-canonical-margin.md", "is_local": 1},
+        ]],
+        "distances": [[0.1, 0.11]],
+        "ids": [["id-1", "id-2"]],
+    }
+    out = run_ask(
+        archetype_id=None,
+        query="What is Aster Grill operating margin?",
+        no_color=True,
+        use_reranker=False,
+    )
+    assert "operating margin: 18.2%" in out
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_direct_value_guardrail_abstains_on_equal_conflict(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [[
+            "Fjord Bistro monthly churn: 4.2%",
+            "Fjord Bistro monthly churn: 6.8%",
+        ]],
+        "metadatas": [[
+            {"source": "/tmp/2025-05-15-equal-conflict-a.md", "is_local": 1},
+            {"source": "/tmp/2025-05-15-equal-conflict-b.md", "is_local": 1},
+        ]],
+        "distances": [[0.1, 0.1]],
+        "ids": [["id-1", "id-2"]],
+    }
+    out = run_ask(
+        archetype_id=None,
+        query="What's the exact Fjord Bistro churn?",
+        no_color=True,
+        use_reranker=False,
+    )
+    assert "don't have enough evidence" in out.lower()
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_direct_value_guardrail_same_with_strict_toggle(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["Aster Grill operating margin: 18.2%"]],
+        "metadatas": [[{"source": "/tmp/2025-04-05-canonical-margin.md", "is_local": 1}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+    out_loose = run_ask(
+        archetype_id=None,
+        query="What is Aster Grill operating margin?",
+        no_color=True,
+        use_reranker=False,
+        strict=False,
+    )
+    out_strict = run_ask(
+        archetype_id=None,
+        query="What is Aster Grill operating margin?",
+        no_color=True,
+        use_reranker=False,
+        strict=True,
+    )
+    assert "operating margin: 18.2%" in out_loose
+    assert "operating margin: 18.2%" in out_strict
+    assert len(mock_ollama["calls"]) == 0

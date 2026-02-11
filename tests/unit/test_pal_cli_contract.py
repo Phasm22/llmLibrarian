@@ -33,3 +33,24 @@ def test_pull_help_mentions_watch():
     assert "--watch" in res.stdout
     assert "--prompt" in res.stdout
     assert "--clear-prompt" in res.stdout
+
+
+def test_ask_help_mentions_catalog_flags():
+    res = runner.invoke(pal.app, ["ask", "--help"])
+    assert res.exit_code == 0
+    assert "--explain" in res.stdout
+    assert "--force" in res.stdout
+
+
+def test_ask_passes_explain_and_force(monkeypatch):
+    monkeypatch.setenv("LLMLIBRARIAN_REQUIRE_SELF_SILO", "0")
+    calls = []
+    monkeypatch.setattr("pal._run_llmli", lambda args: calls.append(list(args)) or 0)
+    res = runner.invoke(
+        pal.app,
+        ["ask", "--in", "stuff", "--quiet", "--explain", "--force", "what", "files", "are", "from", "2022"],
+    )
+    assert res.exit_code == 0
+    assert calls
+    assert "--explain" in calls[-1]
+    assert "--force" in calls[-1]

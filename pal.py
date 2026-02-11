@@ -1031,6 +1031,8 @@ def ask_command(
     unified: bool = typer.Option(False, "--unified", help="Combine results from all silos."),
     strict: bool = typer.Option(False, "--strict", help="Only answer when evidence is strong; say unknown otherwise."),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Answer only (quiet output for scripts)."),
+    explain: bool = typer.Option(False, "--explain", help="Print deterministic catalog diagnostics to stderr when applicable."),
+    force: bool = typer.Option(False, "--force", help="Allow deterministic catalog queries on stale scope."),
 ) -> None:
     ensure_self_silo(force=False)
     llmli_args = ["ask"]
@@ -1042,6 +1044,10 @@ def ask_command(
         llmli_args.append("--strict")
     if quiet:
         llmli_args.append("--quiet")
+    if explain:
+        llmli_args.append("--explain")
+    if force:
+        llmli_args.append("--force")
     llmli_args.extend(query)
     _exit(_run_llmli(llmli_args))
 

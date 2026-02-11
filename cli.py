@@ -83,7 +83,7 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     """Query an archetype's collection or unified llmli collection (default) via Ollama."""
-    from query.core import run_ask
+    from query.core import run_ask, QueryPolicyError
     from state import resolve_silo_to_slug, resolve_silo_prefix
     config = _config_path(args)
     archetype = getattr(args, "archetype", None)
@@ -104,18 +104,24 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if query is None:
         print("Error: empty or invalid query (or too long).", file=sys.stderr)
         return 1
-    out = run_ask(
-        archetype,
-        query,
-        config_path=config,
-        n_results=getattr(args, "n_results", 12),
-        model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.1:8b"),
-        no_color=args.no_color or getattr(args, "quiet", False),
-        silo=silo_slug,
-        db_path=_db_path(args),
-        strict=getattr(args, "strict", False),
-        quiet=getattr(args, "quiet", False),
-    )
+    try:
+        out = run_ask(
+            archetype,
+            query,
+            config_path=config,
+            n_results=getattr(args, "n_results", 12),
+            model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.1:8b"),
+            no_color=args.no_color or getattr(args, "quiet", False),
+            silo=silo_slug,
+            db_path=_db_path(args),
+            strict=getattr(args, "strict", False),
+            quiet=getattr(args, "quiet", False),
+            explain=getattr(args, "explain", False),
+            force=getattr(args, "force", False),
+        )
+    except QueryPolicyError as e:
+        print(str(e), file=sys.stderr)
+        return int(getattr(e, "exit_code", 2) or 2)
     print(out)
     return 0
 
@@ -360,6 +366,8 @@ def main() -> int:
     p_ask.add_argument("--unified", action="store_true", help="Search across all silos (compare/analyze across indexed content)")
     p_ask.add_argument("--strict", action="store_true", help="Never conclude absence from partial evidence; say unknown + sources when unsure")
     p_ask.add_argument("--quiet", "-q", action="store_true", help="Answer only (no source footer); useful for scripting")
+    p_ask.add_argument("--explain", action="store_true", help="Print deterministic catalog diagnostics to stderr when applicable")
+    p_ask.add_argument("--force", action="store_true", help="Allow deterministic catalog queries to run on stale scope")
     p_ask.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.1:8b)")
     p_ask.add_argument("--n-results", type=int, default=12, help="Retrieval count")
     p_ask.add_argument("query", nargs="+", help="Question")

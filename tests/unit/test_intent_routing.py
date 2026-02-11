@@ -4,6 +4,7 @@ from query.intent import (
     INTENT_CODE_LANGUAGE,
     INTENT_EVIDENCE_PROFILE,
     INTENT_FIELD_LOOKUP,
+    INTENT_FILE_LIST,
     INTENT_MONEY_YEAR_TOTAL,
     INTENT_PROJECT_COUNT,
     INTENT_LOOKUP,
@@ -54,6 +55,16 @@ def test_route_intent_money_year_total_without_line():
 def test_route_intent_project_count():
     q = "how many coding projects have i done in this folder"
     assert route_intent(q) == INTENT_PROJECT_COUNT
+
+
+def test_route_intent_file_list_year_query():
+    q = "what files are from 2022"
+    assert route_intent(q) == INTENT_FILE_LIST
+
+
+def test_route_intent_file_list_does_not_capture_summary_queries():
+    q = "summary of architecture files from 2022"
+    assert route_intent(q) == INTENT_LOOKUP
 
 
 def test_route_intent_fallback_lookup():

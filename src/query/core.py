@@ -36,6 +36,7 @@ from query.intent import (
     INTENT_REFLECT,
     INTENT_CODE_LANGUAGE,
     INTENT_CAPABILITIES,
+    INTENT_FILE_LIST,
     route_intent,
     effective_k,
 )
@@ -68,6 +69,11 @@ from query.context import (
     recency_score,
     context_block,
 )
+from query.catalog import (
+    parse_file_list_year_request,
+    validate_catalog_freshness,
+    list_files_from_year,
+)
 from query.formatting import (
     style_answer,
     linkify_sources_in_answer,
@@ -82,6 +88,7 @@ from query.guardrails import (
     run_field_lookup_guardrail,
     run_income_year_total_guardrail,
     run_csv_rank_lookup_guardrail,
+    run_direct_value_consistency_guardrail,
 )
 from query.project_count import compute_project_count, format_project_count
 from query.trace import write_trace
@@ -90,6 +97,14 @@ try:
     from ingest import get_paths_by_silo
 except ImportError:
     get_paths_by_silo = None  # type: ignore[misc, assignment]
+
+
+class QueryPolicyError(Exception):
+    """User-facing deterministic query policy error with exit code."""
+
+    def __init__(self, message: str, exit_code: int = 2) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
 
 
 def _confidence_signal(
@@ -190,6 +205,8 @@ def run_ask(
     db_path: str | Path | None = None,
     strict: bool = False,
     quiet: bool = False,
+    explain: bool = False,
+    force: bool = False,
 ) -> str:
     """Query archetype's collection, or unified llmli collection if archetype_id is None (optional silo filter)."""
     if use_reranker is None:
@@ -262,6 +279,79 @@ def run_ask(
             cap_text = "Could not load capabilities."
         out_lines = [cap_text, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label} (capabilities)")]
         return cap_text if quiet else "\n".join(out_lines)
+
+    # FILE_LIST: deterministic catalog query (manifest/registry only). No retrieval, no LLM.
+    if intent == INTENT_FILE_LIST and use_unified:
+        req = parse_file_list_year_request(query)
+        if not req:
+            raise QueryPolicyError("Could not parse a file-list year request.", exit_code=2)
+        if not silo:
+            raise QueryPolicyError("File-list queries require explicit scope. Use: --in <silo>.", exit_code=2)
+        year = int(req["year"])
+        fresh = validate_catalog_freshness(db, silo)
+        if fresh["stale"] and not force:
+            raise QueryPolicyError(
+                f"Silo catalog is stale ({fresh.get('stale_reason') or 'unknown'}). "
+                f"Run `pal pull` for this silo, or use --force.",
+                exit_code=2,
+            )
+        report = list_files_from_year(db, silo, year, year_mode="mtime", cap=50)
+        report["stale"] = bool(fresh.get("stale"))
+        report["stale_reason"] = fresh.get("stale_reason")
+        if explain:
+            print(
+                "[catalog] "
+                f"scope={report['scope']} year={year} mode=mtime scanned={report['scanned_count']} "
+                f"matched={report['matched_count']} cap=50 cap_applied={report['cap_applied']} "
+                f"stale={report['stale']} stale_reason={report.get('stale_reason') or 'none'}",
+                file=sys.stderr,
+            )
+        files = report["files"]
+        if quiet:
+            if not files:
+                return f"No indexed files matched year {year} in this scope."
+            return "\n".join(files)
+
+        if not files:
+            answer = f"No indexed files matched year {year} in this scope."
+            return "\n".join(
+                [
+                    answer,
+                    "",
+                    dim(no_color, "---"),
+                    label_style(no_color, f"Answered by: {source_label}"),
+                ]
+            )
+
+        lines = [
+            f"Matched {len(files)} file(s) from {year} in {source_label}.",
+            "",
+        ]
+        for p in files:
+            lines.append(f"  • {p}")
+        lines.extend(["", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}"), "", bold(no_color, "Sources:")])
+        for p in files:
+            lines.append(format_source("catalog match", {"source": p, "silo": silo}, None, no_color=no_color))
+        time_ms = (time.perf_counter() - t0) * 1000
+        write_trace(
+            intent=intent,
+            n_stage1=0,
+            n_results=0,
+            model=model,
+            silo=silo,
+            source_label=source_label,
+            num_docs=len(files),
+            time_ms=time_ms,
+            query_len=len(query),
+            hybrid_used=False,
+            guardrail_no_match=(len(files) == 0),
+            guardrail_reason="catalog_file_list",
+            requested_year=str(year),
+            requested_form=None,
+            requested_line=None,
+            receipt_metas=[{"source": p, "silo": silo} for p in files[:5]],
+        )
+        return "\n".join(lines)
 
     n_effective = effective_k(intent, n_results)
     if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE):
@@ -604,6 +694,40 @@ def run_ask(
         sources=source_cache,
     )
     docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+
+    # Deterministic value-consistency guardrail for direct factual lookups.
+    if intent == INTENT_LOOKUP:
+        value_guardrail = run_direct_value_consistency_guardrail(
+            query=query,
+            docs=docs,
+            metas=metas,
+            source_label=source_label,
+            no_color=no_color,
+            canonical_tokens=canonical_tokens,
+            deprioritized_tokens=deprioritized_tokens,
+        )
+        if value_guardrail is not None:
+            time_ms = (time.perf_counter() - t0) * 1000
+            write_trace(
+                intent=intent,
+                n_stage1=n_stage1,
+                n_results=n_results,
+                model=model,
+                silo=silo,
+                source_label=source_label,
+                num_docs=value_guardrail.get("num_docs", 0),
+                time_ms=time_ms,
+                query_len=len(query),
+                hybrid_used=hybrid_used,
+                receipt_metas=value_guardrail.get("receipt_metas"),
+                guardrail_no_match=value_guardrail.get("guardrail_no_match"),
+                guardrail_reason=value_guardrail.get("guardrail_reason"),
+                requested_year=value_guardrail.get("requested_year"),
+                requested_form=value_guardrail.get("requested_form"),
+                requested_line=value_guardrail.get("requested_line"),
+            )
+            response_text = str(value_guardrail["response"])
+            return _quiet_text_only(response_text) if quiet else response_text
 
     # Recency + doc_type tie-breaker: only when query implies recency; apply after diversity so caps are preserved
     if docs and query_implies_recency(query):

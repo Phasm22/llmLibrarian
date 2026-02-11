@@ -125,6 +125,10 @@ def test_format_report_table_contains_key_metrics():
             "confident_error_rate": 0.0,
             "temporal_error_rate": 0.0,
             "unsupported_assertion_rate": 0.0,
+            "forbidden_value_hit_count": 0,
+            "decisive_direct_pass_count": 1,
+            "expected_decisive_from_canonical_count": 0,
+            "missing_allowed_source_count": 0,
         },
         "category_breakdown": {"direct": {"total": 2, "passed": 1, "failed": 1}},
         "failures": [
@@ -176,7 +180,7 @@ def test_run_adversarial_eval_direct_mode_changes_results_independent_of_strict(
         cfg = str(kwargs.get("config_path") or "")
         if "eval-archetypes.yaml" in cfg:
             return "Aster Grill rank is 1.\n\n---\nAnswered by: llmli\n\nSources:\n  • 2025-03-01-canonical-rankings.md (line 1) · 0.11\n"
-        return "I don't have enough evidence to say.\n\n---\nAnswered by: llmli\n\nSources:\n  • 2025-03-01-canonical-rankings.md (line 1) · 0.11\n"
+        return "Aster Grill rank is 2.\n\n---\nAnswered by: llmli\n\nSources:\n  • 2025-03-01-canonical-rankings.md (line 1) · 0.11\n"
 
     monkeypatch.setattr("llmli_evals.adversarial.run_ask", _run_ask)
 
@@ -196,3 +200,7 @@ def test_run_adversarial_eval_direct_mode_changes_results_independent_of_strict(
     )
     assert baseline["totals"]["passed_queries"] == 0
     assert candidate["totals"]["passed_queries"] == 1
+    assert baseline["totals"]["forbidden_value_hit_count"] >= 1
+    assert candidate["totals"]["forbidden_value_hit_count"] == 0
+    assert "expected_decisive_from_canonical_count" in baseline["totals"]
+    assert "missing_allowed_source_count" in candidate["totals"]

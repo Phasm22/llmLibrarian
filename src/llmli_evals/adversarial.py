@@ -595,6 +595,17 @@ def _summarize(records: list[ScoreRecord]) -> tuple[dict[str, Any], dict[str, di
         and "forbidden_value_hit" in r["failure_reason"]
         and not _is_abstain(r["answer_text"])
     )
+    decisive_direct_pass = sum(1 for r in records if r["category"] == "direct" and r["passed"])
+    expected_decisive_from_canonical_count = sum(
+        1
+        for r in records
+        if r["failure_reason"] and "expected_decisive_from_canonical" in r["failure_reason"]
+    )
+    missing_allowed_source_count = sum(
+        1
+        for r in records
+        if r["failure_reason"] and "missing_allowed_source" in r["failure_reason"]
+    )
 
     totals = {
         "total_queries": total,
@@ -605,6 +616,10 @@ def _summarize(records: list[ScoreRecord]) -> tuple[dict[str, Any], dict[str, di
         "confident_error_rate": round((confident_error / total) * 100, 2) if total else 0.0,
         "temporal_error_rate": round((temporal_fail / total) * 100, 2) if total else 0.0,
         "unsupported_assertion_rate": round((unsupported / total) * 100, 2) if total else 0.0,
+        "forbidden_value_hit_count": hallucination,
+        "decisive_direct_pass_count": decisive_direct_pass,
+        "expected_decisive_from_canonical_count": expected_decisive_from_canonical_count,
+        "missing_allowed_source_count": missing_allowed_source_count,
     }
 
     by_cat: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "passed": 0, "failed": 0})

@@ -14,6 +14,7 @@ INTENT_AGGREGATE = "AGGREGATE"
 INTENT_REFLECT = "REFLECT"
 INTENT_CODE_LANGUAGE = "CODE_LANGUAGE"
 INTENT_CAPABILITIES = "CAPABILITIES"
+INTENT_FILE_LIST = "FILE_LIST"
 
 # EVIDENCE_PROFILE / AGGREGATE: wider retrieval (cap). n_results from CLI is still the final context size.
 K_PROFILE_MIN = 48
@@ -23,7 +24,7 @@ K_AGGREGATE_MAX = 128
 
 
 def route_intent(query: str) -> str:
-    """Silent router: LOOKUP | FIELD_LOOKUP | MONEY_YEAR_TOTAL | PROJECT_COUNT | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES."""
+    """Silent router: LOOKUP | FIELD_LOOKUP | MONEY_YEAR_TOTAL | PROJECT_COUNT | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES | FILE_LIST."""
     q = query.strip().lower()
     if not q:
         return INTENT_LOOKUP
@@ -34,6 +35,14 @@ def route_intent(query: str) -> str:
         q,
     ):
         return INTENT_CAPABILITIES
+    # FILE_LIST: explicit file/document listing by year (deterministic catalog query).
+    if (
+        re.search(r"\b(files?|documents?|docs?)\b", q)
+        and re.search(r"\b(20\d{2})(?!\d)\b", q)
+        and re.search(r"\b(list|which|what|show|find|from)\b", q)
+        and not re.search(r"\b(summary|overview|analy[sz]e|analysis|architecture|design|why|how)\b", q)
+    ):
+        return INTENT_FILE_LIST
     # CODE_LANGUAGE: most common / primary / dominant coding language (deterministic count by extension)
     if re.search(
         r"\bmost common\s+(?:coding\s+)?(?:programming\s+)?language\b|\bmost used\s+(?:coding\s+)?language\b|"

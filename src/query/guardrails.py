@@ -11,6 +11,54 @@ from query.context import query_mentioned_years
 from query.formatting import format_source, style_answer
 
 
+DIRECT_VALUE_METRIC_KEYWORDS = (
+    "rank",
+    "margin",
+    "nps",
+    "sla",
+    "vendor",
+    "close",
+    "spoilage",
+    "labor ratio",
+    "loyalty",
+    "cash conversion",
+    "churn",
+    "minutes",
+    "%",
+)
+DIRECT_VALUE_SKIP_KEYWORDS = (
+    "summary",
+    "overview",
+    "architecture",
+    "design choices",
+    "how",
+    "why",
+)
+DIRECT_QUERY_STOPWORDS = {
+    "what",
+    "is",
+    "the",
+    "in",
+    "of",
+    "for",
+    "as",
+    "now",
+    "latest",
+    "current",
+    "did",
+    "does",
+    "was",
+    "are",
+    "to",
+    "on",
+    "a",
+    "an",
+    "this",
+    "that",
+    "it",
+}
+
+
 def parse_csv_rank_request(query: str) -> dict[str, str] | None:
     """Parse rank lookup requests like 'ranked number 1 in 2020'."""
     q = (query or "").strip().lower()
@@ -28,6 +76,27 @@ def parse_csv_rank_request(query: str) -> dict[str, str] | None:
     return out
 
 
+def extract_numeric_or_key_values_from_query(query: str) -> dict[str, Any] | None:
+    """Return value-lookup query signals for deterministic direct guardrail, else None."""
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+    if any(k in q for k in DIRECT_VALUE_SKIP_KEYWORDS):
+        return None
+    if not any(k in q for k in DIRECT_VALUE_METRIC_KEYWORDS):
+        return None
+    year_m = re.search(r"\b(20\d{2})\b", q)
+    words = re.findall(r"[a-z][a-z0-9']{1,}", q)
+    metric_tokens = {w for w in words if w in {"rank", "margin", "nps", "sla", "vendor", "close", "spoilage", "labor", "ratio", "loyalty", "cash", "conversion", "churn", "minutes"}}
+    query_tokens = {w.strip("'") for w in words if w not in DIRECT_QUERY_STOPWORDS and w not in metric_tokens and not w.isdigit()}
+    return {
+        "query": q,
+        "year": year_m.group(1) if year_m else None,
+        "metric_tokens": metric_tokens,
+        "query_tokens": query_tokens,
+    }
+
+
 def _extract_csv_field_value(doc: str, key: str) -> str | None:
     """Extract key=value field from row-style CSV chunks."""
     text = doc or ""
@@ -37,6 +106,124 @@ def _extract_csv_field_value(doc: str, key: str) -> str | None:
         return None
     value = " ".join((m.group(1) or "").strip().split())
     return value or None
+
+
+def _source_priority(meta: dict | None, canonical_tokens: list[str], deprioritized_tokens: list[str]) -> int:
+    source = ((meta or {}).get("source") or "").lower()
+    score = 0
+    if any(tok.lower() in source for tok in canonical_tokens):
+        score += 10
+    if any(tok.lower() in source for tok in deprioritized_tokens):
+        score -= 5
+    return score
+
+
+def extract_candidate_value_pairs_from_context(
+    docs: list[str],
+    metas: list[dict | None],
+    query_signals: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Extract (label, value) pairs from retrieved context that overlap with query terms.
+    Supports CSV row key/value and colon-form statements.
+    """
+    out: list[dict[str, Any]] = []
+    q_tokens: set[str] = set(query_signals.get("query_tokens") or set())
+    metric_tokens: set[str] = set(query_signals.get("metric_tokens") or set())
+    year = query_signals.get("year")
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else None
+        source = ((meta or {}).get("source") or "")
+        source_l = source.lower()
+        if year and year not in source_l:
+            continue
+        text = (doc or "").strip()
+        if not text:
+            continue
+
+        if "CSV row" in text:
+            # CSV row extraction is only relevant to rank-style direct lookups.
+            if metric_tokens and "rank" not in metric_tokens:
+                continue
+            rank = _extract_csv_field_value(text, "rank")
+            restaurant = _extract_csv_field_value(text, "restaurant")
+            if rank and restaurant:
+                label = "restaurant rank"
+                label_tokens = set(re.findall(r"[a-z][a-z0-9']{1,}", f"{label} {restaurant}".lower()))
+                overlap = len(q_tokens & label_tokens)
+                if overlap >= 1:
+                    out.append({"label": label, "value": rank, "meta": meta, "doc": text, "overlap": overlap})
+
+        for m in re.finditer(r"(?im)\b([^:\n]{3,120})\s*:\s*([^\n]{1,80})", text):
+            label = " ".join((m.group(1) or "").strip().split())
+            value = " ".join((m.group(2) or "").strip().split())
+            if not label or not value:
+                continue
+            label_tokens = set(re.findall(r"[a-z][a-z0-9']{1,}", label.lower()))
+            if metric_tokens and len(metric_tokens & label_tokens) == 0:
+                continue
+            overlap = len(q_tokens & label_tokens)
+            if overlap < 1:
+                continue
+            if not re.search(r"\d|%|[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+", value):
+                continue
+            out.append({"label": label, "value": value, "meta": meta, "doc": text, "overlap": overlap})
+    return out
+
+
+def select_consistent_value(
+    candidates: list[dict[str, Any]],
+    canonical_tokens: list[str],
+    deprioritized_tokens: list[str],
+) -> dict[str, Any] | None:
+    """
+    Choose a deterministic value when supported by weighted evidence.
+    Returns {'status': 'selected'|'abstain', ...} or None if insufficient candidates.
+    """
+    if not candidates:
+        return None
+    groups: dict[str, dict[str, Any]] = {}
+    for c in candidates:
+        value_key = str(c.get("value") or "").strip().lower()
+        if not value_key:
+            continue
+        meta = c.get("meta")
+        score = int(c.get("overlap") or 0) + _source_priority(meta if isinstance(meta, dict) or meta is None else None, canonical_tokens, deprioritized_tokens)
+        g = groups.setdefault(value_key, {"score": 0, "items": []})
+        g["score"] += score
+        g["items"].append(c)
+    if not groups:
+        return None
+    ranked = sorted(groups.items(), key=lambda kv: kv[1]["score"], reverse=True)
+    best_val, best_group = ranked[0]
+    best_score = int(best_group["score"])
+    best_has_canonical = any(
+        _source_priority(item.get("meta"), canonical_tokens, deprioritized_tokens) > 0
+        for item in best_group["items"]
+    )
+    if best_score < 1:
+        return {"status": "no_confident_match", "reason": "low_support"}
+    if len(ranked) > 1:
+        second_val, second_group = ranked[1]
+        second_score = int(second_group["score"])
+        second_has_canonical = any(
+            _source_priority(item.get("meta"), canonical_tokens, deprioritized_tokens) > 0
+            for item in second_group["items"]
+        )
+        if best_score == second_score:
+            if best_has_canonical and not second_has_canonical:
+                pass
+            elif second_has_canonical and not best_has_canonical:
+                return {"status": "no_confident_match", "reason": "canonical_lost_tie"}
+            else:
+                return {"status": "abstain_equal_conflict", "reason": "equal_conflict"}
+        elif (best_score - second_score) < 2 and not best_has_canonical:
+            return {"status": "no_confident_match", "reason": "weak_margin"}
+    best_item = sorted(
+        best_group["items"],
+        key=lambda x: -_source_priority(x.get("meta"), canonical_tokens, deprioritized_tokens),
+    )[0]
+    return {"status": "selected", "value": best_val, "item": best_item}
 
 
 def run_csv_rank_lookup_guardrail(
@@ -120,6 +307,79 @@ def run_csv_rank_lookup_guardrail(
         "requested_line": None,
         "num_docs": 1,
         "receipt_metas": [chosen_meta] if chosen_meta else None,
+    }
+
+
+def run_direct_value_consistency_guardrail(
+    *,
+    query: str,
+    docs: list[str],
+    metas: list[dict | None],
+    source_label: str,
+    no_color: bool,
+    canonical_tokens: list[str],
+    deprioritized_tokens: list[str],
+) -> dict[str, Any] | None:
+    """Deterministic value-consistency guardrail for direct factual lookups."""
+    signals = extract_numeric_or_key_values_from_query(query)
+    if not signals:
+        return None
+    candidates = extract_candidate_value_pairs_from_context(docs, metas, signals)
+    decision = select_consistent_value(candidates, canonical_tokens, deprioritized_tokens)
+    if decision is None:
+        return None
+    status = str(decision.get("status") or "")
+    if status == "no_confident_match":
+        return None
+    if status == "abstain_equal_conflict":
+        answer = style_answer("I don't have enough evidence to choose one value confidently.", no_color)
+        out = [
+            answer,
+            "",
+            dim(no_color, "---"),
+            label_style(no_color, f"Answered by: {source_label}"),
+            "",
+            bold(no_color, "Sources:"),
+        ]
+        # Include top sources for debuggable grounding even on abstain.
+        for c in candidates[:2]:
+            out.append(format_source(str(c.get("doc") or ""), c.get("meta"), None, no_color=no_color))
+        return {
+            "response": "\n".join(out),
+            "guardrail_no_match": True,
+            "guardrail_reason": f"direct_value_{decision.get('reason')}",
+            "requested_year": signals.get("year"),
+            "requested_form": None,
+            "requested_line": None,
+            "num_docs": len(candidates),
+            "receipt_metas": [c.get("meta") for c in candidates if c.get("meta")][:5] if candidates else None,
+        }
+    item = decision.get("item") or {}
+    label = str(item.get("label") or "value")
+    value = str(item.get("value") or decision.get("value") or "").strip()
+    meta = item.get("meta")
+    doc = str(item.get("doc") or "")
+    if not value or not isinstance(meta, dict):
+        return None
+    answer = style_answer(f"{label}: {value}", no_color)
+    out = [
+        answer,
+        "",
+        dim(no_color, "---"),
+        label_style(no_color, f"Answered by: {source_label}"),
+        "",
+        bold(no_color, "Sources:"),
+        format_source(doc, meta, None, no_color=no_color),
+    ]
+    return {
+        "response": "\n".join(out),
+        "guardrail_no_match": False,
+        "guardrail_reason": "direct_value_consistency",
+        "requested_year": signals.get("year"),
+        "requested_form": None,
+        "requested_line": None,
+        "num_docs": 1,
+        "receipt_metas": [meta] if meta else None,
     }
 
 
