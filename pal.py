@@ -4,20 +4,120 @@ pal — Agent CLI that orchestrates tools (e.g. llmli). Control-plane: route, re
 Not a replacement for llmli; pal add/ask/ls/log delegate to llmli. Use pal tool llmli ... for passthrough.
 """
 import argparse
+import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 import threading
 from pathlib import Path
+from types import SimpleNamespace
+
+import typer
 
 PAL_HOME = Path(os.environ.get("PAL_HOME", os.path.expanduser("~/.pal")))
 REGISTRY_PATH = PAL_HOME / "registry.json"
+WATCH_LOCKS_DIR = PAL_HOME / "watch_locks"
 
 
 def _ensure_pal_home() -> None:
     PAL_HOME.mkdir(parents=True, exist_ok=True)
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _watch_lock_path(db_path: str | Path, silo_slug: str) -> Path:
+    db_resolved = str(Path(db_path).resolve())
+    key = f"{db_resolved}::{silo_slug}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    safe_slug = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(silo_slug))
+    return WATCH_LOCKS_DIR / f"{safe_slug}-{digest}.pid"
+
+
+def _read_watch_lock_pid(lock_path: Path) -> int | None:
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        value = data.get("pid")
+    except Exception:
+        value = raw
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _acquire_silo_pid_lock(db_path: str | Path, silo_slug: str) -> tuple[Path | None, str | None]:
+    lock_path = _watch_lock_path(db_path, silo_slug)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for _ in range(3):
+        if lock_path.exists():
+            pid = _read_watch_lock_pid(lock_path)
+            if pid is not None and _pid_is_running(pid):
+                return None, f"Error: watcher already running for silo '{silo_slug}' (pid {pid})."
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                return None, f"Error: unable to clear stale watcher lock for silo '{silo_slug}'."
+        payload = {
+            "pid": os.getpid(),
+            "silo": str(silo_slug),
+            "db_path": str(Path(db_path).resolve()),
+            "started_at": int(time.time()),
+        }
+        try:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        except Exception:
+            return None, f"Error: unable to create watcher lock for silo '{silo_slug}'."
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except Exception:
+            try:
+                lock_path.unlink()
+            except Exception:
+                pass
+            return None, f"Error: unable to write watcher lock for silo '{silo_slug}'."
+        return lock_path, None
+    pid = _read_watch_lock_pid(lock_path)
+    if pid is not None and _pid_is_running(pid):
+        return None, f"Error: watcher already running for silo '{silo_slug}' (pid {pid})."
+    return None, f"Error: unable to acquire watcher lock for silo '{silo_slug}'."
+
+
+def _release_silo_pid_lock(lock_path: Path | None) -> None:
+    if lock_path is None:
+        return
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 def _read_registry() -> dict:
@@ -261,15 +361,15 @@ def _get_self_index_mtime_from_registry(reg: dict) -> int | None:
 
 
 def _warn_self_silo_stale() -> None:
-    print("Self-silo stale (repo changed since last index). Run `pal ensure-self`.", file=sys.stderr)
+    print("Self-silo stale (repo changed since last index). Run `pal sync`.", file=sys.stderr)
 
 
 def _warn_self_silo_missing() -> None:
-    print("Self-silo missing. Run `pal ensure-self`.", file=sys.stderr)
+    print("Self-silo missing. Run `pal sync`.", file=sys.stderr)
 
 
 def _warn_self_silo_mismatch() -> None:
-    print("Self-silo path mismatch. Run `pal ensure-self`.", file=sys.stderr)
+    print("Self-silo path mismatch. Run `pal sync`.", file=sys.stderr)
 
 
 def ensure_self_silo(force: bool = False) -> int:
@@ -372,6 +472,8 @@ class SiloWatcher:
         debounce: float = 1.0,
         silo_slug: str = "__self__",
         allow_cloud: bool = False,
+        label: str = "this folder",
+        startup_message: str | None = None,
     ) -> None:
         if Observer is None:
             raise RuntimeError("watchdog is not installed. Install `watchdog` to use watch mode.")
@@ -394,6 +496,8 @@ class SiloWatcher:
         self.debounce = float(debounce)
         self.silo_slug = silo_slug
         self.allow_cloud = allow_cloud
+        self.label = label
+        self.startup_message = startup_message
 
         self._update_single_file = update_single_file
         self._remove_single_file = remove_single_file
@@ -414,6 +518,9 @@ class SiloWatcher:
 
     def _log(self, message: str) -> None:
         print(message)
+
+    def stop(self) -> None:
+        self._stop.set()
 
     def enqueue_update(self, path: str) -> None:
         try:
@@ -473,7 +580,7 @@ class SiloWatcher:
                         update_counts=True,
                     )
                     if status == "removed":
-                        self._log(f"self: removed {path}")
+                        self._log(f"{self.label}: removed {path}")
                         processed += 1
                 else:
                     status, _ = self._update_single_file(
@@ -486,10 +593,10 @@ class SiloWatcher:
                         update_counts=True,
                     )
                     if status == "updated":
-                        self._log(f"self: updated {path}")
+                        self._log(f"{self.label}: updated {path}")
                         processed += 1
                     elif status == "removed":
-                        self._log(f"self: removed {path}")
+                        self._log(f"{self.label}: removed {path}")
                         processed += 1
         return processed
 
@@ -566,10 +673,15 @@ class SiloWatcher:
                 break
             updated, removed, skipped = self._reconcile_once()
             if updated or removed or skipped:
-                self._log(f"Reconcile: +{updated} updated, -{removed} removed, {skipped} skipped")
+                self._log(f"Check for missed changes: +{updated} updated, -{removed} removed, {skipped} skipped")
 
     def run(self) -> None:
-        self._log(f"Watching __self__ (interval={int(self.interval)}s, debounce={self.debounce}s). Ctrl+C to stop.")
+        if self.startup_message:
+            self._log(self.startup_message)
+        else:
+            self._log(
+                f"Watching {self.label} (check every {int(self.interval)}s, wait {self.debounce}s after edits). Ctrl+C to stop."
+            )
         self._observer.schedule(self._handler, str(self.root), recursive=True)
         self._observer.start()
         worker = threading.Thread(target=self._process_loop, daemon=True)
@@ -578,9 +690,9 @@ class SiloWatcher:
         recon.start()
         updated, removed, skipped = self._reconcile_once()
         if updated or removed or skipped:
-            self._log(f"Reconcile: +{updated} updated, -{removed} removed, {skipped} skipped")
+            self._log(f"Check for missed changes: +{updated} updated, -{removed} removed, {skipped} skipped")
         try:
-            while True:
+            while not self._stop.is_set():
                 time.sleep(1.0)
         finally:
             self._stop.set()
@@ -588,26 +700,116 @@ class SiloWatcher:
             self._observer.join()
 
 
-def cmd_add(args: argparse.Namespace) -> int:
-    """Delegate to llmli add <path>; optionally record in pal registry. Cloud-sync paths blocked unless --allow-cloud."""
-    path = Path(args.path).resolve()
+def _run_watcher(watcher: SiloWatcher, db_path: str | Path, silo_slug: str) -> int:
+    lock_path, lock_error = _acquire_silo_pid_lock(db_path, silo_slug)
+    if lock_error:
+        print(lock_error, file=sys.stderr)
+        return 1
+    previous_handlers: dict[int, object] = {}
+
+    def _request_stop(_signum, _frame) -> None:
+        watcher.stop()
+
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            previous_handlers[sig] = signal.signal(sig, _request_stop)
+        except Exception:
+            continue
+    try:
+        watcher.run()
+    except KeyboardInterrupt:
+        watcher.stop()
+    finally:
+        for sig, previous in previous_handlers.items():
+            try:
+                signal.signal(sig, previous)
+            except Exception:
+                pass
+        _release_silo_pid_lock(lock_path)
+    return 0
+
+
+def _record_source_path(path: Path) -> None:
+    reg = _read_registry()
+    sources = reg.get("sources", [])
+    entry = {"path": str(path), "tool": "llmli", "name": path.name}
+    replaced = False
+    for idx, src in enumerate(sources):
+        if src.get("path") == str(path):
+            sources[idx] = entry
+            replaced = True
+            break
+    if not replaced:
+        sources.append(entry)
+    reg["sources"] = sources
+    _write_registry(reg)
+
+
+def _pull_path_mode(
+    path_input: str | Path,
+    allow_cloud: bool = False,
+    follow_symlinks: bool = False,
+    full: bool = False,
+) -> int:
+    path = Path(path_input).resolve()
     if not path.is_dir():
         print(f"Error: not a directory: {path}", file=sys.stderr)
         return 1
     llmli_args = ["add"]
-    if getattr(args, "allow_cloud", False):
+    if full:
+        llmli_args.append("--full")
+    if allow_cloud:
         llmli_args.append("--allow-cloud")
+    if follow_symlinks:
+        llmli_args.append("--follow-symlinks")
     llmli_args.append(str(path))
     code = _run_llmli(llmli_args)
     if code == 0:
-        reg = _read_registry()
-        sources = reg.get("sources", [])
-        entry = {"path": str(path), "tool": "llmli", "name": path.name}
-        if not any(s.get("path") == str(path) for s in sources):
-            sources.append(entry)
-            reg["sources"] = sources
-            _write_registry(reg)
+        _record_source_path(path)
     return code
+
+
+def _pull_watch_path_mode(
+    path_input: str | Path,
+    interval: float,
+    debounce: float,
+    allow_cloud: bool,
+    follow_symlinks: bool,
+) -> int:
+    if Observer is None:
+        print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
+        return 1
+    path = Path(path_input).resolve()
+    rc = _pull_path_mode(path, allow_cloud=allow_cloud, follow_symlinks=follow_symlinks, full=False)
+    if rc != 0:
+        return rc
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    llmli_registry = _read_llmli_registry(db_path)
+    slug = _resolve_llmli_silo_by_path(llmli_registry, path)
+    if slug is None:
+        print("Error: unable to resolve silo slug for watched folder.", file=sys.stderr)
+        return 1
+    watcher = SiloWatcher(
+        path,
+        db_path,
+        interval=interval,
+        debounce=debounce,
+        silo_slug=slug,
+        allow_cloud=allow_cloud,
+        label="this folder",
+    )
+    return _run_watcher(watcher, db_path, slug)
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    """Compatibility alias: delegate to pull path mode."""
+    return _pull_path_mode(
+        getattr(args, "path", ""),
+        allow_cloud=getattr(args, "allow_cloud", False),
+    )
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
@@ -717,13 +919,31 @@ def _build_pull_env(status_file_path: str) -> dict[str, str]:
 
 
 def cmd_pull(args: argparse.Namespace) -> int:
-    """Refresh all registered silos (incremental by default)."""
-    if getattr(args, "watch", False):
-        return cmd_pull_watch(args)
+    """Pull content into pal memory (all registered silos or one folder)."""
+    path = getattr(args, "path", None)
+    watch = bool(getattr(args, "watch", False))
+    if watch and not path:
+        print("--watch requires PATH. Use: pal pull <path> --watch", file=sys.stderr)
+        return 2
+    if watch and path:
+        return _pull_watch_path_mode(
+            path,
+            interval=float(getattr(args, "interval", 10) or 10),
+            debounce=float(getattr(args, "debounce", 1) or 1),
+            allow_cloud=bool(getattr(args, "allow_cloud", False)),
+            follow_symlinks=bool(getattr(args, "follow_symlinks", False)),
+        )
+    if path:
+        return _pull_path_mode(
+            path,
+            allow_cloud=bool(getattr(args, "allow_cloud", False)),
+            follow_symlinks=bool(getattr(args, "follow_symlinks", False)),
+            full=bool(getattr(args, "full", False)),
+        )
     reg = _read_registry()
     sources = reg.get("sources", [])
     if not sources:
-        print("No registered silos. Use: pal add <path>", file=sys.stderr)
+        print("No registered folders. Use: pal pull <path>", file=sys.stderr)
         return 1
     import tempfile
     is_tty = sys.stderr.isatty()
@@ -795,8 +1015,8 @@ def cmd_pull(args: argparse.Namespace) -> int:
     return 0 if fail_count == 0 else 1
 
 
-def cmd_pull_watch(args: argparse.Namespace) -> int:
-    """Watch dev self-silo and apply incremental updates on change."""
+def cmd_watch_self(args: argparse.Namespace) -> int:
+    """Hidden compatibility command: watch dev self-silo (__self__)."""
     if Observer is None:
         print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
         return 1
@@ -812,19 +1032,23 @@ def cmd_pull_watch(args: argparse.Namespace) -> int:
         return 1
     interval = float(getattr(args, "interval", 10) or 10)
     debounce = float(getattr(args, "debounce", 1) or 1)
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
     watcher = SiloWatcher(
         repo_root,
-        os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"),
+        db_path,
         interval=interval,
         debounce=debounce,
         silo_slug="__self__",
         allow_cloud=True,
+        label="self",
+        startup_message="Watching self folder: . (Tip: pal pull <path> --watch watches a folder)",
     )
-    try:
-        watcher.run()
-    except KeyboardInterrupt:
-        return 0
-    return 0
+    return _run_watcher(watcher, db_path, "__self__")
+
+
+def cmd_pull_watch(args: argparse.Namespace) -> int:
+    """Legacy wrapper kept for compatibility with older call paths."""
+    return cmd_watch_self(args)
 
 
 def cmd_silos(args: argparse.Namespace) -> int:
@@ -859,79 +1083,131 @@ def cmd_tool(args: argparse.Namespace) -> int:
     return 1
 
 
-KNOWN_COMMANDS = frozenset({"add", "ask", "ls", "inspect", "log", "capabilities", "ensure-self", "pull", "silos", "remove", "tool"})
+app = typer.Typer(
+    name="pal",
+    help="Index folders, ask questions, stay in sync.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+
+
+def _exit_on_error(rc: int) -> None:
+    if rc != 0:
+        raise typer.Exit(code=rc)
+
+
+@app.command("pull", help="Index a folder (or refresh all).")
+def pull_command(
+    path: str | None = typer.Argument(None, metavar="PATH", help="Folder to index. Omit to refresh all."),
+    watch: bool = typer.Option(False, "--watch", help="Stay running and sync changes live."),
+    full: bool = typer.Option(False, "--full", help="Full rebuild (delete + re-add)."),
+    allow_cloud: bool = typer.Option(False, "--allow-cloud", help="Allow cloud-synced folders."),
+    interval: float = typer.Option(10.0, "--interval", help="Reconcile interval in seconds (watch mode).", hidden=True),
+    debounce: float = typer.Option(1.0, "--debounce", help="Debounce delay in seconds (watch mode).", hidden=True),
+    follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks.", hidden=True),
+) -> None:
+    args = SimpleNamespace(
+        path=path,
+        watch=watch,
+        full=full,
+        allow_cloud=allow_cloud,
+        interval=interval,
+        debounce=debounce,
+        follow_symlinks=follow_symlinks,
+    )
+    _exit_on_error(cmd_pull(args))
+
+
+@app.command("add", hidden=True)
+def add_alias(
+    path: str = typer.Argument(..., metavar="PATH"),
+    allow_cloud: bool = typer.Option(False, "--allow-cloud"),
+) -> None:
+    args = SimpleNamespace(path=path, allow_cloud=allow_cloud)
+    _exit_on_error(cmd_add(args))
+
+
+@app.command("ask", help="Ask a question across your indexed data.")
+def ask_command(
+    query: list[str] = typer.Argument(..., metavar="QUESTION"),
+    in_silo: str | None = typer.Option(None, "--in", help="Query only this silo."),
+    unified: bool = typer.Option(False, "--unified", help="Combine results from all silos."),
+    strict: bool = typer.Option(False, "--strict", help="Only answer when evidence is strong; say unknown otherwise."),
+) -> None:
+    args = SimpleNamespace(query=query, in_silo=in_silo, unified=unified, strict=strict)
+    _exit_on_error(cmd_ask(args))
+
+
+@app.command("ls", help="List indexed silos.")
+def ls_command() -> None:
+    _exit_on_error(cmd_ls(SimpleNamespace()))
+
+
+@app.command("inspect", help="Show details for a silo.")
+def inspect_command(
+    silo: str = typer.Argument(..., help="Silo slug or display name."),
+    top: int | None = typer.Option(None, "--top", help="Show top N files by chunks."),
+    filter: str | None = typer.Option(None, "--filter", help="Show only pdf, docx, or code."),
+) -> None:
+    args = SimpleNamespace(silo=silo, top=top, filter=filter)
+    _exit_on_error(cmd_inspect(args))
+
+
+@app.command("capabilities", help="Supported file types.")
+def capabilities_command() -> None:
+    _exit_on_error(cmd_capabilities(SimpleNamespace()))
+
+
+@app.command("log", help="Show recent failures.")
+def log_command() -> None:
+    _exit_on_error(cmd_log(SimpleNamespace()))
+
+
+@app.command("remove", help="Remove a silo.")
+def remove_command(
+    silo: list[str] = typer.Argument(..., help="Silo slug, display name, or path."),
+) -> None:
+    args = SimpleNamespace(silo=silo)
+    _exit_on_error(cmd_remove(args))
+
+
+@app.command("sync", help="Re-index the project's own source (dev mode).")
+def sync_command() -> None:
+    _exit_on_error(cmd_ensure_self(SimpleNamespace()))
+
+
+@app.command("ensure-self", hidden=True)
+def ensure_self_command() -> None:
+    """Legacy alias for sync."""
+    _exit_on_error(cmd_ensure_self(SimpleNamespace()))
+
+
+@app.command("silos", help="Audit silo health.")
+def silos_command() -> None:
+    _exit_on_error(cmd_silos(SimpleNamespace()))
+
+
+@app.command("tool", help="Pass-through to llmli.")
+def tool_command(
+    tool_name: str = typer.Argument(..., help="Tool name (for example: llmli)."),
+    tool_args: list[str] = typer.Argument([], help="Arguments for the tool."),
+) -> None:
+    args = SimpleNamespace(tool_name=tool_name, tool_args=tool_args)
+    _exit_on_error(cmd_tool(args))
+
+
+@app.command("watch-self", hidden=True)
+def watch_self_command(
+    interval: float = typer.Option(10.0, "--interval"),
+    debounce: float = typer.Option(1.0, "--debounce"),
+) -> None:
+    args = SimpleNamespace(interval=interval, debounce=debounce)
+    _exit_on_error(cmd_watch_self(args))
 
 
 def main() -> int:
-    # Default to ask when first arg is not a known subcommand: pal "who is X" or pal who is X → pal ask ...
-    if len(sys.argv) >= 2 and sys.argv[1] not in KNOWN_COMMANDS and not sys.argv[1].startswith("-"):
-        sys.argv.insert(1, "ask")
-
-    # Natural "ask in <silo> ..." → treat as --in <silo> so silo scope isn't eaten as query words
-    if len(sys.argv) >= 4 and sys.argv[1] == "ask" and sys.argv[2].lower() == "in":
-        third = sys.argv[3]
-        if not third.startswith("-") and third:
-            sys.argv[2:4] = ["--in", third]
-
-    parser = argparse.ArgumentParser(
-        prog="pal",
-        description="Agent CLI: add, ask, ls, log (delegate to llmli); pal <question> runs ask.",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p_add = sub.add_parser("add", help="Index folder (llmli add); register in ~/.pal; cloud paths blocked unless --allow-cloud")
-    p_add.add_argument("path", help="Folder path to index")
-    p_add.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive")
-    p_add.set_defaults(_run=cmd_add)
-
-    p_ask = sub.add_parser("ask", help="Ask (llmli ask; use --unified to search all silos for comparison)")
-    p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to one silo")
-    p_ask.add_argument("--unified", action="store_true", help="Search across all silos (for compare/thematic questions)")
-    p_ask.add_argument("--strict", action="store_true", help="Conservative: never conclude absence from partial evidence; say 'unknown' + sources when unsure")
-    p_ask.add_argument("query", nargs="+", help="Question")
-    p_ask.set_defaults(_run=cmd_ask)
-
-    p_ls = sub.add_parser("ls", help="List silos (llmli ls)")
-    p_ls.set_defaults(_run=cmd_ls)
-
-    p_inspect = sub.add_parser("inspect", help="Silo details and top files by chunk count (llmli inspect)")
-    p_inspect.add_argument("silo", help="Silo slug or display name")
-    p_inspect.add_argument("--top", type=int, default=None, help="Show top N files (default: 20; pass to llmli)")
-    p_inspect.add_argument("--filter", choices=["pdf", "docx", "code"], help="Show only pdf, docx, or code")
-    p_inspect.set_defaults(_run=cmd_inspect)
-
-    p_remove = sub.add_parser("remove", help="Remove silo (friendly alias for llmli remove)")
-    p_remove.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
-    p_remove.set_defaults(_run=cmd_remove)
-
-    p_log = sub.add_parser("log", help="Last failures (llmli log --last)")
-    p_log.set_defaults(_run=cmd_log)
-
-    p_capabilities = sub.add_parser("capabilities", help="Supported file types and extractors (llmli capabilities)")
-    p_capabilities.set_defaults(_run=cmd_capabilities)
-
-    p_ensure = sub.add_parser("ensure-self", help="Ensure dev-mode self-silo exists; warn if stale")
-    p_ensure.set_defaults(_run=cmd_ensure_self)
-
-    p_pull = sub.add_parser("pull", help="Refresh all registered silos (incremental by default)")
-    p_pull.add_argument("--watch", action="store_true", help="Watch dev self-silo and update on change")
-    p_pull.add_argument("--interval", type=float, default=10, help="Reconcile interval in seconds (watch mode)")
-    p_pull.add_argument("--debounce", type=float, default=1, help="Debounce seconds before reindexing (watch mode)")
-    p_pull.add_argument("--full", action="store_true", help="Full reindex (delete + add) instead of incremental")
-    p_pull.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive")
-    p_pull.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks inside folders")
-    p_pull.set_defaults(_run=cmd_pull)
-
-    p_silos = sub.add_parser("silos", help="Silo health report (duplicates, overlaps, mismatches)")
-    p_silos.set_defaults(_run=cmd_silos)
-
-    p_tool = sub.add_parser("tool", help="Passthrough to tool: pal tool llmli <args...>")
-    p_tool.add_argument("tool_name", help="Tool name (e.g. llmli)")
-    p_tool.add_argument("tool_args", nargs=argparse.REMAINDER, default=[], help="Arguments for the tool")
-    p_tool.set_defaults(_run=cmd_tool)
-
-    args = parser.parse_args()
-    return args._run(args)
+    app()
+    return 0
 
 
 if __name__ == "__main__":

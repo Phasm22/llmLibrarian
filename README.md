@@ -14,7 +14,7 @@ uv sync
 ollama pull llama3.1:8b
 
 # Option A: pal (orchestrates llmli; state in ~/.pal/registry.json)
-pal add /path/to/folder
+pal pull /path/to/folder
 pal ask "what did I write about X?"
 pal ls
 
@@ -35,14 +35,16 @@ llmli ls
 
 | Command | Description |
 |--------|-------------|
-| `pal add <path>` | Index folder; register in ~/.pal. Cloud-sync paths blocked unless `--allow-cloud`. |
+| `pal pull` | Update changed files across all registered folders. |
+| `pal pull <path>` | Pull one folder into memory and register it in ~/.pal. |
+| `pal pull <path> --watch` | Keep one folder in sync while you work. |
 | `pal ask ["question"]` | Ask across all silos; use `--in <silo>` to scope. |
 | `pal ls` | List silos (path, files, chunks). |
 | `pal inspect <silo>` | Per-silo details and per-file chunk counts. |
 | `pal capabilities` | Supported file types and extractors. |
 | `pal log` | Last add failures. |
 | `pal ensure-self` | Ensure dev-mode self-silo exists (manual refresh). |
-| `pal pull --watch` | Watch dev self-silo and update on change (quiet logs). |
+| `pal add <path>` | Compatibility alias for `pal pull <path>` (hidden in default help). |
 | `pal tool llmli <args...>` | Passthrough to llmli. |
 
 **llmli** — Full control.
@@ -65,7 +67,7 @@ llmli ls
 - Ask in natural language across silos (“what did I decide about X?”, “where did I list the 2022 classes?”). Sources link to the file; click to open.
 - Scope with `--in` when you know the folder (“pal ask --in school …”).
 - Ask about a tool or project by name (e.g. “why is the scribe tool fast”) without `--in`; retrieval scopes to paths containing that name when possible.
-- After adding a folder, ask about something only in it; use `pal ls` and `pal log` to see state and failures.
+- After pulling a folder, ask about something only in it; use `pal ls` and `pal log` to see state and failures.
 
 ---
 
@@ -77,7 +79,9 @@ If the repo changes since the last self index, `pal` prints:
 
 `Self-silo stale (repo changed since last index). Run pal ensure-self.`
 
-Auto-reindex (dev): `pal pull --watch` uses a watchdog observer + a periodic reconcile (default 10s) to update only changed files. Logs are quiet by design: a single startup line and one line per update/remove/reconcile summary.
+Auto-reindex (folder): `pal pull <path> --watch` uses a watchdog observer plus a periodic missed-change check (default 10s) to update changed files only. Logs are quiet by design: one startup line and one line per update/remove/check summary.
+
+Legacy compatibility: `pal watch-self` is available but hidden from default help.
 
 ---
 

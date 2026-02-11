@@ -121,48 +121,42 @@ def format_report(
     mismatches: list[dict[str, Any]],
     max_paths: int = 4,
 ) -> str:
-    lines = []
-    lines.append("Silo health report")
-    lines.append("------------------")
-    lines.append(f"Silos: {len(registry)}")
-    lines.append(f"Duplicate hashes: {len(dupes)}")
-    lines.append(f"Overlaps: {len(overlaps)}")
-    lines.append(f"Count mismatches: {len(mismatches)}")
-    lines.append("")
+    lines: list[str] = []
+    lines.append(f"Silos: {len(registry)}  Dupes: {len(dupes)}  Overlaps: {len(overlaps)}  Mismatches: {len(mismatches)}")
 
     if dupes:
-        lines.append("Duplicate content (same hash in multiple silos):")
-        for d in dupes:
-            lines.append(f"  - hash {d.get('hash')}")
-            lines.append(f"    silos: {', '.join(d.get('silos') or [])}")
-            paths = d.get("paths") or []
-            for p in paths[:max_paths]:
-                lines.append(f"    path: {p}")
-            if len(paths) > max_paths:
-                lines.append(f"    ... +{len(paths) - max_paths} more")
-            lines.append("    suggested: remove duplicates or re-add only one path (llmli rm <silo>)")
         lines.append("")
+        lines.append("Duplicate content:")
+        for d in dupes:
+            silos = ", ".join(d.get("silos") or [])
+            paths = d.get("paths") or []
+            lines.append(f"  {silos}  (hash {d.get('hash', '?')[:12]})")
+            for p in paths[:max_paths]:
+                lines.append(f"    {p}")
+            if len(paths) > max_paths:
+                lines.append(f"    +{len(paths) - max_paths} more")
+            lines.append("    fix: pal remove <silo>")
 
     if overlaps:
-        lines.append("Overlapping silo paths:")
+        lines.append("")
+        lines.append("Overlapping paths:")
         for o in overlaps:
             if o.get("type") == "same_path":
-                lines.append(f"  - same path: {o.get('path')} (silos: {', '.join(o.get('silos') or [])})")
+                lines.append(f"  same path: {', '.join(o.get('silos') or [])} -> {o.get('path')}")
             else:
-                lines.append(f"  - nested: parent={o.get('parent')} child={o.get('child')} path={o.get('path')}")
-            lines.append("    suggested: remove or re-scope one silo (llmli rm <silo>)")
-        lines.append("")
+                lines.append(f"  nested: {o.get('child')} inside {o.get('parent')}")
+            lines.append("    fix: pal remove <silo>")
 
     if mismatches:
-        lines.append("Registry/manifest mismatches:")
+        lines.append("")
+        lines.append("File count mismatches:")
         for m in mismatches:
             lines.append(
-                f"  - {m.get('slug')}: registry_files={m.get('registry_files')} manifest_files={m.get('manifest_files')}"
+                f"  {m.get('slug')}: indexed {m.get('registry_files')}, on disk {m.get('manifest_files')}"
             )
-            lines.append("    suggested: pal pull --full or llmli add --full <path>")
-        lines.append("")
+            lines.append("    fix: pal pull --full")
 
     if not dupes and not overlaps and not mismatches:
-        lines.append("No issues detected.")
+        lines.append("All clean.")
 
     return "\n".join(lines)

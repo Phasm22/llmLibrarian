@@ -47,4 +47,4 @@ def test_find_count_mismatches():
 
 def test_format_report_empty():
     report = format_report([], [], [], [])
-    assert "No issues detected." in report
+    assert "All clean." in report

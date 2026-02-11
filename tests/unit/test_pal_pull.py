@@ -1,12 +1,29 @@
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pal
 
 
-def _args(full: bool = False, allow_cloud: bool = False, follow_symlinks: bool = False):
-    return SimpleNamespace(full=full, allow_cloud=allow_cloud, follow_symlinks=follow_symlinks)
+def _args(
+    full: bool = False,
+    allow_cloud: bool = False,
+    follow_symlinks: bool = False,
+    path: str | None = None,
+    watch: bool = False,
+    interval: float = 10,
+    debounce: float = 1,
+):
+    return SimpleNamespace(
+        full=full,
+        allow_cloud=allow_cloud,
+        follow_symlinks=follow_symlinks,
+        path=path,
+        watch=watch,
+        interval=interval,
+        debounce=debounce,
+    )
 
 
 def _mock_subprocess(monkeypatch, files_indexed_by_path=None, failures_by_path=None, seen_cmds=None):
@@ -30,7 +47,7 @@ def test_cmd_pull_errors_when_no_sources(monkeypatch, capsys):
     monkeypatch.setattr("pal._read_registry", lambda: {"sources": []})
     rc = pal.cmd_pull(_args())
     assert rc == 1
-    assert "No registered silos" in capsys.readouterr().err
+    assert "No registered folders" in capsys.readouterr().err
 
 
 def test_cmd_pull_reports_all_up_to_date(monkeypatch, capsys):
@@ -84,31 +101,146 @@ def test_cmd_pull_passes_full_and_follow_flags(monkeypatch):
     assert "--follow-symlinks" in cmd
 
 
-def test_cmd_pull_watch_does_not_run_full_add(monkeypatch):
-    monkeypatch.setattr("pal.is_dev_repo", lambda: True)
-    monkeypatch.setattr("pal._get_git_root", lambda: Path("/tmp/repo"))
-    monkeypatch.setattr("pal.ensure_self_silo", lambda force=True: 0)
+def test_cmd_pull_requires_path_for_watch(monkeypatch, capsys):
+    rc = pal.cmd_pull(_args(watch=True))
+    assert rc == 2
+    assert "--watch requires PATH" in capsys.readouterr().err
 
-    calls = []
 
-    def _fake_run_llmli(args):
-        calls.append(args)
-        return 0
+def test_cmd_pull_watch_with_path_uses_path_watcher(monkeypatch):
+    watched = {}
+    monkeypatch.setattr("pal._pull_path_mode", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        "pal._read_llmli_registry",
+        lambda _db: {"folder-slug": {"path": str(Path('/tmp/folder').resolve())}},
+    )
 
     class _DummyWatcher:
-        def __init__(self, *a, **k):
-            pass
+        def __init__(self, root, db_path, interval, debounce, silo_slug, allow_cloud=False, label="this folder", startup_message=None):
+            watched["root"] = str(root)
+            watched["interval"] = interval
+            watched["debounce"] = debounce
+            watched["silo_slug"] = silo_slug
+
+    def _fake_run_watcher(_watcher, db_path, silo_slug):
+        watched["db_path"] = db_path
+        watched["run_silo_slug"] = silo_slug
+        return 0
+
+    monkeypatch.setattr("pal.SiloWatcher", _DummyWatcher)
+    monkeypatch.setattr("pal._run_watcher", _fake_run_watcher)
+    rc = pal.cmd_pull(_args(path="/tmp/folder", watch=True, interval=12, debounce=2))
+    assert rc == 0
+    assert watched["silo_slug"] == "folder-slug"
+    assert watched["run_silo_slug"] == "folder-slug"
+    assert watched["interval"] == 12
+    assert watched["debounce"] == 2
+    assert watched["root"] == str(Path("/tmp/folder").resolve())
+
+
+def test_cmd_pull_with_path_calls_path_mode(monkeypatch):
+    called = {}
+
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False):
+        called["path"] = str(path_input)
+        called["allow_cloud"] = allow_cloud
+        called["follow_symlinks"] = follow_symlinks
+        called["full"] = full
+        return 0
+
+    monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path)
+    rc = pal.cmd_pull(_args(path="/tmp/one", full=True, allow_cloud=True, follow_symlinks=True))
+    assert rc == 0
+    assert called["path"] == "/tmp/one"
+    assert called["allow_cloud"] is True
+    assert called["follow_symlinks"] is True
+    assert called["full"] is True
+
+
+def test_acquire_silo_pid_lock_blocks_live_pid(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("pal.WATCH_LOCKS_DIR", tmp_path / "watch_locks")
+    db_path = tmp_path / "db"
+    lock_path = pal._watch_lock_path(db_path, "demo")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(json.dumps({"pid": 4242}), encoding="utf-8")
+    monkeypatch.setattr("pal._pid_is_running", lambda pid: pid == 4242)
+
+    acquired, err = pal._acquire_silo_pid_lock(db_path, "demo")
+    assert acquired is None
+    assert err is not None
+    assert "pid 4242" in err
+
+
+def test_acquire_silo_pid_lock_clears_stale(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("pal.WATCH_LOCKS_DIR", tmp_path / "watch_locks")
+    db_path = tmp_path / "db"
+    lock_path = pal._watch_lock_path(db_path, "demo")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(json.dumps({"pid": 12345}), encoding="utf-8")
+    monkeypatch.setattr("pal._pid_is_running", lambda _pid: False)
+
+    acquired, err = pal._acquire_silo_pid_lock(db_path, "demo")
+    assert err is None
+    assert acquired == lock_path
+    assert pal._read_watch_lock_pid(lock_path) == os.getpid()
+    pal._release_silo_pid_lock(acquired)
+    assert not lock_path.exists()
+
+
+def test_run_watcher_returns_error_when_lock_held(monkeypatch, capsys):
+    class _DummyWatcher:
+        def __init__(self):
+            self.ran = False
+            self.stopped = False
 
         def run(self):
-            raise KeyboardInterrupt()
+            self.ran = True
 
-    monkeypatch.setattr("pal._run_llmli", _fake_run_llmli)
-    monkeypatch.setattr("pal.SiloWatcher", _DummyWatcher)
+        def stop(self):
+            self.stopped = True
 
-    args = _args()
-    args.watch = True
-    args.interval = 10
-    args.debounce = 1
-    rc = pal.cmd_pull(args)
+    monkeypatch.setattr(
+        "pal._acquire_silo_pid_lock",
+        lambda _db_path, _slug: (None, "Error: watcher already running for silo 'demo' (pid 999)."),
+    )
+    released = []
+    monkeypatch.setattr("pal._release_silo_pid_lock", lambda lock_path: released.append(lock_path))
+    watcher = _DummyWatcher()
+
+    rc = pal._run_watcher(watcher, "/tmp/db", "demo")
+    assert rc == 1
+    assert watcher.ran is False
+    assert released == []
+    assert "watcher already running" in capsys.readouterr().err
+
+
+def test_run_watcher_handles_sigterm_and_releases_lock(monkeypatch):
+    class _DummyWatcher:
+        def __init__(self):
+            self.stop_calls = 0
+
+        def run(self):
+            handlers[pal.signal.SIGTERM](pal.signal.SIGTERM, None)
+
+        def stop(self):
+            self.stop_calls += 1
+
+    watcher = _DummyWatcher()
+    handlers = {}
+    saved = {}
+
+    def _fake_signal(sig, handler):
+        previous = saved.get(sig, "prev")
+        saved[sig] = handler
+        handlers[sig] = handler
+        return previous
+
+    released = []
+    monkeypatch.setattr("pal.signal.signal", _fake_signal)
+    monkeypatch.setattr("pal._acquire_silo_pid_lock", lambda _db_path, _slug: (Path("/tmp/lock"), None))
+    monkeypatch.setattr("pal._release_silo_pid_lock", lambda lock_path: released.append(lock_path))
+
+    rc = pal._run_watcher(watcher, "/tmp/db", "demo")
     assert rc == 0
-    assert calls == []
+    assert watcher.stop_calls >= 1
+    assert released == [Path("/tmp/lock")]

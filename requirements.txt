@@ -7,6 +7,7 @@ pymupdf>=1.23.0
 # DOCX
 python-docx>=1.0.0
 watchdog>=3.0.0
+typer>=0.21.0
 
 # Optional: xlsx/pptx text extraction (otherwise metadata-only chunk with content_extracted=0)
 # openpyxl>=3.0.0

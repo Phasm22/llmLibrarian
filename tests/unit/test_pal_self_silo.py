@@ -110,7 +110,7 @@ def test_ensure_self_silo_warns_when_stale(monkeypatch, capsys):
     assert calls == []
     err = capsys.readouterr().err
     assert "Self-silo stale" in err
-    assert "ensure-self" in err
+    assert "pal sync" in err
 
 
 def test_capabilities_calls_ensure_self_once_and_no_llm(monkeypatch):

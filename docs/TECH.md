@@ -6,12 +6,12 @@ Project layout, environment, tuning, and operational details. For philosophy and
 
 - **pyproject.toml** — Project + deps; **uv** for venv and install (`uv venv`, `uv sync`).
 - **cli.py** — llmli entrypoint: `llmli add|ask|ls|index|rm|log|capabilities|inspect`
-- **pal.py** — Agent CLI: `pal add|ask|ls|log|tool|inspect|capabilities`; state in `~/.pal/registry.json`.
+- **pal.py** — Agent CLI (Typer): Do = `pal pull|ask`, See = `pal ls|inspect|capabilities|log`, Tune = `pal ensure-self|silos|tool`; state in `~/.pal/registry.json`.
 - **archetypes.yaml** — Prompts (and optionally index config). **Prompt-only:** add an entry with `name` + `prompt` and an id that matches a silo slug (e.g. `stuff`); then `pal ask --in stuff "..."` uses that prompt. **Full:** include `folders`, `include`/`exclude`, `collection` for `llmli index --archetype X` and a separate collection. Limits (max_file_size_mb, etc.) apply to add/index.
 - **src/** — Librarian code:
   - **embeddings.py**, **load_config.py**, **style.py**, **reranker.py**, **state.py**, **floor.py** — Support modules.
 - **ingest.py** — Indexing core (archetype + add); **query_engine.py** — Query (ask).
-- **ingest.py (single-file)** — `update_single_file()` / `remove_single_file()` support event-driven updates from `pal pull --watch`.
+- **ingest.py (single-file)** — `update_single_file()` / `remove_single_file()` support event-driven updates from `pal pull <path> --watch`.
   - **indexer.py** / **query.py** — Thin wrappers that re-export from ingest / query_engine for the CLI.
 - **docs/CHROMA_AND_STACK.md** — Chroma usage and stack choices.
 - **gemini_summary.md** — Project manifest and recovery notes.
@@ -56,10 +56,10 @@ Defaults suit a mix of code and docs. Chunking is line-aware (1000 chars, 100 ov
 
 ## Interrupting ingestion (Ctrl+C)
 
-Ingestion only **reads** your files and **writes** to the Chroma DB and (at the end) the silo registry. If you **force-exit** (e.g. Ctrl+C) during `pal add` or `llmli add`:
+Ingestion only **reads** your files and **writes** to the Chroma DB and (at the end) the silo registry. If you **force-exit** (e.g. Ctrl+C) during `pal pull <path>` (or compatibility alias `pal add`) or `llmli add`:
 
 - **Files on disk:** Unaffected (we never write to your source paths).
 - **Chroma:** For that silo we run `delete(where={"silo": ...})` before adding in batches. If you interrupt during the add step, the silo in Chroma may be empty or partially filled.
 - **Registry:** Updated only after all batches complete. If you interrupt, the registry is unchanged (stale counts) or the silo was never added.
 
-**What to do:** Re-run `pal add <path>` or `llmli add <path>`. That will delete and re-add that silo cleanly.
+**What to do:** Re-run `pal pull <path>` (or `pal add <path>`) or `llmli add <path>`. That will delete and re-add that silo cleanly.
