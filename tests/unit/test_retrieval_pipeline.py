@@ -9,6 +9,7 @@ from query.retrieval import (
     rrf_merge,
     extract_direct_lexical_terms,
     sort_by_source_priority,
+    source_extension_rank_map,
 )
 
 
@@ -146,6 +147,22 @@ def test_sort_by_source_priority_promotes_canonical_sources():
     )
     assert docs[0] == "canonical answer"
     assert (metas[0] or {}).get("source", "").endswith("canonical-hours.md")
+
+
+def test_source_extension_rank_map_prefers_extension_at_source_level():
+    metas = [
+        {"source": "/tmp/notes.docx"},
+        {"source": "/tmp/deck.pptx"},
+        {"source": "/tmp/deck.pptx"},
+    ]
+    dists = [0.05, 0.30, 0.40]
+    rank_map = source_extension_rank_map(metas, dists, [".pptx", ".ppt"])
+    assert rank_map["/tmp/deck.pptx"] < rank_map["/tmp/notes.docx"]
+
+
+def test_source_extension_rank_map_empty_without_hints():
+    rank_map = source_extension_rank_map([{"source": "/tmp/a.txt"}], [0.1], [])
+    assert rank_map == {}
 
 
 def test_field_lookup_candidates_do_not_fallback_across_years():

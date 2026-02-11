@@ -25,6 +25,13 @@ def write_trace(
     requested_line: str | None = None,
     project_count: int | None = None,
     project_samples: list[str] | None = None,
+    bound_silo: str | None = None,
+    binding_confidence: float | None = None,
+    binding_reason: str | None = None,
+    weak_scope_gate: bool | None = None,
+    catalog_retry_used: bool | None = None,
+    catalog_retry_silo: str | None = None,
+    filetype_hints: list[str] | None = None,
 ) -> None:
     """Append one JSON-line to LLMLIBRARIAN_TRACE file (if set). Optional receipt: source paths and chunk hashes for chunks sent to the LLM. No-op if env unset. Does not raise."""
     path = os.environ.get("LLMLIBRARIAN_TRACE")
@@ -64,6 +71,20 @@ def write_trace(
         payload["project_count"] = project_count
     if project_samples:
         payload["project_samples"] = project_samples[:5]
+    if bound_silo:
+        payload["bound_silo"] = bound_silo
+    if binding_confidence is not None:
+        payload["binding_confidence"] = round(float(binding_confidence), 3)
+    if binding_reason:
+        payload["binding_reason"] = binding_reason
+    if weak_scope_gate is not None:
+        payload["weak_scope_gate"] = bool(weak_scope_gate)
+    if catalog_retry_used is not None:
+        payload["catalog_retry_used"] = bool(catalog_retry_used)
+    if catalog_retry_silo:
+        payload["catalog_retry_silo"] = catalog_retry_silo
+    if filetype_hints:
+        payload["filetype_hints"] = list(filetype_hints)
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")

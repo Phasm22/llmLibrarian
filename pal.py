@@ -378,15 +378,15 @@ def _get_self_index_mtime_from_registry(reg: dict) -> int | None:
 
 
 def _warn_self_silo_stale() -> None:
-    print("Self-silo stale (repo changed since last index). Run `pal sync`.", file=sys.stderr)
+    print("Self-silo stale (repo changed since last index). Run `pal sync`.", file=sys.stderr, flush=True)
 
 
 def _warn_self_silo_missing() -> None:
-    print("Self-silo missing. Run `pal sync`.", file=sys.stderr)
+    print("Self-silo missing. Run `pal sync`.", file=sys.stderr, flush=True)
 
 
 def _warn_self_silo_mismatch() -> None:
-    print("Self-silo path mismatch. Run `pal sync`.", file=sys.stderr)
+    print("Self-silo path mismatch. Run `pal sync`.", file=sys.stderr, flush=True)
 
 
 def ensure_self_silo(force: bool = False) -> int:
@@ -964,6 +964,7 @@ app = typer.Typer(
     help="Index folders, ask questions, stay in sync.",
     no_args_is_help=True,
     add_completion=False,
+    context_settings={"help_option_names": ["-h", "--help"]},
 )
 
 
@@ -1204,9 +1205,9 @@ def silos_command() -> None:
 @app.command("tool", help="Pass-through to llmli.")
 def tool_command(
     tool_name: str = typer.Argument(..., help="Tool name (e.g. llmli)."),
-    tool_args: list[str] | None = typer.Argument(None, help="Arguments for the tool."),
+    tool_args: list[str] = typer.Argument(..., help="Arguments for the tool."),
 ) -> None:
-    rest = [a for a in (tool_args or []) if a != "--"]
+    rest = [a for a in tool_args if a != "--"]
     if tool_name == "llmli":
         _exit(_run_llmli(rest))
         return

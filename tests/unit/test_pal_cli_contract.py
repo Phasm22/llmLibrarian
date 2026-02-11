@@ -13,6 +13,12 @@ def test_pal_help_shows_expected_commands():
         assert cmd in res.stdout
 
 
+def test_pal_short_help_flag_supported():
+    res = runner.invoke(pal.app, ["-h"])
+    assert res.exit_code == 0
+    assert "Index folders, ask questions, stay in sync." in res.stdout
+
+
 def test_pal_no_argv_preprocessing_shortcuts(monkeypatch):
     monkeypatch.setenv("LLMLIBRARIAN_REQUIRE_SELF_SILO", "0")
     calls = []

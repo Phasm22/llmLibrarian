@@ -49,11 +49,17 @@ from query.retrieval import (
     rrf_merge,
     extract_direct_lexical_terms,
     sort_by_source_priority,
+    source_extension_rank_map,
     source_priority_score,
     filter_by_triggers,
     diversify_by_source,
     dedup_by_chunk_hash,
     resolve_subscope,
+)
+from query.scope_binding import (
+    bind_scope_from_query,
+    detect_filetype_hints,
+    rank_silos_by_catalog_tokens,
 )
 from query.expansion import expand_query
 from query.context import (
@@ -107,12 +113,27 @@ class QueryPolicyError(Exception):
         self.exit_code = exit_code
 
 
+WEAK_SCOPE_TOP_DISTANCE = 0.70
+
+
+def _top_distance(dists: list[float | None]) -> float | None:
+    for d in dists:
+        if d is not None:
+            return float(d)
+    return None
+
+
+def _distinct_source_count(metas: list[dict | None]) -> int:
+    return len({((m or {}).get("source") or "") for m in metas if ((m or {}).get("source") or "")})
+
+
 def _confidence_signal(
     dists: list[float | None],
     metas: list[dict | None],
     intent: str,
     direct_canonical_available: bool = False,
     confidence_relaxation_enabled: bool = True,
+    filetype_hints: list[str] | None = None,
 ) -> str | None:
     """Emit a lightweight confidence warning when retrieval quality is weak."""
     non_none = [float(d) for d in dists if d is not None]
@@ -122,6 +143,15 @@ def _confidence_signal(
     if avg_distance > 0.7:
         if intent == INTENT_LOOKUP and direct_canonical_available and confidence_relaxation_enabled:
             return None
+        hint_exts = {str(e).lower() for e in (filetype_hints or [])}
+        if ".pptx" in hint_exts or ".ppt" in hint_exts:
+            pres_sources = {
+                ((m or {}).get("source") or "")
+                for m in metas
+                if (((m or {}).get("source") or "").lower().endswith(".pptx") or ((m or {}).get("source") or "").lower().endswith(".ppt"))
+            }
+            if len(pres_sources) > 1:
+                return "Low confidence: matched multiple presentations; answer is based on the closest match."
         return "Low confidence: query is weakly related to indexed content."
     if intent == INTENT_FIELD_LOOKUP:
         return None
@@ -129,6 +159,52 @@ def _confidence_signal(
     if unique_sources == 1:
         return "Single source: answer is based on one document only."
     return None
+
+
+def _aggregate_sources_for_footer(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+) -> list[tuple[str, dict | None, float | None]]:
+    """De-duplicate footer sources by source path and aggregate line/page markers."""
+    by_source: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else None
+        dist = dists[i] if i < len(dists) else None
+        source = ((meta or {}).get("source") or "").strip() or f"__unknown_{i}"
+        if source not in by_source:
+            by_source[source] = {
+                "doc": doc,
+                "meta": dict(meta) if isinstance(meta, dict) else (meta or {}),
+                "dist": dist,
+                "lines": set(),
+                "pages": set(),
+            }
+            order.append(source)
+        entry = by_source[source]
+        if dist is not None and (entry["dist"] is None or float(dist) < float(entry["dist"])):
+            entry["dist"] = dist
+        m = meta or {}
+        line = m.get("line_start")
+        page = m.get("page")
+        if line is not None:
+            entry["lines"].add(str(line))
+        if page is not None:
+            entry["pages"].add(str(page))
+
+    out: list[tuple[str, dict | None, float | None]] = []
+    for source in order:
+        entry = by_source[source]
+        meta = dict(entry["meta"] or {})
+        lines = sorted(entry["lines"], key=lambda x: (len(x), x))
+        pages = sorted(entry["pages"], key=lambda x: (len(x), x))
+        if lines:
+            meta["line_start"] = ", ".join(lines)
+        if pages:
+            meta["page"] = ", ".join(pages)
+        out.append((entry["doc"], meta, entry["dist"]))
+    return out
 
 
 def _quiet_text_only(text: str) -> str:
@@ -265,11 +341,30 @@ def run_ask(
     t0 = time.perf_counter()
     intent = route_intent(query)
     query_opts = get_query_options(load_config(config_path))
+    auto_scope_binding = bool(query_opts.get("auto_scope_binding", True))
     direct_decisive_mode = bool(query_opts.get("direct_decisive_mode", False))
     canonical_tokens = [str(x) for x in (query_opts.get("canonical_filename_tokens") or [])]
     deprioritized_tokens = [str(x) for x in (query_opts.get("deprioritized_tokens") or [])]
     confidence_relaxation_enabled = bool(query_opts.get("confidence_relaxation_enabled", True))
     direct_canonical_available = False
+    explicit_silo = silo
+    scope_binding_reason: str | None = None
+    scope_binding_confidence: float | None = None
+    scope_bound_slug: str | None = None
+    scope_cleaned_query: str | None = None
+    filetype_hints = detect_filetype_hints(query)
+
+    if use_unified and silo is None and auto_scope_binding:
+        binding = bind_scope_from_query(query, db)
+        scope_binding_reason = binding.get("reason")
+        scope_binding_confidence = float(binding.get("confidence") or 0.0)
+        scope_cleaned_query = binding.get("cleaned_query")
+        if binding.get("bound_slug") and scope_binding_confidence >= 0.8:
+            scope_bound_slug = binding["bound_slug"]
+            silo = scope_bound_slug
+            # Keep system-policy suffixes intact; only align label for output clarity.
+            if binding.get("bound_display_name"):
+                source_label = str(binding["bound_display_name"])
     # CAPABILITIES: return deterministic report inline (source of truth; no retrieval, no LLM)
     if intent == INTENT_CAPABILITIES and use_unified:
         try:
@@ -362,9 +457,9 @@ def run_ask(
         n_stage1 = RERANK_STAGE1_N if use_reranker else min(100, max(n_results * 5, 60))
 
     hybrid_used = False
-    query_for_retrieval = query
+    query_for_retrieval = (scope_cleaned_query or query).strip()
     if intent not in (INTENT_FIELD_LOOKUP, INTENT_CAPABILITIES, INTENT_CODE_LANGUAGE):
-        query_for_retrieval = expand_query(query)
+        query_for_retrieval = expand_query(query_for_retrieval)
 
     # Intent-specific prompt suffixes (silent)
     if intent == INTENT_EVIDENCE_PROFILE:
@@ -577,6 +672,49 @@ def run_ask(
     metas = (results.get("metadatas") or [[]])[0] or []
     dists = (results.get("distances") or [[]])[0] or []
     ids_v = (results.get("ids") or [[]])[0] or [] if include_ids else []
+    weak_scope_gate = False
+    catalog_retry_used = False
+    catalog_retry_silo: str | None = None
+
+    # Weak-scope retry: when not explicitly scoped and first-pass relevance is weak, pick top catalog silo and retry.
+    if use_unified and explicit_silo is None and scope_bound_slug is None:
+        low_conf_first = _confidence_signal(
+            dists,
+            metas,
+            intent,
+            direct_canonical_available=direct_canonical_available,
+            confidence_relaxation_enabled=confidence_relaxation_enabled,
+            filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
+        )
+        top_d = _top_distance(dists)
+        weak_scope_gate = bool((low_conf_first is not None and low_conf_first.startswith("Low confidence")) or (top_d is not None and top_d > WEAK_SCOPE_TOP_DISTANCE))
+        if weak_scope_gate:
+            ranked = rank_silos_by_catalog_tokens(query, db, filetype_hints)
+            if ranked:
+                retry_slug = ranked[0]["slug"]
+                retry_kw = dict(query_kw)
+                retry_kw["where"] = {"silo": retry_slug}
+                retry_results = collection.query(**retry_kw)
+                docs_r = (retry_results.get("documents") or [[]])[0] or []
+                metas_r = (retry_results.get("metadatas") or [[]])[0] or []
+                dists_r = (retry_results.get("distances") or [[]])[0] or []
+                ids_r = (retry_results.get("ids") or [[]])[0] or [] if include_ids else []
+                top_r = _top_distance(dists_r)
+                if docs_r and (top_d is None or (top_r is not None and top_r < top_d)):
+                    docs, metas, dists, ids_v = docs_r, metas_r, dists_r, ids_r
+                    catalog_retry_used = True
+                    catalog_retry_silo = retry_slug
+                    silo = retry_slug
+                    try:
+                        _bp, source_label = _resolve_unified_silo_prompt(db, config_path, retry_slug)
+                    except Exception:
+                        source_label = retry_slug
+            if explain:
+                print(
+                    f"[scope] weak_scope={weak_scope_gate} retry_used={catalog_retry_used} "
+                    f"retry_silo={catalog_retry_silo or 'none'}",
+                    file=sys.stderr,
+                )
 
     # EVIDENCE_PROFILE + unified + silo/subscope: hybrid search (vector + Chroma where_document, RRF merge)
     if include_ids and ids_v and len(ids_v) == len(docs):
@@ -682,6 +820,24 @@ def run_ask(
         metas = [c[1] for c in combined]
         dists = [c[2] for c in combined]
 
+    # Filetype hinting at source-level (not per chunk) to avoid chunk-count bias.
+    preferred_exts = [str(e) for e in (filetype_hints.get("extensions") or [])]
+    if docs and preferred_exts:
+        source_rank = source_extension_rank_map(metas, dists, preferred_exts)
+        if source_rank:
+            combined = list(zip(docs, metas, dists))
+
+            def _source_hint_key(item: tuple[str, dict | None, float | None]) -> tuple[int, float]:
+                _doc, meta, dist = item
+                src = ((meta or {}).get("source") or "")
+                rank = source_rank.get(src, 99999)
+                return (rank, float(dist) if dist is not None else 999.0)
+
+            combined.sort(key=_source_hint_key)
+            docs = [c[0] for c in combined]
+            metas = [c[1] for c in combined]
+            dists = [c[2] for c in combined]
+
     # Diversify by source: cap chunks per file so one huge file (e.g. Closed Traffic.txt) doesn't crowd out others
     source_cache = [((m or {}).get("source") or "") for m in metas]
     per_intent_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
@@ -694,6 +850,43 @@ def run_ask(
         sources=source_cache,
     )
     docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+
+    # Filetype-hinted summary floor: keep sources that contribute at least one chunk under relevance threshold.
+    # This trims unrelated same-extension files (e.g., other PPTX decks) without introducing non-determinism.
+    if docs and preferred_exts and intent == INTENT_LOOKUP:
+        threshold = min(relevance_max_distance(), WEAK_SCOPE_TOP_DISTANCE)
+        source_best: dict[str, float] = {}
+        source_overlap: dict[str, int] = {}
+        q_tokens = {
+            t
+            for t in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", query.lower())
+            if t not in {"the", "and", "for", "with", "from", "that", "this", "main", "idea", "powerpoint", "ppt", "pptx", "slides"}
+        }
+        for i, meta in enumerate(metas):
+            src = ((meta or {}).get("source") or "")
+            if not src:
+                continue
+            d = dists[i] if i < len(dists) and dists[i] is not None else 999.0
+            if src not in source_best or float(d) < source_best[src]:
+                source_best[src] = float(d)
+            name_tokens = set(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", Path(src).name.lower()))
+            ov = len(q_tokens & name_tokens)
+            if ov > source_overlap.get(src, 0):
+                source_overlap[src] = ov
+        keep_sources = {s for s, d in source_best.items() if d <= threshold and source_overlap.get(s, 0) >= 1}
+        # If floor is too strict, keep top 3 distinct sources by best distance.
+        if not keep_sources and source_best:
+            keep_sources = {s for s, _d in sorted(source_best.items(), key=lambda kv: (kv[1], kv[0]))[:2]}
+        if keep_sources:
+            filtered = [
+                (docs[i], metas[i] if i < len(metas) else None, dists[i] if i < len(dists) else None)
+                for i in range(len(docs))
+                if (((metas[i] or {}).get("source") or "") in keep_sources)
+            ]
+            if filtered:
+                docs = [x[0] for x in filtered]
+                metas = [x[1] for x in filtered]
+                dists = [x[2] for x in filtered]
 
     # Deterministic value-consistency guardrail for direct factual lookups.
     if intent == INTENT_LOOKUP:
@@ -828,6 +1021,7 @@ def run_ask(
         intent,
         direct_canonical_available=direct_canonical_available,
         confidence_relaxation_enabled=confidence_relaxation_enabled,
+        filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
     )
 
     if quiet:
@@ -845,9 +1039,7 @@ def run_ask(
         "",
         bold(no_color, "Sources:"),
     ])
-    for i, doc in enumerate(docs):
-        meta = metas[i] if i < len(metas) else None
-        dist = dists[i] if i < len(dists) else None
+    for doc, meta, dist in _aggregate_sources_for_footer(docs, metas, dists):
         out.append(format_source(doc, meta, dist, no_color=no_color))
 
     time_ms = (time.perf_counter() - t0) * 1000
@@ -863,6 +1055,13 @@ def run_ask(
         query_len=len(query),
         hybrid_used=hybrid_used,
         receipt_metas=metas,
+        bound_silo=scope_bound_slug,
+        binding_confidence=scope_binding_confidence,
+        binding_reason=scope_binding_reason,
+        weak_scope_gate=weak_scope_gate,
+        catalog_retry_used=catalog_retry_used,
+        catalog_retry_silo=catalog_retry_silo,
+        filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
     )
     return "\n".join(out)
 

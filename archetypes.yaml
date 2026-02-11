@@ -154,6 +154,7 @@ limits:
   max_extracted_bytes_per_zip: 52428800
 
 query:
+  auto_scope_binding: true
   direct_decisive_mode: false
   canonical_filename_tokens:
     - canonical

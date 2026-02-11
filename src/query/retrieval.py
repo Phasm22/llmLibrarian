@@ -331,3 +331,40 @@ def sort_by_source_priority(
         [x[1] for x in combined],
         [x[2] for x in combined],
     )
+
+
+def source_extension_rank_map(
+    metas: list[dict | None],
+    dists: list[float | None],
+    preferred_extensions: list[str],
+) -> dict[str, int]:
+    """
+    Build source-level rank map for preferred extensions.
+    Ranking is per unique source (not chunk):
+    - preferred extension sources first
+    - then by best (lowest) distance
+    - then stable source path asc
+    """
+    exts = {e.lower() for e in preferred_extensions or [] if e}
+    if not exts:
+        return {}
+    per_source_best: dict[str, float] = {}
+    per_source_pref: dict[str, int] = {}
+    for i, meta in enumerate(metas):
+        source = ((meta or {}).get("source") or "").strip()
+        if not source:
+            continue
+        dist = dists[i] if i < len(dists) and dists[i] is not None else 999.0
+        if source not in per_source_best or dist < per_source_best[source]:
+            per_source_best[source] = float(dist)
+        suff = Path(source).suffix.lower()
+        per_source_pref[source] = 1 if suff in exts else 0
+    ordered = sorted(
+        per_source_best.keys(),
+        key=lambda s: (
+            0 if per_source_pref.get(s, 0) > 0 else 1,
+            per_source_best.get(s, 999.0),
+            s,
+        ),
+    )
+    return {s: idx for idx, s in enumerate(ordered)}

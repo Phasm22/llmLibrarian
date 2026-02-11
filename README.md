@@ -8,14 +8,22 @@ llmLibrarian keeps the language model **intentionally stateless**. There’s no 
 
 ## Quick start
 
+Setup (copy/paste):
+
 ```bash
 uv venv && source .venv/bin/activate
 uv sync
 ollama pull llama3.1:8b
+```
 
+Examples:
+
+```bash
 # Option A: pal (orchestrates llmli; state in ~/.pal/registry.json)
 pal pull /path/to/folder
 pal ask "what did I write about X?"
+pal ask --in stuff --explain "what files are from 2022"
+pal ask --in stuff --force --quiet "what files are from 2022"
 pal ls
 
 # Option B: llmli directly
@@ -26,6 +34,16 @@ llmli ls
 ```
 
 **Scoping:** Default ask searches all indexed silos. Use `--in <silo>` to limit to one folder (e.g. `--in tax`). Use `--unified` to explicitly search everything (overrides `--in` if both given). Answers are deterministic for the same DB and query (temperature=0, seed=42).
+Natural-language scope binding (for example: "in my stuff") is enabled by default via `query.auto_scope_binding: true`.
+
+Help:
+
+```bash
+pal -h
+pal --help
+llmli -h
+llmli --help
+```
 
 ---
 
@@ -41,6 +59,8 @@ llmli ls
 | `pal pull <path> --prompt "..."` | Set a per-silo system prompt override in the llmli silo registry. |
 | `pal pull <path> --clear-prompt` | Clear that per-silo prompt override. |
 | `pal ask ["question"]` | Ask across all silos; use `--in <silo>` to scope. |
+| `pal ask --explain ...` | Print deterministic catalog/scope diagnostics to stderr when applicable. |
+| `pal ask --force ...` | Allow deterministic catalog queries to run on stale scope. |
 | `pal ls` | List silos (path, files, chunks). |
 | `pal inspect <silo>` | Per-silo details and per-file chunk counts. |
 | `pal capabilities` | Supported file types and extractors. |
@@ -55,6 +75,8 @@ llmli ls
 |--------|-------------|
 | `add <path>` | Index folder (silo = basename). Cloud paths blocked by default. |
 | `ask [--in \<silo\> \| --unified \| --archetype \<id\>] <query...>` | Query. Default: all silos. `--in` = one silo; `--archetype` = archetype collection from archetypes.yaml. |
+| `ask --explain ...` | Print deterministic catalog diagnostics to stderr when applicable. |
+| `ask --force ...` | Allow deterministic catalog queries to run on stale scope. |
 | `ls` | List silos. |
 | `inspect <silo>` | Silo details and top files by chunk count. |
 | `capabilities` | Supported file types (source of truth). |

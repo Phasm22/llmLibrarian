@@ -210,6 +210,92 @@ def test_run_ask_applies_silo_filter(monkeypatch, mock_collection, mock_ollama):
     assert len(mock_ollama["calls"]) == 1
 
 
+def test_run_ask_auto_scope_binding_applies_silo_filter(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr(
+        "query.core.load_config",
+        lambda _p=None: {"archetypes": {}, "query": {"auto_scope_binding": True}},
+    )
+    monkeypatch.setattr(
+        "query.core.bind_scope_from_query",
+        lambda _q, _db: {
+            "bound_slug": "stuff-deadbeef",
+            "bound_display_name": "Stuff",
+            "confidence": 0.9,
+            "reason": "normalized_exact",
+            "cleaned_query": "main idea",
+        },
+    )
+    mock_collection.query_result = {
+        "documents": [["x"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "is_local": 1}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+    run_ask(
+        archetype_id=None,
+        query="main idea in my stuff",
+        no_color=True,
+        use_reranker=False,
+    )
+    q_calls = [kwargs for name, kwargs in mock_collection.calls if name == "query"]
+    assert q_calls
+    assert q_calls[0]["where"] == {"silo": "stuff-deadbeef"}
+
+
+def test_run_ask_weak_scope_retries_single_catalog_silo(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr(
+        "query.core.load_config",
+        lambda _p=None: {"archetypes": {}, "query": {"auto_scope_binding": True}},
+    )
+    monkeypatch.setattr(
+        "query.core.bind_scope_from_query",
+        lambda _q, _db: {
+            "bound_slug": None,
+            "bound_display_name": None,
+            "confidence": 0.0,
+            "reason": "no_scope_phrase",
+            "cleaned_query": _q,
+        },
+    )
+    monkeypatch.setattr(
+        "query.core.rank_silos_by_catalog_tokens",
+        lambda _q, _db, _h: [{"slug": "stuff-deadbeef", "score": 5.0, "matched_tokens": ["stuff"]}],
+    )
+
+    calls = []
+
+    def _query(**kwargs):
+        calls.append(kwargs)
+        where = kwargs.get("where")
+        if where == {"silo": "stuff-deadbeef"}:
+            return {
+                "documents": [["apt context"]],
+                "metadatas": [[{"source": "/tmp/APT Simulation and Analysis.pptx", "is_local": 1}]],
+                "distances": [[0.2]],
+                "ids": [["id-2"]],
+            }
+        return {
+            "documents": [["weak context"]],
+            "metadatas": [[{"source": "/tmp/Domain Administration.docx", "is_local": 1}]],
+            "distances": [[0.92]],
+            "ids": [["id-1"]],
+        }
+
+    mock_collection.query = _query  # type: ignore[method-assign]
+    run_ask(
+        archetype_id=None,
+        query="main idea of the apt simulation powerpoint in my stuff",
+        no_color=True,
+        use_reranker=False,
+    )
+    assert len(calls) == 2
+    assert calls[1]["where"] == {"silo": "stuff-deadbeef"}
+
+
 def test_run_ask_relevance_gate_skips_llm(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
@@ -667,3 +753,63 @@ def test_run_ask_direct_value_guardrail_same_with_strict_toggle(monkeypatch, moc
     assert "operating margin: 18.2%" in out_loose
     assert "operating margin: 18.2%" in out_strict
     assert len(mock_ollama["calls"]) == 0
+
+
+def test_run_ask_presentation_low_confidence_message_is_specific(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["slide content a", "slide content b"]],
+        "metadatas": [[
+            {"source": "/tmp/A.pptx", "line_start": 1, "is_local": 1},
+            {"source": "/tmp/B.pptx", "line_start": 2, "is_local": 1},
+        ]],
+        "distances": [[0.95, 0.94]],
+        "ids": [["id-1", "id-2"]],
+    }
+    out = run_ask(
+        archetype_id=None,
+        query="main idea of this powerpoint",
+        no_color=True,
+        use_reranker=False,
+    )
+    assert "matched multiple presentations" in out
+
+
+def test_run_ask_footer_dedupes_duplicate_source_with_aggregated_lines(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["chunk one", "chunk two"]],
+        "metadatas": [[
+            {"source": "/tmp/APT Simulation and Analysis.pptx", "line_start": 1, "is_local": 1},
+            {"source": "/tmp/APT Simulation and Analysis.pptx", "line_start": 23, "is_local": 1},
+        ]],
+        "distances": [[0.2, 0.3]],
+        "ids": [["id-1", "id-2"]],
+    }
+    out = run_ask(archetype_id=None, query="main idea", no_color=True, use_reranker=False)
+    assert out.count("APT Simulation and Analysis.pptx (line") == 1
+    assert "(line 1, 23)" in out
+
+
+def test_run_ask_filetype_floor_filters_unrelated_presentations(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["apt good", "loops noise"]],
+        "metadatas": [[
+            {"source": "/tmp/APT Simulation and Analysis.pptx", "line_start": 1, "is_local": 1},
+            {"source": "/tmp/Chapter 4 Loops.pptx", "line_start": 1, "is_local": 1},
+        ]],
+        "distances": [[0.25, 0.95]],
+        "ids": [["id-1", "id-2"]],
+    }
+    out = run_ask(
+        archetype_id=None,
+        query="main idea of the apt simulation powerpoint",
+        no_color=True,
+        use_reranker=False,
+    )
+    assert "APT Simulation and Analysis.pptx" in out
+    assert "Chapter 4 Loops.pptx" not in out

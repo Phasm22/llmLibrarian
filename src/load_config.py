@@ -74,6 +74,7 @@ def get_query_options(config: AppConfig | dict | None) -> dict[str, object]:
     """Return query behavior options with stable defaults."""
     q = ((config or {}).get("query") or {}) if isinstance(config, dict) else {}
     return {
+        "auto_scope_binding": bool(q.get("auto_scope_binding", True)),
         "direct_decisive_mode": bool(q.get("direct_decisive_mode", False)),
         "canonical_filename_tokens": list(q.get("canonical_filename_tokens") or ["canonical", "official"]),
         "deprioritized_tokens": list(q.get("deprioritized_tokens") or ["draft", "archive", "stale", "deprecated"]),
