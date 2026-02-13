@@ -6,6 +6,7 @@ from query.catalog import (
     build_structure_outline,
     build_structure_recent,
     build_structure_inventory,
+    build_structure_extension_count,
     rank_scope_candidates,
 )
 from state import update_silo
@@ -15,14 +16,22 @@ def test_parse_structure_request_modes():
     assert parse_structure_request("show structure snapshot") == {
         "mode": "outline",
         "wants_summary": False,
+        "ext": None,
     }
     assert parse_structure_request("recent changes in this folder") == {
         "mode": "recent",
         "wants_summary": False,
+        "ext": None,
     }
     assert parse_structure_request("summarize file type inventory") == {
         "mode": "inventory",
         "wants_summary": True,
+        "ext": None,
+    }
+    assert parse_structure_request("how many .docx files are there") == {
+        "mode": "ext_count",
+        "wants_summary": False,
+        "ext": ".docx",
     }
 
 
@@ -147,6 +156,48 @@ def test_build_structure_inventory_counts_by_unique_file_group(tmp_path: Path):
     assert out["lines"] == [".py 2", ".pptx 1"]
 
 
+def test_build_structure_extension_count_is_deterministic(tmp_path: Path):
+    db = tmp_path / "db"
+    db.mkdir(parents=True, exist_ok=True)
+    root = tmp_path / "stuff"
+    root.mkdir(parents=True, exist_ok=True)
+    a = root / "a.docx"
+    b = root / "b.docx"
+    c = root / "copy.docx"
+    d = root / "deck.pptx"
+    for p in (a, b, c, d):
+        p.write_text("x", encoding="utf-8")
+    update_silo(
+        str(db),
+        "stuff-deadbeef",
+        str(root.resolve()),
+        files_indexed=4,
+        chunks_count=4,
+        updated_iso="2026-02-13T00:00:00+00:00",
+        display_name="Stuff",
+    )
+    _write_file_manifest(
+        db,
+        {
+            "silos": {
+                "stuff-deadbeef": {
+                    "path": str(root.resolve()),
+                    "files": {
+                        str(a.resolve()): {"mtime": 1672531200.0, "size": 1, "hash": "h1"},
+                        str(b.resolve()): {"mtime": 1672531200.0, "size": 1, "hash": "h2"},
+                        str(c.resolve()): {"mtime": 1672531200.0, "size": 1, "hash": "h2"},
+                        str(d.resolve()): {"mtime": 1672531200.0, "size": 1, "hash": "h3"},
+                    },
+                }
+            }
+        },
+    )
+    out = build_structure_extension_count(str(db), "stuff-deadbeef", ".docx")
+    assert out["mode"] == "ext_count"
+    assert out["ext"] == ".docx"
+    assert out["count"] == 2
+
+
 def test_rank_scope_candidates_returns_top_three(tmp_path: Path):
     db = tmp_path / "db"
     db.mkdir(parents=True, exist_ok=True)
@@ -183,4 +234,3 @@ def test_rank_scope_candidates_returns_top_three(tmp_path: Path):
     out = rank_scope_candidates("show structure for apt simulation powerpoint", str(db), top_n=3)
     assert len(out) == 3
     assert out[0]["slug"] == "stuff-deadbeef"
-

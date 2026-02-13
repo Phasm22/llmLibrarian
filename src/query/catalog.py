@@ -34,6 +34,7 @@ class CatalogResult(TypedDict):
 class StructureRequest(TypedDict):
     mode: str
     wants_summary: bool
+    ext: str | None
 
 
 class StructureResult(TypedDict):
@@ -52,6 +53,16 @@ class ScopeCandidate(TypedDict):
     display_name: str
     score: float
     matched_tokens: list[str]
+
+
+class StructureExtensionCountResult(TypedDict):
+    mode: str
+    ext: str
+    count: int
+    scanned_count: int
+    scope: str
+    stale: bool
+    stale_reason: str | None
 
 
 FILE_LIST_SKIP_WORDS = (
@@ -96,12 +107,19 @@ def parse_structure_request(query: str) -> StructureRequest | None:
     if not q:
         return None
     wants_summary = any(w in q for w in STRUCTURE_SUMMARY_WORDS)
+    ext_match = re.search(r"\.([a-z0-9]{1,8})\b", q)
+    if (
+        ext_match
+        and re.search(r"\b(how\s+many|count|number\s+of)\b", q)
+        and re.search(r"\b(files?|documents?|docs?)\b", q)
+    ):
+        return {"mode": "ext_count", "wants_summary": False, "ext": f".{ext_match.group(1)}"}
     if re.search(r"\b(recent\s+(?:changes?|files?)|what\s+changed\s+recently)\b", q):
-        return {"mode": "recent", "wants_summary": wants_summary}
+        return {"mode": "recent", "wants_summary": wants_summary, "ext": None}
     if re.search(r"\b(file\s+types?|extensions?|inventory)\b", q):
-        return {"mode": "inventory", "wants_summary": wants_summary}
+        return {"mode": "inventory", "wants_summary": wants_summary, "ext": None}
     if re.search(r"\b(structure|folder\s+outline|outline|directory|layout|snapshot|tree)\b", q):
-        return {"mode": "outline", "wants_summary": wants_summary}
+        return {"mode": "outline", "wants_summary": wants_summary, "ext": None}
     return None
 
 
@@ -325,6 +343,39 @@ def build_structure_inventory(db_path: str, silo_slug: str, cap: int = 200) -> S
         "scanned_count": len(files_map),
         "matched_count": len(rows),
         "cap_applied": len(rows) > len(capped),
+        "scope": f"silo:{silo_slug}",
+        "stale": False,
+        "stale_reason": None,
+    }
+
+
+def build_structure_extension_count(
+    db_path: str,
+    silo_slug: str,
+    ext: str,
+) -> StructureExtensionCountResult:
+    files_map, err = _iter_manifest_paths_for_silo(db_path, silo_slug)
+    ext_norm = str(ext or "").strip().lower()
+    if ext_norm and not ext_norm.startswith("."):
+        ext_norm = f".{ext_norm}"
+    if err:
+        return {
+            "mode": "ext_count",
+            "ext": ext_norm or ".unknown",
+            "count": 0,
+            "scanned_count": 0,
+            "scope": f"silo:{silo_slug}",
+            "stale": True,
+            "stale_reason": err,
+        }
+    root = str((_silo_info_map(db_path).get(silo_slug) or {}).get("path") or "") or None
+    groups = _collapse_manifest_entries(files_map, root)
+    count = sum(1 for g in groups if str(g.get("ext") or "").lower() == ext_norm)
+    return {
+        "mode": "ext_count",
+        "ext": ext_norm or ".unknown",
+        "count": int(count),
+        "scanned_count": len(files_map),
         "scope": f"silo:{silo_slug}",
         "stale": False,
         "stale_reason": None,

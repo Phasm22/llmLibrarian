@@ -197,6 +197,24 @@ def test_run_ask_structure_without_scope_returns_deterministic_guidance(monkeypa
     assert mock_ollama["calls"] == []
 
 
+def test_run_ask_structure_without_scope_quiet_returns_single_line_policy_error(monkeypatch):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_STRUCTURE)
+    monkeypatch.setattr("query.core.parse_structure_request", lambda _q: {"mode": "outline", "wants_summary": False, "ext": None})
+    try:
+        run_ask(
+            archetype_id=None,
+            query="show structure",
+            no_color=True,
+            use_reranker=False,
+            quiet=True,
+            silo=None,
+        )
+        assert False, "expected QueryPolicyError"
+    except QueryPolicyError as e:
+        assert str(e) == 'No scope selected. Try: pal ask --in <silo> "show structure"'
+        assert e.exit_code == 2
+
+
 def test_run_ask_structure_stale_warns_but_returns_results(monkeypatch, mock_ollama):
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_STRUCTURE)
     monkeypatch.setattr("query.core.parse_structure_request", lambda _q: {"mode": "recent", "wants_summary": False})
@@ -227,6 +245,47 @@ def test_run_ask_structure_stale_warns_but_returns_results(monkeypatch, mock_oll
     )
     assert out.startswith("⚠ Index may be outdated")
     assert "2024-05-01 notes/a.md" in out
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_structure_extension_count_short_circuits_llm(monkeypatch, mock_ollama):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_STRUCTURE)
+    monkeypatch.setattr("query.core.parse_structure_request", lambda _q: {"mode": "ext_count", "wants_summary": False, "ext": ".docx"})
+    monkeypatch.setattr(
+        "query.core.build_structure_extension_count",
+        lambda _db, _silo, _ext: {
+            "mode": "ext_count",
+            "ext": ".docx",
+            "count": 197,
+            "scanned_count": 519,
+            "scope": "silo:stuff-bf5fc7e8",
+            "stale": False,
+            "stale_reason": None,
+        },
+    )
+    monkeypatch.setattr("query.core.validate_catalog_freshness", lambda _db, _silo: {"stale": False, "stale_reason": None, "scanned_count": 519})
+    monkeypatch.setattr(
+        "query.core.chromadb.PersistentClient",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ext_count should not create chroma client")),
+    )
+    out_quiet = run_ask(
+        archetype_id=None,
+        query="how many .docx files are there",
+        no_color=True,
+        use_reranker=False,
+        quiet=True,
+        silo="stuff-bf5fc7e8",
+    )
+    out = run_ask(
+        archetype_id=None,
+        query="how many .docx files are there",
+        no_color=True,
+        use_reranker=False,
+        quiet=False,
+        silo="stuff-bf5fc7e8",
+    )
+    assert out_quiet == "197"
+    assert "There are 197 .docx file(s)" in out
     assert mock_ollama["calls"] == []
 
 

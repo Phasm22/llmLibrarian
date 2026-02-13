@@ -1,3 +1,6 @@
+import sys
+from types import SimpleNamespace
+
 from typer.testing import CliRunner
 
 import pal
@@ -23,6 +26,14 @@ def test_pal_no_argv_preprocessing_shortcuts(monkeypatch):
     monkeypatch.setenv("LLMLIBRARIAN_REQUIRE_SELF_SILO", "0")
     calls = []
     monkeypatch.setattr("pal._run_llmli", lambda args: calls.append(list(args)) or 0)
+    monkeypatch.setitem(
+        sys.modules,
+        "state",
+        SimpleNamespace(
+            resolve_silo_to_slug=lambda _db, name: "tax" if name == "tax" else None,
+            resolve_silo_prefix=lambda _db, _prefix: None,
+        ),
+    )
 
     bad = runner.invoke(pal.app, ["what", "is", "pal"])
     assert bad.exit_code != 0
@@ -30,7 +41,14 @@ def test_pal_no_argv_preprocessing_shortcuts(monkeypatch):
 
     ok = runner.invoke(pal.app, ["ask", "in", "tax", "what", "is", "pal"])
     assert ok.exit_code == 0
-    assert calls[-1] == ["ask", "in", "tax", "what", "is", "pal"]
+    assert calls[-1] == ["ask", "--in", "tax", "what", "is", "pal"]
+
+
+def test_pal_ask_natural_in_malformed_scope_token_has_deterministic_hint(monkeypatch):
+    monkeypatch.setenv("LLMLIBRARIAN_REQUIRE_SELF_SILO", "0")
+    res = runner.invoke(pal.app, ["ask", "in", "marketman--quiet", "show", "structure", "snapshot"])
+    assert res.exit_code == 2
+    assert "Malformed scope token" in (res.stderr or res.stdout)
 
 
 def test_pull_help_mentions_watch():

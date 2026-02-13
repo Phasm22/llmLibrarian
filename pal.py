@@ -813,6 +813,52 @@ def ensure_self_silo(force: bool = False, emit_warning: bool = True) -> int:
     return 0
 
 
+def _normalize_natural_ask_scope(
+    query_tokens: list[str],
+    explicit_in_silo: str | None,
+    db_path: str | Path,
+) -> tuple[str | None, list[str], str | None]:
+    """
+    Normalize natural shorthand:
+      pal ask in <silo> <question...>
+    into explicit --in semantics for llmli delegation.
+    """
+    if explicit_in_silo:
+        return explicit_in_silo, query_tokens, None
+    if len(query_tokens) < 2:
+        return None, query_tokens, None
+    if str(query_tokens[0]).strip().lower() != "in":
+        return None, query_tokens, None
+
+    idx = 1
+    if len(query_tokens) >= 3 and str(query_tokens[1]).strip().lower() == "my":
+        idx = 2
+    if len(query_tokens) <= idx:
+        return None, query_tokens, "Malformed scope shorthand. Use: pal ask --in <silo> \"<question>\""
+
+    candidate = str(query_tokens[idx]).strip()
+    if not candidate:
+        return None, query_tokens, "Malformed scope shorthand. Use: pal ask --in <silo> \"<question>\""
+    if "--" in candidate:
+        return None, query_tokens, (
+            f"Malformed scope token '{candidate}'. "
+            "Use a space before flags or use explicit scope: pal ask --in <silo> \"<question>\""
+        )
+
+    remainder = query_tokens[idx + 1 :]
+    if not remainder:
+        return None, query_tokens, "Missing question after scope. Use: pal ask --in <silo> \"<question>\""
+
+    _ensure_src_on_path()
+    from state import resolve_silo_to_slug, resolve_silo_prefix
+
+    resolved = resolve_silo_to_slug(db_path, candidate) or resolve_silo_prefix(db_path, candidate)
+    if resolved:
+        return resolved, remainder, None
+    # Conservative fallback: if we cannot resolve deterministically, leave query unchanged.
+    return None, query_tokens, None
+
+
 class _SiloEventHandler(FileSystemEventHandler):
     def __init__(self, watcher: "SiloWatcher") -> None:
         super().__init__()
@@ -1479,11 +1525,19 @@ def ask_command(
     explain: bool = typer.Option(False, "--explain", help="Print deterministic catalog diagnostics to stderr when applicable."),
     force: bool = typer.Option(False, "--force", help="Allow deterministic catalog queries on stale scope."),
 ) -> None:
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    in_silo_norm, query_norm, scope_err = _normalize_natural_ask_scope(query, in_silo, db_path)
+    if scope_err:
+        print(scope_err, file=sys.stderr)
+        raise typer.Exit(code=2)
+    if in_silo_norm:
+        in_silo = in_silo_norm
+        query = query_norm
+
     ensure_self_silo(force=False, emit_warning=False)
     if not quiet and _should_require_self_silo():
         repo_root = _get_git_root()
         if repo_root is not None and _is_dev_repo_at_root(repo_root):
-            db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
             llmli_registry = _read_llmli_registry(db_path)
             self_entry = llmli_registry.get("__self__") if isinstance(llmli_registry, dict) else None
             self_path = (self_entry or {}).get("path") if isinstance(self_entry, dict) else None

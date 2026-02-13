@@ -1,56 +1,75 @@
 # AGENTS
 
-This repo supports multiple coding agents (Claude, Cursor, Codex). Each agent uses its own config directory. This file documents common workflows and commands that apply across agents.
+Primary source of truth for coding agents in this repo.
 
-## Workflows
+If any other document conflicts with this file, follow `AGENTS.md`.
+
+## Purpose
+
+This repository is a local-first CLI tool.
+Agent priorities:
+1. Keep behavior deterministic and observable.
+2. Prefer minimal-friction CLI UX (`pal` first, `llmli` direct when needed).
+3. Keep docs and tests aligned with current command behavior.
+
+## Canonical Workflows
 
 ### 1) Setup
-- Create a virtual environment and install dependencies.
-- Verify the CLI runs locally.
-
-### 2) Ingest
-- Prepare inputs.
-- Run ingest.
-- Validate output.
-
-### 3) Query
-- Start the query engine.
-- Run a sample query.
-- Verify formatting output.
-
-### 4) Tests
-- Run unit tests before committing.
-- If adding features, include or update tests.
-
-### 5) Lint/Format
-- Run formatting and linting (if configured).
-- Keep diffs minimal and focused.
-
-## Commands
-
-### Environment
 ```bash
 uv venv
-uv pip install -r requirements.txt
+source .venv/bin/activate
+uv sync
 ```
 
-### Ingest
+### 2) Ingest / Pull
 ```bash
-python -m src.ingest
+# Day-to-day (recommended)
+pal pull /path/to/folder
+
+# Direct tool usage
+llmli add /path/to/folder
 ```
 
-### Query
+### 3) Query
 ```bash
-python -m src.query_engine
+# Scoped ask
+pal ask --in <silo> "question"
+
+# Unified ask
+pal ask --unified "question"
+
+# Direct tool usage
+llmli ask --in <silo> "question"
 ```
 
-### Tests
+### 4) Inspect / Diagnose
 ```bash
-uv run pytest -q
-python -m pytest -q
+pal ls
+pal inspect <silo> --top 20
+pal pull --status
+pal status
 ```
 
-## Notes
-- Each agent may have additional instructions in its own directory/config.
-- Keep commands updated if entry points or tooling change.
-- In this repo, `pal` uses a dev-only self-silo (`__self__`). `pal ask`/`pal capabilities` only warn if it is missing or stale. Use `pal ensure-self` to index or refresh.
+### 5) Test
+```bash
+uv run pytest -q tests/unit
+```
+
+## Command Notes
+
+- `pal` is the operator-facing CLI.
+- `llmli` is the direct engine CLI.
+- `pal sync` refreshes the dev self-silo (`__self__`) when needed.
+- Natural shorthand `pal ask in <silo> "..."` is supported and normalized to `--in`.
+
+## Documentation Policy
+
+- Keep docs short and current.
+- Remove stale implementation diaries and one-off planning details.
+- Prefer behavior contracts over speculative design notes.
+
+## Agent Guardrails
+
+- Run unit tests for touched behavior before finishing.
+- Do not add broad config surfaces unless required.
+- Keep changes focused and reversible.

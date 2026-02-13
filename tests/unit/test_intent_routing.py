@@ -83,6 +83,11 @@ def test_route_intent_structure_inventory_query():
     assert route_intent(q) == INTENT_STRUCTURE
 
 
+def test_route_intent_structure_extension_count_query():
+    q = "how many .docx files are there"
+    assert route_intent(q) == INTENT_STRUCTURE
+
+
 def test_route_intent_fallback_lookup():
     assert route_intent("explain dependency injection") == INTENT_LOOKUP
 

@@ -84,6 +84,7 @@ from query.catalog import (
     build_structure_outline,
     build_structure_recent,
     build_structure_inventory,
+    build_structure_extension_count,
     rank_scope_candidates,
 )
 from query.formatting import (
@@ -438,10 +439,13 @@ def run_ask(
 
     # STRUCTURE: deterministic catalog snapshot (outline/recent/inventory). No retrieval.
     if intent == INTENT_STRUCTURE and use_unified:
-        req = parse_structure_request(query) or {"mode": "outline", "wants_summary": False}
+        req = parse_structure_request(query) or {"mode": "outline", "wants_summary": False, "ext": None}
         mode = str(req.get("mode") or "outline")
         wants_summary = bool(req.get("wants_summary"))
+        ext = str(req.get("ext") or "").strip().lower()
         if not silo:
+            if quiet:
+                raise QueryPolicyError('No scope selected. Try: pal ask --in <silo> "show structure"', exit_code=2)
             candidates = rank_scope_candidates(query, db, top_n=3)
             lines = ['No scope selected. Try: pal ask --in <silo> "show structure"']
             if candidates:
@@ -473,7 +477,50 @@ def run_ask(
             return "\n".join(lines)
 
         fresh = validate_catalog_freshness(db, silo)
-        if mode == "recent":
+        if mode == "ext_count":
+            report_ext = build_structure_extension_count(db, silo, ext)
+            report_ext["stale"] = bool(fresh.get("stale"))
+            report_ext["stale_reason"] = fresh.get("stale_reason")
+            count = int(report_ext.get("count") or 0)
+            ext_norm = str(report_ext.get("ext") or ext or ".unknown")
+            if explain:
+                print(
+                    "[catalog] "
+                    f"scope={report_ext['scope']} mode=ext_count ext={ext_norm} scanned={report_ext['scanned_count']} "
+                    f"count={count} stale={report_ext['stale']} stale_reason={report_ext.get('stale_reason') or 'none'}",
+                    file=sys.stderr,
+                )
+            if quiet:
+                return str(count)
+
+            out: list[str] = []
+            if report_ext.get("stale"):
+                out.append("⚠ Index may be outdated (repo changed since last sync). Results reflect last index.")
+                out.append("")
+            out.append(f"There are {count} {ext_norm} file(s) in {source_label}.")
+            out.extend(["", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")])
+            time_ms = (time.perf_counter() - t0) * 1000
+            write_trace(
+                intent=intent,
+                n_stage1=0,
+                n_results=0,
+                model=model,
+                silo=silo,
+                source_label=source_label,
+                num_docs=1,
+                time_ms=time_ms,
+                query_len=len(query),
+                hybrid_used=False,
+                guardrail_no_match=False,
+                guardrail_reason="catalog_structure_ext_count",
+                requested_year=None,
+                requested_form=None,
+                requested_line=None,
+                receipt_metas=[{"source": f"{ext_norm}:{count}", "silo": silo}],
+                answer_kind="catalog_artifact",
+            )
+            return "\n".join(out)
+        elif mode == "recent":
             report = build_structure_recent(db, silo, cap=100)
             mode_label = "Recent changes snapshot"
         elif mode == "inventory":

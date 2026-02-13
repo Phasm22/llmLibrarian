@@ -57,6 +57,13 @@ def route_intent(query: str) -> str:
         and re.search(r"\b(files?|folders?|docs?|documents?|structure|changes?|types?|extensions?|inventory)\b", q)
     ):
         return INTENT_STRUCTURE
+    # STRUCTURE ext-count: deterministic inventory math (e.g., "how many .docx files").
+    if (
+        re.search(r"\.(?:[a-z0-9]{1,8})\b", q)
+        and re.search(r"\b(how\s+many|count|number\s+of)\b", q)
+        and re.search(r"\b(files?|documents?|docs?)\b", q)
+    ):
+        return INTENT_STRUCTURE
     # CODE_LANGUAGE: most common / primary / dominant coding language (deterministic count by extension)
     if re.search(
         r"\bmost common\s+(?:coding\s+)?(?:programming\s+)?language\b|\bmost used\s+(?:coding\s+)?language\b|"

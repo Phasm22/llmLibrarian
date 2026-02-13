@@ -70,6 +70,8 @@ pal ask --in stuff --quiet "what files are from 2022"
 pal ask --in stuff --quiet "show structure snapshot"
 pal ask --in stuff --quiet "recent changes"
 pal ask --in stuff --quiet "file type inventory"
+pal ask in stuff "how many .docx files are there"
+pal ask --in stuff "how many .docx files are there"
 
 # Cross-silo synthesis (--unified)
 pal ask --unified "compare risk themes in my work incident notes and personal security project slides"
@@ -93,6 +95,7 @@ Scoping:
 - `--in <silo>` limits to one silo.
 - `--unified` explicitly searches everything.
 - Natural-language scope phrases (for example, “in my stuff”) are best-effort and conservative.
+- `pal ask in <silo> "..."` is normalized to explicit `--in` behavior for parity.
 - For structure-style asks without scope, llmLibrarian returns deterministic scope guidance with likely silos instead of guessing.
 
 Help:
