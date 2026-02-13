@@ -9,7 +9,7 @@ runner = CliRunner()
 def test_pal_help_shows_expected_commands():
     res = runner.invoke(pal.app, ["--help"])
     assert res.exit_code == 0
-    for cmd in ("pull", "ask", "ls", "inspect", "remove", "sync", "silos", "tool"):
+    for cmd in ("pull", "ask", "ls", "inspect", "capabilities", "log", "remove", "sync", "diff", "status", "silos", "tool"):
         assert cmd in res.stdout
 
 
@@ -37,6 +37,10 @@ def test_pull_help_mentions_watch():
     res = runner.invoke(pal.app, ["pull", "--help"])
     assert res.exit_code == 0
     assert "--watch" in res.stdout
+    assert "--status" in res.stdout
+    assert "--stop" in res.stdout
+    assert "--json" in res.stdout
+    assert "--prune-stale" in res.stdout
     assert "--prompt" in res.stdout
     assert "--clear-prompt" in res.stdout
 
@@ -60,3 +64,15 @@ def test_ask_passes_explain_and_force(monkeypatch):
     assert calls
     assert "--explain" in calls[-1]
     assert "--force" in calls[-1]
+
+
+def test_pull_rejects_conflicting_operation_modes():
+    res = runner.invoke(pal.app, ["pull", "/tmp/folder", "--watch", "--status"])
+    assert res.exit_code == 2
+    assert "only one operation mode" in (res.stderr or res.stdout).lower()
+
+
+def test_pull_status_rejects_indexing_flags():
+    res = runner.invoke(pal.app, ["pull", "--status", "--full"])
+    assert res.exit_code == 2
+    assert "--status cannot be combined" in (res.stderr or res.stdout)

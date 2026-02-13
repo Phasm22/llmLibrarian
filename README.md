@@ -67,6 +67,9 @@ pal ls
 pal ask --in school "what classes did I take in 2022 and which files support that?"
 pal ask --in taxes "list every 1099 form mentioned in my 2023 tax files"
 pal ask --in stuff --quiet "what files are from 2022"
+pal ask --in stuff --quiet "show structure snapshot"
+pal ask --in stuff --quiet "recent changes"
+pal ask --in stuff --quiet "file type inventory"
 
 # Cross-silo synthesis (--unified)
 pal ask --unified "compare risk themes in my work incident notes and personal security project slides"
@@ -90,6 +93,7 @@ Scoping:
 - `--in <silo>` limits to one silo.
 - `--unified` explicitly searches everything.
 - Natural-language scope phrases (for example, “in my stuff”) are best-effort and conservative.
+- For structure-style asks without scope, llmLibrarian returns deterministic scope guidance with likely silos instead of guessing.
 
 Help:
 
@@ -122,6 +126,9 @@ Expected result:
 | `pal pull` | Update changed files across registered folders. |
 | `pal pull <path>` | Pull one folder and register it in `~/.pal/registry.json`. |
 | `pal pull <path> --watch` | Keep one folder in sync while you work. |
+| `pal pull --status` | Show watcher locks and process state for all watched silos. |
+| `pal pull <path> --status` | Show watcher state for the silo mapped to that path. |
+| `pal pull --stop <target>` | Stop watcher by PID, silo slug/display name, or watched path. |
 | `pal pull <path> --prompt "..."` | Set per-silo prompt override in llmli registry. |
 | `pal pull <path> --clear-prompt` | Clear per-silo prompt override. |
 | `pal ask "..."` | Ask across silos; use `--in <silo>` to scope. |
@@ -164,6 +171,7 @@ Use `pal pull <path> --clear-prompt` to revert.
 - Explicit `--in` always wins.
 - Phrase binding like “in my stuff” is conservative and deterministic.
 - Ambiguous phrase matches do not auto-bind.
+- Structure asks with no clear scope return a deterministic “No scope selected” hint plus likely silos.
 
 ## Troubleshooting (Top 5)
 
@@ -175,15 +183,26 @@ Use `pal pull <path> --clear-prompt` to revert.
 - Meaning: retrieval match quality is weak or mixed.
 - Fix: scope with `--in`, ask a more specific question, or add missing files.
 
-3. `no extractable text` for PDFs
+3. watcher suspended after `^Z`
+- Meaning: process is stopped but still holds watcher lock.
+- Fix:
+
+```bash
+pal pull --status
+pal pull --stop <silo-or-pid>
+```
+
+Watcher locks live at `~/.pal/watch_locks`.
+
+4. `no extractable text` for PDFs
 - Meaning: scanned/image PDF or unreadable structure.
 - Fix: OCR first, or use text-exportable documents.
 
-4. stale catalog + `--force`
+5. stale catalog + `--force`
 - Meaning: deterministic catalog query detected stale scope.
 - Fix: `pal pull <path>` to refresh; use `--force` only if you accept stale results.
 
-5. wrong binary/environment
+6. wrong binary/environment
 - Symptom: command behavior doesn’t match repo changes.
 - Fix:
 

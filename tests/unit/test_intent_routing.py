@@ -5,6 +5,7 @@ from query.intent import (
     INTENT_EVIDENCE_PROFILE,
     INTENT_FIELD_LOOKUP,
     INTENT_FILE_LIST,
+    INTENT_STRUCTURE,
     INTENT_MONEY_YEAR_TOTAL,
     INTENT_PROJECT_COUNT,
     INTENT_LOOKUP,
@@ -65,6 +66,21 @@ def test_route_intent_file_list_year_query():
 def test_route_intent_file_list_does_not_capture_summary_queries():
     q = "summary of architecture files from 2022"
     assert route_intent(q) == INTENT_LOOKUP
+
+
+def test_route_intent_structure_outline_query():
+    q = "show structure snapshot for this silo"
+    assert route_intent(q) == INTENT_STRUCTURE
+
+
+def test_route_intent_structure_recent_query():
+    q = "what changed recently in my docs"
+    assert route_intent(q) == INTENT_STRUCTURE
+
+
+def test_route_intent_structure_inventory_query():
+    q = "file type inventory in this folder"
+    assert route_intent(q) == INTENT_STRUCTURE
 
 
 def test_route_intent_fallback_lookup():

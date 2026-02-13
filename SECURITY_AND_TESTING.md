@@ -9,6 +9,12 @@ Documentation map:
 - Technical/operator behavior and query pipeline: `docs/TECH.md`
 - Security posture and test coverage details: this file (`SECURITY_AND_TESTING.md`)
 
+Watcher lifecycle safety (pal pull watch/status/stop):
+- Watch process locks are persisted in `~/.pal/watch_locks/*.pid`.
+- Stop operations enforce same-user checks when lock `uid` is present.
+- Stop operations refuse to signal when process command signature does not match `pal pull --watch`.
+- Stale locks can be inspected via `pal pull --status` and removed via `pal pull --status --prune-stale`.
+
 ---
 
 ## Part 1: Trust & Security Assessment

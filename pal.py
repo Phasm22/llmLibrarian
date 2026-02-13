@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 import threading
+import getpass
+import re
 from pathlib import Path
 
 import typer
@@ -46,7 +48,13 @@ def _watch_lock_path(db_path: str | Path, silo_slug: str) -> Path:
     return WATCH_LOCKS_DIR / f"{safe_slug}-{digest}.pid"
 
 
-def _read_watch_lock_pid(lock_path: Path) -> int | None:
+def _iter_watch_locks() -> list[Path]:
+    if not WATCH_LOCKS_DIR.exists():
+        return []
+    return sorted(WATCH_LOCKS_DIR.glob("*.pid"))
+
+
+def _read_watch_lock(lock_path: Path) -> dict | None:
     try:
         raw = lock_path.read_text(encoding="utf-8").strip()
     except Exception:
@@ -55,16 +63,67 @@ def _read_watch_lock_pid(lock_path: Path) -> int | None:
         return None
     try:
         data = json.loads(raw)
-        value = data.get("pid")
+        if isinstance(data, dict):
+            return data
     except Exception:
-        value = raw
+        pass
+    try:
+        return {"pid": int(raw)}
+    except Exception:
+        return None
+
+
+def _read_watch_lock_pid(lock_path: Path) -> int | None:
+    data = _read_watch_lock(lock_path)
+    if not data:
+        return None
+    value = data.get("pid")
     try:
         return int(value)
     except Exception:
         return None
 
 
-def _acquire_silo_pid_lock(db_path: str | Path, silo_slug: str) -> tuple[Path | None, str | None]:
+def _current_uid() -> int | None:
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid):
+        try:
+            return int(getuid())
+        except Exception:
+            return None
+    return None
+
+
+def _safe_user_name() -> str:
+    try:
+        return str(getpass.getuser())
+    except Exception:
+        return "unknown"
+
+
+def _detect_pal_version() -> str:
+    root = Path(__file__).resolve().parent
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return "unknown"
+    if r.returncode != 0:
+        return "unknown"
+    out = (r.stdout or "").strip()
+    return out or "unknown"
+
+
+def _acquire_silo_pid_lock(
+    db_path: str | Path,
+    silo_slug: str,
+    root_path: Path | None = None,
+) -> tuple[Path | None, str | None]:
     lock_path = _watch_lock_path(db_path, silo_slug)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -80,10 +139,16 @@ def _acquire_silo_pid_lock(db_path: str | Path, silo_slug: str) -> tuple[Path | 
             except Exception:
                 return None, f"Error: unable to clear stale watcher lock for silo '{silo_slug}'."
         payload = {
+            "version": 2,
             "pid": os.getpid(),
+            "uid": _current_uid(),
+            "user": _safe_user_name(),
             "silo": str(silo_slug),
+            "root_path": str(root_path.resolve()) if root_path else None,
             "db_path": str(Path(db_path).resolve()),
             "started_at": int(time.time()),
+            "argv_hash": hashlib.sha1(" ".join(sys.argv).encode("utf-8")).hexdigest()[:12],
+            "pal_version": _detect_pal_version(),
         }
         try:
             fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -116,6 +181,289 @@ def _release_silo_pid_lock(lock_path: Path | None) -> None:
         pass
     except Exception:
         pass
+
+
+def _process_ps_value(pid: int, field: str) -> str | None:
+    if pid <= 0:
+        return None
+    try:
+        r = subprocess.run(
+            ["ps", "-p", str(pid), "-o", f"{field}="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    return out or None
+
+
+def _process_command_signature(pid: int) -> str | None:
+    return _process_ps_value(pid, "command")
+
+
+def _is_watch_process_command(command: str | None) -> bool:
+    if not command:
+        return False
+    lowered = command.lower()
+    has_watch = "--watch" in lowered
+    has_pull = bool(re.search(r"\bpull\b", lowered))
+    has_pal = bool(re.search(r"\bpal(\.py)?\b", lowered))
+    return has_watch and has_pull and has_pal
+
+
+def _build_watch_status_record(lock_path: Path) -> dict:
+    data = _read_watch_lock(lock_path) or {}
+    pid_val = data.get("pid")
+    pid: int | None = None
+    try:
+        if pid_val is not None:
+            pid = int(pid_val)
+    except Exception:
+        pid = None
+
+    running = bool(pid is not None and _pid_is_running(pid))
+    command = _process_command_signature(pid) if (pid is not None and running) else None
+    process_uid: int | None = None
+    process_uid_raw = _process_ps_value(pid, "uid") if (pid is not None and running) else None
+    if process_uid_raw is not None:
+        try:
+            process_uid = int(process_uid_raw)
+        except Exception:
+            process_uid = None
+    stat = _process_ps_value(pid, "stat") if (pid is not None and running) else None
+    etime = _process_ps_value(pid, "etime") if (pid is not None and running) else None
+    lock_uid_raw = data.get("uid")
+    lock_uid: int | None = None
+    if lock_uid_raw is not None:
+        try:
+            lock_uid = int(lock_uid_raw)
+        except Exception:
+            lock_uid = None
+    started_at_raw = data.get("started_at")
+    started_at: int | None = None
+    if started_at_raw is not None:
+        try:
+            started_at = int(started_at_raw)
+        except Exception:
+            started_at = None
+    now = int(time.time())
+    age_seconds: int | None = (now - started_at) if started_at is not None else None
+    legacy_lock = not isinstance(data.get("version"), int) or lock_uid is None
+    stale = not running
+    suspended = bool(stat and stat.startswith("T"))
+    if stale:
+        state = "stale"
+    elif suspended:
+        state = "suspended"
+    else:
+        state = "running"
+    return {
+        "lock_path": str(lock_path),
+        "legacy_lock": legacy_lock,
+        "stale": stale,
+        "state": state,
+        "running": running,
+        "pid": pid,
+        "uid": lock_uid,
+        "user": data.get("user"),
+        "process_uid": process_uid,
+        "silo": data.get("silo"),
+        "root_path": data.get("root_path"),
+        "db_path": data.get("db_path"),
+        "started_at": started_at,
+        "age_seconds": age_seconds,
+        "argv_hash": data.get("argv_hash"),
+        "pal_version": data.get("pal_version"),
+        "command": command,
+        "signature_ok": _is_watch_process_command(command) if command else None,
+        "etime": etime,
+    }
+
+
+def _status_records(db_path: str | Path, optional_path: Path | None = None) -> tuple[list[dict], str | None]:
+    records = [_build_watch_status_record(lock_path) for lock_path in _iter_watch_locks()]
+    if optional_path is None:
+        return records, None
+    registry = _read_llmli_registry(db_path)
+    slug = _resolve_llmli_silo_by_path(registry, optional_path.resolve())
+    if not slug:
+        return [], f"Error: no indexed silo found for path: {optional_path}"
+    filtered = [r for r in records if str(r.get("silo") or "") == slug]
+    return filtered, None
+
+
+def _resolve_stop_target(target: str, records: list[dict]) -> tuple[dict | None, str | None]:
+    raw = (target or "").strip()
+    if not raw:
+        return None, "Error: --stop requires a non-empty target."
+    matches: list[dict] = []
+    if raw.isdigit():
+        pid = int(raw)
+        matches = [r for r in records if r.get("pid") == pid]
+    else:
+        lowered = raw.lower()
+        normalized_path = None
+        try:
+            normalized_path = str(Path(raw).expanduser().resolve())
+        except Exception:
+            normalized_path = None
+        by_slug = [r for r in records if str(r.get("silo") or "").lower() == lowered]
+        if by_slug:
+            matches = by_slug
+        else:
+            by_display: list[dict] = []
+            for r in records:
+                silo = str(r.get("silo") or "")
+                display = silo
+                db_path = r.get("db_path")
+                if db_path:
+                    reg = _read_llmli_registry(str(db_path))
+                    entry = reg.get(silo) if isinstance(reg, dict) else None
+                    if isinstance(entry, dict):
+                        display = str(entry.get("display_name") or display)
+                if display.lower() == lowered:
+                    by_display.append(r)
+            if by_display:
+                matches = by_display
+            elif normalized_path:
+                matches = [r for r in records if str((r.get("root_path") or "")).lower() == normalized_path.lower()]
+    if not matches:
+        return None, f"Error: no watcher target found for '{target}'."
+    if len(matches) > 1:
+        candidates = ", ".join(
+            f"{m.get('silo')} (pid {m.get('pid')})"
+            for m in matches
+        )
+        return None, f"Error: ambiguous watcher target '{target}'. Matches: {candidates}"
+    return matches[0], None
+
+
+def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
+    deadline = time.time() + max(timeout, 0.0)
+    while time.time() < deadline:
+        if not _pid_is_running(pid):
+            return True
+        time.sleep(0.1)
+    return not _pid_is_running(pid)
+
+
+def _stop_watch_process(record: dict, timeout: float = 3.0) -> dict:
+    lock_path = Path(str(record.get("lock_path")))
+    pid = record.get("pid")
+    out = {
+        "silo": record.get("silo"),
+        "pid": pid,
+        "lock_path": str(lock_path),
+        "status": "unknown",
+        "forced": False,
+        "lock_removed": False,
+    }
+    try:
+        pid_i = int(pid)
+    except Exception:
+        _release_silo_pid_lock(lock_path)
+        out.update({"status": "stale_lock_removed", "lock_removed": True, "message": "Lock had no valid PID."})
+        return out
+
+    if not _pid_is_running(pid_i):
+        _release_silo_pid_lock(lock_path)
+        out.update({"status": "stale_lock_removed", "lock_removed": True, "message": "Process already exited."})
+        return out
+
+    current_uid = _current_uid()
+    lock_uid = record.get("uid")
+    if current_uid is not None and lock_uid is not None:
+        try:
+            if int(lock_uid) != int(current_uid):
+                out.update({"status": "refused_uid_mismatch", "message": "Refusing to signal watcher owned by a different user."})
+                return out
+        except Exception:
+            pass
+
+    command = _process_command_signature(pid_i)
+    if not _is_watch_process_command(command):
+        out.update({
+            "status": "refused_signature_mismatch",
+            "message": "Refusing to stop process: command signature does not match `pal pull --watch`.",
+            "suspicious": True,
+        })
+        return out
+
+    try:
+        os.kill(pid_i, signal.SIGTERM)
+    except ProcessLookupError:
+        _release_silo_pid_lock(lock_path)
+        out.update({"status": "stale_lock_removed", "lock_removed": True, "message": "Process already exited."})
+        return out
+    except PermissionError:
+        out.update({"status": "refused_permission", "message": "Permission denied while signaling target PID."})
+        return out
+    except Exception as exc:
+        out.update({"status": "signal_error", "message": f"Failed to signal watcher: {exc}"})
+        return out
+
+    if _wait_for_pid_exit(pid_i, timeout):
+        _release_silo_pid_lock(lock_path)
+        out.update({"status": "stopped", "lock_removed": True, "message": "Watcher stopped with SIGTERM."})
+        return out
+
+    try:
+        os.kill(pid_i, signal.SIGKILL)
+        out["forced"] = True
+    except ProcessLookupError:
+        _release_silo_pid_lock(lock_path)
+        out.update({"status": "stale_lock_removed", "lock_removed": True, "message": "Process exited during stop."})
+        return out
+    except PermissionError:
+        out.update({"status": "refused_permission", "message": "Permission denied while force-stopping target PID."})
+        return out
+    except Exception as exc:
+        out.update({"status": "signal_error", "message": f"Failed to force-stop watcher: {exc}"})
+        return out
+
+    if _wait_for_pid_exit(pid_i, 1.0):
+        _release_silo_pid_lock(lock_path)
+        out.update({"status": "stopped", "lock_removed": True, "message": "Watcher stopped with SIGKILL."})
+    else:
+        out.update({"status": "still_running", "message": "Watcher did not exit after SIGTERM/SIGKILL."})
+    return out
+
+
+def _prune_stale_locks(records: list[dict]) -> dict:
+    removed = 0
+    failed: list[str] = []
+    for record in records:
+        if not record.get("stale"):
+            continue
+        lock_path = Path(str(record.get("lock_path")))
+        try:
+            lock_path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except Exception:
+            failed.append(str(lock_path))
+    return {"removed": removed, "failed": failed}
+
+
+def _render_watch_status(records: list[dict]) -> None:
+    if not records:
+        print("No watcher locks.")
+        return
+    print("Silo                      PID     State      Legacy  Stale  Root")
+    print("--------------------------------------------------------------------------")
+    for r in records:
+        silo = str(r.get("silo") or "-")
+        pid = str(r.get("pid") or "-")
+        state = str(r.get("state") or "-")
+        legacy = "yes" if r.get("legacy_lock") else "no"
+        stale = "yes" if r.get("stale") else "no"
+        root = str(r.get("root_path") or "-")
+        print(f"{silo:24} {pid:7} {state:10} {legacy:6} {stale:5}  {root}")
 
 
 def _read_registry() -> dict:
@@ -730,7 +1078,8 @@ class SiloWatcher:
 
 
 def _run_watcher(watcher: SiloWatcher, db_path: str | Path, silo_slug: str) -> int:
-    lock_path, lock_error = _acquire_silo_pid_lock(db_path, silo_slug)
+    root_path = getattr(watcher, "root", None)
+    lock_path, lock_error = _acquire_silo_pid_lock(db_path, silo_slug, root_path=root_path)
     if lock_error:
         print(lock_error, file=sys.stderr)
         return 1
@@ -862,6 +1211,56 @@ def _pull_watch_path_mode(
     return _run_watcher(watcher, db_path, slug)
 
 
+def _pull_watch_status_mode(path_input: str | None, json_output: bool, prune_stale: bool) -> int:
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    opt_path = Path(path_input).resolve() if path_input else None
+    records, err = _status_records(db_path, opt_path)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    prune_result = None
+    if prune_stale:
+        prune_result = _prune_stale_locks(records)
+        records, _ = _status_records(db_path, opt_path)
+    if json_output:
+        payload: dict[str, object] = {"records": records}
+        if prune_result is not None:
+            payload["prune"] = prune_result
+        print(json.dumps(payload, indent=2))
+        return 0
+    _render_watch_status(records)
+    if prune_result is not None:
+        failed = prune_result.get("failed") or []
+        print(f"Pruned stale locks: removed={prune_result.get('removed', 0)} failed={len(failed)}")
+        for path in failed:
+            print(f"  failed: {path}", file=sys.stderr)
+    return 0
+
+
+def _pull_watch_stop_mode(target: str, json_output: bool, timeout: float = 3.0) -> int:
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    records, _ = _status_records(db_path, None)
+    record, err = _resolve_stop_target(target, records)
+    if err:
+        if json_output:
+            print(json.dumps({"error": err}, indent=2))
+        else:
+            print(err, file=sys.stderr)
+        return 1
+    result = _stop_watch_process(record or {}, timeout=timeout)
+    ok = str(result.get("status")) in {"stopped", "stale_lock_removed"}
+    if json_output:
+        print(json.dumps(result, indent=2))
+    else:
+        msg = str(result.get("message") or "")
+        line = f"{result.get('silo')} (pid {result.get('pid')}): {result.get('status')}"
+        if msg:
+            line = f"{line} - {msg}"
+        stream = sys.stdout if ok else sys.stderr
+        print(line, file=stream)
+    return 0 if ok else 1
+
+
 def _pull_status_line(current: int, total: int, name: str, detail: str = "") -> None:
     """Overwrite a single terminal line with pull progress."""
     is_tty = sys.stderr.isatty()
@@ -989,6 +1388,10 @@ def _exit(rc: int) -> None:
 def pull_command(
     path: str | None = typer.Argument(None, metavar="PATH", help="Folder to index. Omit to refresh all."),
     watch: bool = typer.Option(False, "--watch", help="Stay running and sync changes live."),
+    status: bool = typer.Option(False, "--status", help="Show watcher status (all, or only PATH when provided)."),
+    stop: str | None = typer.Option(None, "--stop", metavar="TARGET", help="Stop watcher by pid, silo slug/display name, or watched path."),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON for --status/--stop."),
+    prune_stale: bool = typer.Option(False, "--prune-stale", help="Remove stale watcher locks (status mode only)."),
     full: bool = typer.Option(False, "--full", help="Full rebuild (delete + re-add)."),
     prompt: str | None = typer.Option(None, "--prompt", help="Custom system prompt override for this silo."),
     clear_prompt: bool = typer.Option(False, "--clear-prompt", help="Clear custom prompt override for this silo."),
@@ -997,6 +1400,35 @@ def pull_command(
     debounce: float = typer.Option(1.0, "--debounce", help="Debounce delay (watch mode).", hidden=True),
     follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks.", hidden=True),
 ) -> None:
+    mode_count = int(bool(watch)) + int(bool(status)) + int(bool(stop))
+    if mode_count > 1:
+        print("Use only one operation mode: --watch, --status, or --stop.", file=sys.stderr)
+        raise typer.Exit(code=2)
+
+    if status:
+        if prompt is not None or clear_prompt or full or watch or stop is not None:
+            print("--status cannot be combined with --watch/--stop/--full/--prompt/--clear-prompt.", file=sys.stderr)
+            raise typer.Exit(code=2)
+        _exit(_pull_watch_status_mode(path, json_output=json_output, prune_stale=prune_stale))
+        return
+
+    if stop is not None:
+        if path:
+            print("--stop does not accept PATH. Use: pal pull --stop <target>", file=sys.stderr)
+            raise typer.Exit(code=2)
+        if watch or prompt is not None or clear_prompt or full or prune_stale:
+            print("--stop cannot be combined with --watch/--full/--prompt/--clear-prompt/--prune-stale.", file=sys.stderr)
+            raise typer.Exit(code=2)
+        _exit(_pull_watch_stop_mode(stop, json_output=json_output))
+        return
+
+    if prune_stale:
+        print("--prune-stale is only valid with --status.", file=sys.stderr)
+        raise typer.Exit(code=2)
+    if json_output:
+        print("--json is only valid with --status or --stop.", file=sys.stderr)
+        raise typer.Exit(code=2)
+
     if prompt is not None and clear_prompt:
         print("Use either --prompt or --clear-prompt, not both.", file=sys.stderr)
         raise typer.Exit(code=2)
@@ -1111,7 +1543,7 @@ def remove_command(
     silo: list[str] = typer.Argument(..., help="Silo slug, display name, or path."),
 ) -> None:
     name = " ".join(silo) if isinstance(silo, list) else str(silo)
-    _exit(_run_llmli(["remove", name]))
+    _exit(_run_llmli(["rm", name]))
 
 
 @app.command("sync", help="Re-index the project's own source (dev mode).")

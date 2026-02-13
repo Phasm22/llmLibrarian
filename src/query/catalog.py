@@ -1,5 +1,5 @@
 """
-Deterministic catalog queries for file-list style asks.
+Deterministic catalog queries and structure snapshots.
 Uses manifest/registry metadata only (no retrieval, no LLM).
 """
 from __future__ import annotations
@@ -11,6 +11,7 @@ from typing import TypedDict
 
 from file_registry import _read_file_manifest
 from state import list_silos
+from query.scope_binding import detect_filetype_hints, rank_silos_by_catalog_tokens
 
 
 class FreshnessResult(TypedDict):
@@ -30,6 +31,29 @@ class CatalogResult(TypedDict):
     stale_reason: str | None
 
 
+class StructureRequest(TypedDict):
+    mode: str
+    wants_summary: bool
+
+
+class StructureResult(TypedDict):
+    mode: str
+    lines: list[str]
+    scanned_count: int
+    matched_count: int
+    cap_applied: bool
+    scope: str
+    stale: bool
+    stale_reason: str | None
+
+
+class ScopeCandidate(TypedDict):
+    slug: str
+    display_name: str
+    score: float
+    matched_tokens: list[str]
+
+
 FILE_LIST_SKIP_WORDS = (
     "summary",
     "overview",
@@ -39,6 +63,13 @@ FILE_LIST_SKIP_WORDS = (
     "design",
     "why",
     "how",
+)
+
+STRUCTURE_SUMMARY_WORDS = (
+    "summarize",
+    "summary",
+    "explain",
+    "overview",
 )
 
 
@@ -59,6 +90,21 @@ def parse_file_list_year_request(query: str) -> dict[str, str] | None:
     return {"year": year_m.group(1)}
 
 
+def parse_structure_request(query: str) -> StructureRequest | None:
+    """Parse deterministic structure asks into submodes: outline | recent | inventory."""
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+    wants_summary = any(w in q for w in STRUCTURE_SUMMARY_WORDS)
+    if re.search(r"\b(recent\s+(?:changes?|files?)|what\s+changed\s+recently)\b", q):
+        return {"mode": "recent", "wants_summary": wants_summary}
+    if re.search(r"\b(file\s+types?|extensions?|inventory)\b", q):
+        return {"mode": "inventory", "wants_summary": wants_summary}
+    if re.search(r"\b(structure|folder\s+outline|outline|directory|layout|snapshot|tree)\b", q):
+        return {"mode": "outline", "wants_summary": wants_summary}
+    return None
+
+
 def _path_has_year_token(path_str: str, year: int) -> bool:
     year_s = str(year)
     # Strict token boundaries: /2022/, _2022_, -2022-, ".2022."
@@ -75,6 +121,214 @@ def _iter_manifest_paths_for_silo(db_path: str, silo_slug: str) -> tuple[dict[st
     if not isinstance(files_map, dict):
         return {}, "manifest_files_missing"
     return files_map, None
+
+
+def _silo_info_map(db_path: str) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for row in list_silos(db_path):
+        slug = str((row or {}).get("slug") or "")
+        if slug:
+            out[slug] = row or {}
+    return out
+
+
+def _relative_display_path(abs_path: str, root_path: str | None) -> str:
+    p = Path(abs_path)
+    if root_path:
+        try:
+            return str(p.resolve().relative_to(Path(root_path).resolve()))
+        except Exception:
+            pass
+    return str(p.resolve())
+
+
+def _normalize_rel_key(path_str: str) -> str:
+    return str(Path(path_str).as_posix()).lower().strip()
+
+
+def _parse_mtime(meta: dict | None) -> float | None:
+    raw = (meta or {}).get("mtime")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collapse_manifest_entries(files_map: dict[str, dict], root_path: str | None) -> list[dict]:
+    groups: dict[str, dict] = {}
+    for abs_path_raw, meta in files_map.items():
+        abs_path = str(Path(abs_path_raw).resolve())
+        rel_display = _relative_display_path(abs_path, root_path)
+        rel_norm = _normalize_rel_key(rel_display)
+        hash_v = str((meta or {}).get("hash") or "").strip().lower()
+        key = f"h:{hash_v}" if hash_v else f"p:{rel_norm}"
+        entry = groups.get(key)
+        if entry is None:
+            entry = {
+                "display_path": rel_display,
+                "paths": {rel_display},
+                "copies": 0,
+                "mtime": None,
+                "ext": (Path(rel_display).suffix.lower() or "(no_ext)"),
+            }
+            groups[key] = entry
+        entry["copies"] += 1
+        entry["paths"].add(rel_display)
+        # Stable label: lexicographically smallest relative path.
+        entry["display_path"] = sorted(entry["paths"])[0]
+        mtime = _parse_mtime(meta)
+        if mtime is not None and (entry["mtime"] is None or float(mtime) > float(entry["mtime"])):
+            entry["mtime"] = float(mtime)
+    return list(groups.values())
+
+
+def rank_scope_candidates(query: str, db_path: str, top_n: int = 3) -> list[ScopeCandidate]:
+    """Deterministic top scope hints for unscoped structure asks."""
+    info_map = _silo_info_map(db_path)
+    requested = max(1, int(top_n))
+    ranked = rank_silos_by_catalog_tokens(query, db_path, detect_filetype_hints(query))
+    out: list[ScopeCandidate] = []
+    chosen: set[str] = set()
+    for row in ranked[:requested]:
+        slug = str(row.get("slug") or "")
+        if not slug:
+            continue
+        info = info_map.get(slug) or {}
+        out.append(
+            {
+                "slug": slug,
+                "display_name": str(info.get("display_name") or slug),
+                "score": float(row.get("score") or 0.0),
+                "matched_tokens": list(row.get("matched_tokens") or []),
+            }
+        )
+        chosen.add(slug)
+    # Keep UX deterministic even with low overlap: fill remaining slots by stable silo order.
+    if len(out) < requested:
+        for slug in sorted(info_map.keys()):
+            if slug in chosen:
+                continue
+            info = info_map.get(slug) or {}
+            out.append(
+                {
+                    "slug": slug,
+                    "display_name": str(info.get("display_name") or slug),
+                    "score": 0.0,
+                    "matched_tokens": [],
+                }
+            )
+            if len(out) >= requested:
+                break
+    return out
+
+
+def build_structure_outline(db_path: str, silo_slug: str, cap: int = 200) -> StructureResult:
+    files_map, err = _iter_manifest_paths_for_silo(db_path, silo_slug)
+    if err:
+        return {
+            "mode": "outline",
+            "lines": [],
+            "scanned_count": 0,
+            "matched_count": 0,
+            "cap_applied": False,
+            "scope": f"silo:{silo_slug}",
+            "stale": True,
+            "stale_reason": err,
+        }
+    root = str((_silo_info_map(db_path).get(silo_slug) or {}).get("path") or "") or None
+    groups = _collapse_manifest_entries(files_map, root)
+    rows = []
+    for g in groups:
+        base = str(g.get("display_path") or "")
+        copies = int(g.get("copies") or 0)
+        rows.append(f"{base} ({copies} copies)" if copies > 1 else base)
+    rows = sorted(set(rows))
+    capped = rows[:cap]
+    return {
+        "mode": "outline",
+        "lines": capped,
+        "scanned_count": len(files_map),
+        "matched_count": len(rows),
+        "cap_applied": len(rows) > len(capped),
+        "scope": f"silo:{silo_slug}",
+        "stale": False,
+        "stale_reason": None,
+    }
+
+
+def build_structure_recent(db_path: str, silo_slug: str, cap: int = 100) -> StructureResult:
+    files_map, err = _iter_manifest_paths_for_silo(db_path, silo_slug)
+    if err:
+        return {
+            "mode": "recent",
+            "lines": [],
+            "scanned_count": 0,
+            "matched_count": 0,
+            "cap_applied": False,
+            "scope": f"silo:{silo_slug}",
+            "stale": True,
+            "stale_reason": err,
+        }
+    root = str((_silo_info_map(db_path).get(silo_slug) or {}).get("path") or "") or None
+    groups = _collapse_manifest_entries(files_map, root)
+    recents: list[tuple[float, str]] = []
+    for g in groups:
+        mtime = g.get("mtime")
+        if mtime is None:
+            continue
+        date_str = datetime.fromtimestamp(float(mtime), tz=timezone.utc).strftime("%Y-%m-%d")
+        base = str(g.get("display_path") or "")
+        copies = int(g.get("copies") or 0)
+        label = f"{base} ({copies} copies)" if copies > 1 else base
+        recents.append((float(mtime), f"{date_str} {label}"))
+    recents.sort(key=lambda x: (-x[0], x[1]))
+    rows = [x[1] for x in recents]
+    capped = rows[:cap]
+    return {
+        "mode": "recent",
+        "lines": capped,
+        "scanned_count": len(files_map),
+        "matched_count": len(rows),
+        "cap_applied": len(rows) > len(capped),
+        "scope": f"silo:{silo_slug}",
+        "stale": False,
+        "stale_reason": None,
+    }
+
+
+def build_structure_inventory(db_path: str, silo_slug: str, cap: int = 200) -> StructureResult:
+    files_map, err = _iter_manifest_paths_for_silo(db_path, silo_slug)
+    if err:
+        return {
+            "mode": "inventory",
+            "lines": [],
+            "scanned_count": 0,
+            "matched_count": 0,
+            "cap_applied": False,
+            "scope": f"silo:{silo_slug}",
+            "stale": True,
+            "stale_reason": err,
+        }
+    root = str((_silo_info_map(db_path).get(silo_slug) or {}).get("path") or "") or None
+    groups = _collapse_manifest_entries(files_map, root)
+    by_ext: dict[str, int] = {}
+    for g in groups:
+        ext = str(g.get("ext") or "(no_ext)").lower()
+        by_ext[ext] = by_ext.get(ext, 0) + 1
+    rows = [f"{ext} {count}" for ext, count in sorted(by_ext.items(), key=lambda kv: (-kv[1], kv[0]))]
+    capped = rows[:cap]
+    return {
+        "mode": "inventory",
+        "lines": capped,
+        "scanned_count": len(files_map),
+        "matched_count": len(rows),
+        "cap_applied": len(rows) > len(capped),
+        "scope": f"silo:{silo_slug}",
+        "stale": False,
+        "stale_reason": None,
+    }
 
 
 def validate_catalog_freshness(db_path: str, silo_slug: str) -> FreshnessResult:

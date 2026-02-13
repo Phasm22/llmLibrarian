@@ -4,6 +4,7 @@ from query.intent import (
     INTENT_EVIDENCE_PROFILE,
     INTENT_FIELD_LOOKUP,
     INTENT_FILE_LIST,
+    INTENT_STRUCTURE,
     INTENT_LOOKUP,
 )
 from query.core import QueryPolicyError, run_ask
@@ -138,6 +139,133 @@ def test_run_ask_file_list_strict_toggle_no_effect(monkeypatch):
         strict=True,
     )
     assert out_loose == out_strict == "/tmp/a.txt"
+
+
+def test_run_ask_structure_short_circuits_without_retrieval(monkeypatch, mock_ollama):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_STRUCTURE)
+    monkeypatch.setattr("query.core.parse_structure_request", lambda _q: {"mode": "outline", "wants_summary": False})
+    monkeypatch.setattr(
+        "query.core.build_structure_outline",
+        lambda _db, _silo, cap=200: {
+            "mode": "outline",
+            "lines": ["slides/APT Simulation and Analysis.pptx", "notes/summary.md"],
+            "scanned_count": 10,
+            "matched_count": 2,
+            "cap_applied": False,
+            "scope": "silo:stuff-deadbeef",
+            "stale": False,
+            "stale_reason": None,
+        },
+    )
+    monkeypatch.setattr("query.core.validate_catalog_freshness", lambda _db, _silo: {"stale": False, "stale_reason": None, "scanned_count": 10})
+    monkeypatch.setattr(
+        "query.core.chromadb.PersistentClient",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("structure path should not create chroma client")),
+    )
+    out = run_ask(
+        archetype_id=None,
+        query="show structure snapshot",
+        no_color=True,
+        use_reranker=False,
+        quiet=True,
+        silo="stuff-deadbeef",
+    )
+    assert out == "slides/APT Simulation and Analysis.pptx\nnotes/summary.md"
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_structure_without_scope_returns_deterministic_guidance(monkeypatch, mock_ollama):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_STRUCTURE)
+    monkeypatch.setattr("query.core.parse_structure_request", lambda _q: {"mode": "outline", "wants_summary": False})
+    monkeypatch.setattr(
+        "query.core.rank_scope_candidates",
+        lambda _q, _db, top_n=3: [
+            {"slug": "stuff-deadbeef", "display_name": "Stuff", "score": 5.0, "matched_tokens": ["stuff"]},
+            {"slug": "school-12345678", "display_name": "School", "score": 3.0, "matched_tokens": ["school"]},
+        ],
+    )
+    out = run_ask(
+        archetype_id=None,
+        query="show structure",
+        no_color=True,
+        use_reranker=False,
+        quiet=False,
+        silo=None,
+    )
+    assert "No scope selected." in out
+    assert "Stuff (stuff-deadbeef)" in out
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_structure_stale_warns_but_returns_results(monkeypatch, mock_ollama):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_STRUCTURE)
+    monkeypatch.setattr("query.core.parse_structure_request", lambda _q: {"mode": "recent", "wants_summary": False})
+    monkeypatch.setattr(
+        "query.core.build_structure_recent",
+        lambda _db, _silo, cap=100: {
+            "mode": "recent",
+            "lines": ["2024-05-01 notes/a.md"],
+            "scanned_count": 5,
+            "matched_count": 1,
+            "cap_applied": False,
+            "scope": "silo:stuff-deadbeef",
+            "stale": False,
+            "stale_reason": None,
+        },
+    )
+    monkeypatch.setattr(
+        "query.core.validate_catalog_freshness",
+        lambda _db, _silo: {"stale": True, "stale_reason": "file_changed_since_index", "scanned_count": 5},
+    )
+    out = run_ask(
+        archetype_id=None,
+        query="recent changes",
+        no_color=True,
+        use_reranker=False,
+        quiet=False,
+        silo="stuff-deadbeef",
+    )
+    assert out.startswith("⚠ Index may be outdated")
+    assert "2024-05-01 notes/a.md" in out
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_structure_strict_toggle_no_effect(monkeypatch):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_STRUCTURE)
+    monkeypatch.setattr("query.core.parse_structure_request", lambda _q: {"mode": "inventory", "wants_summary": False})
+    monkeypatch.setattr(
+        "query.core.build_structure_inventory",
+        lambda _db, _silo, cap=200: {
+            "mode": "inventory",
+            "lines": [".md 2", ".pdf 1"],
+            "scanned_count": 3,
+            "matched_count": 2,
+            "cap_applied": False,
+            "scope": "silo:stuff-deadbeef",
+            "stale": False,
+            "stale_reason": None,
+        },
+    )
+    monkeypatch.setattr("query.core.validate_catalog_freshness", lambda _db, _silo: {"stale": False, "stale_reason": None, "scanned_count": 3})
+    out_loose = run_ask(
+        archetype_id=None,
+        query="file type inventory",
+        no_color=True,
+        use_reranker=False,
+        quiet=True,
+        strict=False,
+        silo="stuff-deadbeef",
+    )
+    out_strict = run_ask(
+        archetype_id=None,
+        query="file type inventory",
+        no_color=True,
+        use_reranker=False,
+        quiet=True,
+        strict=True,
+        silo="stuff-deadbeef",
+    )
+    assert out_loose == out_strict == ".md 2\n.pdf 1"
 
 
 def test_run_ask_code_language_bypasses_llm(monkeypatch, mock_collection, mock_ollama):

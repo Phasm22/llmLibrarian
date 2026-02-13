@@ -173,6 +173,41 @@ def test_pull_with_path_calls_path_mode(monkeypatch):
     assert called["clear_prompt"] is False
 
 
+def test_pull_status_mode_dispatches(monkeypatch):
+    called = {}
+
+    def _fake_status(path_input, json_output=False, prune_stale=False):
+        called["path_input"] = path_input
+        called["json_output"] = json_output
+        called["prune_stale"] = prune_stale
+        return 0
+
+    monkeypatch.setattr("pal._pull_watch_status_mode", _fake_status)
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "/tmp/one", "--status", "--json", "--prune-stale"])
+    assert res.exit_code == 0
+    assert called == {"path_input": "/tmp/one", "json_output": True, "prune_stale": True}
+
+
+def test_pull_stop_mode_dispatches(monkeypatch):
+    called = {}
+
+    def _fake_stop(target, json_output=False, timeout=3.0):
+        called["target"] = target
+        called["json_output"] = json_output
+        called["timeout"] = timeout
+        return 0
+
+    monkeypatch.setattr("pal._pull_watch_stop_mode", _fake_stop)
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "--stop", "demo", "--json"])
+    assert res.exit_code == 0
+    assert called["target"] == "demo"
+    assert called["json_output"] is True
+
+
 def test_pull_with_path_passes_prompt_option(monkeypatch):
     called = {}
 
@@ -267,6 +302,12 @@ def test_acquire_silo_pid_lock_clears_stale(monkeypatch, tmp_path: Path):
     assert err is None
     assert acquired == lock_path
     assert pal._read_watch_lock_pid(lock_path) == os.getpid()
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 2
+    assert payload["silo"] == "demo"
+    assert payload["db_path"] == str(Path(db_path).resolve())
+    assert "argv_hash" in payload
+    assert "pal_version" in payload
     pal._release_silo_pid_lock(acquired)
     assert not lock_path.exists()
 
@@ -285,7 +326,7 @@ def test_run_watcher_returns_error_when_lock_held(monkeypatch, capsys):
 
     monkeypatch.setattr(
         "pal._acquire_silo_pid_lock",
-        lambda _db_path, _slug: (None, "Error: watcher already running for silo 'demo' (pid 999)."),
+        lambda _db_path, _slug, root_path=None: (None, "Error: watcher already running for silo 'demo' (pid 999)."),
     )
     released = []
     monkeypatch.setattr("pal._release_silo_pid_lock", lambda lock_path: released.append(lock_path))
@@ -321,7 +362,7 @@ def test_run_watcher_handles_sigterm_and_releases_lock(monkeypatch):
 
     released = []
     monkeypatch.setattr("pal.signal.signal", _fake_signal)
-    monkeypatch.setattr("pal._acquire_silo_pid_lock", lambda _db_path, _slug: (Path("/tmp/lock"), None))
+    monkeypatch.setattr("pal._acquire_silo_pid_lock", lambda _db_path, _slug, root_path=None: (Path("/tmp/lock"), None))
     monkeypatch.setattr("pal._release_silo_pid_lock", lambda lock_path: released.append(lock_path))
 
     rc = pal._run_watcher(watcher, "/tmp/db", "demo")

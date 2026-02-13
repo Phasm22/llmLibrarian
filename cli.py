@@ -55,10 +55,9 @@ def _truncate_mid(text: str, max_len: int) -> str:
 def cmd_add(args: argparse.Namespace) -> int:
     """Index a folder into the unified llmli collection; silo name = basename(path)."""
     from ingest import run_add
-    from constants import DB_PATH
     from ingest import CloudSyncPathError
     path = Path(args.path).resolve()
-    db = args.db or DB_PATH
+    db = _db_path(args)
     if not path.is_dir():
         print(f"Error: not a directory: {path}", file=sys.stderr)
         return 1

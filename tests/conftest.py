@@ -22,6 +22,13 @@ if _pal_spec is not None and _pal_spec.loader is not None:
     sys.modules["pal"] = _pal_module
     _pal_spec.loader.exec_module(_pal_module)
 
+_cli_path = (ROOT / "cli.py").resolve()
+_cli_spec = importlib.util.spec_from_file_location("cli", _cli_path)
+if _cli_spec is not None and _cli_spec.loader is not None:
+    _cli_module = importlib.util.module_from_spec(_cli_spec)
+    sys.modules["cli"] = _cli_module
+    _cli_spec.loader.exec_module(_cli_module)
+
 # Avoid color/style differences in test output formatting.
 os.environ.setdefault("LLMLIBRARIAN_EDITOR_SCHEME", "file")
 

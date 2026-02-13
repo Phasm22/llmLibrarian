@@ -37,6 +37,7 @@ from query.intent import (
     INTENT_CODE_LANGUAGE,
     INTENT_CAPABILITIES,
     INTENT_FILE_LIST,
+    INTENT_STRUCTURE,
     route_intent,
     effective_k,
 )
@@ -77,8 +78,13 @@ from query.context import (
 )
 from query.catalog import (
     parse_file_list_year_request,
+    parse_structure_request,
     validate_catalog_freshness,
     list_files_from_year,
+    build_structure_outline,
+    build_structure_recent,
+    build_structure_inventory,
+    rank_scope_candidates,
 )
 from query.formatting import (
     style_answer,
@@ -280,6 +286,49 @@ def _resolve_unified_silo_prompt(
     return default_prompt, (display_name or silo)
 
 
+def _llm_summarize_structure(
+    model: str,
+    query: str,
+    source_label: str,
+    mode_label: str,
+    lines: list[str],
+) -> str | None:
+    if not lines:
+        return None
+    try:
+        import ollama
+        preview = "\n".join(lines[:120])
+        resp = ollama.chat(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Summarize only the provided deterministic structure snapshot. "
+                        "Do not invent files or dates. Keep it concise."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Query: {query}\n"
+                        f"Scope: {source_label}\n"
+                        f"Snapshot type: {mode_label}\n\n"
+                        "[START SNAPSHOT]\n"
+                        f"{preview}\n"
+                        "[END SNAPSHOT]"
+                    ),
+                },
+            ],
+            keep_alive=0,
+            options={"temperature": 0, "seed": 42},
+        )
+        text = ((resp.get("message") or {}).get("content") or "").strip()
+        return text or None
+    except Exception:
+        return None
+
+
 def run_ask(
     archetype_id: str | None,
     query: str,
@@ -387,6 +436,113 @@ def run_ask(
         out_lines = [cap_text, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label} (capabilities)")]
         return cap_text if quiet else "\n".join(out_lines)
 
+    # STRUCTURE: deterministic catalog snapshot (outline/recent/inventory). No retrieval.
+    if intent == INTENT_STRUCTURE and use_unified:
+        req = parse_structure_request(query) or {"mode": "outline", "wants_summary": False}
+        mode = str(req.get("mode") or "outline")
+        wants_summary = bool(req.get("wants_summary"))
+        if not silo:
+            candidates = rank_scope_candidates(query, db, top_n=3)
+            lines = ['No scope selected. Try: pal ask --in <silo> "show structure"']
+            if candidates:
+                lines.extend(["", "Likely silos:"])
+                for c in candidates:
+                    display = str(c.get("display_name") or c.get("slug") or "")
+                    slug = str(c.get("slug") or "")
+                    lines.append(f"  • {display} ({slug})")
+            time_ms = (time.perf_counter() - t0) * 1000
+            write_trace(
+                intent=intent,
+                n_stage1=0,
+                n_results=0,
+                model=model,
+                silo=silo,
+                source_label=source_label,
+                num_docs=0,
+                time_ms=time_ms,
+                query_len=len(query),
+                hybrid_used=False,
+                guardrail_no_match=True,
+                guardrail_reason="catalog_structure_scope_required",
+                requested_year=None,
+                requested_form=None,
+                requested_line=None,
+                receipt_metas=[{"silo": c.get("slug"), "source": c.get("display_name")} for c in candidates],
+                answer_kind="catalog_artifact",
+            )
+            return "\n".join(lines)
+
+        fresh = validate_catalog_freshness(db, silo)
+        if mode == "recent":
+            report = build_structure_recent(db, silo, cap=100)
+            mode_label = "Recent changes snapshot"
+        elif mode == "inventory":
+            report = build_structure_inventory(db, silo, cap=200)
+            mode_label = "File type inventory"
+        else:
+            report = build_structure_outline(db, silo, cap=200)
+            mode_label = "Structure snapshot"
+        report["stale"] = bool(fresh.get("stale"))
+        report["stale_reason"] = fresh.get("stale_reason")
+
+        if explain:
+            print(
+                "[catalog] "
+                f"scope={report['scope']} mode={mode} scanned={report['scanned_count']} "
+                f"matched={report['matched_count']} cap_applied={report['cap_applied']} "
+                f"stale={report['stale']} stale_reason={report.get('stale_reason') or 'none'}",
+                file=sys.stderr,
+            )
+
+        lines = list(report.get("lines") or [])
+        if quiet:
+            if not lines:
+                return f"No indexed entries found for {mode_label.lower()} in this scope."
+            return "\n".join(lines)
+
+        out: list[str] = []
+        if report.get("stale"):
+            out.append("⚠ Index may be outdated (repo changed since last sync). Results reflect last index.")
+            out.append("")
+
+        llm_summary: str | None = None
+        if wants_summary:
+            llm_summary = _llm_summarize_structure(model, query, source_label, mode_label, lines)
+        if llm_summary:
+            out.append(llm_summary)
+            out.append("")
+
+        if lines:
+            out.append(f"{mode_label} for {source_label}: showing {len(lines)} item(s).")
+            out.append("")
+            for row in lines:
+                out.append(f"  • {row}")
+        else:
+            out.append(f"No indexed entries found for {mode_label.lower()} in this scope.")
+
+        out.extend(["", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")])
+        time_ms = (time.perf_counter() - t0) * 1000
+        write_trace(
+            intent=intent,
+            n_stage1=0,
+            n_results=0,
+            model=model,
+            silo=silo,
+            source_label=source_label,
+            num_docs=len(lines),
+            time_ms=time_ms,
+            query_len=len(query),
+            hybrid_used=False,
+            guardrail_no_match=(len(lines) == 0),
+            guardrail_reason=f"catalog_structure_{mode}",
+            requested_year=None,
+            requested_form=None,
+            requested_line=None,
+            receipt_metas=[{"source": row, "silo": silo} for row in lines[:5]],
+            answer_kind="catalog_artifact",
+        )
+        return "\n".join(out)
+
     # FILE_LIST: deterministic catalog query (manifest/registry only). No retrieval, no LLM.
     if intent == INTENT_FILE_LIST and use_unified:
         req = parse_file_list_year_request(query)
@@ -457,6 +613,7 @@ def run_ask(
             requested_form=None,
             requested_line=None,
             receipt_metas=[{"source": p, "silo": silo} for p in files[:5]],
+            answer_kind="catalog_artifact",
         )
         return "\n".join(lines)
 
@@ -521,6 +678,7 @@ def run_ask(
             time_ms=time_ms,
             query_len=len(query),
             hybrid_used=False,
+            answer_kind="guardrail",
         )
         return format_code_language_answer(by_ext, sample_paths, source_label, no_color)
 
@@ -567,6 +725,7 @@ def run_ask(
                 requested_year=guardrail.get("requested_year"),
                 requested_form=guardrail.get("requested_form"),
                 requested_line=guardrail.get("requested_line"),
+                answer_kind="guardrail",
             )
             response_text = str(guardrail["response"])
             return _quiet_text_only(response_text) if quiet else response_text
@@ -601,6 +760,7 @@ def run_ask(
                 requested_year=csv_guardrail.get("requested_year"),
                 requested_form=csv_guardrail.get("requested_form"),
                 requested_line=csv_guardrail.get("requested_line"),
+                answer_kind="guardrail",
             )
             response_text = str(csv_guardrail["response"])
             return _quiet_text_only(response_text) if quiet else response_text
@@ -635,6 +795,7 @@ def run_ask(
                 requested_year=guardrail.get("requested_year"),
                 requested_form=guardrail.get("requested_form"),
                 requested_line=guardrail.get("requested_line"),
+                answer_kind="guardrail",
             )
             response_text = str(guardrail["response"])
             return _quiet_text_only(response_text) if quiet else response_text
@@ -662,6 +823,7 @@ def run_ask(
             requested_line=None,
             project_count=project_count,
             project_samples=samples[:5],
+            answer_kind="guardrail",
         )
         return response
 
@@ -932,6 +1094,7 @@ def run_ask(
                 requested_year=value_guardrail.get("requested_year"),
                 requested_form=value_guardrail.get("requested_form"),
                 requested_line=value_guardrail.get("requested_line"),
+                answer_kind="guardrail",
             )
             response_text = str(value_guardrail["response"])
             return _quiet_text_only(response_text) if quiet else response_text
@@ -1078,6 +1241,7 @@ def run_ask(
         catalog_retry_used=catalog_retry_used,
         catalog_retry_silo=catalog_retry_silo,
         filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
+        answer_kind="rag",
     )
     return "\n".join(out)
 
