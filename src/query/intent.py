@@ -16,6 +16,8 @@ INTENT_CODE_LANGUAGE = "CODE_LANGUAGE"
 INTENT_CAPABILITIES = "CAPABILITIES"
 INTENT_FILE_LIST = "FILE_LIST"
 INTENT_STRUCTURE = "STRUCTURE"
+INTENT_TIMELINE = "TIMELINE"
+INTENT_METADATA_ONLY = "METADATA_ONLY"
 
 # EVIDENCE_PROFILE / AGGREGATE: wider retrieval (cap). n_results from CLI is still the final context size.
 K_PROFILE_MIN = 48
@@ -44,6 +46,37 @@ def route_intent(query: str) -> str:
         and not re.search(r"\b(summary|overview|analy[sz]e|analysis|architecture|design|why|how)\b", q)
     ):
         return INTENT_FILE_LIST
+    # METADATA_ONLY: pure metadata aggregation queries (check before STRUCTURE to avoid conflicts)
+    if (
+        re.search(
+            r'\b(how\s+many|count|total|number\s+of)\b',
+            q
+        )
+        and re.search(
+            r'\b(files?|documents?|docs?)\b',
+            q
+        )
+        and re.search(
+            r'\b(by\s+(?:year|month|quarter|type|extension|folder))\b',
+            q
+        )
+    ):
+        return INTENT_METADATA_ONLY
+    # Also catch "file counts", "document types", "extension breakdown"
+    if re.search(
+        r'\b(file\s+counts?|document\s+(?:types?|counts?)|extension\s+breakdown)\b',
+        q
+    ):
+        return INTENT_METADATA_ONLY
+    # TIMELINE: temporal sequence queries (deterministic chronological ordering)
+    if (
+        re.search(
+            r'\b(timeline|chronolog|sequence|history|evolution|progression)\b',
+            q
+        )
+        and re.search(r'\b(20\d{2}|events?|milestones?|changes?|updates?)\b', q)
+    ):
+        return INTENT_TIMELINE
     # STRUCTURE: deterministic catalog snapshots (outline/recent/inventory).
     if (
         re.search(

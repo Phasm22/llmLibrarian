@@ -38,6 +38,8 @@ from query.intent import (
     INTENT_CAPABILITIES,
     INTENT_FILE_LIST,
     INTENT_STRUCTURE,
+    INTENT_TIMELINE,
+    INTENT_METADATA_ONLY,
     route_intent,
     effective_k,
 )
@@ -62,7 +64,7 @@ from query.scope_binding import (
     detect_filetype_hints,
     rank_silos_by_catalog_tokens,
 )
-from query.expansion import expand_query
+from query.expansion import expand_query, decompose_temporal_query
 from query.context import (
     DOC_TYPE_BONUS,
     RECENCY_WEIGHT,
@@ -104,6 +106,8 @@ from query.guardrails import (
     run_direct_value_consistency_guardrail,
 )
 from query.project_count import compute_project_count, format_project_count
+from query.timeline import parse_timeline_request, build_timeline_from_manifest, format_timeline_answer
+from query.metadata import parse_metadata_request, aggregate_metadata, format_metadata_answer
 from query.trace import write_trace
 
 try:
@@ -664,6 +668,92 @@ def run_ask(
         )
         return "\n".join(lines)
 
+    # TIMELINE: deterministic chronological sequence from manifest (no LLM)
+    if intent == INTENT_TIMELINE and use_unified:
+        req = parse_timeline_request(query)
+        if not req:
+            raise QueryPolicyError("Could not parse timeline request.", exit_code=2)
+        if not silo:
+            raise QueryPolicyError("Timeline queries require explicit scope. Use: --in <silo>.", exit_code=2)
+
+        timeline_result = build_timeline_from_manifest(
+            db_path=db,
+            silo_slug=silo,
+            start_year=req["start_year"],
+            end_year=req["end_year"],
+            keywords=req["keywords"],
+            cap=100,
+        )
+
+        if timeline_result.get("stale"):
+            stale_reason = timeline_result.get("stale_reason") or "unknown"
+            raise QueryPolicyError(f"Timeline unavailable: {stale_reason}. Run: llmli add {silo}", exit_code=2)
+
+        events = timeline_result["events"]
+        response = format_timeline_answer(events, source_label, no_color)
+
+        time_ms = (time.perf_counter() - t0) * 1000
+        write_trace(
+            intent=intent,
+            n_stage1=0,
+            n_results=0,
+            model=model,
+            silo=silo,
+            source_label=source_label,
+            num_docs=len(events),
+            time_ms=time_ms,
+            query_len=len(query),
+            hybrid_used=False,
+            guardrail_no_match=(len(events) == 0),
+            guardrail_reason="timeline",
+            answer_kind="catalog_artifact",
+        )
+        return response
+
+    # METADATA_ONLY: deterministic aggregation over file registry (no LLM)
+    if intent == INTENT_METADATA_ONLY and use_unified:
+        req = parse_metadata_request(query)
+        if not req:
+            raise QueryPolicyError("Could not parse metadata request.", exit_code=2)
+        if not silo:
+            raise QueryPolicyError("Metadata queries require explicit scope. Use: --in <silo>.", exit_code=2)
+
+        meta_result = aggregate_metadata(
+            db_path=db,
+            silo_slug=silo,
+            dimension=req["dimension"],
+        )
+
+        if meta_result.get("stale"):
+            stale_reason = meta_result.get("stale_reason") or "unknown"
+            raise QueryPolicyError(f"Metadata unavailable: {stale_reason}. Run: llmli add {silo}", exit_code=2)
+
+        aggregates = meta_result["aggregates"]
+        response = format_metadata_answer(
+            dimension=req["dimension"],
+            aggregates=aggregates,
+            source_label=source_label,
+            no_color=no_color,
+        )
+
+        time_ms = (time.perf_counter() - t0) * 1000
+        write_trace(
+            intent=intent,
+            n_stage1=0,
+            n_results=0,
+            model=model,
+            silo=silo,
+            source_label=source_label,
+            num_docs=len(aggregates),
+            time_ms=time_ms,
+            query_len=len(query),
+            hybrid_used=False,
+            guardrail_no_match=(len(aggregates) == 0),
+            guardrail_reason="metadata_only",
+            answer_kind="catalog_artifact",
+        )
+        return response
+
     n_effective = effective_k(intent, n_results)
     if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE):
         n_stage1 = max(n_effective, RERANK_STAGE1_N if use_reranker else 60)
@@ -888,11 +978,47 @@ def run_ask(
         query_kw["where"] = {"silo": silo}
     elif subscope_where:
         query_kw["where"] = subscope_where
-    results = collection.query(**query_kw)
-    docs = (results.get("documents") or [[]])[0] or []
-    metas = (results.get("metadatas") or [[]])[0] or []
-    dists = (results.get("distances") or [[]])[0] or []
-    ids_v = (results.get("ids") or [[]])[0] or [] if include_ids else []
+
+    # Temporal query decomposition: break down comparison queries into sequential sub-queries
+    temporal_subqueries = decompose_temporal_query(query)
+    if temporal_subqueries and len(temporal_subqueries) > 1:
+        # Execute each sub-query sequentially and aggregate results
+        aggregated_docs, aggregated_metas, aggregated_dists = [], [], []
+        n_per_subquery = max(1, n_stage1 // len(temporal_subqueries))
+
+        for subq in temporal_subqueries:
+            expanded_subq = expand_query(subq)
+            sub_query_kw = dict(query_kw)
+            sub_query_kw["query_texts"] = [expanded_subq]
+            sub_query_kw["n_results"] = n_per_subquery
+
+            sub_results = collection.query(**sub_query_kw)
+            if sub_results and sub_results.get("documents"):
+                sub_docs = (sub_results.get("documents") or [[]])[0] or []
+                sub_metas = (sub_results.get("metadatas") or [[]])[0] or []
+                sub_dists = (sub_results.get("distances") or [[]])[0] or []
+
+                aggregated_docs.extend(sub_docs)
+                aggregated_metas.extend(sub_metas)
+                aggregated_dists.extend(sub_dists)
+
+        docs = aggregated_docs
+        metas = aggregated_metas
+        dists = aggregated_dists
+        ids_v = [] if include_ids else []
+
+        # Enhance system prompt for temporal comparison
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nThis is a temporal comparison query. Present results chronologically and highlight changes over time."
+        )
+    else:
+        # Normal single-query path
+        results = collection.query(**query_kw)
+        docs = (results.get("documents") or [[]])[0] or []
+        metas = (results.get("metadatas") or [[]])[0] or []
+        dists = (results.get("distances") or [[]])[0] or []
+        ids_v = (results.get("ids") or [[]])[0] or [] if include_ids else []
     weak_scope_gate = False
     catalog_retry_used = False
     catalog_retry_silo: str | None = None
@@ -1170,9 +1296,59 @@ def run_ask(
             return f"No indexed content for {source_label}. Run: llmli add <path>"
         return f"No indexed content for {source_label}. Run: index --archetype {archetype_id}"
 
-    # Relevance gate: if no chunk passes the bar, skip LLM (avoid confidently wrong answers)
+    # Relevance gate: fall back to structure info on low confidence
     threshold = relevance_max_distance()
     if all_dists_above_threshold(dists, threshold):
+        # Low confidence - provide structure outline as fallback
+        if intent == INTENT_LOOKUP and use_unified and silo:
+            struct_result = build_structure_outline(db, silo, cap=50)
+
+            if not struct_result.get("stale") and struct_result.get("lines"):
+                lines_preview = struct_result["lines"][:20]
+                total_files = struct_result["matched_count"]
+
+                fallback_msg = (
+                    f"I don't have content closely matching that query. "
+                    f"Here's what I have indexed in {source_label} ({total_files} files):\n\n"
+                )
+                for line in lines_preview:
+                    fallback_msg += f"  • {line}\n"
+
+                if total_files > len(lines_preview):
+                    fallback_msg += f"\n  ... and {total_files - len(lines_preview)} more files\n"
+
+                fallback_msg += (
+                    f"\nTry rephrasing your query to match indexed content, "
+                    f"or add more documents with: llmli add <path>"
+                )
+
+                if not quiet:
+                    fallback_msg += (
+                        "\n\n" + dim(no_color, "---") + "\n"
+                        + label_style(no_color, f"Answered by: {source_label} (structure fallback)")
+                    )
+
+                # Write trace
+                time_ms = (time.perf_counter() - t0) * 1000
+                write_trace(
+                    intent="LOOKUP_STRUCTURE_FALLBACK",
+                    n_stage1=n_stage1,
+                    n_results=n_results,
+                    model=model,
+                    silo=silo,
+                    source_label=source_label,
+                    num_docs=len(lines_preview),
+                    time_ms=time_ms,
+                    query_len=len(query),
+                    hybrid_used=hybrid_used,
+                    guardrail_no_match=True,
+                    guardrail_reason="low_confidence_structure_fallback",
+                    answer_kind="structure_fallback",
+                )
+
+                return fallback_msg
+
+        # Default fallback when structure not available
         if quiet:
             return "I don't have relevant content for that. Try rephrasing or adding more specific documents (llmli add)."
         return (
