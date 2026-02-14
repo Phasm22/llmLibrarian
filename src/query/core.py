@@ -56,7 +56,10 @@ from query.retrieval import (
     source_priority_score,
     filter_by_triggers,
     diversify_by_source,
+    diversify_by_silo,
+    soft_promote_silo_diversity,
     dedup_by_chunk_hash,
+    max_silo_chunks_for_intent,
     resolve_subscope,
 )
 from query.scope_binding import (
@@ -93,6 +96,10 @@ from query.formatting import (
     style_answer,
     sanitize_answer_metadata_artifacts,
     normalize_answer_direct_address,
+    normalize_uncertainty_tone,
+    normalize_ownership_claims,
+    normalize_sentence_start,
+    normalize_inline_numbered_lists,
     linkify_sources_in_answer,
     format_source,
 )
@@ -170,6 +177,177 @@ def _is_code_activity_year_lookup(query: str) -> bool:
             q,
         )
     )
+
+
+_UNIFIED_ANALYTICAL_PATTERN = re.compile(
+    r"\b("
+    r"across\s+silos|"
+    r"recurring\s+themes?|"
+    r"repeatedly|"
+    r"versus|"
+    r"\bvs\b|"
+    r"abandoned|"
+    r"likely\s+next\s+step|"
+    r"llm[- ]oriented\s+workflows?|"
+    r"traditional\s+workflows?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_TIMELINE_RECENCY_PATTERN = re.compile(
+    r"\b("
+    r"timeline|"
+    r"shift|"
+    r"changed?|"
+    r"over\s+time|"
+    r"abandon(?:ed|ment)?|"
+    r"stale|"
+    r"inactive|"
+    r"last\s+touched|"
+    r"stopped|"
+    r"pending"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_OWNERSHIP_PATTERN = re.compile(
+    r"\b("
+    r"mine|"
+    r"my\s+authored|"
+    r"authored|"
+    r"i\s+wrote|"
+    r"my\s+work|"
+    r"not\s+mine|"
+    r"reference|"
+    r"course|"
+    r"vendor|"
+    r"ownership"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_unified_analytical_query(query: str, intent: str) -> bool:
+    if intent not in (INTENT_LOOKUP, INTENT_AGGREGATE, INTENT_REFLECT, INTENT_EVIDENCE_PROFILE):
+        return False
+    return bool(_UNIFIED_ANALYTICAL_PATTERN.search(query or ""))
+
+
+def _query_requests_recency_hints(query: str) -> bool:
+    return bool(_TIMELINE_RECENCY_PATTERN.search(query or ""))
+
+
+def _query_requests_ownership_framing(query: str) -> bool:
+    return bool(_OWNERSHIP_PATTERN.search(query or ""))
+
+
+def _combine_where_and(base_where: dict[str, Any] | None, extra: dict[str, Any]) -> dict[str, Any]:
+    if not base_where:
+        return extra
+    if "$and" in base_where and isinstance(base_where.get("$and"), list):
+        return {"$and": [*list(base_where["$and"]), extra]}
+    return {"$and": [base_where, extra]}
+
+
+def _rank_candidate_silos(
+    metas: list[dict | None],
+    dists: list[float | None],
+    max_candidates: int = 6,
+) -> list[str]:
+    by_silo: dict[str, tuple[float, int]] = {}
+    for i, meta in enumerate(metas):
+        silo = str((meta or {}).get("silo") or "").strip()
+        if not silo:
+            continue
+        dist = float(dists[i]) if i < len(dists) and dists[i] is not None else 999.0
+        prev = by_silo.get(silo)
+        if prev is None or dist < prev[0]:
+            by_silo[silo] = (dist, i)
+    ranked = sorted(by_silo.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0]))
+    return [s for s, _ in ranked[:max_candidates]]
+
+
+def _distinct_silo_count(metas: list[dict | None]) -> int:
+    return len(
+        {
+            str((m or {}).get("silo") or "").strip()
+            for m in metas
+            if str((m or {}).get("silo") or "").strip()
+        }
+    )
+
+
+def _format_mtime_utc(value: float | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _build_recency_hints(metas: list[dict | None], cap: int = 6) -> list[str]:
+    buckets: dict[str, dict[str, Any]] = {}
+    for meta in metas:
+        silo = str((meta or {}).get("silo") or "").strip() or "unknown"
+        raw_mtime = (meta or {}).get("mtime")
+        if raw_mtime is None:
+            continue
+        try:
+            mtime = float(raw_mtime)
+        except (TypeError, ValueError):
+            continue
+        slot = buckets.setdefault(silo, {"newest": mtime, "oldest": mtime, "count": 0})
+        slot["newest"] = max(float(slot["newest"]), mtime)
+        slot["oldest"] = min(float(slot["oldest"]), mtime)
+        slot["count"] = int(slot["count"]) + 1
+
+    ranked = sorted(buckets.items(), key=lambda kv: (-float(kv[1]["newest"]), kv[0]))[:cap]
+    lines: list[str] = []
+    for silo, row in ranked:
+        newest = _format_mtime_utc(float(row["newest"]))
+        oldest = _format_mtime_utc(float(row["oldest"]))
+        if not newest:
+            continue
+        if oldest and oldest != newest:
+            lines.append(f"- {silo}: newest {newest}, oldest {oldest}, mtime samples={int(row['count'])}")
+        else:
+            lines.append(f"- {silo}: newest {newest}, mtime samples={int(row['count'])}")
+    return lines
+
+
+def _group_context_by_silo(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    show_silo_in_context: bool,
+) -> str:
+    if not docs:
+        return ""
+    groups: dict[str, list[int]] = {}
+    for i, _doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else None
+        silo = str((meta or {}).get("silo") or "").strip() or "unknown"
+        groups.setdefault(silo, []).append(i)
+
+    def _best_dist(idxs: list[int]) -> float:
+        vals = [float(dists[i]) for i in idxs if i < len(dists) and dists[i] is not None]
+        if not vals:
+            return 999.0
+        return min(vals)
+
+    ordered_silos = sorted(groups.keys(), key=lambda s: (_best_dist(groups[s]), groups[s][0], s))
+    sections: list[str] = []
+    for silo in ordered_silos:
+        parts = [f"[SILO GROUP: {silo}]"]
+        for i in groups[silo]:
+            doc = docs[i] if i < len(docs) else ""
+            meta = metas[i] if i < len(metas) else None
+            if not doc:
+                continue
+            parts.append(context_block(doc, meta, show_silo_in_context))
+        sections.append("\n---\n".join(parts))
+    return "\n\n====\n\n".join(sections)
 
 
 def _distinct_source_count(metas: list[dict | None]) -> int:
@@ -639,6 +817,9 @@ def run_ask(
     code_activity_year_lookup = bool(intent == INTENT_LOOKUP and _is_code_activity_year_lookup(query))
     code_activity_requested_year = _single_year_from_query(query) if code_activity_year_lookup else None
     code_activity_sources: list[str] = []
+    ownership_framing_requested = _query_requests_ownership_framing(query)
+    recency_hints_requested = _query_requests_recency_hints(query)
+    unified_analytical_query = False
 
     if use_unified and silo is None and auto_scope_binding:
         binding = bind_scope_from_query(query, db)
@@ -651,6 +832,29 @@ def run_ask(
             # Keep system-policy suffixes intact; only align label for output clarity.
             if binding.get("bound_display_name"):
                 source_label = str(binding["bound_display_name"])
+
+    unified_analytical_query = bool(
+        use_unified
+        and explicit_silo is None
+        and scope_bound_slug is None
+        and silo is None
+        and _is_unified_analytical_query(query, intent)
+    )
+    if unified_analytical_query:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nThis is a cross-silo analytical synthesis request."
+            + " Synthesize shared themes and differences across silos."
+            + " Lead with direct findings, then give concise supporting evidence."
+            + " If evidence is concentrated in one silo, state that in one line."
+        )
+    if ownership_framing_requested:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nOwnership framing policy: use doc_type hints such as syllabus/homework/transcript as likely reference/course signals."
+            + " Treat custom scripts/tests/docs in personal repos as likely authored unless contradictory evidence appears."
+            + " Label uncertain ownership explicitly."
+        )
     # CAPABILITIES: return deterministic report inline (source of truth; no retrieval, no LLM)
     if intent == INTENT_CAPABILITIES and use_unified:
         try:
@@ -1414,6 +1618,57 @@ def run_ask(
             source_priority_score(m, canonical_tokens, deprioritized_tokens) > 0 for m in metas[:3]
         )
 
+    # Unified analytical two-stage synthesis:
+    # Stage A is the broad retrieval above; Stage B fans out into top candidate silos
+    # and merges deterministically so cross-silo synthesis has better evidence coverage.
+    if unified_analytical_query and docs:
+        candidate_silos = _rank_candidate_silos(metas, dists, max_candidates=6)
+        if candidate_silos:
+            base_where = query_kw.get("where") if isinstance(query_kw.get("where"), dict) else None
+            fanout_k = max(2, min(6, max(2, n_stage1 // 8)))
+            fanout_rows: list[tuple[str, dict | None, float | None]] = []
+            for silo_slug in candidate_silos:
+                fan_kw: dict[str, Any] = {
+                    "query_texts": [query_for_retrieval],
+                    "n_results": fanout_k,
+                    "include": ["documents", "metadatas", "distances"],
+                    "where": _combine_where_and(base_where, {"silo": silo_slug}),
+                }
+                fan_results = collection.query(**fan_kw)
+                fan_docs = (fan_results.get("documents") or [[]])[0] or []
+                fan_metas = (fan_results.get("metadatas") or [[]])[0] or []
+                fan_dists = (fan_results.get("distances") or [[]])[0] or []
+                for i, fan_doc in enumerate(fan_docs):
+                    fan_meta = fan_metas[i] if i < len(fan_metas) else None
+                    fan_dist = fan_dists[i] if i < len(fan_dists) else None
+                    fanout_rows.append((fan_doc, fan_meta, fan_dist))
+
+            if fanout_rows:
+                combined_rows = list(zip(docs, metas, dists)) + fanout_rows
+                combined_rows.sort(
+                    key=lambda row: (
+                        float(row[2]) if row[2] is not None else 999.0,
+                        str((row[1] or {}).get("silo") or ""),
+                        str((row[1] or {}).get("source") or ""),
+                    )
+                )
+                merged_docs: list[str] = []
+                merged_metas: list[dict | None] = []
+                merged_dists: list[float | None] = []
+                seen_keys: set[tuple[str, str, str, str]] = set()
+                for doc_row, meta_row, dist_row in combined_rows:
+                    source = str((meta_row or {}).get("source") or "")
+                    line = str((meta_row or {}).get("line_start") or "")
+                    page = str((meta_row or {}).get("page") or "")
+                    key = (doc_row or "", source, line, page)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    merged_docs.append(doc_row)
+                    merged_metas.append(meta_row)
+                    merged_dists.append(dist_row)
+                docs, metas, dists = merged_docs, merged_metas, merged_dists
+
     # Year boost on full retrieval set (before rerank/diversify) so queries like "AGI in 2024" get 2024 chunks in the pool
     mentioned_years = query_mentioned_years(query)
     asks_agi = query_asks_for_agi(query)
@@ -1490,15 +1745,49 @@ def run_ask(
     # Diversify by source: cap chunks per file so one huge file (e.g. Closed Traffic.txt) doesn't crowd out others
     source_cache = [((m or {}).get("source") or "") for m in metas]
     per_intent_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
+    diversity_top_k = n_stage1 if unified_analytical_query else n_results
     docs, metas, dists = diversify_by_source(
         docs,
         metas,
         dists,
-        n_results,
+        diversity_top_k,
         max_per_source=per_intent_cap,
         sources=source_cache,
     )
     docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+    # Unified cross-silo balancing: cap per-silo contribution so one very large silo
+    # does not dominate final evidence context.
+    if use_unified and explicit_silo is None and silo is None:
+        per_silo_cap = max_silo_chunks_for_intent(intent, 3)
+        if unified_analytical_query:
+            docs, metas, dists = soft_promote_silo_diversity(
+                docs,
+                metas,
+                dists,
+                n_results,
+                max_promotions_per_alt_silo=1,
+                max_total_promotions=2,
+                relevance_delta=0.08,
+            )
+            silo_cache = [str(((m or {}).get("silo") or "")) for m in metas]
+            docs, metas, dists = diversify_by_silo(
+                docs,
+                metas,
+                dists,
+                n_results,
+                max_per_silo=per_silo_cap,
+                silos=silo_cache,
+            )
+        else:
+            silo_cache = [str(((m or {}).get("silo") or "")) for m in metas]
+            docs, metas, dists = diversify_by_silo(
+                docs,
+                metas,
+                dists,
+                diversity_top_k,
+                max_per_silo=per_silo_cap,
+                silos=silo_cache,
+            )
 
     # Filetype-hinted summary floor: keep sources that contribute at least one chunk under relevance threshold.
     # This trims unrelated same-extension files (e.g., other PPTX decks) without introducing non-determinism.
@@ -1749,13 +2038,63 @@ def run_ask(
             + f"\n\nI can't prove completeness; only {unique_sources} source(s) in context."
         )
 
+    recency_hints: list[str] = []
+    if recency_hints_requested:
+        recency_hints = _build_recency_hints(metas)
+        if recency_hints:
+            system_prompt = (
+                system_prompt.rstrip()
+                + "\n\nRecency guidance: treat mtime recency hints as weak evidence only."
+                + " Do not conclude abandonment from timestamps alone; combine with content evidence."
+            )
+
+    predicted_confidence_warning = _confidence_signal(
+        dists,
+        metas,
+        intent,
+        query,
+        docs=docs,
+        explicit_unified=explicit_unified,
+        direct_canonical_available=direct_canonical_available,
+        confidence_relaxation_enabled=confidence_relaxation_enabled,
+        filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
+    )
+    if predicted_confidence_warning and not strict:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nTone policy when confidence is weak:"
+            + " Do not start with 'Based on the provided context...'."
+            + " Do not repeat uncertainty phrases more than once."
+            + " Provide direct findings first; add one concise caveat line only if needed."
+        )
+    if predicted_confidence_warning and ownership_framing_requested and not strict:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nOwnership claim policy: prefer evidence-backed ownership statements."
+            + " Avoid speculative ownership claims unless explicitly labeled once."
+            + " Do not contradict ownership labels in the same answer."
+        )
+
     # Standardized context packaging: file, mtime, silo, doc_type, snippet (helps model and debugging)
     show_silo_in_context = use_unified and silo is None
-    context = "\n---\n".join(context_block(docs[i], metas[i] if i < len(metas) else None, show_silo_in_context) for i, d in enumerate(docs) if d)
+    if unified_analytical_query and show_silo_in_context:
+        context = _group_context_by_silo(docs, metas, dists, show_silo_in_context)
+    else:
+        context = "\n---\n".join(
+            context_block(docs[i], metas[i] if i < len(metas) else None, show_silo_in_context)
+            for i, d in enumerate(docs)
+            if d
+        )
+    recency_section = ""
+    if recency_hints:
+        recency_section = (
+            "\n\n[RECENCY HINTS - WEAK EVIDENCE]\n"
+            + "\n".join(recency_hints)
+        )
     user_prompt = (
         f"Using ONLY the following context, answer: {query}\n\n"
         "[START CONTEXT]\n"
-        f"{context}\n"
+        f"{context}{recency_section}\n"
         "[END CONTEXT]"
     )
 
@@ -1772,8 +2111,6 @@ def run_ask(
     raw_answer = (response.get("message") or {}).get("content") or ""
     raw_answer = sanitize_answer_metadata_artifacts(raw_answer.strip())
     raw_answer = normalize_answer_direct_address(raw_answer)
-    answer = style_answer(raw_answer, no_color)
-    answer = linkify_sources_in_answer(answer, metas, no_color)
     confidence_assessment = _confidence_assessment(
         dists,
         metas,
@@ -1787,6 +2124,23 @@ def run_ask(
         answer_text=raw_answer,
     )
     confidence_warning = str(confidence_assessment.get("warning") or "") or None
+    raw_answer = normalize_uncertainty_tone(
+        raw_answer,
+        has_confidence_banner=bool(confidence_warning),
+        strict=strict,
+    )
+    raw_answer = normalize_ownership_claims(raw_answer)
+    raw_answer = normalize_inline_numbered_lists(raw_answer)
+    raw_answer = normalize_sentence_start(raw_answer)
+    if unified_analytical_query and _distinct_silo_count(metas) <= 1:
+        lone = str((metas[0] or {}).get("silo") or "one silo") if metas else "one silo"
+        if "evidence concentration note" not in raw_answer.lower():
+            raw_answer = (
+                raw_answer.rstrip()
+                + f"\n\nEvidence concentration note: retrieved evidence was concentrated in one silo ({lone})."
+            )
+    answer = style_answer(raw_answer, no_color)
+    answer = linkify_sources_in_answer(answer, metas, no_color)
 
     if quiet:
         return answer

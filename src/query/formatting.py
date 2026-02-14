@@ -112,6 +112,12 @@ _HEADER_META_PATTERN = re.compile(
     r'(?:"|\'|`)?',
     re.IGNORECASE,
 )
+_FILE_ONLY_PATTERN = re.compile(
+    r'(?:"|\'|`)?file=(?P<path>[^"\',\n]+?)'
+    r'(?:\s+\(line\s+(?P<line>\d+)\)|\s+\(page\s+(?P<page>\d+)\))?'
+    r'(?:"|\'|`)?',
+    re.IGNORECASE,
+)
 
 
 def sanitize_answer_metadata_artifacts(answer: str) -> str:
@@ -137,7 +143,9 @@ def sanitize_answer_metadata_artifacts(answer: str) -> str:
             return f"{display} (page {page})"
         return display
 
-    return _HEADER_META_PATTERN.sub(_repl, answer)
+    out = _HEADER_META_PATTERN.sub(_repl, answer)
+    out = _FILE_ONLY_PATTERN.sub(_repl, out)
+    return out
 
 
 _THIRD_PERSON_USER_PATTERNS = (
@@ -181,6 +189,136 @@ def normalize_answer_direct_address(answer: str) -> str:
     for pattern, replacement in _THIRD_PERSON_USER_PATTERNS:
         out = pattern.sub(lambda m: _repl(m, replacement), out)
     return out
+
+
+_UNCERTAINTY_LEAD_PATTERNS = (
+    re.compile(r"^\s*based on the provided context,\s*", re.IGNORECASE),
+    re.compile(r"^\s*it appears that\s*", re.IGNORECASE),
+)
+_UNCERTAINTY_SENTENCE_PATTERN = re.compile(
+    r"\b("
+    r"it appears that|"
+    r"it is difficult to|"
+    r"without (?:more|additional) (?:information|context)|"
+    r"cannot determine|"
+    r"unable to determine|"
+    r"not explicitly (?:mentioned|shown)|"
+    r"likely|possibly|unclear|uncertain"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_uncertainty_tone(answer: str, has_confidence_banner: bool, strict: bool) -> str:
+    """
+    Keep uncertainty signaling concise when confidence banner is already shown.
+    """
+    if not answer:
+        return ""
+    if not has_confidence_banner or strict:
+        return answer
+
+    out = answer.strip()
+    for pattern in _UNCERTAINTY_LEAD_PATTERNS:
+        out = pattern.sub("", out, count=1)
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", out) if s.strip()]
+    if not sentences:
+        return out
+
+    kept: list[str] = []
+    caveat: str | None = None
+    for sent in sentences:
+        if _UNCERTAINTY_SENTENCE_PATTERN.search(sent):
+            if caveat is not None:
+                continue
+            sent = re.sub(r"^\s*based on the provided context,\s*", "", sent, flags=re.IGNORECASE)
+            sent = re.sub(r"^\s*it appears that\s*", "", sent, flags=re.IGNORECASE)
+            caveat = sent.strip()
+            continue
+        kept.append(sent)
+
+    joined = " ".join(kept).strip()
+    if caveat:
+        if joined:
+            return f"{joined}\n\nCaveat: {caveat}".strip()
+        return f"Caveat: {caveat}"
+    return joined or out
+
+
+_OWNERSHIP_CONFLICT_REWRITES = (
+    (
+        re.compile(r"\b(?:it|this|that)\s+(?:also\s+)?(?:appears|seems)\s+to\s+be\s+written\s+by\s+someone\s+else\b", re.IGNORECASE),
+        "ownership is uncertain",
+    ),
+    (
+        re.compile(r"\bsuggest(?:s|ing)\s+they\s+were\s+written\s+by\s+someone\s+else\b", re.IGNORECASE),
+        "ownership is uncertain",
+    ),
+    (
+        re.compile(r"\bwritten\s+by\s+someone\s+else\b", re.IGNORECASE),
+        "ownership is uncertain",
+    ),
+)
+
+
+def normalize_ownership_claims(answer: str) -> str:
+    """
+    Reduce obvious ownership-claim contradictions to one consistent uncertainty label.
+    """
+    if not answer:
+        return ""
+    out = answer
+    lower = out.lower()
+    has_authored_claim = bool(
+        re.search(r"\b(authored|written by you|your authored|likely authored)\b", lower)
+    )
+    has_other_claim = bool(
+        re.search(r"\b(someone else|written by someone else)\b", lower)
+    )
+    if not (has_authored_claim and has_other_claim):
+        return out
+    for pattern, replacement in _OWNERSHIP_CONFLICT_REWRITES:
+        out = pattern.sub(replacement, out)
+    return out
+
+
+def normalize_sentence_start(answer: str) -> str:
+    """
+    Capitalize first alphabetical character in the answer body.
+    """
+    if not answer:
+        return ""
+    chars = list(answer)
+    for i, ch in enumerate(chars):
+        if ch.isalpha():
+            chars[i] = ch.upper()
+            break
+    return "".join(chars)
+
+
+def normalize_inline_numbered_lists(answer: str) -> str:
+    """
+    Reflow single-line numbered lists like "1. ... 2. ..." into multi-line lists.
+    """
+    if not answer:
+        return ""
+    out_lines: list[str] = []
+    for raw in answer.splitlines():
+        markers = list(re.finditer(r"(?<!\w)(\d+)\.\s+", raw))
+        if len(markers) < 2:
+            out_lines.append(raw)
+            continue
+        prefix = raw[: markers[0].start()].strip()
+        if prefix:
+            out_lines.append(prefix)
+        for idx, match in enumerate(markers):
+            start = match.start()
+            end = markers[idx + 1].start() if (idx + 1) < len(markers) else len(raw)
+            item = raw[start:end].strip()
+            if item:
+                out_lines.append(item)
+    return "\n".join(out_lines)
 
 
 def linkify_sources_in_answer(answer: str, metas: list[dict | None], no_color: bool) -> str:
