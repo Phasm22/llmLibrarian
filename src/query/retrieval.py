@@ -35,6 +35,12 @@ DIVERSITY_CAPS: dict[str, int] = {
     "REFLECT": 4,
     "FIELD_LOOKUP": 8,
 }
+SILO_DIVERSITY_CAPS: dict[str, int] = {
+    "LOOKUP": 3,
+    "EVIDENCE_PROFILE": 3,
+    "AGGREGATE": 6,
+    "REFLECT": 3,
+}
 
 # Catalog sub-scope: tokens we never use for path routing (avoid junk matches).
 SCOPE_TOKEN_STOPLIST = frozenset(
@@ -85,6 +91,12 @@ def relevance_max_distance() -> float:
 def max_chunks_for_intent(intent: str, default: int) -> int:
     """Return per-intent diversity cap, falling back to the configured default."""
     cap = DIVERSITY_CAPS.get((intent or "").upper(), default)
+    return cap if cap >= 1 else default
+
+
+def max_silo_chunks_for_intent(intent: str, default: int) -> int:
+    """Return per-intent cross-silo cap when unified retrieval spans many silos."""
+    cap = SILO_DIVERSITY_CAPS.get((intent or "").upper(), default)
     return cap if cap >= 1 else default
 
 
@@ -183,6 +195,217 @@ def diversify_by_source(
         out_metas.append(meta)
         out_dists.append(dists[i] if i < len(dists) else None)
     return out_docs, out_metas, out_dists
+
+
+def diversify_by_silo(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    top_k: int,
+    max_per_silo: int = 3,
+    silos: list[str] | None = None,
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    """Cap chunks per silo to avoid large silos dominating unified answers."""
+    if not docs or max_per_silo < 1:
+        return docs[:top_k], (metas or [])[:top_k], (dists or [])[:top_k]
+    if silos is None:
+        silos = [str(((m or {}).get("silo") or "")) for m in metas]
+    out_docs: list[str] = []
+    out_metas: list[dict | None] = []
+    out_dists: list[float | None] = []
+    count_per_silo: dict[str, int] = {}
+    for i, doc in enumerate(docs):
+        if len(out_docs) >= top_k:
+            break
+        meta = metas[i] if i < len(metas) else None
+        silo = silos[i] if i < len(silos) else str(((meta or {}).get("silo") or ""))
+        if not silo:
+            silo = f"__unknown_silo_{i}"
+        n = count_per_silo.get(silo, 0)
+        if n >= max_per_silo:
+            continue
+        count_per_silo[silo] = n + 1
+        out_docs.append(doc)
+        out_metas.append(meta)
+        out_dists.append(dists[i] if i < len(dists) else None)
+    return out_docs, out_metas, out_dists
+
+
+def ensure_min_silo_coverage(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    top_k: int,
+    min_silos: int = 3,
+    silos: list[str] | None = None,
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    """
+    Ensure at least one chunk from up to `min_silos` distinct silos when available.
+
+    Deterministic behavior:
+    - Candidate silos are ranked by best distance, then first-seen index, then silo id.
+    - Within a silo, first-seen chunk is used for coverage pass.
+    - Remaining slots are filled in original order.
+    """
+    if not docs:
+        return docs[:top_k], (metas or [])[:top_k], (dists or [])[:top_k]
+    if min_silos <= 1:
+        return docs[:top_k], (metas or [])[:top_k], (dists or [])[:top_k]
+    if silos is None:
+        silos = [str(((m or {}).get("silo") or "")) for m in metas]
+
+    silo_rows: dict[str, dict[str, Any]] = {}
+    ordered_rows: list[tuple[int, str, str, dict | None, float | None]] = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else None
+        dist = dists[i] if i < len(dists) else None
+        silo = silos[i] if i < len(silos) else str(((meta or {}).get("silo") or ""))
+        if not silo:
+            silo = f"__unknown_silo_{i}"
+        ordered_rows.append((i, silo, doc, meta, dist))
+        best_dist = float(dist) if dist is not None else 999.0
+        slot = silo_rows.get(silo)
+        if slot is None:
+            silo_rows[silo] = {
+                "first_idx": i,
+                "best_dist": best_dist,
+            }
+            continue
+        if best_dist < slot["best_dist"]:
+            slot["best_dist"] = best_dist
+
+    if not silo_rows:
+        return docs[:top_k], (metas or [])[:top_k], (dists or [])[:top_k]
+
+    ranked_silos = sorted(
+        silo_rows.items(),
+        key=lambda kv: (kv[1]["best_dist"], kv[1]["first_idx"], kv[0]),
+    )
+    target_silos = {s for s, _row in ranked_silos[: min(min_silos, len(ranked_silos))]}
+
+    selected_idx: list[int] = []
+    picked_silos: set[str] = set()
+    for i, silo, _doc, _meta, _dist in ordered_rows:
+        if len(selected_idx) >= top_k:
+            break
+        if silo in target_silos and silo not in picked_silos:
+            selected_idx.append(i)
+            picked_silos.add(silo)
+
+    if len(selected_idx) < top_k:
+        selected_set = set(selected_idx)
+        for i, _silo, _doc, _meta, _dist in ordered_rows:
+            if len(selected_idx) >= top_k:
+                break
+            if i in selected_set:
+                continue
+            selected_idx.append(i)
+            selected_set.add(i)
+
+    selected_idx.sort()
+    return (
+        [docs[i] for i in selected_idx if i < len(docs)],
+        [metas[i] if i < len(metas) else None for i in selected_idx],
+        [dists[i] if i < len(dists) else None for i in selected_idx],
+    )
+
+
+def soft_promote_silo_diversity(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    top_k: int,
+    max_promotions_per_alt_silo: int = 1,
+    max_total_promotions: int = 2,
+    relevance_delta: float = 0.08,
+    dominance_ratio: float = 0.7,
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    """
+    Best-effort cross-silo balancing: if one silo dominates and other silos are
+    near-relevant, promote a small number of alternate-silo chunks into the tail.
+    """
+    limit = min(top_k, len(docs))
+    if limit <= 0:
+        return [], [], []
+    if limit < 4 or max_total_promotions < 1 or max_promotions_per_alt_silo < 1:
+        return docs[:limit], (metas or [])[:limit], (dists or [])[:limit]
+
+    silos: list[str] = []
+    for i in range(len(docs)):
+        silo = str(((metas[i] if i < len(metas) else None) or {}).get("silo") or "")
+        silos.append(silo or f"__unknown_silo_{i}")
+
+    count_per_silo: dict[str, int] = {}
+    first_idx_per_silo: dict[str, int] = {}
+    for i in range(limit):
+        silo = silos[i]
+        count_per_silo[silo] = count_per_silo.get(silo, 0) + 1
+        if silo not in first_idx_per_silo:
+            first_idx_per_silo[silo] = i
+
+    if not count_per_silo:
+        return docs[:limit], (metas or [])[:limit], (dists or [])[:limit]
+    top_silo, top_count = sorted(
+        count_per_silo.items(),
+        key=lambda kv: (-kv[1], first_idx_per_silo.get(kv[0], 99999), kv[0]),
+    )[0]
+    if (top_count / float(limit)) < dominance_ratio:
+        return docs[:limit], (metas or [])[:limit], (dists or [])[:limit]
+
+    best_dist_per_silo: dict[str, float] = {}
+    for i in range(len(docs)):
+        silo = silos[i]
+        d = float(dists[i]) if i < len(dists) and dists[i] is not None else 999.0
+        if silo not in best_dist_per_silo or d < best_dist_per_silo[silo]:
+            best_dist_per_silo[silo] = d
+
+    top_best = best_dist_per_silo.get(top_silo, 999.0)
+    eligible_alt_silos = {
+        silo
+        for silo in best_dist_per_silo.keys()
+        if silo != top_silo and best_dist_per_silo.get(silo, 999.0) <= (top_best + relevance_delta)
+    }
+    if not eligible_alt_silos:
+        return docs[:limit], (metas or [])[:limit], (dists or [])[:limit]
+
+    base_idx = list(range(limit))
+    replace_positions = [i for i in range(limit - 1, -1, -1) if silos[base_idx[i]] == top_silo]
+    if not replace_positions:
+        return docs[:limit], (metas or [])[:limit], (dists or [])[:limit]
+
+    alt_candidates: list[int] = []
+    for i in range(limit, len(docs)):
+        if silos[i] in eligible_alt_silos:
+            alt_candidates.append(i)
+    alt_candidates.sort(
+        key=lambda i: (
+            float(dists[i]) if i < len(dists) and dists[i] is not None else 999.0,
+            silos[i],
+            i,
+        )
+    )
+
+    promoted_per_silo: dict[str, int] = {}
+    promotions = 0
+    for cand in alt_candidates:
+        if promotions >= max_total_promotions:
+            break
+        if not replace_positions:
+            break
+        cand_silo = silos[cand]
+        used = promoted_per_silo.get(cand_silo, 0)
+        if used >= max_promotions_per_alt_silo:
+            continue
+        pos = replace_positions.pop(0)
+        base_idx[pos] = cand
+        promoted_per_silo[cand_silo] = used + 1
+        promotions += 1
+
+    return (
+        [docs[i] for i in base_idx if i < len(docs)],
+        [metas[i] if i < len(metas) else None for i in base_idx],
+        [dists[i] if i < len(dists) else None for i in base_idx],
+    )
 
 
 def dedup_by_chunk_hash(

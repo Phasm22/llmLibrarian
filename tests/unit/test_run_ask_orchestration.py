@@ -501,6 +501,224 @@ def test_run_ask_applies_silo_filter(monkeypatch, mock_collection, mock_ollama):
     assert len(mock_ollama["calls"]) == 1
 
 
+def test_run_ask_unified_balances_final_context_across_silos(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    docs = [f"openclaw context {i}" for i in range(1, 13)] + ["tax context 1", "tax context 2"]
+    metas = [
+        {"source": f"/tmp/openclaw-{i}.ts", "is_local": 1, "silo": "openclaw-aa2df362"}
+        for i in range(1, 13)
+    ] + [
+        {"source": "/tmp/tax-1.pdf", "is_local": 1, "silo": "tax"},
+        {"source": "/tmp/tax-2.pdf", "is_local": 1, "silo": "tax"},
+    ]
+    mock_collection.query_result = {
+        "documents": [docs],
+        "metadatas": [metas],
+        "distances": [[0.1] * len(docs)],
+        "ids": [[f"id-{i}" for i in range(1, len(docs) + 1)]],
+    }
+    run_ask(
+        archetype_id=None,
+        query="what recurring themes are across my silos",
+        no_color=True,
+        use_reranker=False,
+        n_results=20,
+        explicit_unified=True,
+    )
+    assert len(mock_ollama["calls"]) == 1
+    context = mock_ollama["calls"][0]["messages"][1]["content"]
+    assert "[silo: tax]" in context
+    assert context.count("[silo: openclaw-aa2df362]") <= 3
+
+
+def test_run_ask_unified_analytical_fanout_groups_context_by_silo(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"auto_scope_binding": False}})
+    monkeypatch.setattr("query.core.resolve_subscope", lambda _q, _db, _gps: None)
+    calls = []
+
+    def _query(**kwargs):
+        calls.append(kwargs)
+        where = kwargs.get("where")
+        where_repr = repr(where)
+        if where is None:
+            return {
+                "documents": [[
+                    "openclaw primary",
+                    "openclaw transport",
+                    "tax summary seed",
+                    "self repo seed",
+                ]],
+                "metadatas": [[
+                    {"source": "/tmp/openclaw/a.ts", "is_local": 1, "silo": "openclaw-aa2df362"},
+                    {"source": "/tmp/openclaw/b.ts", "is_local": 1, "silo": "openclaw-aa2df362"},
+                    {"source": "/tmp/tax/return.pdf", "is_local": 1, "silo": "tax-123"},
+                    {"source": "/tmp/self/core.py", "is_local": 1, "silo": "__self__"},
+                ]],
+                "distances": [[0.20, 0.22, 0.25, 0.27]],
+                "ids": [["id-1", "id-2", "id-3", "id-4"]],
+            }
+        if "openclaw-aa2df362" in where_repr:
+            return {
+                "documents": [["openclaw fanout"]],
+                "metadatas": [[{"source": "/tmp/openclaw/c.ts", "is_local": 1, "silo": "openclaw-aa2df362"}]],
+                "distances": [[0.18]],
+                "ids": [["id-5"]],
+            }
+        if "tax-123" in where_repr:
+            return {
+                "documents": [["tax fanout"]],
+                "metadatas": [[{"source": "/tmp/tax/w2.pdf", "is_local": 1, "silo": "tax-123"}]],
+                "distances": [[0.19]],
+                "ids": [["id-6"]],
+            }
+        if "__self__" in where_repr:
+            return {
+                "documents": [["self fanout"]],
+                "metadatas": [[{"source": "/tmp/self/tests.py", "is_local": 1, "silo": "__self__"}]],
+                "distances": [[0.21]],
+                "ids": [["id-7"]],
+            }
+        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+
+    mock_collection.query = _query  # type: ignore[method-assign]
+    run_ask(
+        archetype_id=None,
+        query="what recurring themes are across silos versus traditional workflows?",
+        no_color=True,
+        use_reranker=False,
+        explicit_unified=True,
+    )
+    assert len(calls) >= 4  # stage A + per-silo fanout
+    context = mock_ollama["calls"][0]["messages"][1]["content"]
+    assert "[SILO GROUP: openclaw-aa2df362]" in context
+    assert "[SILO GROUP: tax-123]" in context
+    assert "[SILO GROUP: __self__]" in context
+
+
+def test_run_ask_unified_analytical_adds_single_silo_concentration_note(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"auto_scope_binding": False}})
+    monkeypatch.setattr("query.core.resolve_subscope", lambda _q, _db, _gps: None)
+    mock_collection.query_result = {
+        "documents": [["openclaw only evidence", "more openclaw evidence"]],
+        "metadatas": [[
+            {"source": "/tmp/openclaw/a.ts", "is_local": 1, "silo": "openclaw-aa2df362"},
+            {"source": "/tmp/openclaw/b.ts", "is_local": 1, "silo": "openclaw-aa2df362"},
+        ]],
+        "distances": [[0.20, 0.21]],
+        "ids": [["id-1", "id-2"]],
+    }
+    mock_ollama["response"] = {"message": {"content": "Primary findings listed."}}
+    out = run_ask(
+        archetype_id=None,
+        query="what recurring themes are across silos?",
+        no_color=True,
+        use_reranker=False,
+        explicit_unified=True,
+    )
+    assert "Evidence concentration note: retrieved evidence was concentrated in one silo" in out
+
+
+def test_run_ask_unified_analytical_soft_promotion_adds_close_alt_silo(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"auto_scope_binding": False}})
+    monkeypatch.setattr("query.core.resolve_subscope", lambda _q, _db, _gps: None)
+    monkeypatch.setattr("query.core._rank_candidate_silos", lambda _m, _d, max_candidates=6: [])
+    mock_collection.query_result = {
+        "documents": [[
+            "alpha one",
+            "alpha two",
+            "alpha three",
+            "alpha four",
+            "beta one",
+            "gamma one",
+        ]],
+        "metadatas": [[
+            {"source": "/tmp/a1.md", "is_local": 1, "silo": "alpha"},
+            {"source": "/tmp/a2.md", "is_local": 1, "silo": "alpha"},
+            {"source": "/tmp/a3.md", "is_local": 1, "silo": "alpha"},
+            {"source": "/tmp/a4.md", "is_local": 1, "silo": "alpha"},
+            {"source": "/tmp/b1.md", "is_local": 1, "silo": "beta"},
+            {"source": "/tmp/c1.md", "is_local": 1, "silo": "gamma"},
+        ]],
+        "distances": [[0.10, 0.11, 0.12, 0.13, 0.16, 0.17]],
+        "ids": [["id-1", "id-2", "id-3", "id-4", "id-5", "id-6"]],
+    }
+    run_ask(
+        archetype_id=None,
+        query="what recurring themes are across silos?",
+        no_color=True,
+        use_reranker=False,
+        explicit_unified=True,
+        n_results=4,
+    )
+    context = mock_ollama["calls"][0]["messages"][1]["content"]
+    assert "[SILO GROUP: alpha]" in context
+    assert ("[SILO GROUP: beta]" in context) or ("[SILO GROUP: gamma]" in context)
+
+
+def test_run_ask_unified_analytical_soft_promotion_skips_weak_alt_silo(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"auto_scope_binding": False}})
+    monkeypatch.setattr("query.core.resolve_subscope", lambda _q, _db, _gps: None)
+    monkeypatch.setattr("query.core._rank_candidate_silos", lambda _m, _d, max_candidates=6: [])
+    mock_collection.query_result = {
+        "documents": [["alpha one", "alpha two", "alpha three", "alpha four", "beta far"]],
+        "metadatas": [[
+            {"source": "/tmp/a1.md", "is_local": 1, "silo": "alpha"},
+            {"source": "/tmp/a2.md", "is_local": 1, "silo": "alpha"},
+            {"source": "/tmp/a3.md", "is_local": 1, "silo": "alpha"},
+            {"source": "/tmp/a4.md", "is_local": 1, "silo": "alpha"},
+            {"source": "/tmp/b1.md", "is_local": 1, "silo": "beta"},
+        ]],
+        "distances": [[0.10, 0.11, 0.12, 0.13, 0.45]],
+        "ids": [["id-1", "id-2", "id-3", "id-4", "id-5"]],
+    }
+    mock_ollama["response"] = {"message": {"content": "Direct synthesis."}}
+    out = run_ask(
+        archetype_id=None,
+        query="what recurring themes are across silos?",
+        no_color=True,
+        use_reranker=False,
+        explicit_unified=True,
+        n_results=4,
+    )
+    context = mock_ollama["calls"][0]["messages"][1]["content"]
+    assert "[SILO GROUP: alpha]" in context
+    assert "[SILO GROUP: beta]" not in context
+    assert "Evidence concentration note: retrieved evidence was concentrated in one silo (alpha)." in out
+
+
+def test_run_ask_explicit_single_silo_does_not_apply_silo_diversification(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr(
+        "query.core.diversify_by_silo",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not diversify by silo for explicit scope")),
+    )
+    mock_collection.query_result = {
+        "documents": [["x"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "is_local": 1, "silo": "tax-1234"}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+    out = run_ask(
+        archetype_id=None,
+        query="what",
+        no_color=True,
+        use_reranker=False,
+        silo="tax-1234",
+    )
+    assert "Sources:" in out
+    assert len(mock_ollama["calls"]) == 1
+
+
 def test_run_ask_auto_scope_binding_applies_silo_filter(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
@@ -665,7 +883,7 @@ def test_run_ask_relevance_gate_allows_scoped_lookup_with_lexical_overlap(monkey
         use_reranker=False,
         silo="job-related-stuff",
     )
-    assert "skills found" in out
+    assert "Skills found" in out
     assert len(mock_ollama["calls"]) == 1
 
 
@@ -680,7 +898,7 @@ def test_run_ask_quiet_omits_footer_and_sources(monkeypatch, mock_collection, mo
     }
     mock_ollama["response"] = {"message": {"content": "final answer"}}
     out = run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, quiet=True)
-    assert out == "final answer"
+    assert out == "Final answer"
     assert "Sources:" not in out
 
 
@@ -726,6 +944,53 @@ def test_run_ask_uses_direct_address_tone_policy(monkeypatch, mock_collection, m
     assert "Address the user directly as 'you'/'your'." in system_prompt
     assert "Do not refer to the user in third person" in system_prompt
     assert "Do not start responses with 'You'." not in system_prompt
+
+
+def test_run_ask_adds_recency_hints_for_abandoned_timeline_queries(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"auto_scope_binding": False}})
+    mock_collection.query_result = {
+        "documents": [["project paused", "follow-up notes"]],
+        "metadatas": [[
+            {"source": "/tmp/openclaw/a.md", "is_local": 1, "silo": "openclaw-aa2df362", "mtime": 1704067200},
+            {"source": "/tmp/self/b.md", "is_local": 1, "silo": "__self__", "mtime": 1735689600},
+        ]],
+        "distances": [[0.2, 0.3]],
+        "ids": [["id-1", "id-2"]],
+    }
+    run_ask(
+        archetype_id=None,
+        query="which projects look abandoned and what likely next step was pending?",
+        no_color=True,
+        use_reranker=False,
+        explicit_unified=True,
+    )
+    system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
+    user_prompt = mock_ollama["calls"][0]["messages"][1]["content"]
+    assert "Recency guidance: treat mtime recency hints as weak evidence only." in system_prompt
+    assert "[RECENCY HINTS - WEAK EVIDENCE]" in user_prompt
+    assert "2024-01-01" in user_prompt
+
+
+def test_run_ask_adds_ownership_framing_policy_when_requested(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "is_local": 1, "silo": "s1"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    run_ask(
+        archetype_id=None,
+        query="distinguish my authored work vs reference/course/vendor material",
+        no_color=True,
+        use_reranker=False,
+    )
+    system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
+    assert "Ownership framing policy:" in system_prompt
+    assert "syllabus/homework/transcript" in system_prompt
 
 
 def test_run_ask_sanitizes_internal_context_header_artifacts(monkeypatch, mock_collection, mock_ollama):
@@ -911,6 +1176,90 @@ def test_run_ask_uncertainty_answer_emits_low_confidence_banner_scoped_and_unsco
 
     assert "Low confidence: query is weakly related to indexed content." in out_unscoped
     assert "Low confidence: query is weakly related to indexed content." in out_scoped
+
+
+def test_run_ask_banner_mode_normalizes_repetitive_uncertainty_phrasing(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["weak evidence one", "weak evidence two"]],
+        "metadatas": [[
+            {"source": "/tmp/a.md", "is_local": 1, "silo": "s1"},
+            {"source": "/tmp/b.md", "is_local": 1, "silo": "s2"},
+        ]],
+        "distances": [[0.92, 0.95]],
+        "ids": [["id-1", "id-2"]],
+    }
+    mock_ollama["response"] = {
+        "message": {
+            "content": (
+                "Based on the provided context, it appears that this is uncertain. "
+                "It appears that there are mixed signals. "
+                "Without more information, it is difficult to be definitive."
+            )
+        }
+    }
+    out = run_ask(archetype_id=None, query="what happened?", no_color=True, use_reranker=False)
+    assert "Low confidence: query is weakly related to indexed content." in out
+    assert "Based on the provided context" not in out
+    assert out.lower().count("it appears that") <= 1
+    assert "Caveat:" in out
+
+
+def test_run_ask_strict_mode_keeps_original_uncertainty_phrasing(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["weak evidence one", "weak evidence two"]],
+        "metadatas": [[
+            {"source": "/tmp/a.md", "is_local": 1, "silo": "s1"},
+            {"source": "/tmp/b.md", "is_local": 1, "silo": "s2"},
+        ]],
+        "distances": [[0.92, 0.95]],
+        "ids": [["id-1", "id-2"]],
+    }
+    mock_ollama["response"] = {
+        "message": {
+            "content": "Based on the provided context, it appears that evidence is limited."
+        }
+    }
+    out = run_ask(archetype_id=None, query="what happened?", no_color=True, use_reranker=False, strict=True)
+    assert "Based on the provided context, it appears that evidence is limited." in out
+
+
+def test_run_ask_normalizes_inline_numbered_lists_and_sentence_start(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["context"]],
+        "metadatas": [[{"source": "/tmp/a.md", "is_local": 1, "silo": "s1"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = {"message": {"content": "here are findings: 1. alpha 2. beta"}}
+    out = run_ask(archetype_id=None, query="what happened?", no_color=True, use_reranker=False)
+    assert "Here are findings:" in out
+    assert "\n1. alpha" in out
+    assert "\n2. beta" in out
+
+
+def test_run_ask_normalizes_ownership_claim_conflicts(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["context"]],
+        "metadatas": [[{"source": "/tmp/a.md", "is_local": 1, "silo": "s1"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = {
+        "message": {
+            "content": "This appears authored by you, suggesting they were written by someone else."
+        }
+    }
+    out = run_ask(archetype_id=None, query="ownership split", no_color=True, use_reranker=False)
+    assert "written by someone else" not in out.lower()
+    assert "ownership is uncertain" in out.lower()
 
 
 def test_run_ask_confident_direct_answer_does_not_emit_low_confidence(monkeypatch, mock_collection, mock_ollama):

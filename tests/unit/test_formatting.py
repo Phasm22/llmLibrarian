@@ -5,6 +5,10 @@ from query.formatting import (
     source_url,
     sanitize_answer_metadata_artifacts,
     normalize_answer_direct_address,
+    normalize_uncertainty_tone,
+    normalize_ownership_claims,
+    normalize_sentence_start,
+    normalize_inline_numbered_lists,
 )
 
 
@@ -41,6 +45,13 @@ def test_sanitize_answer_metadata_artifacts_rewrites_internal_header_tokens():
     assert "TD-resume.docx (line 24)" in out
 
 
+def test_sanitize_answer_metadata_artifacts_rewrites_file_only_token():
+    raw = 'See file=GE04 Portfolio Django MVT .docx for details.'
+    out = sanitize_answer_metadata_artifacts(raw)
+    assert "file=" not in out
+    assert "GE04 Portfolio Django MVT .docx" in out
+
+
 def test_normalize_answer_direct_address_rewrites_common_third_person_terms():
     raw = (
         "A patient named Tandon Jenkins had normal levels. "
@@ -58,3 +69,41 @@ def test_normalize_answer_direct_address_rewrites_common_third_person_terms():
     assert "Your visit was brief." in out
     assert "You should retest." in out
     assert "You requested follow-up." in out
+
+
+def test_normalize_uncertainty_tone_reduces_hedge_loops_when_banner_present():
+    raw = (
+        "Based on the provided context, it appears that you worked on parser tooling. "
+        "It appears that you also adjusted tests. "
+        "Without more information, it is difficult to determine exact ownership."
+    )
+    out = normalize_uncertainty_tone(raw, has_confidence_banner=True, strict=False)
+    assert not out.lower().startswith("based on the provided context")
+    assert out.lower().count("it appears that") <= 1
+    assert out.lower().count("without more information") <= 1
+    assert "Caveat:" in out
+
+
+def test_normalize_uncertainty_tone_no_change_when_strict():
+    raw = "Based on the provided context, it appears that evidence is limited."
+    out = normalize_uncertainty_tone(raw, has_confidence_banner=True, strict=True)
+    assert out == raw
+
+
+def test_normalize_ownership_claims_rewrites_obvious_conflicts():
+    raw = "This appears authored by you, suggesting they were written by someone else."
+    out = normalize_ownership_claims(raw)
+    assert "written by someone else" not in out.lower()
+    assert "ownership is uncertain" in out.lower()
+
+
+def test_normalize_sentence_start_capitalizes_first_letter():
+    assert normalize_sentence_start("here is your answer.") == "Here is your answer."
+
+
+def test_normalize_inline_numbered_lists_reflows_single_line_lists():
+    raw = "Findings: 1. alpha 2. beta 3. gamma"
+    out = normalize_inline_numbered_lists(raw)
+    assert "1. alpha" in out
+    assert "\n2. beta" in out
+    assert "\n3. gamma" in out

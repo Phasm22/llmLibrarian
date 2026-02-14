@@ -14,7 +14,7 @@ def test_truncate_mid():
 
 def test_truncate_tail():
     trunc_tail = cli._truncate_tail  # type: ignore[attr-defined]
-    text = "/Users/tjm4/Desktop/Become a Linear Algebra Master"
+    text = "/home/user/Documents/Become a Linear Algebra Master"
     out = trunc_tail(text, 20)
     assert out.startswith("...")
     assert out.endswith("Master")
