@@ -21,5 +21,7 @@ DEFAULT_MODEL = "llama3.1:8b"
 SNIPPET_MAX_LEN = 180
 # Limit per-source chunks to avoid a single file dominating answers.
 MAX_CHUNKS_PER_FILE = 4
-# Distance threshold for default relevance filtering (tuned for Chroma distances ~0-2).
-DEFAULT_RELEVANCE_MAX_DISTANCE = 2.0
+# Distance threshold for default relevance filtering.
+# Balanced to avoid noisy hallucination while still allowing useful low-confidence
+# responses for moderately related scoped queries.
+DEFAULT_RELEVANCE_MAX_DISTANCE = 0.9

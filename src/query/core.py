@@ -91,6 +91,8 @@ from query.catalog import (
 )
 from query.formatting import (
     style_answer,
+    sanitize_answer_metadata_artifacts,
+    normalize_answer_direct_address,
     linkify_sources_in_answer,
     format_source,
 )
@@ -138,49 +140,216 @@ def _distinct_source_count(metas: list[dict | None]) -> int:
     return len({((m or {}).get("source") or "") for m in metas if ((m or {}).get("source") or "")})
 
 
+_OVERLAP_STOPWORDS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "what",
+        "which",
+        "when",
+        "where",
+        "your",
+        "about",
+        "mentioned",
+        "files",
+        "file",
+        "docs",
+        "documents",
+        "list",
+        "technical",
+    }
+)
+
+
+def _has_query_evidence_overlap(query: str, docs: list[str], metas: list[dict | None]) -> bool:
+    """
+    True when query tokens overlap with retrieved evidence text or source paths.
+    Helps avoid false-negative structure fallback on scoped queries where semantic
+    distance is high but lexical anchors (e.g., filenames like "resume") match.
+    """
+    q_tokens = {
+        t
+        for t in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", (query or "").lower())
+        if t not in _OVERLAP_STOPWORDS and not t.isdigit()
+    }
+    if not q_tokens:
+        return False
+
+    evidence_tokens: set[str] = set()
+    for doc in docs[:16]:
+        evidence_tokens.update(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", (doc or "").lower()))
+    for meta in metas[:16]:
+        src = str((meta or {}).get("source") or "")
+        if src:
+            evidence_tokens.update(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", src.lower()))
+    return bool(q_tokens.intersection(evidence_tokens))
+
+
+_UNCERTAINTY_ANSWER_PATTERN = re.compile(
+    r"\b("
+    r"there is no mention|"
+    r"not in the provided context|"
+    r"couldn['’]t find|"
+    r"could not find|"
+    r"i don['’]t have enough evidence|"
+    r"i do not have enough evidence"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _query_overlap_support(query: str, docs: list[str], metas: list[dict | None], cap: int = 8) -> float:
+    """
+    Return max query-token overlap ratio against top evidence chunks.
+    Value in [0, 1]; lower values indicate weaker lexical support concentration.
+    """
+    q_tokens = {
+        t
+        for t in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", (query or "").lower())
+        if t not in _OVERLAP_STOPWORDS and not t.isdigit()
+    }
+    if not q_tokens:
+        return 0.0
+
+    best = 0.0
+    for i in range(min(cap, len(docs))):
+        doc = docs[i] if i < len(docs) else ""
+        meta = metas[i] if i < len(metas) else None
+        src = str((meta or {}).get("source") or "")
+        evidence_tokens = set(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", ((doc or "") + " " + src).lower()))
+        if not evidence_tokens:
+            continue
+        overlap_ratio = len(q_tokens.intersection(evidence_tokens)) / max(1, len(q_tokens))
+        if overlap_ratio > best:
+            best = overlap_ratio
+    return best
+
+
+def _confidence_assessment(
+    dists: list[float | None],
+    metas: list[dict | None],
+    intent: str,
+    query: str,
+    docs: list[str] | None = None,
+    explicit_unified: bool = False,
+    direct_canonical_available: bool = False,
+    confidence_relaxation_enabled: bool = True,
+    filetype_hints: list[str] | None = None,
+    answer_text: str | None = None,
+) -> dict[str, Any]:
+    """Return confidence warning + diagnostics used for trace observability."""
+    non_none = [float(d) for d in dists if d is not None]
+    if not non_none:
+        return {
+            "warning": None,
+            "reason": "no_distances",
+            "top_distance": None,
+            "avg_distance": None,
+            "source_count": _distinct_source_count(metas),
+            "overlap_support": _query_overlap_support(query, docs or [], metas),
+        }
+
+    avg_distance = sum(non_none) / len(non_none)
+    top_distance = min(non_none) if non_none else None
+    unique_sources = _distinct_source_count(metas)
+    overlap_support = _query_overlap_support(query, docs or [], metas)
+    query_overlap = _has_query_evidence_overlap(query, docs or [], metas)
+
+    warning: str | None = None
+    reason: str | None = None
+    if avg_distance > 0.7:
+        if intent == INTENT_LOOKUP and direct_canonical_available and confidence_relaxation_enabled:
+            warning = None
+            reason = "relaxed_canonical"
+        elif intent == INTENT_LOOKUP and query_overlap and not explicit_unified:
+            warning = None
+            reason = "relaxed_overlap"
+        else:
+            ql = (query or "").lower()
+            is_broad_synthesis = bool(
+                re.search(r"\b(timeline|across|compare|synthesi[sz]e|major events)\b", ql)
+            )
+            if explicit_unified and is_broad_synthesis:
+                warning = (
+                    "Low confidence: unified search found weak or uneven evidence across silos. "
+                    "Try narrowing by silo/time/type or splitting into sub-questions."
+                )
+                reason = "weak_unified_broad"
+            else:
+                hint_exts = {str(e).lower() for e in (filetype_hints or [])}
+                if ".pptx" in hint_exts or ".ppt" in hint_exts:
+                    pres_sources = {
+                        ((m or {}).get("source") or "")
+                        for m in metas
+                        if (((m or {}).get("source") or "").lower().endswith(".pptx") or ((m or {}).get("source") or "").lower().endswith(".ppt"))
+                    }
+                    if len(pres_sources) > 1:
+                        warning = "Low confidence: matched multiple presentations; answer is based on the closest match."
+                        reason = "weak_multi_presentation"
+                if warning is None:
+                    warning = "Low confidence: query is weakly related to indexed content."
+                    reason = "weak_distance"
+    elif intent == INTENT_FIELD_LOOKUP:
+        warning = None
+        reason = "field_lookup_suppressed"
+    elif unique_sources == 1:
+        warning = "Single source: answer is based on one document only."
+        reason = "single_source"
+
+    # If the model's answer is uncertainty/absence language and evidence quality is mixed,
+    # force the standard low-confidence banner for user-facing consistency.
+    if answer_text and _UNCERTAINTY_ANSWER_PATTERN.search(answer_text):
+        mixed_noisy = (
+            unique_sources >= 3
+            and (top_distance is not None and top_distance >= 0.35)
+            and avg_distance >= 0.45
+            and overlap_support <= 0.50
+        )
+        if mixed_noisy:
+            warning = "Low confidence: query is weakly related to indexed content."
+            reason = "uncertainty_mixed_retrieval"
+
+    return {
+        "warning": warning,
+        "reason": reason,
+        "top_distance": top_distance,
+        "avg_distance": avg_distance,
+        "source_count": unique_sources,
+        "overlap_support": overlap_support,
+    }
+
+
 def _confidence_signal(
     dists: list[float | None],
     metas: list[dict | None],
     intent: str,
     query: str,
+    docs: list[str] | None = None,
     explicit_unified: bool = False,
     direct_canonical_available: bool = False,
     confidence_relaxation_enabled: bool = True,
     filetype_hints: list[str] | None = None,
+    answer_text: str | None = None,
 ) -> str | None:
     """Emit a lightweight confidence warning when retrieval quality is weak."""
-    non_none = [float(d) for d in dists if d is not None]
-    if not non_none:
-        return None
-    avg_distance = sum(non_none) / len(non_none)
-    if avg_distance > 0.7:
-        if intent == INTENT_LOOKUP and direct_canonical_available and confidence_relaxation_enabled:
-            return None
-        ql = (query or "").lower()
-        is_broad_synthesis = bool(
-            re.search(r"\b(timeline|across|compare|synthesi[sz]e|major events)\b", ql)
-        )
-        if explicit_unified and is_broad_synthesis:
-            return (
-                "Low confidence: unified search found weak or uneven evidence across silos. "
-                "Try narrowing by silo/time/type or splitting into sub-questions."
-            )
-        hint_exts = {str(e).lower() for e in (filetype_hints or [])}
-        if ".pptx" in hint_exts or ".ppt" in hint_exts:
-            pres_sources = {
-                ((m or {}).get("source") or "")
-                for m in metas
-                if (((m or {}).get("source") or "").lower().endswith(".pptx") or ((m or {}).get("source") or "").lower().endswith(".ppt"))
-            }
-            if len(pres_sources) > 1:
-                return "Low confidence: matched multiple presentations; answer is based on the closest match."
-        return "Low confidence: query is weakly related to indexed content."
-    if intent == INTENT_FIELD_LOOKUP:
-        return None
-    unique_sources = len({((m or {}).get("source") or "") for m in metas if (m or {}).get("source")})
-    if unique_sources == 1:
-        return "Single source: answer is based on one document only."
-    return None
+    assessment = _confidence_assessment(
+        dists=dists,
+        metas=metas,
+        intent=intent,
+        query=query,
+        docs=docs,
+        explicit_unified=explicit_unified,
+        direct_canonical_available=direct_canonical_available,
+        confidence_relaxation_enabled=confidence_relaxation_enabled,
+        filetype_hints=filetype_hints,
+        answer_text=answer_text,
+    )
+    return assessment.get("warning")
 
 
 def _aggregate_sources_for_footer(
@@ -356,6 +525,10 @@ def run_ask(
 
     db = str(db_path or DB_PATH)
     use_unified = archetype_id is None
+    voice_policy = (
+        "Use a neutral, direct tone. Address the user directly as 'you'/'your'. "
+        "Do not refer to the user in third person (for example, 'the patient', 'a patient', or 'the user'). "
+    )
 
     if use_unified:
         collection_name = LLMLI_COLLECTION
@@ -363,12 +536,16 @@ def run_ask(
             base_prompt, source_label = _resolve_unified_silo_prompt(db, config_path, silo)
             system_prompt = (
                 base_prompt
-                + "\n\nAddress the user as 'you'. If the context does not contain the answer, state that clearly but remain helpful."
+                + "\n\n" + voice_policy
+                +
+                "If the context does not contain the answer, state that clearly but remain helpful."
             )
         else:
             system_prompt = (
                 "Answer only from the provided context. Be concise. "
-                "Address the user as 'you'. If the context does not contain the answer, state that clearly but remain helpful."
+                + voice_policy
+                +
+                "If the context does not contain the answer, state that clearly but remain helpful."
             )
             source_label = "llmli"
     else:
@@ -378,7 +555,8 @@ def run_ask(
         base_prompt = arch.get("prompt") or "Answer only from the provided context. Be concise."
         system_prompt = (
             base_prompt
-            + "\n\nAddress the user as 'you' and 'your' (e.g. 'Your 1099', not 'Tandon's 1099'). "
+            + "\n\n" + voice_policy
+            +
             "If the context does not contain the answer, state that clearly but remain helpful."
         )
         source_label = arch.get("name") or archetype_id
@@ -1030,6 +1208,7 @@ def run_ask(
             metas,
             intent,
             query,
+            docs=docs,
             explicit_unified=explicit_unified,
             direct_canonical_available=direct_canonical_available,
             confidence_relaxation_enabled=confidence_relaxation_enabled,
@@ -1298,7 +1477,19 @@ def run_ask(
 
     # Relevance gate: fall back to structure info on low confidence
     threshold = relevance_max_distance()
-    if all_dists_above_threshold(dists, threshold):
+    top_d = _top_distance(dists)
+    # Preserve existing unscoped low-confidence UX for moderate-distance results.
+    # Scoped LOOKUP queries still use the tighter threshold to trigger deterministic
+    # structure fallback more often.
+    unscoped_soft_low_conf = bool(
+        intent == INTENT_LOOKUP
+        and use_unified
+        and silo is None
+        and top_d is not None
+        and top_d < 2.0
+    )
+    has_evidence_overlap = _has_query_evidence_overlap(query, docs, metas)
+    if all_dists_above_threshold(dists, threshold) and not unscoped_soft_low_conf and not has_evidence_overlap:
         # Low confidence - provide structure outline as fallback
         if intent == INTENT_LOOKUP and use_unified and silo:
             struct_result = build_structure_outline(db, silo, cap=50)
@@ -1412,19 +1603,24 @@ def run_ask(
         keep_alive=0,
         options={"temperature": 0, "seed": 42},
     )
-    answer = (response.get("message") or {}).get("content") or ""
-    answer = style_answer(answer.strip(), no_color)
+    raw_answer = (response.get("message") or {}).get("content") or ""
+    raw_answer = sanitize_answer_metadata_artifacts(raw_answer.strip())
+    raw_answer = normalize_answer_direct_address(raw_answer)
+    answer = style_answer(raw_answer, no_color)
     answer = linkify_sources_in_answer(answer, metas, no_color)
-    confidence_warning = _confidence_signal(
+    confidence_assessment = _confidence_assessment(
         dists,
         metas,
         intent,
         query,
+        docs=docs,
         explicit_unified=explicit_unified,
         direct_canonical_available=direct_canonical_available,
         confidence_relaxation_enabled=confidence_relaxation_enabled,
         filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
+        answer_text=raw_answer,
     )
+    confidence_warning = str(confidence_assessment.get("warning") or "") or None
 
     if quiet:
         return answer
@@ -1465,6 +1661,12 @@ def run_ask(
         catalog_retry_silo=catalog_retry_silo,
         filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
         answer_kind="rag",
+        confidence_top_distance=confidence_assessment.get("top_distance"),
+        confidence_avg_distance=confidence_assessment.get("avg_distance"),
+        confidence_source_count=confidence_assessment.get("source_count"),
+        confidence_overlap_support=confidence_assessment.get("overlap_support"),
+        confidence_reason=confidence_assessment.get("reason"),
+        confidence_banner_emitted=bool(confidence_warning),
     )
     return "\n".join(out)
 

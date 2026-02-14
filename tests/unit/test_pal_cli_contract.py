@@ -44,6 +44,82 @@ def test_pal_no_argv_preprocessing_shortcuts(monkeypatch):
     assert calls[-1] == ["ask", "--in", "tax", "what", "is", "pal"]
 
 
+def test_pal_ask_natural_in_supports_multiword_display_name(monkeypatch):
+    monkeypatch.setenv("LLMLIBRARIAN_REQUIRE_SELF_SILO", "0")
+    calls = []
+    monkeypatch.setattr("pal._run_llmli", lambda args: calls.append(list(args)) or 0)
+    monkeypatch.setattr(
+        "pal._read_llmli_registry",
+        lambda _db: {
+            "job-related-stuff-35edf4b2": {
+                "slug": "job-related-stuff-35edf4b2",
+                "display_name": "Job Related Stuff",
+            }
+        },
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "state",
+        SimpleNamespace(
+            resolve_silo_to_slug=lambda _db, _name: None,
+            resolve_silo_prefix=lambda _db, _prefix: None,
+        ),
+    )
+
+    res = runner.invoke(
+        pal.app,
+        ["ask", "in", "Job", "Related", "Stuff", "what", "are", "my", "skills?"],
+    )
+    assert res.exit_code == 0
+    assert calls[-1] == [
+        "ask",
+        "--in",
+        "job-related-stuff-35edf4b2",
+        "what",
+        "are",
+        "my",
+        "skills?",
+    ]
+
+
+def test_pal_ask_natural_in_supports_hyphenated_scope_variant(monkeypatch):
+    monkeypatch.setenv("LLMLIBRARIAN_REQUIRE_SELF_SILO", "0")
+    calls = []
+    monkeypatch.setattr("pal._run_llmli", lambda args: calls.append(list(args)) or 0)
+    monkeypatch.setattr(
+        "pal._read_llmli_registry",
+        lambda _db: {
+            "job-related-stuff-35edf4b2": {
+                "slug": "job-related-stuff-35edf4b2",
+                "display_name": "Job Related Stuff",
+            }
+        },
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "state",
+        SimpleNamespace(
+            resolve_silo_to_slug=lambda _db, _name: None,
+            resolve_silo_prefix=lambda _db, _prefix: None,
+        ),
+    )
+
+    res = runner.invoke(
+        pal.app,
+        ["ask", "in", "Job-Related-Stuff", "what", "are", "my", "skills?"],
+    )
+    assert res.exit_code == 0
+    assert calls[-1] == [
+        "ask",
+        "--in",
+        "job-related-stuff-35edf4b2",
+        "what",
+        "are",
+        "my",
+        "skills?",
+    ]
+
+
 def test_pal_ask_natural_in_malformed_scope_token_has_deterministic_hint(monkeypatch):
     monkeypatch.setenv("LLMLIBRARIAN_REQUIRE_SELF_SILO", "0")
     res = runner.invoke(pal.app, ["ask", "in", "marketman--quiet", "show", "structure", "snapshot"])

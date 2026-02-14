@@ -55,7 +55,7 @@ def source_url(source: str, line: int | None = None, page: int | None = None) ->
     Build URL for OSC 8 hyperlink so click opens file (and line when possible).
     Use vscode:// or cursor:// only for code/text extensions (.py, .md, .txt, etc.) so they open in the editor at line.
     For .docx, .pdf, .xlsx, etc. use file:// so the OS opens in the default app (Word, Preview).
-    Set LLMLIBRARIAN_EDITOR_SCHEME=vscode|cursor|file (default vscode).
+    Set LLMLIBRARIAN_EDITOR_SCHEME=vscode|cursor|file (default file).
     """
     if not source or source == "?":
         return ""
@@ -63,7 +63,7 @@ def source_url(source: str, line: int | None = None, page: int | None = None) ->
         p = Path(source).resolve()
         posix = p.as_posix()
         quoted = quote(posix, safe="/")
-        scheme = (os.environ.get("LLMLIBRARIAN_EDITOR_SCHEME") or "vscode").strip().lower()
+        scheme = (os.environ.get("LLMLIBRARIAN_EDITOR_SCHEME") or "file").strip().lower()
         use_editor = scheme in ("vscode", "cursor") and _use_editor_link(p)
         if use_editor and line is not None:
             prefix = "cursor://file" if scheme == "cursor" else "vscode://file"
@@ -100,6 +100,86 @@ def style_answer(answer: str, no_color: bool) -> str:
     out = re.sub(r"\*([^*]+)\*", lambda m: dim(no_color, m.group(1)), out)
     # Inline `code`
     out = re.sub(r"`([^`]+)`", lambda m: code_style(no_color, m.group(1)), out)
+    return out
+
+
+_HEADER_META_PATTERN = re.compile(
+    r'(?:"|\'|`)?file=(?P<path>[^"\',\n]+?)'
+    r'(?:\s+\(line\s+(?P<line>\d+)\)|\s+\(page\s+(?P<page>\d+)\))?'
+    r'\s+mtime=[^\s"\']+'
+    r'\s+silo=[^\s"\']+'
+    r'\s+doc_type=[^\s"\']+'
+    r'(?:"|\'|`)?',
+    re.IGNORECASE,
+)
+
+
+def sanitize_answer_metadata_artifacts(answer: str) -> str:
+    """
+    Remove leaked internal context header artifacts from model output.
+
+    Converts fragments like:
+      file=TD-resume.docx (line 24) mtime=2025-08-12 silo=... doc_type=other
+    into:
+      TD-resume.docx (line 24)
+    """
+    if not answer:
+        return ""
+
+    def _repl(m: re.Match) -> str:
+        raw_path = (m.group("path") or "").strip()
+        display = shorten_path(raw_path)
+        line = m.group("line")
+        page = m.group("page")
+        if line:
+            return f"{display} (line {line})"
+        if page:
+            return f"{display} (page {page})"
+        return display
+
+    return _HEADER_META_PATTERN.sub(_repl, answer)
+
+
+_THIRD_PERSON_USER_PATTERNS = (
+    (re.compile(r"\b(?:the|this|a|an)\s+patient['’]s\b", re.IGNORECASE), "your"),
+    (re.compile(r"\b(?:the|this|a|an)\s+user['’]s\b", re.IGNORECASE), "your"),
+    (
+        re.compile(
+            r"\b(?:[Tt]he|[Tt]his|[Aa]|[Aa]n)\s+patient\s+named\s+"
+            r"[A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*){0,3}\b",
+        ),
+        "you",
+    ),
+    (
+        re.compile(
+            r"\b(?:[Tt]he|[Tt]his|[Aa]|[Aa]n)\s+user\s+named\s+"
+            r"[A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*){0,3}\b",
+        ),
+        "you",
+    ),
+    (re.compile(r"\b(?:the|this|a|an)\s+patient\b", re.IGNORECASE), "you"),
+    (re.compile(r"\b(?:the|this|a|an)\s+user\b", re.IGNORECASE), "you"),
+)
+
+
+def normalize_answer_direct_address(answer: str) -> str:
+    """
+    Normalize common third-person user references to second-person.
+
+    Conservative lexical rewrite only; avoids broader grammatical mutation.
+    """
+    if not answer:
+        return ""
+    out = answer
+
+    def _repl(m: re.Match, replacement: str) -> str:
+        idx = m.start()
+        prefix = m.string[:idx].rstrip()
+        sentence_start = (idx == 0) or prefix.endswith((".", "!", "?", "\n"))
+        return replacement.capitalize() if sentence_start else replacement
+
+    for pattern, replacement in _THIRD_PERSON_USER_PATTERNS:
+        out = pattern.sub(lambda m: _repl(m, replacement), out)
     return out
 
 

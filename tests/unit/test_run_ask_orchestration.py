@@ -1,3 +1,5 @@
+import json
+
 from query.intent import (
     INTENT_CAPABILITIES,
     INTENT_CODE_LANGUAGE,
@@ -543,6 +545,28 @@ def test_run_ask_relevance_gate_skips_llm(monkeypatch, mock_collection, mock_oll
     assert mock_ollama["calls"] == []
 
 
+def test_run_ask_relevance_gate_allows_scoped_lookup_with_lexical_overlap(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["Summary includes python sql linux and networking skills."]],
+        "metadatas": [[{"source": "/tmp/TD-resume.docx", "is_local": 1, "silo": "job-related-stuff"}]],
+        "distances": [[0.95]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = {"message": {"content": "skills found"}}
+
+    out = run_ask(
+        archetype_id=None,
+        query="list skills from my resume",
+        no_color=True,
+        use_reranker=False,
+        silo="job-related-stuff",
+    )
+    assert "skills found" in out
+    assert len(mock_ollama["calls"]) == 1
+
+
 def test_run_ask_quiet_omits_footer_and_sources(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
@@ -583,6 +607,67 @@ def test_run_ask_strict_mode_adds_strict_instruction(monkeypatch, mock_collectio
     run_ask(archetype_id=None, query="list all", no_color=True, use_reranker=False, strict=True)
     system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
     assert "Strict mode:" in system_prompt
+
+
+def test_run_ask_uses_direct_address_tone_policy(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "is_local": 1}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    run_ask(archetype_id=None, query="what is this", no_color=True, use_reranker=False, silo="stuff")
+    system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
+    assert "Use a neutral, direct tone." in system_prompt
+    assert "Address the user directly as 'you'/'your'." in system_prompt
+    assert "Do not refer to the user in third person" in system_prompt
+    assert "Do not start responses with 'You'." not in system_prompt
+
+
+def test_run_ask_sanitizes_internal_context_header_artifacts(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["resume context"]],
+        "metadatas": [[{"source": "/tmp/TD-resume.docx", "line_start": 24, "is_local": 1}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = {
+        "message": {
+            "content": (
+                'Use "file=TD-resume.docx (line 24) '
+                'mtime=2025-08-12 silo=job-related-stuff doc_type=other" for evidence.'
+            )
+        }
+    }
+    out = run_ask(archetype_id=None, query="what skills", no_color=True, use_reranker=False, silo="job-related-stuff")
+    assert "file=" not in out
+    assert "mtime=" not in out
+    assert "silo=" not in out
+    assert "doc_type=" not in out
+    assert "TD-resume.docx (line 24)" in out
+
+
+def test_run_ask_normalizes_third_person_user_phrasing(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["medical context"]],
+        "metadatas": [[{"source": "/tmp/labResults.pdf", "line_start": 12, "is_local": 1}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = {
+        "message": {"content": "The patient should retest in 3 months. The user requested follow-up."}
+    }
+    out = run_ask(archetype_id=None, query="bloodwork", no_color=True, use_reranker=False, silo="documents")
+    assert "The patient" not in out
+    assert "The user" not in out
+    assert "You should retest in 3 months." in out
+    assert "You requested follow-up." in out
 
 
 def test_run_ask_direct_decisive_mode_adds_conflict_policy(monkeypatch, mock_collection, mock_ollama):
@@ -657,6 +742,142 @@ def test_run_ask_direct_decisive_relaxes_low_confidence_when_canonical_present(m
     }
     out = run_ask(archetype_id=None, query="what is the fact", no_color=True, use_reranker=False)
     assert "Low confidence: query is weakly related to indexed content." not in out
+
+
+def test_run_ask_low_confidence_warning_suppressed_when_top_hit_overlaps_query(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["Prometheus metrics are part of monitoring setup.", "unrelated noisy chunk"]],
+        "metadatas": [[
+            {"source": "/tmp/safe_resume.docx", "is_local": 1},
+            {"source": "/tmp/other.txt", "is_local": 1},
+        ]],
+        "distances": [[0.45, 1.20]],
+        "ids": [["id-1", "id-2"]],
+    }
+    mock_ollama["response"] = {"message": {"content": "Prometheus is used for monitoring metrics."}}
+
+    out = run_ask(
+        archetype_id=None,
+        query="what is prometheus?",
+        no_color=True,
+        use_reranker=False,
+        silo="job-related-stuff",
+    )
+    assert "Low confidence: query is weakly related to indexed content." not in out
+    assert "Prometheus is used for monitoring metrics." in out
+
+
+def test_run_ask_uncertainty_answer_emits_low_confidence_banner_scoped_and_unscoped(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [[
+            "Final report summary and visit notes.",
+            "General chemistry panel history details.",
+            "Project verification notes from another source.",
+            "Journal entry unrelated to labs.",
+        ]],
+        "metadatas": [[
+            {"source": "/tmp/labResults.pdf", "is_local": 1},
+            {"source": "/tmp/lab-history.pdf", "is_local": 1},
+            {"source": "/tmp/DOD_VERIFICATION.md", "is_local": 1},
+            {"source": "/tmp/journal.md", "is_local": 1},
+        ]],
+        "distances": [[0.48, 0.61, 0.65, 0.68]],
+        "ids": [["id-1", "id-2", "id-3", "id-4"]],
+    }
+    mock_ollama["response"] = {
+        "message": {"content": "There is no mention of bloodwork results in the provided context."}
+    }
+
+    out_unscoped = run_ask(
+        archetype_id=None,
+        query="tell me about my bloodwork results",
+        no_color=True,
+        use_reranker=False,
+        silo=None,
+    )
+    out_scoped = run_ask(
+        archetype_id=None,
+        query="tell me about my bloodwork results",
+        no_color=True,
+        use_reranker=False,
+        silo="documents-4d300c97",
+    )
+
+    assert "Low confidence: query is weakly related to indexed content." in out_unscoped
+    assert "Low confidence: query is weakly related to indexed content." in out_scoped
+
+
+def test_run_ask_confident_direct_answer_does_not_emit_low_confidence(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [[
+            "Prometheus is used for collecting monitoring metrics.",
+            "Prometheus integrates with Grafana.",
+            "Monitoring stack includes alerting.",
+        ]],
+        "metadatas": [[
+            {"source": "/tmp/safe_resume.docx", "is_local": 1},
+            {"source": "/tmp/README.md", "is_local": 1},
+            {"source": "/tmp/docs.md", "is_local": 1},
+        ]],
+        "distances": [[0.11, 0.18, 0.27]],
+        "ids": [["id-1", "id-2", "id-3"]],
+    }
+    mock_ollama["response"] = {"message": {"content": "Prometheus is a monitoring system."}}
+
+    out = run_ask(
+        archetype_id=None,
+        query="what is prometheus?",
+        no_color=True,
+        use_reranker=False,
+        silo="job-related-stuff",
+    )
+    assert "Low confidence: query is weakly related to indexed content." not in out
+    assert "Prometheus is a monitoring system." in out
+
+
+def test_run_ask_trace_includes_confidence_diagnostics(monkeypatch, tmp_path, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    trace_path = tmp_path / "trace.jsonl"
+    monkeypatch.setenv("LLMLIBRARIAN_TRACE", str(trace_path))
+    mock_collection.query_result = {
+        "documents": [[
+            "Final report summary and visit notes.",
+            "General chemistry panel history details.",
+            "Project verification notes from another source.",
+        ]],
+        "metadatas": [[
+            {"source": "/tmp/labResults.pdf", "is_local": 1},
+            {"source": "/tmp/lab-history.pdf", "is_local": 1},
+            {"source": "/tmp/DOD_VERIFICATION.md", "is_local": 1},
+        ]],
+        "distances": [[0.48, 0.61, 0.65]],
+        "ids": [["id-1", "id-2", "id-3"]],
+    }
+    mock_ollama["response"] = {
+        "message": {"content": "There is no mention of bloodwork results in the provided context."}
+    }
+
+    run_ask(
+        archetype_id=None,
+        query="tell me about my bloodwork results",
+        no_color=True,
+        use_reranker=False,
+        silo="documents-4d300c97",
+    )
+    payload = json.loads(trace_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert "confidence_top_distance" in payload
+    assert "confidence_avg_distance" in payload
+    assert "confidence_source_count" in payload
+    assert "confidence_overlap_support" in payload
+    assert "confidence_reason" in payload
+    assert "confidence_banner_emitted" in payload
 
 
 def test_run_ask_silo_prompt_override_precedence(monkeypatch, mock_collection, mock_ollama):

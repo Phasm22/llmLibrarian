@@ -4,6 +4,7 @@ from query.retrieval import (
     dedup_by_chunk_hash,
     diversify_by_source,
     max_chunks_for_intent,
+    relevance_max_distance,
     extract_scope_tokens,
     resolve_subscope,
     rrf_merge,
@@ -128,6 +129,16 @@ def test_all_dists_above_threshold_true_only_when_all_non_none_are_above():
     assert all_dists_above_threshold([2.1, 2.2, None], 2.0) is True
     assert all_dists_above_threshold([2.1, 1.8], 2.0) is False
     assert all_dists_above_threshold([None, None], 2.0) is False
+
+
+def test_relevance_max_distance_uses_tighter_default(monkeypatch):
+    monkeypatch.delenv("LLMLIBRARIAN_RELEVANCE_MAX_DISTANCE", raising=False)
+    assert relevance_max_distance() == 0.9
+
+
+def test_relevance_max_distance_allows_env_override(monkeypatch):
+    monkeypatch.setenv("LLMLIBRARIAN_RELEVANCE_MAX_DISTANCE", "0.72")
+    assert relevance_max_distance() == 0.72
 
 
 def test_extract_direct_lexical_terms_keeps_entity_and_numeric_anchors():

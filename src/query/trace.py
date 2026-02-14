@@ -33,6 +33,12 @@ def write_trace(
     catalog_retry_silo: str | None = None,
     filetype_hints: list[str] | None = None,
     answer_kind: str | None = None,
+    confidence_top_distance: float | None = None,
+    confidence_avg_distance: float | None = None,
+    confidence_source_count: int | None = None,
+    confidence_overlap_support: float | None = None,
+    confidence_reason: str | None = None,
+    confidence_banner_emitted: bool | None = None,
 ) -> None:
     """Append one JSON-line to LLMLIBRARIAN_TRACE file (if set). Optional receipt: source paths and chunk hashes for chunks sent to the LLM. No-op if env unset. Does not raise."""
     path = os.environ.get("LLMLIBRARIAN_TRACE")
@@ -88,6 +94,18 @@ def write_trace(
         payload["filetype_hints"] = list(filetype_hints)
     if answer_kind:
         payload["answer_kind"] = str(answer_kind)
+    if confidence_top_distance is not None:
+        payload["confidence_top_distance"] = round(float(confidence_top_distance), 4)
+    if confidence_avg_distance is not None:
+        payload["confidence_avg_distance"] = round(float(confidence_avg_distance), 4)
+    if confidence_source_count is not None:
+        payload["confidence_source_count"] = int(confidence_source_count)
+    if confidence_overlap_support is not None:
+        payload["confidence_overlap_support"] = round(float(confidence_overlap_support), 4)
+    if confidence_reason:
+        payload["confidence_reason"] = str(confidence_reason)
+    if confidence_banner_emitted is not None:
+        payload["confidence_banner_emitted"] = bool(confidence_banner_emitted)
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")

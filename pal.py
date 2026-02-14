@@ -466,6 +466,47 @@ def _render_watch_status(records: list[dict]) -> None:
         print(f"{silo:24} {pid:7} {state:10} {legacy:6} {stale:5}  {root}")
 
 
+def _fmt_int(n: int) -> str:
+    try:
+        return f"{int(n):,}"
+    except Exception:
+        return str(n)
+
+
+def _status_action_for_mismatch(slug: str, registry_files: int, manifest_files: int, path: str | None) -> str:
+    if slug == "__adversarial_eval__" and manifest_files == 0:
+        return "remove transient eval silo: pal remove __adversarial_eval__"
+    if path:
+        return f"re-index this source: pal pull --full \"{path}\""
+    return "re-index all sources: pal pull --full"
+
+
+def _render_health_summary(
+    registry: list[dict],
+    dupes: list[dict],
+    overlaps: list[dict],
+    mismatches: list[dict],
+) -> str:
+    total_silos = len(registry)
+    total_chunks = sum(int(s.get("chunks_count", 0) or 0) for s in registry)
+    issue_count = len(dupes) + len(overlaps) + len(mismatches)
+    state = "Healthy" if issue_count == 0 else "Needs Attention"
+
+    lines: list[str] = [
+        "Health Summary",
+        f"  State: {state}",
+        f"  Silos: {_fmt_int(total_silos)}",
+        f"  Chunks: {_fmt_int(total_chunks)}",
+        f"  Duplicate groups: {_fmt_int(len(dupes))}",
+        f"  Path overlaps: {_fmt_int(len(overlaps))}",
+        f"  Count mismatches: {_fmt_int(len(mismatches))}",
+    ]
+
+    if issue_count == 0:
+        lines.extend(["", "No action needed."])
+    return "\n".join(lines)
+
+
 def _read_registry() -> dict:
     if not REGISTRY_PATH.exists():
         return {"sources": [], "tools": {"llmli": {"last_ok": None, "last_failures": None}}}
@@ -836,25 +877,101 @@ def _normalize_natural_ask_scope(
     if len(query_tokens) <= idx:
         return None, query_tokens, "Malformed scope shorthand. Use: pal ask --in <silo> \"<question>\""
 
-    candidate = str(query_tokens[idx]).strip()
-    if not candidate:
+    first_token = str(query_tokens[idx]).strip()
+    if not first_token:
         return None, query_tokens, "Malformed scope shorthand. Use: pal ask --in <silo> \"<question>\""
-    if "--" in candidate:
+    if "--" in first_token:
         return None, query_tokens, (
-            f"Malformed scope token '{candidate}'. "
+            f"Malformed scope token '{first_token}'. "
             "Use a space before flags or use explicit scope: pal ask --in <silo> \"<question>\""
         )
-
-    remainder = query_tokens[idx + 1 :]
-    if not remainder:
-        return None, query_tokens, "Missing question after scope. Use: pal ask --in <silo> \"<question>\""
 
     _ensure_src_on_path()
     from state import resolve_silo_to_slug, resolve_silo_prefix
 
-    resolved = resolve_silo_to_slug(db_path, candidate) or resolve_silo_prefix(db_path, candidate)
-    if resolved:
-        return resolved, remainder, None
+    def _norm_scope_token(raw: str | None) -> str:
+        s = (raw or "").strip().lower()
+        s = re.sub(r"[^\w\s-]", "", s)
+        s = re.sub(r"[-\s]+", "-", s).strip("-")
+        return s
+
+    def _strip_hash_suffix(slug: str | None) -> str | None:
+        if not slug:
+            return None
+        m = re.match(r"^(.+)-[0-9a-f]{8}$", slug)
+        return m.group(1) if m else slug
+
+    def _resolve_candidate(raw_candidate: str) -> str | None:
+        candidate = (raw_candidate or "").strip()
+        if not candidate:
+            return None
+
+        resolved = resolve_silo_to_slug(db_path, candidate)
+        if resolved:
+            return resolved
+
+        # Prefix matching in registry is case-sensitive; normalize before trying.
+        candidate_norm = _norm_scope_token(candidate)
+        if candidate_norm:
+            resolved = resolve_silo_prefix(db_path, candidate_norm)
+            if resolved:
+                return resolved
+
+        # Relaxed matching for natural language inputs:
+        # - hyphen/space/case variants
+        # - display names vs slugs
+        registry = _read_llmli_registry(db_path)
+        if not isinstance(registry, dict):
+            return None
+        matches: list[str] = []
+        for slug, data in registry.items():
+            display = ""
+            if isinstance(data, dict):
+                display = str(data.get("display_name") or "")
+            aliases = {
+                _norm_scope_token(slug),
+                _norm_scope_token(display),
+                _norm_scope_token(_strip_hash_suffix(slug)),
+            }
+            if candidate_norm in aliases:
+                matches.append(slug)
+        if len(matches) == 1:
+            return matches[0]
+
+        # Normalized prefix fallback when unique.
+        if candidate_norm:
+            prefix_matches: list[str] = []
+            for slug, data in registry.items():
+                display = ""
+                if isinstance(data, dict):
+                    display = str(data.get("display_name") or "")
+                aliases = [
+                    _norm_scope_token(slug),
+                    _norm_scope_token(display),
+                    _norm_scope_token(_strip_hash_suffix(slug)),
+                ]
+                if any(a.startswith(candidate_norm) for a in aliases if a):
+                    prefix_matches.append(slug)
+            uniq = list(dict.fromkeys(prefix_matches))
+            if len(uniq) == 1:
+                return uniq[0]
+        return None
+
+    # Prefer the longest candidate that resolves, so multi-word silo names work:
+    # pal ask in Job Related Stuff "..."
+    for end in range(len(query_tokens) - 1, idx, -1):
+        candidate = " ".join(str(t) for t in query_tokens[idx:end]).strip()
+        if not candidate:
+            continue
+        resolved = _resolve_candidate(candidate)
+        if resolved:
+            remainder = query_tokens[end:]
+            if remainder:
+                return resolved, remainder, None
+
+    remainder = query_tokens[idx + 1 :]
+    if not remainder:
+        return None, query_tokens, "Missing question after scope. Use: pal ask --in <silo> \"<question>\""
     # Conservative fallback: if we cannot resolve deterministically, leave query unchanged.
     return None, query_tokens, None
 
@@ -1535,7 +1652,10 @@ def ask_command(
         query = query_norm
 
     ensure_self_silo(force=False, emit_warning=False)
-    if not quiet and _should_require_self_silo():
+    # Only surface self-silo staleness when the query explicitly targets __self__.
+    # This avoids noisy warnings while asking other silos during active development.
+    should_warn_self_stale = bool(in_silo == "__self__")
+    if not quiet and should_warn_self_stale and _should_require_self_silo():
         repo_root = _get_git_root()
         if repo_root is not None and _is_dev_repo_at_root(repo_root):
             llmli_registry = _read_llmli_registry(db_path)
@@ -1682,25 +1802,15 @@ def diff_command(
 @app.command("status", help="Quick health check.")
 def status_command() -> None:
     _ensure_src_on_path()
-    from silo_audit import load_registry, load_manifest, find_count_mismatches
+    from silo_audit import (
+        load_registry,
+        load_manifest,
+        load_file_registry,
+        find_count_mismatches,
+        find_duplicate_hashes,
+        find_path_overlaps,
+    )
 
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
-    registry = load_registry(db_path)
-    manifest = load_manifest(db_path)
-    mismatches = find_count_mismatches(registry, manifest)
-    total_silos = len(registry)
-    total_chunks = sum(int(s.get("chunks_count", 0) or 0) for s in registry)
-    stale = len(mismatches)
-    if stale:
-        print(f"{total_silos} silos, {total_chunks} chunks, {stale} stale")
-    else:
-        print(f"{total_silos} silos, {total_chunks} chunks, all current")
-
-
-@app.command("silos", help="Audit silo health.")
-def silos_command() -> None:
-    _ensure_src_on_path()
-    from silo_audit import load_registry, load_file_registry, load_manifest, find_duplicate_hashes, find_path_overlaps, find_count_mismatches, format_report
     db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
     registry = load_registry(db_path)
     file_registry = load_file_registry(db_path)
@@ -1708,7 +1818,118 @@ def silos_command() -> None:
     dupes = find_duplicate_hashes(file_registry)
     overlaps = find_path_overlaps(registry)
     mismatches = find_count_mismatches(registry, manifest)
-    print(format_report(registry, dupes, overlaps, mismatches))
+    print(_render_health_summary(registry, dupes, overlaps, mismatches))
+
+    if not (dupes or overlaps or mismatches):
+        return
+
+    print("\nTop Issues")
+    if mismatches:
+        top = sorted(
+            mismatches,
+            key=lambda m: abs(int(m.get("registry_files", 0) or 0) - int(m.get("manifest_files", 0) or 0)),
+            reverse=True,
+        )[:3]
+        reg_by_slug = {str((s or {}).get("slug") or ""): s for s in registry if isinstance(s, dict)}
+        print(f"  Count mismatches: {len(mismatches)}")
+        for m in top:
+            slug = str(m.get("slug") or "?")
+            rf = int(m.get("registry_files", 0) or 0)
+            mf = int(m.get("manifest_files", 0) or 0)
+            delta = mf - rf
+            sign = "+" if delta >= 0 else ""
+            path = str((reg_by_slug.get(slug) or {}).get("path") or "")
+            action = _status_action_for_mismatch(slug, rf, mf, path or None)
+            print(f"    - {slug}: indexed={rf}, manifest={mf} (delta {sign}{delta})")
+            print(f"      action: {action}")
+    if overlaps:
+        print(f"  Path overlaps: {len(overlaps)}")
+        first = overlaps[0]
+        if first.get("type") == "nested":
+            print(f"    - nested: {first.get('child')} inside {first.get('parent')}")
+            print(f"      action: remove duplicate scope: pal remove {first.get('child')}")
+        else:
+            silos = first.get("silos") or []
+            print(f"    - same path: {', '.join(str(s) for s in silos)}")
+            if silos:
+                print(f"      action: keep one scope: pal remove {silos[-1]}")
+    if dupes:
+        print(f"  Duplicate groups: {len(dupes)}")
+
+    print("\nNext Actions")
+    print("  1. Inspect full details: pal silos")
+    print("  2. Re-index out-of-sync silos: pal pull --full")
+
+
+@app.command("silos", help="Audit silo health.")
+def silos_command() -> None:
+    _ensure_src_on_path()
+    from silo_audit import (
+        load_registry,
+        load_file_registry,
+        load_manifest,
+        find_duplicate_hashes,
+        find_path_overlaps,
+        find_count_mismatches,
+    )
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    registry = load_registry(db_path)
+    file_registry = load_file_registry(db_path)
+    manifest = load_manifest(db_path)
+    dupes = find_duplicate_hashes(file_registry)
+    overlaps = find_path_overlaps(registry)
+    mismatches = find_count_mismatches(registry, manifest)
+    print(_render_health_summary(registry, dupes, overlaps, mismatches))
+
+    reg_by_slug = {str((s or {}).get("slug") or ""): s for s in registry if isinstance(s, dict)}
+    action_lines: list[str] = []
+
+    if overlaps:
+        print("\nPath Overlaps")
+        for o in overlaps:
+            if o.get("type") == "same_path":
+                silos = [str(s) for s in (o.get("silos") or [])]
+                path = str(o.get("path") or "?")
+                print(f"  - same path: {', '.join(silos)}")
+                print(f"    path: {path}")
+                if silos:
+                    action_lines.append(f"keep one overlapping scope: pal remove {silos[-1]}")
+            else:
+                parent = str(o.get("parent") or "?")
+                child = str(o.get("child") or "?")
+                print(f"  - nested scope: {child} inside {parent}")
+                action_lines.append(f"remove nested duplicate scope: pal remove {child}")
+
+    if mismatches:
+        print("\nCount Mismatches")
+        ordered = sorted(
+            mismatches,
+            key=lambda m: abs(int(m.get("registry_files", 0) or 0) - int(m.get("manifest_files", 0) or 0)),
+            reverse=True,
+        )
+        for m in ordered:
+            slug = str(m.get("slug") or "?")
+            rf = int(m.get("registry_files", 0) or 0)
+            mf = int(m.get("manifest_files", 0) or 0)
+            delta = mf - rf
+            sign = "+" if delta >= 0 else ""
+            path = str((reg_by_slug.get(slug) or {}).get("path") or "")
+            print(f"  - {slug}: indexed={rf}, manifest={mf} (delta {sign}{delta})")
+            if path:
+                print(f"    path: {path}")
+            action_lines.append(_status_action_for_mismatch(slug, rf, mf, path or None))
+
+    if dupes:
+        print("\nDuplicate Content")
+        print(f"  - {len(dupes)} duplicate hash group(s) found")
+
+    if action_lines:
+        deduped = list(dict.fromkeys(action_lines))
+        print("\nRecommended Actions")
+        for idx, action in enumerate(deduped, start=1):
+            print(f"  {idx}. {action}")
+    else:
+        print("\nNo action needed.")
 
 
 @app.command("tool", help="Pass-through to llmli.")

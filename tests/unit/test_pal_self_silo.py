@@ -133,7 +133,7 @@ def test_capabilities_calls_ensure_self_once_and_no_llm(monkeypatch):
     assert calls["llmli"] == [["capabilities"]]
 
 
-def test_ask_non_quiet_prints_stale_banner_before_answer(monkeypatch):
+def test_ask_explicit_self_scope_prints_stale_banner_before_answer(monkeypatch):
     from typer.testing import CliRunner
 
     monkeypatch.setattr("pal._should_require_self_silo", lambda: True)
@@ -151,7 +151,7 @@ def test_ask_non_quiet_prints_stale_banner_before_answer(monkeypatch):
 
     monkeypatch.setattr("pal._run_llmli", _fake_run_llmli)
     runner = CliRunner()
-    res = runner.invoke(pal.app, ["ask", "hello"])
+    res = runner.invoke(pal.app, ["ask", "--in", "__self__", "hello"])
     assert res.exit_code == 0
     out = res.stdout
     assert "Index may be outdated" in out
@@ -178,6 +178,30 @@ def test_ask_quiet_does_not_print_stale_banner(monkeypatch):
     monkeypatch.setattr("pal._run_llmli", _fake_run_llmli)
     runner = CliRunner()
     res = runner.invoke(pal.app, ["ask", "--quiet", "hello"])
+    assert res.exit_code == 0
+    assert "Index may be outdated" not in res.stdout
+    assert "ANSWER_BODY" in res.stdout
+
+
+def test_ask_scoped_non_self_does_not_print_stale_banner(monkeypatch):
+    from typer.testing import CliRunner
+
+    monkeypatch.setattr("pal._should_require_self_silo", lambda: True)
+    monkeypatch.setattr("pal._get_git_root", lambda: Path("/tmp/repo"))
+    monkeypatch.setattr("pal._is_dev_repo_at_root", lambda _root: True)
+    monkeypatch.setattr("pal._read_llmli_registry", lambda _db: {"__self__": {"path": str(Path('/tmp/repo').resolve())}})
+    monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"silo": "__self__", "path": str(Path('/tmp/repo').resolve()), "self_silo_last_index_mtime": 1}]})
+    monkeypatch.setattr("pal._git_is_dirty", lambda _root: True)
+    monkeypatch.setattr("pal._git_last_commit_ct", lambda _root: 99999)
+    monkeypatch.setattr("pal.ensure_self_silo", lambda force=False, emit_warning=True: 0)
+
+    def _fake_run_llmli(_args):
+        print("ANSWER_BODY")
+        return 0
+
+    monkeypatch.setattr("pal._run_llmli", _fake_run_llmli)
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["ask", "--in", "tax", "hello"])
     assert res.exit_code == 0
     assert "Index may be outdated" not in res.stdout
     assert "ANSWER_BODY" in res.stdout

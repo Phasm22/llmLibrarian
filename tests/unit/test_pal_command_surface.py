@@ -108,8 +108,10 @@ def test_pal_status_and_silos_command_run_without_identifiable_error(monkeypatch
 
     res_status = runner.invoke(pal.app, ["status"])
     assert res_status.exit_code == 0
-    assert "all current" in res_status.stdout
+    assert "Health Summary" in res_status.stdout
+    assert "State: Healthy" in res_status.stdout
 
     res_silos = runner.invoke(pal.app, ["silos"])
     assert res_silos.exit_code == 0
-    assert "silo audit report" in res_silos.stdout
+    assert "Health Summary" in res_silos.stdout
+    assert "No action needed." in res_silos.stdout
