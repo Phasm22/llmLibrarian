@@ -106,6 +106,14 @@ def test_route_intent_structure_extension_count_query():
     assert route_intent(q) == INTENT_STRUCTURE
 
 
+def test_route_intent_neutral_context_preface_does_not_force_structure():
+    q = (
+        "Context anchors for Demo: anchors: AGENTS.md, README.md; dominant formats: py, md; themes: tests. "
+        "What was I building in this silo?"
+    )
+    assert route_intent(q) == INTENT_LOOKUP
+
+
 def test_route_intent_fallback_lookup():
     assert route_intent("explain dependency injection") == INTENT_LOOKUP
 

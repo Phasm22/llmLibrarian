@@ -2,7 +2,11 @@ from query.guardrails import field_lookup_candidates_from_scope
 from query.retrieval import (
     all_dists_above_threshold,
     dedup_by_chunk_hash,
+    diversify_by_silo,
     diversify_by_source,
+    ensure_min_silo_coverage,
+    soft_promote_silo_diversity,
+    max_silo_chunks_for_intent,
     max_chunks_for_intent,
     relevance_max_distance,
     extract_scope_tokens,
@@ -52,11 +56,126 @@ def test_diversify_by_source_handles_empty_docs():
     assert dists == []
 
 
+def test_diversify_by_silo_caps_per_silo_deterministically():
+    docs, metas, dists = diversify_by_silo(
+        docs=["a1", "a2", "a3", "b1", "b2"],
+        metas=[
+            {"source": "A-1", "silo": "alpha"},
+            {"source": "A-2", "silo": "alpha"},
+            {"source": "A-3", "silo": "alpha"},
+            {"source": "B-1", "silo": "beta"},
+            {"source": "B-2", "silo": "beta"},
+        ],
+        dists=[0.1, 0.2, 0.3, 0.4, 0.5],
+        top_k=5,
+        max_per_silo=2,
+        silos=["alpha", "alpha", "alpha", "beta", "beta"],
+    )
+    assert docs == ["a1", "a2", "b1", "b2"]
+    assert [m.get("silo") for m in metas if m] == ["alpha", "alpha", "beta", "beta"]
+    assert dists == [0.1, 0.2, 0.4, 0.5]
+
+
+def test_diversify_by_silo_handles_missing_silo_metadata():
+    docs, metas, dists = diversify_by_silo(
+        docs=["x1", "x2", "x3"],
+        metas=[{"source": "x1"}, {"source": "x2"}, {"source": "x3"}],
+        dists=[0.1, 0.2, 0.3],
+        top_k=3,
+        max_per_silo=1,
+    )
+    assert docs == ["x1", "x2", "x3"]
+    assert len(metas) == 3
+    assert len(dists) == 3
+
+
+def test_ensure_min_silo_coverage_promotes_distinct_silos_when_available():
+    docs, metas, dists = ensure_min_silo_coverage(
+        docs=["a1", "a2", "a3", "b1", "c1"],
+        metas=[
+            {"source": "a1", "silo": "alpha"},
+            {"source": "a2", "silo": "alpha"},
+            {"source": "a3", "silo": "alpha"},
+            {"source": "b1", "silo": "beta"},
+            {"source": "c1", "silo": "gamma"},
+        ],
+        dists=[0.05, 0.06, 0.07, 0.50, 0.60],
+        top_k=4,
+        min_silos=3,
+    )
+    silos = [str((m or {}).get("silo") or "") for m in metas]
+    assert len(docs) == 4
+    assert "alpha" in silos
+    assert "beta" in silos
+    assert "gamma" in silos
+
+
+def test_ensure_min_silo_coverage_is_deterministic_with_missing_silos():
+    docs, metas, dists = ensure_min_silo_coverage(
+        docs=["x1", "x2", "x3"],
+        metas=[{"source": "x1"}, {"source": "x2"}, {"source": "x3"}],
+        dists=[0.1, 0.2, 0.3],
+        top_k=2,
+        min_silos=3,
+    )
+    assert docs == ["x1", "x2"]
+    assert len(metas) == 2
+    assert len(dists) == 2
+
+
+def test_soft_promote_silo_diversity_promotes_close_alt_silos():
+    docs, metas, dists = soft_promote_silo_diversity(
+        docs=["a1", "a2", "a3", "a4", "b1", "c1"],
+        metas=[
+            {"silo": "alpha"},
+            {"silo": "alpha"},
+            {"silo": "alpha"},
+            {"silo": "alpha"},
+            {"silo": "beta"},
+            {"silo": "gamma"},
+        ],
+        dists=[0.10, 0.11, 0.12, 0.13, 0.15, 0.16],
+        top_k=4,
+        max_promotions_per_alt_silo=1,
+        max_total_promotions=2,
+        relevance_delta=0.08,
+    )
+    assert len(docs) == 4
+    silos = [str((m or {}).get("silo") or "") for m in metas]
+    assert "alpha" in silos
+    assert ("beta" in silos) or ("gamma" in silos)
+
+
+def test_soft_promote_silo_diversity_skips_weak_alt_silos():
+    docs, metas, dists = soft_promote_silo_diversity(
+        docs=["a1", "a2", "a3", "a4", "b1"],
+        metas=[
+            {"silo": "alpha"},
+            {"silo": "alpha"},
+            {"silo": "alpha"},
+            {"silo": "alpha"},
+            {"silo": "beta"},
+        ],
+        dists=[0.10, 0.11, 0.12, 0.13, 0.45],
+        top_k=4,
+        relevance_delta=0.08,
+    )
+    assert docs == ["a1", "a2", "a3", "a4"]
+    assert [str((m or {}).get("silo") or "") for m in metas] == ["alpha", "alpha", "alpha", "alpha"]
+
+
 def test_max_chunks_for_intent_uses_intent_specific_caps():
     assert max_chunks_for_intent("LOOKUP", 4) == 3
     assert max_chunks_for_intent("EVIDENCE_PROFILE", 4) == 2
     assert max_chunks_for_intent("AGGREGATE", 4) == 6
     assert max_chunks_for_intent("unknown", 4) == 4
+
+
+def test_max_silo_chunks_for_intent_uses_intent_specific_caps():
+    assert max_silo_chunks_for_intent("LOOKUP", 9) == 3
+    assert max_silo_chunks_for_intent("EVIDENCE_PROFILE", 9) == 3
+    assert max_silo_chunks_for_intent("AGGREGATE", 9) == 6
+    assert max_silo_chunks_for_intent("unknown", 9) == 9
 
 
 def test_dedup_by_chunk_hash_noop_when_env_disabled(monkeypatch):

@@ -1,0 +1,772 @@
+{
+  "Random-01": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 4,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-02": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 4,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-03": {
+    "has_concentration_note": true,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 4,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-04": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 3,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-05": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": true,
+    "quality_score": 82,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 4,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-06": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 5,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-07": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 6,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-08": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 4,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-09": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 5,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-10": {
+    "has_concentration_note": true,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 94,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 1,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-11": {
+    "has_concentration_note": true,
+    "hedge_count": 5,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": true,
+    "quality_score": 48,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 3,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Random-12": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 4,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-AdversarialEval-01": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 92,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-AdversarialEval-02": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-AdversarialEval-03": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-AdversarialEval-04": {
+    "has_concentration_note": false,
+    "hedge_count": 5,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 80,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-AdversarialEval-05": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-BecomeALinearAlgebraMaster-01": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 92,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-BecomeALinearAlgebraMaster-02": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-BecomeALinearAlgebraMaster-03": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 10,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-BecomeALinearAlgebraMaster-04": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-BecomeALinearAlgebraMaster-05": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-Documents-01": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 2,
+    "ownership_conflict_flag": false,
+    "quality_score": 72,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 5,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Documents-02": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 2,
+    "ownership_conflict_flag": false,
+    "quality_score": 72,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 5,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Documents-03": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 2,
+    "ownership_conflict_flag": false,
+    "quality_score": 90,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 6,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Documents-04": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 2,
+    "ownership_conflict_flag": false,
+    "quality_score": 66,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 6,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Documents-05": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 2,
+    "ownership_conflict_flag": false,
+    "quality_score": 72,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-JobRelatedStuff-01": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-JobRelatedStuff-02": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 0,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-JobRelatedStuff-03": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 0,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-JobRelatedStuff-04": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-JobRelatedStuff-05": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 9,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Marketman-01": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 10,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Marketman-02": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 10,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Marketman-03": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Marketman-04": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 10,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Marketman-05": {
+    "has_concentration_note": false,
+    "hedge_count": 6,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 80,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 9,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-OldSchool-01": {
+    "has_concentration_note": false,
+    "hedge_count": 5,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 80,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 6,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-OldSchool-02": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 92,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 6,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-OldSchool-03": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 9,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-OldSchool-04": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 10,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-OldSchool-05": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Openclaw-01": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Openclaw-02": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Openclaw-03": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Openclaw-04": {
+    "has_concentration_note": false,
+    "hedge_count": 5,
+    "list_format_issues": 1,
+    "ownership_conflict_flag": false,
+    "quality_score": 70,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Openclaw-05": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 9,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-ProjectPalindrome-01": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 2,
+    "ownership_conflict_flag": false,
+    "quality_score": 66,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 12,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-ProjectPalindrome-02": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 92,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-ProjectPalindrome-03": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 1,
+    "ownership_conflict_flag": false,
+    "quality_score": 88,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 12,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-ProjectPalindrome-04": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 1,
+    "ownership_conflict_flag": false,
+    "quality_score": 88,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 10,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-ProjectPalindrome-05": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 1,
+    "ownership_conflict_flag": false,
+    "quality_score": 82,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 9,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-RestaurantBusinessRankings2020-01": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 2,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-RestaurantBusinessRankings2020-02": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 0,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-RestaurantBusinessRankings2020-03": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 0,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-RestaurantBusinessRankings2020-04": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 2,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-RestaurantBusinessRankings2020-05": {
+    "has_concentration_note": false,
+    "hedge_count": 0,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 2,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-SelfPalLlmlibrarianRepo-01": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 7,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-SelfPalLlmlibrarianRepo-02": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 9,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-SelfPalLlmlibrarianRepo-03": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-SelfPalLlmlibrarianRepo-04": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 7,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-SelfPalLlmlibrarianRepo-05": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_focus_run.md",
+    "source_count": 7,
+    "updated_utc": "2026-02-14T06:25:54Z"
+  },
+  "Silo-Sentinelzero-01": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 9,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Sentinelzero-02": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Sentinelzero-03": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 98,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 12,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Sentinelzero-04": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 11,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Sentinelzero-05": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 12,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Src-01": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 92,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Src-02": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 7,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Src-03": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 100,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Src-04": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Src-05": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 92,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 7,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Tax-01": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 1,
+    "ownership_conflict_flag": false,
+    "quality_score": 82,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 6,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Tax-02": {
+    "has_concentration_note": false,
+    "hedge_count": 4,
+    "list_format_issues": 0,
+    "ownership_conflict_flag": false,
+    "quality_score": 86,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Tax-03": {
+    "has_concentration_note": false,
+    "hedge_count": 2,
+    "list_format_issues": 1,
+    "ownership_conflict_flag": false,
+    "quality_score": 88,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Tax-04": {
+    "has_concentration_note": false,
+    "hedge_count": 3,
+    "list_format_issues": 1,
+    "ownership_conflict_flag": false,
+    "quality_score": 82,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 7,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  },
+  "Silo-Tax-05": {
+    "has_concentration_note": false,
+    "hedge_count": 1,
+    "list_format_issues": 1,
+    "ownership_conflict_flag": false,
+    "quality_score": 94,
+    "run_ref": "/Users/tjm4/llmLibrarian/docs/personal_gap_full_run.md",
+    "source_count": 8,
+    "updated_utc": "2026-02-14T06:18:30Z"
+  }
+}
