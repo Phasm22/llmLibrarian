@@ -31,6 +31,24 @@ def test_route_intent_code_language_query():
     assert route_intent("what is my most common programming language") == INTENT_CODE_LANGUAGE
 
 
+def test_route_intent_year_scoped_code_language_query():
+    assert route_intent("what was i coding in 2022") == INTENT_LOOKUP
+
+
+def test_route_intent_year_scoped_code_language_alt_phrasing():
+    assert route_intent("which language did i code in 2022") == INTENT_CODE_LANGUAGE
+
+
+def test_route_intent_year_scoped_code_language_does_not_capture_project_count():
+    q = "how many coding projects did i do in 2022"
+    assert route_intent(q) == INTENT_PROJECT_COUNT
+
+
+def test_route_intent_year_scoped_code_language_does_not_capture_file_list():
+    q = "what files are from 2022"
+    assert route_intent(q) == INTENT_FILE_LIST
+
+
 def test_route_intent_reflect_query():
     assert route_intent("reflect on this") == INTENT_REFLECT
 

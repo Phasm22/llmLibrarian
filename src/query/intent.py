@@ -97,6 +97,28 @@ def route_intent(query: str) -> str:
         and re.search(r"\b(files?|documents?|docs?)\b", q)
     ):
         return INTENT_STRUCTURE
+    # CODE_LANGUAGE (year-scoped): explicit language asks only.
+    # Guardrails:
+    # - exactly one year token
+    # - explicit language signal present (don't steal "what was i coding in 2022")
+    # - do not steal project-count or explicit file-list asks
+    year_tokens = re.findall(r"\b20\d{2}\b", q)
+    asks_project_count = bool(re.search(r"\bhow\s+(many|much)\b", q) and re.search(r"\bprojects?\b", q))
+    asks_explicit_file_list = bool(
+        re.search(r"\b(files?|documents?|docs?)\b", q)
+        and re.search(r"\b(list|which|what|show|find|from)\b", q)
+    )
+    if (
+        len(year_tokens) == 1
+        and not asks_project_count
+        and not asks_explicit_file_list
+        and re.search(
+            r"\b(?:language|lang)\b|\bwhich\s+language\b",
+            q,
+        )
+    ):
+        return INTENT_CODE_LANGUAGE
+
     # CODE_LANGUAGE: most common / primary / dominant coding language (deterministic count by extension)
     if re.search(
         r"\bmost common\s+(?:coding\s+)?(?:programming\s+)?language\b|\bmost used\s+(?:coding\s+)?language\b|"

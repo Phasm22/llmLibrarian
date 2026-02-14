@@ -97,9 +97,14 @@ from query.formatting import (
     format_source,
 )
 from query.code_language import (
+    CODE_EXTENSIONS,
     get_code_language_stats_from_registry,
     compute_code_language_from_chroma,
     format_code_language_answer,
+    get_code_language_stats_from_manifest_year,
+    get_code_sources_from_manifest_year,
+    format_code_language_year_answer,
+    summarize_code_activity_year,
 )
 from query.guardrails import (
     run_field_lookup_guardrail,
@@ -134,6 +139,37 @@ def _top_distance(dists: list[float | None]) -> float | None:
         if d is not None:
             return float(d)
     return None
+
+
+def _single_year_from_query(query: str) -> int | None:
+    years = query_mentioned_years(query)
+    if len(years) != 1:
+        return None
+    try:
+        return int(years[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_code_activity_year_lookup(query: str) -> bool:
+    """
+    Detect "what was I coding/programming in YYYY" style asks.
+    These should use year+code constrained retrieval, not language-only summaries.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    if _single_year_from_query(q) is None:
+        return False
+    if re.search(r"\b(files?|documents?|docs?)\b", q):
+        return False
+    return bool(
+        re.search(
+            r"\bwhat\s+was\s+i\s+(?:coding|programming)\b|"
+            r"\bwhat\s+did\s+i\s+(?:code|program)\b",
+            q,
+        )
+    )
 
 
 def _distinct_source_count(metas: list[dict | None]) -> int:
@@ -263,7 +299,10 @@ def _confidence_assessment(
     warning: str | None = None
     reason: str | None = None
     if avg_distance > 0.7:
-        if intent == INTENT_LOOKUP and direct_canonical_available and confidence_relaxation_enabled:
+        if intent == INTENT_LOOKUP and _is_code_activity_year_lookup(query):
+            warning = None
+            reason = "relaxed_code_activity_year"
+        elif intent == INTENT_LOOKUP and direct_canonical_available and confidence_relaxation_enabled:
             warning = None
             reason = "relaxed_canonical"
         elif intent == INTENT_LOOKUP and query_overlap and not explicit_unified:
@@ -597,6 +636,9 @@ def run_ask(
     scope_bound_slug: str | None = None
     scope_cleaned_query: str | None = None
     filetype_hints = detect_filetype_hints(query)
+    code_activity_year_lookup = bool(intent == INTENT_LOOKUP and _is_code_activity_year_lookup(query))
+    code_activity_requested_year = _single_year_from_query(query) if code_activity_year_lookup else None
+    code_activity_sources: list[str] = []
 
     if use_unified and silo is None and auto_scope_binding:
         binding = bind_scope_from_query(query, db)
@@ -967,6 +1009,14 @@ def run_ask(
             + "\n\nDirect query conflict policy: if sources conflict, prioritize canonical/official sources over draft/archive/stale notes."
             + " If canonical evidence is present, answer decisively from it."
         )
+    if code_activity_year_lookup and code_activity_requested_year is not None:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nThe user is asking what they were coding in a specific year."
+            + " Summarize projects, scripts, tasks, and topics supported by the code context."
+            + " Do not reduce the answer to only naming a language unless that is the only evidence."
+            + f" Keep the answer grounded to evidence from {code_activity_requested_year} code files."
+        )
 
     ef = get_embedding_function()
     client = chromadb.PersistentClient(path=db, settings=Settings(anonymized_telemetry=False))
@@ -977,6 +1027,38 @@ def run_ask(
 
     # CODE_LANGUAGE: deterministic count by extension (code files only). No retrieval, no LLM.
     if intent == INTENT_CODE_LANGUAGE and use_unified:
+        requested_year = _single_year_from_query(query)
+        if requested_year is not None:
+            by_ext, sample_paths = get_code_language_stats_from_manifest_year(
+                db_path=db,
+                silo=silo,
+                year=requested_year,
+            )
+            time_ms = (time.perf_counter() - t0) * 1000
+            write_trace(
+                intent=intent,
+                n_stage1=0,
+                n_results=0,
+                model=model,
+                silo=silo,
+                source_label=source_label,
+                num_docs=0,
+                time_ms=time_ms,
+                query_len=len(query),
+                hybrid_used=False,
+                guardrail_no_match=(len(by_ext) == 0),
+                guardrail_reason="code_language_year",
+                requested_year=str(requested_year),
+                answer_kind="guardrail",
+            )
+            return format_code_language_year_answer(
+                year=requested_year,
+                by_ext=by_ext,
+                sample_paths=sample_paths,
+                source_label=source_label,
+                no_color=no_color,
+            )
+
         stats = get_code_language_stats_from_registry(db, silo)
         if stats is None:
             stats = compute_code_language_from_chroma(collection, silo)
@@ -1000,7 +1082,7 @@ def run_ask(
     # Catalog sub-scope: when unified and no CLI silo, try to restrict to paths matching query tokens.
     subscope_where: dict[str, Any] | None = None
     subscope_tokens: list[str] = []
-    if use_unified and silo is None:
+    if use_unified and silo is None and not code_activity_year_lookup:
         subscope = resolve_subscope(query, db, get_paths_by_silo)
         if subscope:
             silos_sub, paths_sub, tokens_used = subscope
@@ -1009,6 +1091,38 @@ def run_ask(
             if os.environ.get("PAL_DEBUG"):
                 token_str = ",".join(subscope_tokens)
                 print(f"scoped_to={len(paths_sub)} paths token={token_str}", file=sys.stderr)
+
+    code_year_where: dict[str, Any] | None = None
+    if code_activity_year_lookup and code_activity_requested_year is not None:
+        code_sources = get_code_sources_from_manifest_year(
+            db_path=db,
+            silo=silo,
+            year=code_activity_requested_year,
+        )
+        code_activity_sources = list(code_sources)
+        if not code_sources:
+            answer = f"I couldn't find code files from {code_activity_requested_year} in {source_label}."
+            if not quiet:
+                answer = "\n".join([answer, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")])
+            time_ms = (time.perf_counter() - t0) * 1000
+            write_trace(
+                intent=intent,
+                n_stage1=0,
+                n_results=0,
+                model=model,
+                silo=silo,
+                source_label=source_label,
+                num_docs=0,
+                time_ms=time_ms,
+                query_len=len(query),
+                hybrid_used=False,
+                guardrail_no_match=True,
+                guardrail_reason="code_activity_year_no_code_files",
+                requested_year=str(code_activity_requested_year),
+                answer_kind="guardrail",
+            )
+            return answer
+        code_year_where = {"source": {"$in": code_sources}}
 
     # Trust-first terminal guardrail for explicit year/form/line lookup queries.
     if intent == INTENT_FIELD_LOOKUP:
@@ -1152,10 +1266,17 @@ def run_ask(
         "n_results": n_stage1,
         "include": ["documents", "metadatas", "distances"],
     }
+    where_parts: list[dict[str, Any]] = []
     if use_unified and silo:
-        query_kw["where"] = {"silo": silo}
+        where_parts.append({"silo": silo})
     elif subscope_where:
-        query_kw["where"] = subscope_where
+        where_parts.append(subscope_where)
+    if code_year_where:
+        where_parts.append(code_year_where)
+    if len(where_parts) == 1:
+        query_kw["where"] = where_parts[0]
+    elif len(where_parts) > 1:
+        query_kw["where"] = {"$and": where_parts}
 
     # Temporal query decomposition: break down comparison queries into sequential sub-queries
     temporal_subqueries = decompose_temporal_query(query)
@@ -1202,7 +1323,7 @@ def run_ask(
     catalog_retry_silo: str | None = None
 
     # Weak-scope retry: when not explicitly scoped and first-pass relevance is weak, pick top catalog silo and retry.
-    if use_unified and explicit_silo is None and scope_bound_slug is None and not explicit_unified:
+    if use_unified and explicit_silo is None and scope_bound_slug is None and not explicit_unified and not code_activity_year_lookup:
         low_conf_first = _confidence_signal(
             dists,
             metas,
@@ -1471,9 +1592,54 @@ def run_ask(
         dists = [x[3] for x in combined_list]
 
     if not docs:
+        if code_activity_year_lookup and code_activity_requested_year is not None and code_activity_sources:
+            lang_counts: dict[str, int] = {}
+            for src in code_activity_sources:
+                ext = Path(src).suffix.lower()
+                if ext in CODE_EXTENSIONS:
+                    lang_counts[ext] = lang_counts.get(ext, 0) + 1
+            lang_frag = ", ".join(f"{k} ({v})" for k, v in sorted(lang_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:3]) or "unknown"
+            text = (
+                f"I found code files from {code_activity_requested_year}, but no matching code chunks were retrievable for summarization.\n"
+                f"Observed file extensions: {lang_frag}."
+            )
+            if quiet:
+                return text
+            lines = [text, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")]
+            return "\n".join(lines)
         if use_unified:
             return f"No indexed content for {source_label}. Run: llmli add <path>"
         return f"No indexed content for {source_label}. Run: index --archetype {archetype_id}"
+
+    if code_activity_year_lookup and code_activity_requested_year is not None:
+        summary = summarize_code_activity_year(
+            year=code_activity_requested_year,
+            docs=docs,
+            metas=metas,
+        )
+        time_ms = (time.perf_counter() - t0) * 1000
+        write_trace(
+            intent=intent,
+            n_stage1=n_stage1,
+            n_results=n_results,
+            model=model,
+            silo=silo,
+            source_label=source_label,
+            num_docs=len(docs),
+            time_ms=time_ms,
+            query_len=len(query),
+            hybrid_used=hybrid_used,
+            receipt_metas=metas,
+            requested_year=str(code_activity_requested_year),
+            guardrail_reason="code_activity_year_summary",
+            answer_kind="guardrail",
+        )
+        if quiet:
+            return summary
+        out = [summary, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}"), "", bold(no_color, "Sources:")]
+        for doc, meta, dist in _aggregate_sources_for_footer(docs, metas, dists):
+            out.append(format_source(doc, meta, dist, no_color=no_color))
+        return "\n".join(out)
 
     # Relevance gate: fall back to structure info on low confidence
     threshold = relevance_max_distance()

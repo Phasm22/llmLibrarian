@@ -345,6 +345,108 @@ def test_run_ask_code_language_bypasses_llm(monkeypatch, mock_collection, mock_o
     assert mock_ollama["calls"] == []
 
 
+def test_run_ask_code_language_year_scoped_bypasses_llm(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_CODE_LANGUAGE)
+    monkeypatch.setattr(
+        "query.core.get_code_language_stats_from_manifest_year",
+        lambda db_path, silo, year: ({".py": 2}, {".py": ["/tmp/a.py"]}),
+    )
+    monkeypatch.setattr(
+        "query.core.format_code_language_year_answer",
+        lambda year, by_ext, sample_paths, source_label, no_color: f"In {year}: {next(iter(by_ext.keys()))}",
+    )
+
+    out = run_ask(archetype_id=None, query="which language did i code in 2022?", no_color=True, use_reranker=False)
+    assert "In 2022: .py" in out
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_code_activity_year_lookup_applies_code_year_source_filter(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.resolve_subscope", lambda _q, _db, _gps: None)
+    monkeypatch.setattr(
+        "query.core.get_code_sources_from_manifest_year",
+        lambda db_path, silo, year: ["/tmp/a.py", "/tmp/b.py"],
+    )
+    mock_collection.query_result = {
+        "documents": [["worked on parser refactor", "built api utility"]],
+        "metadatas": [[
+            {"source": "/tmp/a.py", "is_local": 1},
+            {"source": "/tmp/b.py", "is_local": 1},
+        ]],
+        "distances": [[0.1, 0.2]],
+        "ids": [["id-1", "id-2"]],
+    }
+    out = run_ask(archetype_id=None, query="what was i coding in 2022?", no_color=True, use_reranker=False)
+    q_calls = [kwargs for name, kwargs in mock_collection.calls if name == "query"]
+    assert q_calls
+    assert q_calls[0]["where"] == {"source": {"$in": ["/tmp/a.py", "/tmp/b.py"]}}
+    assert "working on code across 2 file(s)" in out
+    assert "a.py" in out
+    assert "b.py" in out
+    assert len(mock_ollama["calls"]) == 0
+
+
+def test_run_ask_code_activity_year_lookup_no_code_files_returns_deterministic_message(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr(
+        "query.core.get_code_sources_from_manifest_year",
+        lambda db_path, silo, year: [],
+    )
+
+    out = run_ask(archetype_id=None, query="what was i coding in 2022?", no_color=True, use_reranker=False)
+    assert "I couldn't find code files from 2022 in llmli." in out
+    assert mock_ollama["calls"] == []
+
+
+def test_run_ask_code_activity_year_lookup_skips_subscope_resolution(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr(
+        "query.core.resolve_subscope",
+        lambda _q, _db, _gps: (_ for _ in ()).throw(AssertionError("subscope should be skipped for code-activity-year lookup")),
+    )
+    monkeypatch.setattr(
+        "query.core.get_code_sources_from_manifest_year",
+        lambda db_path, silo, year: ["/tmp/a.py"],
+    )
+    mock_collection.query_result = {
+        "documents": [["did coding work"]],
+        "metadatas": [[{"source": "/tmp/a.py", "is_local": 1}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    out = run_ask(archetype_id=None, query="what was i coding in 2022?", no_color=True, use_reranker=False)
+    assert "working on code across 1 file(s)" in out
+    assert len(mock_ollama["calls"]) == 0
+
+
+def test_run_ask_code_activity_year_lookup_suppresses_low_conf_and_summarizes_themes(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.resolve_subscope", lambda _q, _db, _gps: None)
+    monkeypatch.setattr(
+        "query.core.get_code_sources_from_manifest_year",
+        lambda db_path, silo, year: ["/tmp/a.py", "/tmp/b.py"],
+    )
+    mock_collection.query_result = {
+        "documents": [["simple python script", "tkinter helper"]],
+        "metadatas": [[
+            {"source": "/tmp/a.py", "is_local": 1},
+            {"source": "/tmp/b.py", "is_local": 1},
+        ]],
+        "distances": [[0.95, 0.91]],
+        "ids": [["id-1", "id-2"]],
+    }
+    out = run_ask(archetype_id=None, query="what was i coding in 2022?", no_color=True, use_reranker=False)
+    assert "Low confidence: query is weakly related to indexed content." not in out
+    assert "GUI apps (tkinter/PIL)" in out
+    assert len(mock_ollama["calls"]) == 0
+
+
 def test_run_ask_lookup_calls_ollama(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
