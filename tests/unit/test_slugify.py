@@ -14,7 +14,7 @@ def test_slugify_differs_by_path():
 
 
 def test_slugify_with_spaces():
-    slug = slugify("Become a Linear Algebra Master", "/Users/tjm4/Desktop/Become a Linear Algebra Master")
+    slug = slugify("Become a Linear Algebra Master", "/tmp/Become a Linear Algebra Master")
     assert "become-a-linear-algebra-master" in slug
 
 
