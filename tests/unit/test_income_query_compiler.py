@@ -72,3 +72,40 @@ def test_income_plan_reports_missing_year(monkeypatch, mock_collection, mock_oll
     out = run_ask(archetype_id=None, query="what was my income in 2024", no_color=True, use_reranker=False, silo="tax")
     assert "I could not find indexed tax documents for 2024 in this silo." in out
     assert mock_ollama["calls"] == []
+
+
+def test_make_query_defaults_to_w2_box1_sum_when_line9_missing(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_MONEY_YEAR_TOTAL)
+    mock_collection.get_result = {
+        "ids": ["id-1", "id-2", "id-3"],
+        "documents": [
+            "Form 1040 (2024)\nline 11: 14,600.",
+            "Form W-2 Wage and Tax Statement\nEmployer: YMCA\nBox 1 of W-2: 10,000.00",
+            "Form W-2 Wage and Tax Statement\nEmployer: ACME\nBox 1 of W-2: 2,500.00",
+        ],
+        "metadatas": [
+            {"source": "/Users/x/Tax/2024/2024 Federal Income Tax Return.pdf", "silo": "tax"},
+            {"source": "/Users/x/Tax/2024/ymca-w2-2024.pdf", "silo": "tax"},
+            {"source": "/Users/x/Tax/2024/acme-w2-2024.pdf", "silo": "tax"},
+        ],
+    }
+    out = run_ask(archetype_id=None, query="how much did i make in 2024", no_color=True, use_reranker=False, silo="tax")
+    assert "Total income (2024): 12,500.00" in out
+    assert "12,500.00" in out
+    assert "line 11" not in out
+    assert mock_ollama["calls"] == []
+
+
+def test_make_query_does_not_fallback_to_agi_when_w2_sum_unavailable(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_MONEY_YEAR_TOTAL)
+    mock_collection.get_result = {
+        "ids": ["id-1"],
+        "documents": ["Form 1040 (2024)\nline 11: 14,600."],
+        "metadatas": [{"source": "/Users/x/Tax/2024/2024 Federal Income Tax Return.pdf", "silo": "tax"}],
+    }
+    out = run_ask(archetype_id=None, query="how much did i make in 2024", no_color=True, use_reranker=False, silo="tax")
+    assert "I can't find a single income field for 2024." in out
+    assert "fallback from line 9" not in out
+    assert mock_ollama["calls"] == []

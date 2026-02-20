@@ -3,6 +3,7 @@ Trust-first deterministic guardrails: field lookup (year/form/line) and
 income-year-total. No LLM; no cross-year inference.
 """
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from style import bold, dim, label_style
@@ -585,6 +586,100 @@ def _extract_w2_wage_candidates(doc: str) -> list[tuple[str, str]]:
     return out
 
 
+def _money_value_key(value: str) -> str:
+    """Canonical key for comparing money values with/without separators."""
+    raw = (value or "").strip().replace("$", "")
+    raw = re.sub(r"[^\d,.\-]", "", raw).replace(",", "")
+    if not raw:
+        return ""
+    if not re.fullmatch(r"-?\d+(?:\.\d+)?", raw):
+        return raw.lower()
+    sign = "-" if raw.startswith("-") else ""
+    core = raw[1:] if sign else raw
+    if "." in core:
+        whole, frac = core.split(".", 1)
+        frac = frac.rstrip("0")
+        whole_num = str(int(whole or "0"))
+        return f"{sign}{whole_num}.{frac}" if frac else f"{sign}{whole_num}"
+    return f"{sign}{int(core or '0')}"
+
+
+def _money_key_to_decimal(value_key: str) -> Decimal | None:
+    if not value_key:
+        return None
+    try:
+        return Decimal(value_key)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _format_decimal_money(value: Decimal) -> str:
+    quantized = value.quantize(Decimal("0.01"))
+    return f"{quantized:,.2f}"
+
+
+def _query_prefers_total_income_default(query: str) -> bool:
+    q = (query or "").strip().lower()
+    return bool(re.search(r"\bhow\s+much\b[^\n]{0,80}\b(?:make|made|earn|earned)\b", q))
+
+
+def _sum_w2_box1_for_year(
+    year_docs: list[tuple[str, dict | None]],
+) -> dict[str, Any]:
+    per_source_values: dict[str, set[str]] = {}
+    source_doc: dict[str, str] = {}
+    source_meta: dict[str, dict | None] = {}
+    source_display_value: dict[str, str] = {}
+
+    for idx, (doc, meta) in enumerate(year_docs):
+        source = str((meta or {}).get("source") or "")
+        if not _looks_like_w2_doc(source, doc):
+            continue
+        source_key = source or f"<unknown-source:{idx}>"
+        for field_label, value in _extract_w2_wage_candidates(doc):
+            if field_label.lower() != "box 1":
+                continue
+            value_key = _money_value_key(value)
+            if not value_key:
+                continue
+            per_source_values.setdefault(source_key, set()).add(value_key)
+            source_doc[source_key] = doc
+            source_meta[source_key] = meta
+            source_display_value.setdefault(source_key, value)
+
+    if not per_source_values:
+        return {"status": "no_values"}
+
+    conflicts = {k: sorted(v) for k, v in per_source_values.items() if len(v) > 1}
+    if conflicts:
+        ordered_keys = sorted(conflicts.keys())
+        sources = [(source_doc[k], source_meta[k]) for k in ordered_keys]
+        return {
+            "status": "conflict",
+            "sources": sources,
+            "conflicting_values": {k: conflicts[k] for k in ordered_keys},
+        }
+
+    total = Decimal("0")
+    source_rows: list[tuple[str, dict | None]] = []
+    values: list[str] = []
+    for source_key in sorted(per_source_values.keys()):
+        only_key = next(iter(per_source_values[source_key]))
+        numeric = _money_key_to_decimal(only_key)
+        if numeric is None:
+            return {"status": "no_values"}
+        total += numeric
+        source_rows.append((source_doc[source_key], source_meta[source_key]))
+        values.append(source_display_value.get(source_key, only_key))
+
+    return {
+        "status": "ok",
+        "total": total,
+        "sources": source_rows,
+        "values": values,
+    }
+
+
 def field_lookup_candidates_from_scope(
     docs: list[str],
     metas: list[dict | None],
@@ -813,7 +908,7 @@ def run_income_year_total_guardrail(
 
         grouped: dict[str, dict[str, Any]] = {}
         for row in value_rows:
-            key = str(row["value"]).lower()
+            key = _money_value_key(str(row["value"]))
             g = grouped.get(key)
             if g is None:
                 grouped[key] = {
@@ -847,7 +942,13 @@ def run_income_year_total_guardrail(
                 label_style(no_color, f"Answered by: {source_label}"),
                 "",
                 bold(no_color, "Sources:"),
-                format_source(str(selected["doc"]), selected.get("meta"), None, no_color=no_color),
+                format_source(
+                    str(selected["doc"]),
+                    selected.get("meta"),
+                    None,
+                    include_snippet=False,
+                    no_color=no_color,
+                ),
             ]
             return {
                 "response": "\n".join(out),
@@ -876,7 +977,15 @@ def run_income_year_total_guardrail(
         ]
         for g in ranked[:4]:
             row = g["row"]
-            out.append(format_source(str(row["doc"]), row.get("meta"), None, no_color=no_color))
+            out.append(
+                format_source(
+                    str(row["doc"]),
+                    row.get("meta"),
+                    None,
+                    include_snippet=False,
+                    no_color=no_color,
+                )
+            )
         return {
             "response": "\n".join(out),
             "guardrail_no_match": True,
@@ -887,6 +996,8 @@ def run_income_year_total_guardrail(
             "num_docs": len(ranked),
             "receipt_metas": [g["row"].get("meta") for g in ranked if g["row"].get("meta")][:5],
         }
+
+    prefers_total_default = _query_prefers_total_income_default(query)
 
     def _scan_line(line_label: str) -> tuple[str | None, dict | None]:
         for doc, meta in year_docs:
@@ -926,33 +1037,93 @@ def run_income_year_total_guardrail(
             "receipt_metas": [meta9] if meta9 else None,
         }
 
-    val11, meta11 = _scan_line("11")
-    if val11:
-        answer = style_answer(f"Form 1040 line 11 (AGI) ({year}) [fallback from line 9]: {val11}", no_color)
-        out = [
-            answer,
-            "",
-            dim(no_color, "---"),
-            label_style(no_color, f"Answered by: {source_label}"),
-        ]
-        if meta11:
-            out.extend(
-                [
-                    "",
-                    bold(no_color, "Sources:"),
-                    format_source("", meta11, None, no_color=no_color),
-                ]
+    if prefers_total_default:
+        summed = _sum_w2_box1_for_year(year_docs)
+        status = str(summed.get("status") or "")
+        if status == "ok":
+            total = _format_decimal_money(Decimal(summed["total"]))
+            source_rows = list(summed.get("sources") or [])
+            answer = style_answer(
+                f"Total income ({year}): {total}",
+                no_color,
             )
-        return {
-            "response": "\n".join(out),
-            "guardrail_no_match": False,
-            "guardrail_reason": "income_line11_fallback",
-            "requested_year": year,
-            "requested_form": "1040",
-            "requested_line": "11",
-            "num_docs": 1,
-            "receipt_metas": [meta11] if meta11 else None,
-        }
+            out = [
+                answer,
+                "",
+                dim(no_color, "---"),
+                label_style(no_color, f"Answered by: {source_label}"),
+            ]
+            if source_rows:
+                out.extend(["", bold(no_color, "Sources:")])
+                for doc, meta in source_rows[:8]:
+                    out.append(format_source(doc, meta, None, include_snippet=False, no_color=no_color))
+                if len(source_rows) > 8:
+                    out.append(dim(no_color, f"... ({len(source_rows) - 8} more W-2 sources omitted)"))
+            return {
+                "response": "\n".join(out),
+                "guardrail_no_match": False,
+                "guardrail_reason": "income_w2_box1_sum_fallback",
+                "requested_year": year,
+                "requested_form": "W-2",
+                "requested_line": "box 1 (sum)",
+                "num_docs": len(source_rows),
+                "receipt_metas": [m for _d, m in source_rows if m][:8] if source_rows else None,
+            }
+        if status == "conflict":
+            conflict_sources = list(summed.get("sources") or [])
+            answer = style_answer(
+                f"I found conflicting Box 1 wage values in {year} W-2 evidence, so I did not sum them.",
+                no_color,
+            )
+            out = [
+                answer,
+                "",
+                dim(no_color, "---"),
+                label_style(no_color, f"Answered by: {source_label}"),
+            ]
+            if conflict_sources:
+                out.extend(["", bold(no_color, "Sources:")])
+                for doc, meta in conflict_sources[:8]:
+                    out.append(format_source(doc, meta, None, include_snippet=False, no_color=no_color))
+            return {
+                "response": "\n".join(out),
+                "guardrail_no_match": True,
+                "guardrail_reason": "income_w2_box1_sum_conflict",
+                "requested_year": year,
+                "requested_form": "W-2",
+                "requested_line": "box 1 (sum)",
+                "num_docs": len(conflict_sources),
+                "receipt_metas": [m for _d, m in conflict_sources if m][:8] if conflict_sources else None,
+            }
+
+    if not prefers_total_default:
+        val11, meta11 = _scan_line("11")
+        if val11:
+            answer = style_answer(f"Form 1040 line 11 (AGI) ({year}) [fallback from line 9]: {val11}", no_color)
+            out = [
+                answer,
+                "",
+                dim(no_color, "---"),
+                label_style(no_color, f"Answered by: {source_label}"),
+            ]
+            if meta11:
+                out.extend(
+                    [
+                        "",
+                        bold(no_color, "Sources:"),
+                        format_source("", meta11, None, no_color=no_color),
+                    ]
+                )
+            return {
+                "response": "\n".join(out),
+                "guardrail_no_match": False,
+                "guardrail_reason": "income_line11_fallback",
+                "requested_year": year,
+                "requested_form": "1040",
+                "requested_line": "11",
+                "num_docs": 1,
+                "receipt_metas": [meta11] if meta11 else None,
+            }
 
     response = (
         f"I can't find a single income field for {year}. "

@@ -78,6 +78,31 @@ def test_format_source_includes_location_and_score():
     assert "0.50" in out
 
 
+def test_format_source_can_omit_snippet():
+    out = format_source(
+        doc="line1\nline2",
+        meta={"source": "/tmp/test.txt", "line_start": 7},
+        distance=None,
+        include_snippet=False,
+        no_color=True,
+    )
+    assert "test.txt" in out or "/tmp/test.txt" in out
+    assert "(line 7)" in out
+    assert "\n    " not in out
+
+
+def test_format_source_omits_blank_snippet_line_when_doc_empty():
+    out = format_source(
+        doc="",
+        meta={"source": "/tmp/test.txt", "line_start": 7},
+        distance=None,
+        no_color=True,
+    )
+    assert "test.txt" in out or "/tmp/test.txt" in out
+    assert "(line 7)" in out
+    assert "\n    " not in out
+
+
 def test_snippet_preview_truncates_and_flattens():
     text = "a\nb\nc " + ("x" * 300)
     out = snippet_preview(text, max_len=32)

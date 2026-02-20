@@ -1417,7 +1417,7 @@ def run_ask(
             source_label=source_label,
             no_color=no_color,
         )
-        if guardrail is not None and not guardrail.get("guardrail_no_match"):
+        if guardrail is not None:
             time_ms = (time.perf_counter() - t0) * 1000
             write_trace(
                 intent=intent,
@@ -1440,9 +1440,6 @@ def run_ask(
             )
             response_text = str(guardrail["response"])
             return _quiet_text_only(response_text) if quiet else response_text
-        # guardrail_no_match=True: fall through to LLM with year-filtered docs (no vector search)
-        if guardrail and guardrail.get("year_docs_for_llm"):
-            _money_year_docs_override = guardrail["year_docs_for_llm"]
 
     # Deterministic project count (no LLM).
     if intent == INTENT_PROJECT_COUNT:

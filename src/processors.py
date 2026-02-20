@@ -73,11 +73,25 @@ _MAX_HINT_LINE_NUMBER = 80
 _OCR_LABEL = "OCR text (scan fallback):"
 _PADDLE_OCR_ENGINE: Any | None = None
 _PADDLE_OCR_INIT_ATTEMPTED = False
+_PADDLE_OCR_USE_ANGLE: bool | None = None
+_OCR_PREPROCESS_WARNED: set[str] = set()
+_PROCESSOR_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+
+def _processor_min_log_level() -> str:
+    raw = (os.environ.get("LLMLIBRARIAN_PROCESSOR_LOG_LEVEL") or "WARN").strip().upper()
+    if raw == "WARNING":
+        raw = "WARN"
+    return raw if raw in _PROCESSOR_LOG_LEVELS else "WARN"
 
 
 def _log_processor_event(level: str, message: str, **fields: Any) -> None:
     """Write structured processor events in the same JSON-lines style as ingest logs."""
-    payload = {"ts": datetime.now(timezone.utc).isoformat(), "level": level, "message": message}
+    normalized_level = str(level or "INFO").upper()
+    min_level = _processor_min_log_level()
+    if _PROCESSOR_LOG_LEVELS.get(normalized_level, 20) < _PROCESSOR_LOG_LEVELS[min_level]:
+        return
+    payload = {"ts": datetime.now(timezone.utc).isoformat(), "level": normalized_level, "message": message}
     if fields:
         payload.update(fields)
     try:
@@ -86,16 +100,33 @@ def _log_processor_event(level: str, message: str, **fields: Any) -> None:
         pass
 
 
+def _log_warn_once(key: str, message: str, **fields: Any) -> None:
+    """Emit a warning once per process for noisy repeated failures."""
+    if key in _OCR_PREPROCESS_WARNED:
+        return
+    _OCR_PREPROCESS_WARNED.add(key)
+    _log_processor_event("WARN", message, **fields)
+
+
 def _pdf_tables_enabled() -> bool:
     # Default OFF: table extraction via pdfplumber is expensive and noisy on malformed/scanned PDFs.
     val = os.environ.get("LLMLIBRARIAN_PDF_TABLES", "0").strip().lower()
     return val not in ("0", "false", "no")
 
 
+def _ocr_preprocess_enabled() -> bool:
+    """Whether OCR preprocessing and enhanced OCR mode is enabled."""
+    val = os.environ.get("LLMLIBRARIAN_OCR_PREPROCESS", "0").strip().lower()
+    return val not in ("0", "false", "no")
+
+
 def _paddleocr_available() -> bool:
     """True when paddleocr is importable in the current environment."""
     try:
-        return importlib.util.find_spec("paddleocr") is not None
+        return (
+            importlib.util.find_spec("paddleocr") is not None
+            and importlib.util.find_spec("paddle") is not None
+        )
     except Exception:
         return False
 
@@ -115,18 +146,114 @@ def _available_ocr_backends() -> list[str]:
     return out
 
 
+def _alnum_ratio(s: str) -> float:
+    if not s:
+        return 0.0
+    alnum = sum(1 for c in s if c.isalnum() or c in " $.,")
+    return alnum / len(s)
+
+
+def _preprocess_image_for_ocr(image_bytes: bytes) -> bytes:
+    """Apply OpenCV-based cleanup to scanned pages before OCR."""
+    steps: list[str] = []
+    try:
+        try:
+            import cv2
+            import numpy as np
+        except Exception as e:
+            _log_warn_once(
+                "ocr_preprocess_import",
+                "OCR preprocessing unavailable; missing optional dependencies",
+                error=str(e),
+                extractor="opencv",
+            )
+            return image_bytes
+
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if image is None:
+            _log_warn_once(
+                "ocr_preprocess_decode",
+                "OCR preprocessing decode failed; using original page image",
+                extractor="opencv",
+            )
+            return image_bytes
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        steps.append("grayscale")
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        steps.append("denoise")
+        blurred = cv2.GaussianBlur(denoised, (3, 3), 0)
+        steps.append("gaussian_blur")
+        _threshold, binarized = cv2.threshold(
+            blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        steps.append("otsu_binarize")
+
+        deskewed = binarized
+        coords = np.column_stack(np.where(binarized < 128))
+        if len(coords) > 5:
+            rect = cv2.minAreaRect(coords.astype("float32"))
+            raw_angle = float(rect[-1])
+            angle = -(90.0 + raw_angle) if raw_angle < -45.0 else -raw_angle
+            if 0.5 < abs(angle) < 15.0:
+                h, w = binarized.shape[:2]
+                center = (w / 2.0, h / 2.0)
+                matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+                deskewed = cv2.warpAffine(
+                    binarized,
+                    matrix,
+                    (w, h),
+                    flags=cv2.INTER_CUBIC,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+                steps.append(f"deskew({angle:.1f}deg)")
+
+        ok, encoded = cv2.imencode(".png", deskewed)
+        if not ok:
+            _log_warn_once(
+                "ocr_preprocess_encode",
+                "OCR preprocessing encode failed; using original page image",
+                extractor="opencv",
+            )
+            return image_bytes
+
+        if steps:
+            _log_processor_event("DEBUG", "OCR preprocessing applied", steps=steps)
+        return encoded.tobytes()
+    except Exception as e:
+        _log_warn_once(
+            "ocr_preprocess_error",
+            "OCR preprocessing failed; using original page image",
+            error=str(e),
+            extractor="opencv",
+        )
+        return image_bytes
+
+
 def _get_paddle_ocr_engine() -> Any | None:
     """Lazy-init PaddleOCR engine once per process; returns None when unavailable."""
-    global _PADDLE_OCR_ENGINE, _PADDLE_OCR_INIT_ATTEMPTED
-    if _PADDLE_OCR_INIT_ATTEMPTED:
+    global _PADDLE_OCR_ENGINE, _PADDLE_OCR_INIT_ATTEMPTED, _PADDLE_OCR_USE_ANGLE
+    use_angle = _ocr_preprocess_enabled()
+    if _PADDLE_OCR_INIT_ATTEMPTED and _PADDLE_OCR_USE_ANGLE == use_angle:
         return _PADDLE_OCR_ENGINE
     _PADDLE_OCR_INIT_ATTEMPTED = True
+    _PADDLE_OCR_USE_ANGLE = use_angle
     if not _paddleocr_available():
+        _PADDLE_OCR_ENGINE = None
         return None
     try:
+        # Avoid startup network checks in local/offline workflows.
+        os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
         from paddleocr import PaddleOCR
 
-        _PADDLE_OCR_ENGINE = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
+        try:
+            _PADDLE_OCR_ENGINE = PaddleOCR(use_angle_cls=use_angle, lang="en", show_log=False)
+        except Exception as e:
+            # PaddleOCR versions differ on constructor kwargs (e.g., no show_log).
+            if "show_log" not in str(e):
+                raise
+            _PADDLE_OCR_ENGINE = PaddleOCR(use_angle_cls=use_angle, lang="en")
     except Exception as e:
         _PADDLE_OCR_ENGINE = None
         _log_processor_event(
@@ -174,7 +301,8 @@ def _ocr_with_paddle(image_png: bytes) -> str | None:
         with tempfile.TemporaryDirectory() as td:
             image_path = Path(td) / "page.png"
             image_path.write_bytes(image_png)
-            result = engine.ocr(str(image_path), cls=False)
+            use_angle = _ocr_preprocess_enabled()
+            result = engine.ocr(str(image_path), cls=use_angle)
         text = _extract_paddleocr_text(result)
         return text or None
     except Exception as e:
@@ -194,31 +322,57 @@ def _ocr_with_tesseract(image_png: bytes) -> str | None:
     try:
         with tempfile.TemporaryDirectory() as td:
             image_path = Path(td) / "page.png"
-            output_base = Path(td) / "ocr_out"
             image_path.write_bytes(image_png)
-            cmd = [
-                "tesseract",
-                str(image_path),
-                str(output_base),
-                "-l",
-                "eng",
-                "--psm",
-                "6",
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                _log_processor_event(
-                    "WARN",
-                    "tesseract OCR failed",
-                    error=(proc.stderr or "").strip()[:240],
-                    extractor="tesseract",
-                )
-                return None
-            out_path = output_base.with_suffix(".txt")
-            if not out_path.exists():
-                return None
-            text = out_path.read_text(encoding="utf-8", errors="replace").strip()
-            return text or None
+
+            def _run_tesseract(psm: str) -> str | None:
+                output_base = Path(td) / f"ocr_out_psm{psm}"
+                cmd = [
+                    "tesseract",
+                    str(image_path),
+                    str(output_base),
+                    "-l",
+                    "eng",
+                    "--psm",
+                    psm,
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    _log_processor_event(
+                        "WARN",
+                        "tesseract OCR failed",
+                        error=(proc.stderr or "").strip()[:240],
+                        extractor="tesseract",
+                        psm=psm,
+                    )
+                    return None
+                out_path = output_base.with_suffix(".txt")
+                if not out_path.exists():
+                    return None
+                text = out_path.read_text(encoding="utf-8", errors="replace").strip()
+                return text or None
+
+            if not _ocr_preprocess_enabled():
+                return _run_tesseract("6")
+
+            text_6 = _run_tesseract("6")
+            text_11 = _run_tesseract("11")
+            ratio_6 = _alnum_ratio(text_6 or "")
+            ratio_11 = _alnum_ratio(text_11 or "")
+
+            chosen_psm = "6"
+            chosen_text = text_6
+            if text_11 and (not chosen_text or ratio_11 > ratio_6):
+                chosen_psm = "11"
+                chosen_text = text_11
+
+            _log_processor_event(
+                "DEBUG",
+                "tesseract OCR PSM comparison",
+                psm_6_ratio=round(ratio_6, 4),
+                psm_11_ratio=round(ratio_11, 4),
+                chosen_psm=chosen_psm if chosen_text else None,
+            )
+            return chosen_text
     except Exception as e:
         _log_processor_event(
             "WARN",
@@ -231,8 +385,10 @@ def _ocr_with_tesseract(image_png: bytes) -> str | None:
 
 def _ocr_pdf_page_text(page: Any, source_path: str) -> tuple[str | None, str | None]:
     """OCR fallback for image-only PDF pages. Returns (text, backend) or (None, None)."""
+    use_preprocess = _ocr_preprocess_enabled()
     try:
-        image_png = page.get_pixmap(dpi=300, alpha=False).tobytes("png")
+        dpi = 400 if use_preprocess else 300
+        image_png = page.get_pixmap(dpi=dpi, alpha=False).tobytes("png")
     except Exception as e:
         _log_processor_event(
             "WARN",
@@ -243,29 +399,19 @@ def _ocr_pdf_page_text(page: Any, source_path: str) -> tuple[str | None, str | N
         )
         return None, None
 
-    paddle_text: str | None = None
+    if use_preprocess:
+        image_png = _preprocess_image_for_ocr(image_png)
+
     if _paddleocr_available():
         paddle_text = _ocr_with_paddle(image_png)
-    tess_text: str | None = None
+        if paddle_text:
+            return paddle_text, "paddleocr"
+
     if _tesseract_available():
         tess_text = _ocr_with_tesseract(image_png)
-    # Pick the better result: prefer the one with more alphanumeric content.
-    # PaddleOCR can produce garbled output on structured forms; tesseract with psm 6 often does better.
-    def _alnum_ratio(s: str) -> float:
-        if not s:
-            return 0.0
-        alnum = sum(1 for c in s if c.isalnum() or c in " $.,")
-        return alnum / len(s)
-    if paddle_text and tess_text:
-        pr = _alnum_ratio(paddle_text)
-        tr = _alnum_ratio(tess_text)
-        if tr > pr + 0.15:  # tesseract is meaningfully cleaner
+        if tess_text:
             return tess_text, "tesseract"
-        return paddle_text, "paddleocr"
-    if paddle_text:
-        return paddle_text, "paddleocr"
-    if tess_text:
-        return tess_text, "tesseract"
+
     return None, None
 
 

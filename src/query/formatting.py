@@ -357,6 +357,7 @@ def format_source(
     doc: str,
     meta: dict | None,
     distance: float | None,
+    include_snippet: bool = True,
     no_color: bool = True,
 ) -> str:
     """Format one source: short path (with file:// hyperlink when TTY), line/page, score, and a one-line snippet."""
@@ -364,7 +365,7 @@ def format_source(
     display_path = shorten_path(source_val)
     line = (meta or {}).get("line_start")
     page = (meta or {}).get("page")
-    snippet = snippet_preview(doc or "")
+    snippet = snippet_preview(doc or "") if include_snippet else ""
     loc = ""
     if page is not None:
         loc = f" (page {page})"
@@ -380,5 +381,7 @@ def format_source(
     file_url = source_url(source_val, line=line, page=page)
     path_part = link_style(no_color, file_url, display_path)
     meta_part = dim(no_color, f"{loc}{score_str}")
-    snippet_part = dim(no_color, snippet)
-    return f"  \u2022 {path_part}{meta_part}\n    {snippet_part}"
+    if snippet:
+        snippet_part = dim(no_color, snippet)
+        return f"  \u2022 {path_part}{meta_part}\n    {snippet_part}"
+    return f"  \u2022 {path_part}{meta_part}"
