@@ -13,6 +13,7 @@ import json
 import csv
 import os
 import re
+import shutil
 import sys
 import tempfile
 import traceback
@@ -96,6 +97,22 @@ def get_capabilities_text() -> str:
     lines = ["Supported file extensions (indexed by llmli add):", "  " + ", ".join(exts), ""]
     lines.append("Document extractors:")
     lines.append("  PDF: yes (pymupdf)")
+    has_paddle = False
+    try:
+        import importlib.util
+
+        has_paddle = importlib.util.find_spec("paddleocr") is not None
+    except Exception:
+        has_paddle = False
+    has_tesseract = bool(shutil.which("tesseract"))
+    if has_paddle and has_tesseract:
+        lines.append("  PDF OCR fallback: yes (paddleocr -> tesseract)")
+    elif has_paddle:
+        lines.append("  PDF OCR fallback: partial (paddleocr only; tesseract not found)")
+    elif has_tesseract:
+        lines.append("  PDF OCR fallback: partial (tesseract only; paddleocr not installed)")
+    else:
+        lines.append("  PDF OCR fallback: no (install paddleocr or tesseract for scanned/image PDFs)")
     lines.append("  DOCX: yes (python-docx)")
     lines.append("  ZIP: yes (PDF/DOCX/XLSX/PPTX + text inside)")
     try:
@@ -396,6 +413,17 @@ def _chunk_hash(text: str) -> str:
 def _stable_chunk_id(source_path: str, mtime: float, chunk_index: int) -> str:
     key = f"{source_path}|{mtime}|{chunk_index}"
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+
+
+def _flatten_get_values(values: Any) -> list[Any]:
+    """Normalize Chroma get() values to a flat list."""
+    if not values:
+        return []
+    if isinstance(values, list) and values and isinstance(values[0], list):
+        return list(values[0])
+    if isinstance(values, list):
+        return list(values)
+    return []
 
 
 def _is_local(source_path: str) -> int:
@@ -984,7 +1012,12 @@ def run_index(
                 files_indexed += 1
                 print(success_style(no_color, f"  ✅ {path.name} ({len(chunks)} chunks)"))
             elif kind == "pdf":
-                print(warn_style(no_color, f"  ⚠️ {path.name}: no extractable text (encrypted, image-only, or empty)"))
+                print(
+                    warn_style(
+                        no_color,
+                        f"  ⚠️ {path.name}: no extractable text (image-only, empty, or OCR unavailable)",
+                    )
+                )
 
     # 4. Process ZIPs in main thread (limits, encrypted check)
     for zip_path in zips:
@@ -1160,27 +1193,28 @@ def run_add(
             stat = p_res.stat()
             mtime = stat.st_mtime
             size = stat.st_size
+            h = get_file_hash(p_res)
             if incremental:
                 prev = manifest_files.get(str(p_res)) if isinstance(manifest_files, dict) else None
                 if prev and prev.get("mtime") == mtime and prev.get("size") == size:
-                    continue
-            h = get_file_hash(p_res)
+                    if not h:
+                        continue
+                    existing_same = any(
+                        str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") == str(p_res)
+                        for e in _file_registry_get(db_path, h)
+                    )
+                    if existing_same:
+                        continue
             if not h:
                 regular_with_hash.append((p, k, "", p_res))
                 continue
-            existing = _file_registry_get(db_path, h)
-            if existing:
-                other = existing[0]
-                if other.get("silo") != silo_slug:
-                    print(dim(no_color, f"  SKIPPING: {p_res.name} already indexed in [silo: {other.get('silo', '?')}]"))
-                    skipped += 1
-                    continue
             regular_with_hash.append((p, k, h, p_res))
         except OSError:
             regular_with_hash.append((p, k, "", None))
 
     if incremental and isinstance(manifest_files, dict):
-        for _p, _k, _h, p_res in regular_with_hash:
+        cleanup_targets: list[Path] = [p_res for _p, _k, _h, p_res in regular_with_hash if p_res is not None]
+        for p_res in cleanup_targets:
             if p_res is None:
                 continue
             path_str = str(p_res)
@@ -1233,14 +1267,22 @@ def run_add(
                 print(f"[llmli] FAIL {p}: {e}", file=sys.stderr)
                 continue
             if chunks:
-                for _id, doc, meta in chunks:
-                    meta["silo"] = silo_slug
+                chunks = [
+                    (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug})
+                    for cid, doc, meta in chunks
+                ]
                 all_chunks.extend(chunks)
                 files_indexed += 1
                 if fhash:
                     to_register.append((fhash, str(p)))
             elif kind == "pdf":
-                print(warn_style(no_color, f"  ⚠️ {p.name}: no extractable text"), file=sys.stderr)
+                print(
+                    warn_style(
+                        no_color,
+                        f"  ⚠️ {p.name}: no extractable text (image-only, empty, or OCR unavailable)",
+                    ),
+                    file=sys.stderr,
+                )
 
     for fhash, path_str in to_register:
         _file_registry_add(db_path, fhash, silo_slug, path_str)
@@ -1277,8 +1319,10 @@ def run_add(
             print(f"[llmli] FAIL {zip_path}: {e}", file=sys.stderr)
             continue
         if chunks:
-            for _id, doc, meta in chunks:
-                meta["silo"] = silo_slug
+            chunks = [
+                (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug})
+                for cid, doc, meta in chunks
+            ]
             all_chunks.extend(chunks)
             files_indexed += 1
 
@@ -1569,15 +1613,17 @@ def update_single_file(
     file_hash = ""
     if kind != "zip":
         file_hash = get_file_hash(p)
+        if prev and prev.get("mtime") == mtime and prev.get("size") == size:
+            if not file_hash:
+                return ("unchanged", path_str)
+            existing_same = any(
+                str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") == path_str
+                for e in _file_registry_get(db_path, file_hash)
+            )
+            if prev.get("hash") == file_hash and existing_same:
+                return ("unchanged", path_str)
         if file_hash:
             existing = _file_registry_get(db_path, file_hash)
-            if existing:
-                other = existing[0]
-                if other.get("silo") != silo_slug:
-                    return ("duplicate", path_str)
-        if prev and prev.get("mtime") == mtime and prev.get("size") == size:
-            if not file_hash or prev.get("hash") == file_hash:
-                return ("unchanged", path_str)
     else:
         if prev and prev.get("mtime") == mtime and prev.get("size") == size:
             return ("unchanged", path_str)
@@ -1618,8 +1664,10 @@ def update_single_file(
             chunks = []
 
     if chunks:
-        for _id, _doc, meta in chunks:
-            meta["silo"] = silo_slug
+        chunks = [
+            (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug})
+            for cid, doc, meta in chunks
+        ]
         batch_size = ADD_BATCH_SIZE
         try:
             batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))

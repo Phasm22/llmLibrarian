@@ -19,6 +19,7 @@ Current deterministic query families:
 - Project count
 - File-list by year
 - Structure snapshots (`outline`, `recent`, `inventory`, extension counts)
+- Income-year guardrails (1040 line 9/11 and employer-scoped W-2 wage extraction)
 - Direct value guardrails (when extraction is confident)
 
 For deterministic structure asks:
@@ -49,6 +50,15 @@ Lock files:
 
 If `LLMLIBRARIAN_TRACE` is set, asks append JSON-lines traces.
 Trace includes `answer_kind` (`catalog_artifact`, `guardrail`, or `rag`).
+
+## OCR Observability
+
+- PDF extraction uses PyMuPDF text first.
+- For image-only pages, OCR fallback is attempted in deterministic order:
+  1) PaddleOCR (if installed), then
+  2) `tesseract` CLI (if available).
+- OCR availability/fallback outcomes are logged as structured processor events.
+- Missing OCR backends do not fail ingestion; indexing continues with warnings.
 
 ## Environment Variables (most used)
 

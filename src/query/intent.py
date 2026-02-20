@@ -144,10 +144,16 @@ def route_intent(query: str) -> str:
             q,
         )
     )
+    has_make_earn = bool(
+        re.search(
+            r"\bhow\s+much\b[^\n]{0,80}\b(?:make|made|earn|earned|paid)\b",
+            q,
+        )
+    )
     has_year_only = bool(re.search(r"\b20\d{2}\b", q))
     lacks_line = not has_line
     lacks_form = not has_form
-    if has_year_only and has_income and lacks_line and lacks_form:
+    if has_year_only and (has_income or has_make_earn) and lacks_line and lacks_form:
         return INTENT_MONEY_YEAR_TOTAL
     # PROJECT_COUNT: how many coding projects in this folder/silo
     if re.search(r"\bhow\s+(many|much)\b", q) and re.search(r"\bprojects?\b", q):

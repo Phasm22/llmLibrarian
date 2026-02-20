@@ -483,7 +483,14 @@ def _confidence_assessment(
         elif intent == INTENT_LOOKUP and direct_canonical_available and confidence_relaxation_enabled:
             warning = None
             reason = "relaxed_canonical"
-        elif intent == INTENT_LOOKUP and query_overlap and not explicit_unified:
+        elif (
+            intent == INTENT_LOOKUP
+            and query_overlap
+            and not explicit_unified
+            and top_distance is not None
+            and top_distance <= 0.6
+            and overlap_support >= 0.34
+        ):
             warning = None
             reason = "relaxed_overlap"
         else:
@@ -1399,6 +1406,7 @@ def run_ask(
             return _quiet_text_only(response_text) if quiet else response_text
 
     # Trust-first deterministic income plan for broad income-in-year queries.
+    _money_year_docs_override: list[tuple[str, dict | None]] | None = None
     if intent == INTENT_MONEY_YEAR_TOTAL:
         guardrail = run_income_year_total_guardrail(
             collection=collection,
@@ -1409,7 +1417,7 @@ def run_ask(
             source_label=source_label,
             no_color=no_color,
         )
-        if guardrail is not None:
+        if guardrail is not None and not guardrail.get("guardrail_no_match"):
             time_ms = (time.perf_counter() - t0) * 1000
             write_trace(
                 intent=intent,
@@ -1432,6 +1440,9 @@ def run_ask(
             )
             response_text = str(guardrail["response"])
             return _quiet_text_only(response_text) if quiet else response_text
+        # guardrail_no_match=True: fall through to LLM with year-filtered docs (no vector search)
+        if guardrail and guardrail.get("year_docs_for_llm"):
+            _money_year_docs_override = guardrail["year_docs_for_llm"]
 
     # Deterministic project count (no LLM).
     if intent == INTENT_PROJECT_COUNT:
@@ -1522,6 +1533,13 @@ def run_ask(
         metas = (results.get("metadatas") or [[]])[0] or []
         dists = (results.get("distances") or [[]])[0] or []
         ids_v = (results.get("ids") or [[]])[0] or [] if include_ids else []
+    # MONEY_YEAR_TOTAL fallthrough: replace vector results with deterministic year-filtered docs
+    # so wrong-year chunks don't crowd out 2025 W-2s/1099s when the collection has many years.
+    if _money_year_docs_override:
+        docs = [str(d) for d, _ in _money_year_docs_override]
+        metas = [m for _, m in _money_year_docs_override]
+        dists = [0.35] * len(docs)  # synthetic low distance = treat as high-confidence match
+        ids_v = []
     weak_scope_gate = False
     catalog_retry_used = False
     catalog_retry_silo: str | None = None
@@ -1744,8 +1762,14 @@ def run_ask(
 
     # Diversify by source: cap chunks per file so one huge file (e.g. Closed Traffic.txt) doesn't crowd out others
     source_cache = [((m or {}).get("source") or "") for m in metas]
-    per_intent_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
-    diversity_top_k = n_stage1 if unified_analytical_query else n_results
+    if _money_year_docs_override:
+        # Year-filtered income query: ensure every source file gets at least one chunk in context.
+        # Use 3 chunks/file (cover + detail pages) with a large top_k so no source is dropped.
+        per_intent_cap = 3
+        diversity_top_k = max(48, len(docs))
+    else:
+        per_intent_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
+        diversity_top_k = n_stage1 if unified_analytical_query else n_results
     docs, metas, dists = diversify_by_source(
         docs,
         metas,
@@ -1862,7 +1886,8 @@ def run_ask(
             return _quiet_text_only(response_text) if quiet else response_text
 
     # Recency + doc_type tie-breaker: only when query implies recency; apply after diversity so caps are preserved
-    if docs and query_implies_recency(query):
+    # Skip for money-year override: docs are already year-filtered so recency truncation would drop W-2s.
+    if docs and query_implies_recency(query) and not _money_year_docs_override:
         combined_list: list[tuple[float, str, dict | None, float | None]] = []
         for i, doc in enumerate(docs):
             meta = metas[i] if i < len(metas) else None
@@ -2038,6 +2063,14 @@ def run_ask(
             + f"\n\nI can't prove completeness; only {unique_sources} source(s) in context."
         )
 
+    if _money_year_docs_override:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nAll context chunks are from year-filtered documents. List every income source found "
+            "(W-2 wages, 1099-INT interest, 1099-DIV dividends, 1099-NEC/MISC self-employment, etc.) "
+            "with its amount. Sum all sources at the end. Do not omit any source present in context."
+        )
+
     recency_hints: list[str] = []
     if recency_hints_requested:
         recency_hints = _build_recency_hints(metas)
@@ -2048,16 +2081,19 @@ def run_ask(
                 + " Do not conclude abandonment from timestamps alone; combine with content evidence."
             )
 
-    predicted_confidence_warning = _confidence_signal(
-        dists,
-        metas,
-        intent,
-        query,
-        docs=docs,
-        explicit_unified=explicit_unified,
-        direct_canonical_available=direct_canonical_available,
-        confidence_relaxation_enabled=confidence_relaxation_enabled,
-        filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
+    predicted_confidence_warning = (
+        None if _money_year_docs_override
+        else _confidence_signal(
+            dists,
+            metas,
+            intent,
+            query,
+            docs=docs,
+            explicit_unified=explicit_unified,
+            direct_canonical_available=direct_canonical_available,
+            confidence_relaxation_enabled=confidence_relaxation_enabled,
+            filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
+        )
     )
     if predicted_confidence_warning and not strict:
         system_prompt = (

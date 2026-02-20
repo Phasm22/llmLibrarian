@@ -57,6 +57,57 @@ DIRECT_QUERY_STOPWORDS = {
     "that",
     "it",
 }
+EMPLOYER_TOKEN_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "from",
+    "at",
+    "in",
+    "on",
+    "my",
+    "me",
+    "i",
+    "did",
+    "do",
+    "does",
+    "was",
+    "were",
+    "is",
+    "are",
+    "to",
+    "of",
+    "by",
+    "llc",
+    "inc",
+    "co",
+    "corp",
+    "corporation",
+    "company",
+    "ltd",
+}
+W2_SOURCE_SIGNALS = ("w-2", "w2", "wage and tax statement", "form w-2")
+W2_WAGE_PATTERNS: tuple[tuple[str, str], ...] = (
+    (
+        "Box 1",
+        # Scanned W-2 OCR layout: value appears on the line BEFORE its box label.
+        # Matches: <number>\n  1 Wages...
+        r"(?m)^\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*\n\s*1\s+[Ww]ages?",
+    ),
+    (
+        "Box 1",
+        r"(?im)\bbox\s*1(?:\s*of\s*w-?2)?\b[^\n]{0,100}?\$?[ \t]*([0-9][0-9,]*(?:\.\d{1,2})?)\b",
+    ),
+    (
+        "Wages, tips, other compensation",
+        # Use [ \t]* (not \s*) before capture so we don't cross line boundaries into the next box value.
+        r"(?im)\bwages?\s*,?\s*tips?\s*,?\s*other\s+comp(?:ensation|\.)?\b[^\n]{0,120}?\$?[ \t]*([0-9][0-9,]*(?:\.\d{1,2})?)\b",
+    ),
+    (
+        "Gross pay",
+        r"(?im)\bgross\s+pay\b[^\n]{0,80}?\$?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\b",
+    ),
+)
 
 
 def parse_csv_rank_request(query: str) -> dict[str, str] | None:
@@ -459,6 +510,81 @@ def _extract_exact_line_value(doc: str, line: str) -> str | None:
     return None
 
 
+def parse_income_employer_request(query: str) -> dict[str, Any] | None:
+    """Parse optional employer phrase from income queries: 'at <employer>' or 'from <employer>'."""
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+    m = re.search(r"\b(?:at|from)\s+([a-z0-9][a-z0-9&'().,\- ]{1,100})", q)
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    raw = re.split(r"[?.!,;]", raw, maxsplit=1)[0]
+    raw = re.sub(r"\b(?:in|for|during|on)\s+20\d{2}\b", "", raw).strip()
+    tokens = [
+        t
+        for t in re.findall(r"[a-z0-9][a-z0-9&'-]*", raw)
+        if t not in EMPLOYER_TOKEN_STOPWORDS and not re.fullmatch(r"20\d{2}", t)
+    ]
+    if not tokens:
+        return None
+    label_parts = [t.upper() if len(t) <= 5 else t.title() for t in tokens]
+    return {"tokens": tokens, "label": " ".join(label_parts)}
+
+
+def _employer_token_hits(text: str, employer_tokens: list[str]) -> int:
+    if not text or not employer_tokens:
+        return 0
+    hay = text.lower()
+    return sum(1 for tok in employer_tokens if tok and tok in hay)
+
+
+def _looks_like_w2_doc(source: str, doc: str) -> bool:
+    hay = f"{source}\n{doc}".lower()
+    return any(sig in hay for sig in W2_SOURCE_SIGNALS)
+
+
+def _normalize_money_value(value: str) -> str | None:
+    if not value:
+        return None
+    v = value.strip().replace("$", "")
+    v = re.sub(r"[^\d,.\-]", "", v)
+    v = re.sub(r"\.+$", "", v)
+    if not re.fullmatch(r"-?\d[\d,]*(?:\.\d{1,2})?", v):
+        return None
+    digits_only = re.sub(r"\D", "", v)
+    # Reject low-signal box/line ordinals (e.g., 1, 2, 3, 4) that appear near W-2 labels.
+    if "." not in v and "," not in v:
+        try:
+            if int(v) < 1000:
+                return None
+        except ValueError:
+            return None
+    if len(digits_only) < 3:
+        return None
+    return v
+
+
+def _extract_w2_wage_candidates(doc: str) -> list[tuple[str, str]]:
+    """Extract deterministic W-2 wage values from a chunk."""
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    text = doc or ""
+    if not text:
+        return out
+    for label, pattern in W2_WAGE_PATTERNS:
+        for m in re.finditer(pattern, text):
+            value = _normalize_money_value(str(m.group(1) or ""))
+            if not value:
+                continue
+            key = (label, value)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out
+
+
 def field_lookup_candidates_from_scope(
     docs: list[str],
     metas: list[dict | None],
@@ -619,6 +745,149 @@ def run_income_year_total_guardrail(
             "receipt_metas": None,
         }
 
+    employer_req = parse_income_employer_request(query)
+    if employer_req:
+        employer_tokens = list(employer_req.get("tokens") or [])
+        employer_label = str(employer_req.get("label") or "requested employer")
+        matched_employer_docs: list[tuple[str, dict | None, int, bool]] = []
+        value_rows: list[dict[str, Any]] = []
+
+        for doc, meta in year_docs:
+            source = str((meta or {}).get("source") or "")
+            haystack = f"{source}\n{doc}".lower()
+            token_hits = _employer_token_hits(haystack, employer_tokens)
+            if token_hits <= 0:
+                continue
+            w2_like = _looks_like_w2_doc(source, doc)
+            matched_employer_docs.append((doc, meta, token_hits, w2_like))
+
+            for field_label, value in _extract_w2_wage_candidates(doc):
+                score = token_hits * 10 + (20 if w2_like else 0)
+                if field_label.lower() == "box 1":
+                    score += 6
+                elif field_label.lower().startswith("wages"):
+                    score += 4
+                value_rows.append(
+                    {
+                        "value": value,
+                        "field_label": field_label,
+                        "score": score,
+                        "doc": doc,
+                        "meta": meta,
+                    }
+                )
+
+        if not matched_employer_docs:
+            response = (
+                f"I found {year} tax documents, but none matched employer '{employer_label}'. "
+                "I did not infer from other employers or years."
+            )
+            response = "\n".join([response, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")])
+            return {
+                "response": response,
+                "guardrail_no_match": True,
+                "guardrail_reason": "income_employer_no_match",
+                "requested_year": year,
+                "requested_form": "W-2",
+                "requested_line": "box 1",
+                "num_docs": 0,
+                "receipt_metas": None,
+            }
+
+        if not value_rows:
+            response = (
+                f"I found {year} documents matching employer '{employer_label}', but I could not extract a single "
+                "W-2 wage value (Box 1 / Wages, tips, other compensation / Gross pay)."
+            )
+            response = "\n".join([response, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")])
+            return {
+                "response": response,
+                "guardrail_no_match": True,
+                "guardrail_reason": "income_employer_no_value",
+                "requested_year": year,
+                "requested_form": "W-2",
+                "requested_line": "box 1",
+                "num_docs": len(matched_employer_docs),
+                "receipt_metas": [m for _d, m, _h, _w in matched_employer_docs if m][:5],
+            }
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for row in value_rows:
+            key = str(row["value"]).lower()
+            g = grouped.get(key)
+            if g is None:
+                grouped[key] = {
+                    "value": row["value"],
+                    "best_score": int(row["score"]),
+                    "row": row,
+                    "count": 1,
+                }
+                continue
+            g["count"] = int(g["count"]) + 1
+            if int(row["score"]) > int(g["best_score"]):
+                g["best_score"] = int(row["score"])
+                g["row"] = row
+
+        ranked = sorted(
+            grouped.values(),
+            key=lambda g: (-int(g["best_score"]), str(g["value"])),
+        )
+        if len(ranked) == 1:
+            selected = ranked[0]["row"]
+            value = str(selected["value"])
+            field_label = str(selected["field_label"])
+            answer = style_answer(
+                f"W-2 wages for {employer_label} ({year}): {value} [{field_label}]",
+                no_color,
+            )
+            out = [
+                answer,
+                "",
+                dim(no_color, "---"),
+                label_style(no_color, f"Answered by: {source_label}"),
+                "",
+                bold(no_color, "Sources:"),
+                format_source(str(selected["doc"]), selected.get("meta"), None, no_color=no_color),
+            ]
+            return {
+                "response": "\n".join(out),
+                "guardrail_no_match": False,
+                "guardrail_reason": "income_employer_w2",
+                "requested_year": year,
+                "requested_form": "W-2",
+                "requested_line": "box 1",
+                "num_docs": 1,
+                "receipt_metas": [selected.get("meta")] if selected.get("meta") else None,
+            }
+
+        conflict_values = ", ".join(str(g["value"]) for g in ranked[:4])
+        answer = style_answer(
+            f"I found conflicting wage values for {employer_label} in {year} ({conflict_values}). "
+            "I am not choosing one value.",
+            no_color,
+        )
+        out = [
+            answer,
+            "",
+            dim(no_color, "---"),
+            label_style(no_color, f"Answered by: {source_label}"),
+            "",
+            bold(no_color, "Sources:"),
+        ]
+        for g in ranked[:4]:
+            row = g["row"]
+            out.append(format_source(str(row["doc"]), row.get("meta"), None, no_color=no_color))
+        return {
+            "response": "\n".join(out),
+            "guardrail_no_match": True,
+            "guardrail_reason": "income_employer_conflict",
+            "requested_year": year,
+            "requested_form": "W-2",
+            "requested_line": "box 1",
+            "num_docs": len(ranked),
+            "receipt_metas": [g["row"].get("meta") for g in ranked if g["row"].get("meta")][:5],
+        }
+
     def _scan_line(line_label: str) -> tuple[str | None, dict | None]:
         for doc, meta in year_docs:
             source = ((meta or {}).get("source") or "").lower()
@@ -699,4 +968,5 @@ def run_income_year_total_guardrail(
         "requested_line": "9",
         "num_docs": len(year_docs),
         "receipt_metas": [m for _d, m in year_docs if m][:5] if year_docs else None,
+        "year_docs_for_llm": year_docs,
     }

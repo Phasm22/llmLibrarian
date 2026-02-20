@@ -6,6 +6,7 @@ from query.intent import (
     INTENT_EVIDENCE_PROFILE,
     INTENT_FIELD_LOOKUP,
     INTENT_FILE_LIST,
+    INTENT_MONEY_YEAR_TOTAL,
     INTENT_STRUCTURE,
     INTENT_LOOKUP,
 )
@@ -1533,6 +1534,31 @@ def test_run_ask_field_lookup_exact_match_is_value_first(monkeypatch, mock_colle
     assert "Form 1040 line 9 (2024): 7,522." in out
     assert "2024 Federal Income Tax Return.pdf" in out
     assert mock_ollama["calls"] == []
+
+
+def test_run_ask_income_employer_guardrail_short_circuits_llm(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_MONEY_YEAR_TOTAL)
+    mock_collection.get_result = {
+        "ids": ["id-1"],
+        "documents": [
+            "Form W-2 Wage and Tax Statement\nEmployer: YMCA\nBox 1 of W-2: 4,626.76",
+        ],
+        "metadatas": [
+            {"source": "/Users/x/Tax/2025/ymca-w2-2025.pdf", "silo": "tax"},
+        ],
+    }
+
+    out = run_ask(
+        archetype_id=None,
+        query="how much did i make in 2025 at ymca",
+        no_color=True,
+        use_reranker=False,
+        silo="tax",
+    )
+    assert "W-2 wages for YMCA (2025): 4,626.76 [Box 1]" in out
+    assert mock_ollama["calls"] == []
+    assert not any(name == "query" for name, _kwargs in mock_collection.calls)
 
 
 def test_run_ask_csv_rank_guardrail_short_circuits_llm(monkeypatch, mock_collection, mock_ollama):

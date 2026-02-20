@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from ingest import CloudSyncPathError, _file_manifest_path, run_add
+from file_registry import _file_registry_path
 
 
 class _FakeCollection:
@@ -79,7 +80,7 @@ def test_run_add_writes_status_file(monkeypatch, tmp_path):
     assert payload["failures"] == 0
 
 
-def test_run_add_skips_cross_silo_duplicates(monkeypatch, tmp_path):
+def test_run_add_reuses_cross_silo_duplicates(monkeypatch, tmp_path):
     root = tmp_path / "docs"
     root.mkdir()
     f = root / "a.txt"
@@ -90,14 +91,38 @@ def test_run_add_skips_cross_silo_duplicates(monkeypatch, tmp_path):
 
     monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [(f, "code")])
     monkeypatch.setattr("ingest.get_file_hash", lambda _p: "hash-1")
-    monkeypatch.setattr("ingest._file_registry_get", lambda _db, _h: [{"silo": "other", "path": "/tmp/other"}])
+    monkeypatch.setattr(
+        "ingest._file_registry_get",
+        lambda _db, _h: [{"silo": "other", "path": str(f.resolve())}],
+    )
+    monkeypatch.setattr(
+        "ingest._clone_chunks_from_existing_silo",
+        lambda **_kwargs: [
+            (
+                "id-1",
+                "hello",
+                {
+                    "source": str(f.resolve()),
+                    "source_path": str(f.resolve()),
+                    "mtime": f.resolve().stat().st_mtime,
+                    "chunk_hash": "h",
+                    "file_id": "a.txt",
+                    "line_start": 1,
+                    "is_local": 1,
+                    "doc_type": "other",
+                    "content_extracted": 1,
+                    "silo": "docs",
+                },
+            )
+        ],
+    )
     monkeypatch.setattr(
         "ingest.process_one_file",
         lambda *a, **k: called.__setitem__("process", called["process"] + 1) or [],
     )
 
     files_indexed, failures = run_add(root, db_path=tmp_path / "db", allow_cloud=True)
-    assert files_indexed == 0
+    assert files_indexed == 1
     assert failures == 0
     assert called["process"] == 0
 
@@ -148,6 +173,18 @@ def test_run_add_incremental_skips_unchanged_files(monkeypatch, tmp_path):
         ),
         encoding="utf-8",
     )
+    registry_path = _file_registry_path(db_path)
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "by_hash": {
+                    "h1": [{"silo": "silo-fixed", "path": str(f.resolve())}],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
 
     coll = _FakeCollection()
     _patch_runtime(monkeypatch, coll)
@@ -155,6 +192,7 @@ def test_run_add_incremental_skips_unchanged_files(monkeypatch, tmp_path):
     monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _path: None)
     monkeypatch.setattr("state.slugify", lambda _name, _path=None: "silo-fixed")
     monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [(f, "code")])
+    monkeypatch.setattr("ingest.get_file_hash", lambda _p: "h1")
     monkeypatch.setattr("ingest.process_one_file", lambda *a, **k: called.__setitem__("process", 1) or [])
 
     files_indexed, failures = run_add(root, db_path=db_path, allow_cloud=True, incremental=True)

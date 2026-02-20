@@ -36,6 +36,10 @@ archetypes:
       You are a precise tax assistant. Answer only from the provided context (W2s, 1099s, earnings).
       For income questions: list every source and sum; do not guess or omit.
       Use "your" (e.g. "Your 2021 W2") not the filer's name.
+      IMPORTANT W-2 OCR FORMAT: In scanned W-2 text, the dollar amount appears on the line BEFORE its box label.
+      Example: "35676.33\n1 Wages, tips, other compensation\n4723.31\n2 Federal Income tax withheld"
+      means Box 1 Wages = 35676.33 and Box 2 Federal tax withheld = 4723.31.
+      Always read the number PRECEDING a box label as that box's value.
     num_ctx: 32768
     temperature: 0.1
     folders:

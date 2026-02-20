@@ -58,3 +58,43 @@ def test_remove_single_file_deletes(monkeypatch, mock_collection, db_path: Path,
 
     delete_calls = [c for c in mock_collection.calls if c[0] == "delete"]
     assert delete_calls
+
+
+def test_update_single_file_reuses_cross_silo_duplicate(monkeypatch, mock_collection, db_path: Path, tmp_path: Path):
+    _patch_ingest_runtime(monkeypatch, mock_collection)
+    target = tmp_path / "note.txt"
+    target.write_text("hello world", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "ingest._file_registry_get",
+        lambda _db, _h: [{"silo": "documents", "path": str(target.resolve())}],
+    )
+    monkeypatch.setattr(
+        "ingest._clone_chunks_from_existing_silo",
+        lambda **_kwargs: [
+            (
+                "id-1",
+                "hello world",
+                {
+                    "source": str(target.resolve()),
+                    "source_path": str(target.resolve()),
+                    "mtime": target.resolve().stat().st_mtime,
+                    "chunk_hash": "h",
+                    "file_id": "note.txt",
+                    "line_start": 1,
+                    "is_local": 1,
+                    "doc_type": "other",
+                    "content_extracted": 1,
+                    "silo": "__self__",
+                },
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "ingest.process_one_file",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not re-extract when clone succeeds")),
+    )
+
+    status, _ = update_single_file(target, db_path=db_path, silo_slug="__self__", allow_cloud=True)
+    assert status == "updated"
+    assert any(name == "add" for name, _kwargs in mock_collection.calls)

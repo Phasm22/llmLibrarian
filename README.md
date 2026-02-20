@@ -199,7 +199,9 @@ Watcher locks live at `~/.pal/watch_locks`.
 
 4. `no extractable text` for PDFs
 - Meaning: scanned/image PDF or unreadable structure.
-- Fix: OCR first, or use text-exportable documents.
+- Current behavior: llmLibrarian attempts OCR fallback in this order: PaddleOCR (if installed), then `tesseract` (if available on PATH).
+- Fix when still failing: install `paddleocr` or `tesseract`, then re-run `pal pull <path>`.
+- Note: OpenCV is not required for the baseline OCR fallback.
 
 5. stale catalog + `--force`
 - Meaning: deterministic catalog query detected stale scope.

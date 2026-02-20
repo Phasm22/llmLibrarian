@@ -178,3 +178,78 @@ def test_pdf_processor_skips_table_enrichment_when_disabled(monkeypatch):
     text, _page_num = pages[0]
     assert "raw only" in text
     assert "Structured values:" not in text
+
+
+def test_pdf_processor_uses_paddle_ocr_when_page_text_is_empty(monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    doc.new_page()
+    data = doc.tobytes()
+    doc.close()
+
+    monkeypatch.setattr(processors, "_paddleocr_available", lambda: True)
+    monkeypatch.setattr(processors, "_tesseract_available", lambda: True)
+    monkeypatch.setattr(
+        processors,
+        "_ocr_with_paddle",
+        lambda _img: "Form W-2 Wage and Tax Statement Employer YMCA Box 1: 4,626.76",
+    )
+    monkeypatch.setattr(
+        processors,
+        "_ocr_with_tesseract",
+        lambda _img: (_ for _ in ()).throw(AssertionError("tesseract should not run when paddle succeeds")),
+    )
+
+    proc = PDFProcessor()
+    pages = proc.extract(data, "scan.pdf")
+    text, page_num = pages[0]
+    assert page_num == 1
+    assert "OCR text (scan fallback):" in text
+    assert "4,626.76" in text
+
+
+def test_pdf_processor_falls_back_to_tesseract_when_paddle_unavailable(monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    doc.new_page()
+    data = doc.tobytes()
+    doc.close()
+
+    monkeypatch.setattr(processors, "_paddleocr_available", lambda: False)
+    monkeypatch.setattr(processors, "_tesseract_available", lambda: True)
+    monkeypatch.setattr(
+        processors,
+        "_ocr_with_tesseract",
+        lambda _img: "Gross Pay $4,626.76",
+    )
+
+    proc = PDFProcessor()
+    pages = proc.extract(data, "scan.pdf")
+    text, _page_num = pages[0]
+    assert "OCR text (scan fallback):" in text
+    assert "4,626.76" in text
+
+
+def test_pdf_processor_keeps_empty_text_when_no_ocr_backend(monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    doc = fitz.open()
+    doc.new_page()
+    data = doc.tobytes()
+    doc.close()
+
+    events: list[dict] = []
+
+    def _capture_event(level, message, **fields):
+        payload = {"level": level, "message": message}
+        payload.update(fields)
+        events.append(payload)
+
+    monkeypatch.setattr(processors, "_paddleocr_available", lambda: False)
+    monkeypatch.setattr(processors, "_tesseract_available", lambda: False)
+    monkeypatch.setattr(processors, "_log_processor_event", _capture_event)
+
+    proc = PDFProcessor()
+    pages = proc.extract(data, "scan.pdf")
+    text, _page_num = pages[0]
+    assert text == ""
+    assert any("OCR produced no text" in e.get("message", "") for e in events)

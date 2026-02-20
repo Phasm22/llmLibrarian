@@ -3,11 +3,15 @@ Document processor abstraction for llmLibrarian ingestion.
 Each processor handles extraction for a specific file type.
 """
 import io
+import importlib.util
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -66,6 +70,9 @@ _PDF_STRUCTURED_MAX_CHARS = 6000
 _NUMERIC_VALUE_PATTERN = re.compile(r"^\$?\s*-?\d[\d,]*(?:\.\d+)?\.?$")
 _LINE_TOKEN_PATTERN = re.compile(r"^(?:line\s*)?(\d{1,3}[a-z]?)$", re.IGNORECASE)
 _MAX_HINT_LINE_NUMBER = 80
+_OCR_LABEL = "OCR text (scan fallback):"
+_PADDLE_OCR_ENGINE: Any | None = None
+_PADDLE_OCR_INIT_ATTEMPTED = False
 
 
 def _log_processor_event(level: str, message: str, **fields: Any) -> None:
@@ -83,6 +90,183 @@ def _pdf_tables_enabled() -> bool:
     # Default OFF: table extraction via pdfplumber is expensive and noisy on malformed/scanned PDFs.
     val = os.environ.get("LLMLIBRARIAN_PDF_TABLES", "0").strip().lower()
     return val not in ("0", "false", "no")
+
+
+def _paddleocr_available() -> bool:
+    """True when paddleocr is importable in the current environment."""
+    try:
+        return importlib.util.find_spec("paddleocr") is not None
+    except Exception:
+        return False
+
+
+def _tesseract_available() -> bool:
+    """True when the tesseract binary is available on PATH."""
+    return bool(shutil.which("tesseract"))
+
+
+def _available_ocr_backends() -> list[str]:
+    """Return available OCR backends in deterministic priority order."""
+    out: list[str] = []
+    if _paddleocr_available():
+        out.append("paddleocr")
+    if _tesseract_available():
+        out.append("tesseract")
+    return out
+
+
+def _get_paddle_ocr_engine() -> Any | None:
+    """Lazy-init PaddleOCR engine once per process; returns None when unavailable."""
+    global _PADDLE_OCR_ENGINE, _PADDLE_OCR_INIT_ATTEMPTED
+    if _PADDLE_OCR_INIT_ATTEMPTED:
+        return _PADDLE_OCR_ENGINE
+    _PADDLE_OCR_INIT_ATTEMPTED = True
+    if not _paddleocr_available():
+        return None
+    try:
+        from paddleocr import PaddleOCR
+
+        _PADDLE_OCR_ENGINE = PaddleOCR(use_angle_cls=False, lang="en", show_log=False)
+    except Exception as e:
+        _PADDLE_OCR_ENGINE = None
+        _log_processor_event(
+            "WARN",
+            "PaddleOCR initialization failed",
+            error=str(e),
+            extractor="paddleocr",
+        )
+    return _PADDLE_OCR_ENGINE
+
+
+def _extract_paddleocr_text(result: Any) -> str:
+    """Extract OCR text fragments from PaddleOCR result payload."""
+    parts: list[str] = []
+
+    def _walk(node: Any) -> None:
+        if not isinstance(node, (list, tuple)):
+            return
+        if len(node) >= 2 and isinstance(node[1], (list, tuple)) and node[1]:
+            text_candidate = node[1][0]
+            if isinstance(text_candidate, str):
+                cleaned = text_candidate.strip()
+                if cleaned:
+                    parts.append(cleaned)
+        for child in node:
+            _walk(child)
+
+    _walk(result)
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for part in parts:
+        if part in seen:
+            continue
+        seen.add(part)
+        deduped.append(part)
+    return " ".join(deduped).strip()
+
+
+def _ocr_with_paddle(image_png: bytes) -> str | None:
+    """Run OCR with PaddleOCR when available. Returns extracted text or None."""
+    engine = _get_paddle_ocr_engine()
+    if engine is None:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            image_path = Path(td) / "page.png"
+            image_path.write_bytes(image_png)
+            result = engine.ocr(str(image_path), cls=False)
+        text = _extract_paddleocr_text(result)
+        return text or None
+    except Exception as e:
+        _log_processor_event(
+            "WARN",
+            "PaddleOCR inference failed",
+            error=str(e),
+            extractor="paddleocr",
+        )
+        return None
+
+
+def _ocr_with_tesseract(image_png: bytes) -> str | None:
+    """Run OCR with tesseract CLI when available. Returns extracted text or None."""
+    if not _tesseract_available():
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            image_path = Path(td) / "page.png"
+            output_base = Path(td) / "ocr_out"
+            image_path.write_bytes(image_png)
+            cmd = [
+                "tesseract",
+                str(image_path),
+                str(output_base),
+                "-l",
+                "eng",
+                "--psm",
+                "6",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                _log_processor_event(
+                    "WARN",
+                    "tesseract OCR failed",
+                    error=(proc.stderr or "").strip()[:240],
+                    extractor="tesseract",
+                )
+                return None
+            out_path = output_base.with_suffix(".txt")
+            if not out_path.exists():
+                return None
+            text = out_path.read_text(encoding="utf-8", errors="replace").strip()
+            return text or None
+    except Exception as e:
+        _log_processor_event(
+            "WARN",
+            "tesseract OCR invocation failed",
+            error=str(e),
+            extractor="tesseract",
+        )
+        return None
+
+
+def _ocr_pdf_page_text(page: Any, source_path: str) -> tuple[str | None, str | None]:
+    """OCR fallback for image-only PDF pages. Returns (text, backend) or (None, None)."""
+    try:
+        image_png = page.get_pixmap(dpi=300, alpha=False).tobytes("png")
+    except Exception as e:
+        _log_processor_event(
+            "WARN",
+            "PDF OCR render failed",
+            path=source_path,
+            page=(getattr(page, "number", 0) + 1),
+            error=str(e),
+        )
+        return None, None
+
+    paddle_text: str | None = None
+    if _paddleocr_available():
+        paddle_text = _ocr_with_paddle(image_png)
+    tess_text: str | None = None
+    if _tesseract_available():
+        tess_text = _ocr_with_tesseract(image_png)
+    # Pick the better result: prefer the one with more alphanumeric content.
+    # PaddleOCR can produce garbled output on structured forms; tesseract with psm 6 often does better.
+    def _alnum_ratio(s: str) -> float:
+        if not s:
+            return 0.0
+        alnum = sum(1 for c in s if c.isalnum() or c in " $.,")
+        return alnum / len(s)
+    if paddle_text and tess_text:
+        pr = _alnum_ratio(paddle_text)
+        tr = _alnum_ratio(tess_text)
+        if tr > pr + 0.15:  # tesseract is meaningfully cleaner
+            return tess_text, "tesseract"
+        return paddle_text, "paddleocr"
+    if paddle_text:
+        return paddle_text, "paddleocr"
+    if tess_text:
+        return tess_text, "tesseract"
+    return None, None
 
 
 def _normalize_table_rows(rows: list[list[str | None]]) -> list[list[str]]:
@@ -164,13 +348,21 @@ def _extract_line_value_hints(rows: list[list[str]]) -> list[str]:
     return hints
 
 
-def _merge_pdf_page_content(raw_text: str, table_md: str, hints: list[str], max_structured_chars: int = _PDF_STRUCTURED_MAX_CHARS) -> str:
+def _merge_pdf_page_content(
+    raw_text: str,
+    table_md: str,
+    hints: list[str],
+    ocr_text: str | None = None,
+    max_structured_chars: int = _PDF_STRUCTURED_MAX_CHARS,
+) -> str:
     """Merge structured table context ahead of raw text with a hard cap on structured size."""
     sections: list[str] = []
     if hints:
         sections.append("Structured values:\n" + "\n".join(hints))
     if table_md:
         sections.append("Extracted tables:\n" + table_md)
+    if ocr_text:
+        sections.append(f"{_OCR_LABEL}\n{ocr_text.strip()}")
     structured = "\n\n".join(s for s in sections if s).strip()
     if structured and len(structured) > max_structured_chars:
         structured = structured[:max_structured_chars].rstrip()
@@ -220,6 +412,7 @@ class PDFProcessor:
                 out: list[tuple[str, int]] = []
                 for page in doc:
                     raw_text = page.get_text()
+                    ocr_text: str | None = None
                     try:
                         for w in page.widgets():
                             name = getattr(w, "field_name", None) or ""
@@ -228,6 +421,24 @@ class PDFProcessor:
                                 raw_text += f"\n{name}: {val}"
                     except Exception:
                         pass
+                    if not raw_text.strip():
+                        ocr_text, backend = _ocr_pdf_page_text(page, source_path)
+                        if ocr_text:
+                            _log_processor_event(
+                                "INFO",
+                                "PDF OCR fallback applied",
+                                path=source_path,
+                                page=page.number + 1,
+                                backend=backend,
+                            )
+                        else:
+                            _log_processor_event(
+                                "WARN",
+                                "PDF page has no extractable text and OCR produced no text",
+                                path=source_path,
+                                page=page.number + 1,
+                                available_ocr_backends=_available_ocr_backends(),
+                            )
                     page_tables = tables_by_page[page.number] if page.number < len(tables_by_page) else []
                     hints: list[str] = []
                     md_tables: list[str] = []
@@ -239,7 +450,7 @@ class PDFProcessor:
                         md = _table_to_markdown(normalized)
                         if md:
                             md_tables.append(md)
-                    text = _merge_pdf_page_content(raw_text, "\n\n".join(md_tables), hints)
+                    text = _merge_pdf_page_content(raw_text, "\n\n".join(md_tables), hints, ocr_text=ocr_text)
                     out.append((text, page.number + 1))
                 return out
         except Exception as e:

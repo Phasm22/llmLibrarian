@@ -25,3 +25,7 @@ llmli_last_failures.json
 .DS_Store
 *.swp
 *.swo
+
+# Local/private test cases (contains personal/local references)
+tests/unit/test_income_employer_guardrail.py
+tests/integration/test_income_year_query.py

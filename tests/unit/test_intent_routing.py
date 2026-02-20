@@ -71,6 +71,16 @@ def test_route_intent_money_year_total_without_line():
     assert route_intent(q) == INTENT_MONEY_YEAR_TOTAL
 
 
+def test_route_intent_money_year_total_make_phrase():
+    q = "how much did i make in 2025 at ymca"
+    assert route_intent(q) == INTENT_MONEY_YEAR_TOTAL
+
+
+def test_route_intent_money_year_total_earn_phrase():
+    q = "how much did i earn in 2025"
+    assert route_intent(q) == INTENT_MONEY_YEAR_TOTAL
+
+
 def test_route_intent_project_count():
     q = "how many coding projects have i done in this folder"
     assert route_intent(q) == INTENT_PROJECT_COUNT
