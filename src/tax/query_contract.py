@@ -68,6 +68,10 @@ def _parse_employer(query: str, year: int | None) -> tuple[str | None, tuple[str
         box_m = re.search(r"\bbox\s*\d{1,2}\s+([a-z0-9][a-z0-9&'().,\- ]{1,80})", q)
         if box_m:
             employer = box_m.group(1)
+        else:
+            for_m = re.search(r"\bfor\s+([a-z0-9][a-z0-9&'().,\- ]{1,100})", q)
+            if for_m:
+                employer = for_m.group(1)
 
     if employer is None:
         return None, tuple()
@@ -90,7 +94,7 @@ def _parse_employer(query: str, year: int | None) -> tuple[str | None, tuple[str
 def _is_tax_domain(query: str) -> bool:
     q = query.lower()
     return bool(
-        re.search(r"\b(tax|w-?2|1099|1040|box\s*\d{1,2}|withheld|withholding|income|agi|wages|payroll)\b", q)
+        re.search(r"\b(tax|w-?2|1099|1040|box\s*\d{1,2}|withheld|witheld|withholding|income|agi|wages|payroll|federal)\b", q)
         or re.search(r"\bhow\s+much\b[\s\S]{0,80}\b(make|made|earn|earned|pay|paid)\b", q)
     )
 
@@ -134,7 +138,10 @@ def parse_tax_query(query: str) -> TaxQuery | None:
     if re.search(r"\badjusted\s+gross\s+income|\bagi\b|\bline\s*11\b", q):
         return TaxQuery(raw, year, METRIC_AGI, "1040", "f1040_line_11_agi", employer, employer_tokens, None, None)
 
-    if re.search(r"\btaxes?\s+paid\b|\bpay\s+in\s+taxes\b|\bfederal\s+tax\s+withheld\b|\bwithholding\b", q):
+    if re.search(
+        r"\btaxes?\s+paid\b|\bpay\s+in\s+taxes\b|\bfederal\s+tax\s+withh?eld\b|\bfederal\s+wages?\s+withh?eld\b|\bwithh?eld\b|\bwitheld\b|\bwithholding\b",
+        q,
+    ):
         return TaxQuery(
             raw,
             year,

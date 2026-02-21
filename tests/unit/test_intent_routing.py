@@ -1,3 +1,5 @@
+import pytest
+
 from query.intent import (
     INTENT_AGGREGATE,
     INTENT_CAPABILITIES,
@@ -18,6 +20,19 @@ from query.intent import (
     effective_k,
     route_intent,
 )
+
+TOP10_W2_REAL_LIFE_QUERIES_WITH_EXPECTED_INTENT = [
+    ("how much did i make in 2025", INTENT_MONEY_YEAR_TOTAL),
+    ("how much did i make at acme in 2025", INTENT_MONEY_YEAR_TOTAL),
+    ("what were my w-2 wages in 2025", INTENT_TAX_QUERY),
+    ("how much federal income tax was withheld in 2025", INTENT_TAX_QUERY),
+    ("how much did i pay in taxes at acme in 2025", INTENT_TAX_QUERY),
+    ("what were my payroll taxes in 2025", INTENT_TAX_QUERY),
+    ("what was my social security and medicare withholding in 2025", INTENT_TAX_QUERY),
+    ("how much state tax was withheld in 2025", INTENT_TAX_QUERY),
+    ("box 2 acme 2025", INTENT_TAX_QUERY),
+    ("box 17 acme 2025", INTENT_TAX_QUERY),
+]
 
 
 def test_route_intent_defaults_to_lookup_for_empty_query():
@@ -92,6 +107,11 @@ def test_route_intent_tax_query_taxes_paid_phrase():
     assert route_intent(q) == INTENT_TAX_QUERY
 
 
+def test_route_intent_tax_query_with_misspelled_withheld_phrase():
+    q = "what was my federal wages witheld for deloitte in 2025"
+    assert route_intent(q) == INTENT_TAX_QUERY
+
+
 def test_route_intent_project_count():
     q = "how many coding projects have i done in this folder"
     assert route_intent(q) == INTENT_PROJECT_COUNT
@@ -156,3 +176,8 @@ def test_effective_k_reflect_clamps_to_range():
 
 def test_effective_k_lookup_passthrough():
     assert effective_k(INTENT_LOOKUP, 17) == 17
+
+
+@pytest.mark.parametrize("query,expected_intent", TOP10_W2_REAL_LIFE_QUERIES_WITH_EXPECTED_INTENT)
+def test_route_intent_top10_real_life_w2_queries(query, expected_intent):
+    assert route_intent(query) == expected_intent

@@ -1187,8 +1187,8 @@ def run_ask(
         )
         return response
 
-    # TAX_QUERY: terminal deterministic resolver against ingest-time tax ledger.
-    if intent == INTENT_TAX_QUERY:
+    # TAX_QUERY / MONEY_YEAR_TOTAL: attempt terminal deterministic resolver against ingest-time tax ledger first.
+    if intent in (INTENT_TAX_QUERY, INTENT_MONEY_YEAR_TOTAL):
         tax_guardrail = run_tax_resolver(
             query=query,
             intent=intent,

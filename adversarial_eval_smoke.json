@@ -1,10 +1,10 @@
 {
-  "run_id": "a10c104aab01",
+  "run_id": "390361b0ce93",
   "model": "llama3.1:8b",
   "silo": "__adversarial_eval__",
   "totals": {
-    "total_queries": 15,
-    "passed_queries": 15,
+    "total_queries": 5,
+    "passed_queries": 5,
     "failed_queries": 0,
     "overall_trust_score": 100.0,
     "hallucination_rate": 0.0,
@@ -12,21 +12,21 @@
     "temporal_error_rate": 0.0,
     "unsupported_assertion_rate": 0.0,
     "forbidden_value_hit_count": 0,
-    "decisive_direct_pass_count": 15,
+    "decisive_direct_pass_count": 5,
     "expected_decisive_from_canonical_count": 0,
     "missing_allowed_source_count": 0
   },
   "category_breakdown": {
     "direct": {
-      "total": 15,
-      "passed": 15,
+      "total": 5,
+      "passed": 5,
       "failed": 0
     }
   },
   "run_config": {
-    "strict_mode": false,
-    "direct_decisive_mode": true,
-    "config_path": "/var/folders/6r/_htmvfn17y3dvkzwblt2tbxr0000gn/T/llmli_adversarial_reaptfxz/eval-archetypes.yaml"
+    "strict_mode": true,
+    "direct_decisive_mode": null,
+    "config_path": null
   },
   "failures": [],
   "records": [
@@ -108,166 +108,6 @@
       "answer_text": "Blue Harbor delivery SLA minutes: 30\n\n---\nAnswered by: Adversarial Eval",
       "sources_seen": [
         "2025-02-15-canonical-ops-sla.md"
-      ]
-    },
-    {
-      "query_id": "Q006",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Ember Table NPS: 62\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-01-20-canonical-nps.md"
-      ]
-    },
-    {
-      "query_id": "Q007",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Cedar Spoon NPS: 59\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-01-20-canonical-nps.md"
-      ]
-    },
-    {
-      "query_id": "Q008",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Delta Noodle NPS: 54\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-01-20-canonical-nps.md"
-      ]
-    },
-    {
-      "query_id": "Q009",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Primary packaging vendor: Kappa Packaging\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-04-01-canonical-contract.md"
-      ]
-    },
-    {
-      "query_id": "Q010",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Aster Grill operating margin: 18.2%\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-04-05-canonical-margin.md"
-      ]
-    },
-    {
-      "query_id": "Q011",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Aster Grill weekend close: 23:00\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-04-10-canonical-hours.md"
-      ]
-    },
-    {
-      "query_id": "Q012",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Cedar Spoon labor ratio: 29%\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-04-14-canonical-labor.md"
-      ]
-    },
-    {
-      "query_id": "Q013",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Ember Table loyalty participation: 43%\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-04-18-canonical-loyalty.md"
-      ]
-    },
-    {
-      "query_id": "Q014",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Blue Harbor weekly spoilage: 2.1%\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-04-20-canonical-inventory.md"
-      ]
-    },
-    {
-      "query_id": "Q015",
-      "category": "direct",
-      "passed": true,
-      "subscores": {
-        "factual_correctness": 1,
-        "trust_behavior": 1,
-        "evidence_grounding": 1,
-        "temporal_correctness": null
-      },
-      "failure_reason": null,
-      "answer_text": "Aster Grill cash conversion cycle: 16 days\n\n---\nAnswered by: Adversarial Eval",
-      "sources_seen": [
-        "2025-04-22-canonical-cash.md"
       ]
     }
   ]

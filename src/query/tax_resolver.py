@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 from decimal import Decimal
-from pathlib import Path
+import re
 from typing import Any
 
 from style import bold, dim, label_style
+from query.formatting import format_source
 
 from tax.ledger import load_tax_ledger_rows
 from tax.normalize import format_money_decimal, parse_decimal, source_tokens
@@ -200,7 +201,7 @@ def _resolve_total_income(
             form_type="1040",
             field_code="f1040_line_9_total_income",
             rows=primary["rows"],
-            interpretation=request.interpretation,
+            interpretation=None,
         )
     if primary["status"] in {"conflict", "low_confidence_extraction"}:
         return _status_to_abstain(primary, request, source_label, no_color, "f1040_line_9_total_income", "1040")
@@ -217,8 +218,8 @@ def _resolve_total_income(
         form_type="W2",
         field_code="w2_box_1_wages",
         rows=wages["rows"],
-        interpretation=(request.interpretation or "Fallback: sum of W-2 Box 1 wages."),
-        fallback_prefix="[fallback: sum of W-2 Box 1 wages]",
+        interpretation=None,
+        fallback_prefix=None,
     )
 
 
@@ -299,9 +300,33 @@ def _filter_rows(
 
     resolved: list[dict[str, Any]] = []
     conflicts: list[dict[str, Any]] = []
-    for _k, items in grouped.items():
+    for (source, page, field_code), items in grouped.items():
+        items = [
+            i
+            for i in items
+            if not _looks_like_w2_label_number_artifact(field_code, str(i.get("normalized_decimal") or ""))
+            and not _looks_like_w2_year_artifact(field_code, str(i.get("normalized_decimal") or ""))
+            and not _looks_like_1040_line_artifact(field_code, str(i.get("normalized_decimal") or ""))
+        ]
+        if not items:
+            continue
         values = {str(i.get("normalized_decimal") or "") for i in items if str(i.get("normalized_decimal") or "")}
         if len(values) > 1:
+            if field_code == "w2_box_1_wages":
+                chosen = _choose_w2_box1_candidate(items)
+                if chosen is not None:
+                    resolved.append(chosen)
+                    continue
+            if field_code == "w2_box_2_federal_income_tax_withheld":
+                chosen = _choose_w2_box2_candidate(
+                    items,
+                    all_rows=rows,
+                    source=str(source),
+                    page=int(page),
+                )
+                if chosen is not None:
+                    resolved.append(chosen)
+                    continue
             conflicts.extend(items)
             continue
         chosen = sorted(items, key=lambda r: float(r.get("confidence") or 0.0), reverse=True)[0]
@@ -314,6 +339,126 @@ def _filter_rows(
         return {"status": "no_match", "message": "No resolved value rows.", "rows": []}
 
     return {"status": "ok", "rows": resolved}
+
+
+def _looks_like_w2_label_number_artifact(field_code: str, normalized_decimal: str) -> bool:
+    if not field_code.startswith("w2_box_"):
+        return False
+    dec = parse_decimal(normalized_decimal)
+    if dec is None:
+        return False
+    if dec != dec.to_integral_value():
+        return False
+    value = int(dec)
+    if 0 <= value <= 20:
+        return True
+    box_m = re.match(r"w2_box_(\d+)_", field_code)
+    if box_m and value == int(box_m.group(1)):
+        return True
+    return False
+
+
+def _looks_like_1040_line_artifact(field_code: str, normalized_decimal: str) -> bool:
+    if not field_code.startswith("f1040_line_"):
+        return False
+    dec = parse_decimal(normalized_decimal)
+    if dec is None:
+        return False
+    if dec != dec.to_integral_value():
+        return False
+    value = int(dec)
+    if value <= 0:
+        return False
+    line_m = re.match(r"f1040_line_(\d+)_", field_code)
+    if line_m:
+        line_num = int(line_m.group(1))
+        # Common worksheet artifacts are tiny integers around the referenced line label.
+        if value <= 50 and abs(value - line_num) <= 3:
+            return True
+    # Income/tax lines should not resolve to tiny worksheet marker values.
+    if field_code in {"f1040_line_9_total_income", "f1040_line_11_agi", "f1040_line_24_total_tax"} and value <= 50:
+        return True
+    return False
+
+
+def _looks_like_w2_year_artifact(field_code: str, normalized_decimal: str) -> bool:
+    if field_code != "w2_box_1_wages":
+        return False
+    dec = parse_decimal(normalized_decimal)
+    if dec is None or dec != dec.to_integral_value():
+        return False
+    year_like = int(dec)
+    return 1900 <= year_like <= 2099
+
+
+def _choose_w2_box1_candidate(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    ranked: list[tuple[Decimal, float, dict[str, Any]]] = []
+    for row in items:
+        dec = parse_decimal(str(row.get("normalized_decimal") or ""))
+        if dec is None or dec <= 0:
+            continue
+        if dec == dec.to_integral_value() and 1900 <= int(dec) <= 2099:
+            # Ignore likely year artifacts (e.g., 2022 from worksheet/header text).
+            continue
+        ranked.append((dec, float(row.get("confidence") or 0.0), row))
+    if not ranked:
+        return None
+    # Box 1 is wages; in noisy OCR/layout duplicates, keep the largest plausible amount deterministically.
+    ranked.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    return ranked[0][2]
+
+
+def _choose_w2_box2_candidate(
+    items: list[dict[str, Any]],
+    *,
+    all_rows: list[dict[str, Any]],
+    source: str,
+    page: int,
+) -> dict[str, Any] | None:
+    ranked: list[tuple[Decimal, float, dict[str, Any]]] = []
+    for row in items:
+        dec = parse_decimal(str(row.get("normalized_decimal") or ""))
+        if dec is None or dec <= 0:
+            continue
+        ranked.append((dec, float(row.get("confidence") or 0.0), row))
+    if not ranked:
+        return None
+
+    box1_amount = _choose_w2_box1_amount_for_source_page(all_rows, source=source, page=page)
+    if box1_amount is not None:
+        under_wages = [t for t in ranked if t[0] < box1_amount]
+        if under_wages:
+            ranked = under_wages
+
+    ranked.sort(key=lambda t: (t[1], t[0]), reverse=True)
+    return ranked[0][2]
+
+
+def _choose_w2_box1_amount_for_source_page(
+    all_rows: list[dict[str, Any]],
+    *,
+    source: str,
+    page: int,
+) -> Decimal | None:
+    candidates = [
+        r
+        for r in all_rows
+        if str(r.get("source") or "") == source
+        and int(r.get("page") or 1) == page
+        and str(r.get("field_code") or "") == "w2_box_1_wages"
+        and float(r.get("confidence") or 0.0) >= _MIN_CONFIDENCE
+    ]
+    candidates = [
+        r
+        for r in candidates
+        if not _looks_like_w2_label_number_artifact("w2_box_1_wages", str(r.get("normalized_decimal") or ""))
+    ]
+    if not candidates:
+        return None
+    chosen = _choose_w2_box1_candidate(candidates)
+    if chosen is None:
+        return None
+    return parse_decimal(str(chosen.get("normalized_decimal") or ""))
 
 
 def _row_matches_employer(row: dict[str, Any], employer_tokens: tuple[str, ...]) -> bool:
@@ -337,11 +482,15 @@ def _single_value_response(
 ) -> dict[str, Any]:
     values = sorted({str(r.get("normalized_decimal") or "") for r in rows if str(r.get("normalized_decimal") or "")})
     if len(values) != 1:
+        detail = _format_conflict_candidates(rows)
+        msg = "Conflicting values found for requested field."
+        if detail:
+            msg = f"{msg} Candidates: {detail}"
         return _abstain_response(
             source_label=source_label,
             no_color=no_color,
             category="conflict",
-            message="Conflicting values found for requested field.",
+            message=msg,
             metric=field_code,
             form_type=form_type,
             tax_year=request.tax_year,
@@ -429,6 +578,10 @@ def _status_to_abstain(
 ) -> dict[str, Any]:
     category = str(status.get("status") or "no_match")
     message = str(status.get("message") or "No matching rows found.")
+    if category == "conflict":
+        detail = _format_conflict_candidates(status.get("rows") or [])
+        if detail:
+            message = f"{message} Candidates: {detail}"
     if category == "ok":
         category = "no_match"
     return _abstain_response(
@@ -480,15 +633,15 @@ def _final_response(
     guardrail_no_match: bool,
     guardrail_reason: str,
 ) -> dict[str, Any]:
-    out = [line, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}"), ""]
+    out = [line, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")]
     metric_str = metric or "n/a"
     form_str = form_type or "n/a"
     year_str = str(tax_year) if tax_year is not None else "n/a"
-    out.append(f"Metric: field_code={metric_str} | form_type={form_str} | tax_year={year_str}")
-    out.append("")
-    out.append(bold(no_color, "Sources:"))
-    for src in _compact_sources(rows):
-        out.append(f"  • {src}")
+    source_metas = _compact_source_metas(rows)
+    if source_metas:
+        out.extend(["", bold(no_color, "Sources:")])
+        for meta in source_metas:
+            out.append(format_source("", meta, None, include_snippet=False, no_color=no_color))
 
     receipt_metas = [
         {
@@ -511,9 +664,9 @@ def _final_response(
     }
 
 
-def _compact_sources(rows: list[dict[str, Any]]) -> list[str]:
+def _compact_source_metas(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[tuple[str, int]] = set()
-    out: list[str] = []
+    out: list[dict[str, Any]] = []
     for row in rows:
         source = str(row.get("source") or "")
         if not source:
@@ -523,7 +676,25 @@ def _compact_sources(rows: list[dict[str, Any]]) -> list[str]:
         if key in seen:
             continue
         seen.add(key)
-        out.append(f"{Path(source).name} (page {page})")
-    if not out:
-        out.append("(no grounded source rows)")
+        out.append({"source": source, "page": page})
     return out
+
+
+def _format_conflict_candidates(rows: list[dict[str, Any]], *, max_items: int = 4) -> str:
+    seen: set[tuple[str, str, int]] = set()
+    parts: list[str] = []
+    for row in rows:
+        value = str(row.get("normalized_decimal") or "")
+        source = str(row.get("source") or "")
+        page = int(row.get("page") or 1)
+        if not value or not source:
+            continue
+        key = (value, source, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = source.rsplit("/", 1)[-1]
+        parts.append(f"{value} ({name} p{page})")
+        if len(parts) >= max_items:
+            break
+    return "; ".join(parts)

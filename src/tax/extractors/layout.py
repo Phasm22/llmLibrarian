@@ -101,19 +101,19 @@ def extract_layout_fields(
             if canonical is None:
                 continue
             field_code, field_label = canonical
-            label_first = rf"(?im){label_pat}[^\n]{{0,96}}?\$?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)"
             value_first = rf"(?im)\b([0-9][0-9,]*(?:\.\d{{1,2}})?)\s+{label_pat}"
-            number_label_first = rf"(?im)\b{box_num}\s+{label_pat}[^\n]{{0,64}}?\$?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)"
             number_value_first = rf"(?im)\b([0-9][0-9,]*(?:\.\d{{1,2}})?)\s+{box_num}\s+{label_pat}"
             box_label_first = rf"(?im)\bbox\s*{box_num}\b(?:\s*of\s*w-?2)?[^\n]{{0,64}}?\$?\s*([0-9][0-9,]*(?:\.\d{{1,2}})?)"
             for pat, conf in (
-                (label_first, base_confidence),
                 (value_first, base_confidence - 0.05),
-                (number_label_first, base_confidence),
                 (number_value_first, base_confidence - 0.05),
                 (box_label_first, base_confidence),
             ):
                 for m in re.finditer(pat, body):
+                    norm = normalize_money_value(m.group(1))
+                    if norm == f"{box_num:.2f}":
+                        # Common flattened/OCR artifact: captured box number, not field value.
+                        continue
                     _append_match(
                         out,
                         seen,

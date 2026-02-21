@@ -67,8 +67,14 @@ def parse_decimal(normalized: str) -> Decimal | None:
 
 
 def extract_tax_year(source: str, text: str) -> int | None:
-    """Extract tax year from source path first, then text body."""
+    """Extract tax year from filename first, then source path, then text body."""
     src = source or ""
+    filename = src.rsplit("/", 1)[-1]
+    filename_years = re.findall(r"(20\d{2})", filename)
+    if filename_years:
+        # Prefer the first filename year token; filenames often include the tax year
+        # followed by generated/export timestamps.
+        return int(filename_years[0])
     src_years = re.findall(r"\b(20\d{2})\b", src)
     if src_years:
         return int(src_years[-1])
@@ -105,9 +111,19 @@ def is_ocr_text(text: str) -> bool:
 
 
 def tokenize_entity(value: str) -> list[str]:
+    raw_tokens = re.findall(r"[a-z0-9][a-z0-9&'-]*", (value or "").lower())
+    expanded: list[str] = []
+    for tok in raw_tokens:
+        # Split mixed alpha+digit tokens so employer names like "deloitte2025"
+        # remain matchable as "deloitte".
+        if re.search(r"[a-z]", tok) and re.search(r"\d", tok):
+            parts = re.findall(r"[a-z]+|\d+", tok)
+            expanded.extend(parts or [tok])
+        else:
+            expanded.append(tok)
     tokens = [
         t
-        for t in re.findall(r"[a-z0-9][a-z0-9&'-]*", (value or "").lower())
+        for t in expanded
         if t not in _ENTITY_STOPWORDS and not re.fullmatch(r"20\d{2}", t)
     ]
     seen: set[str] = set()

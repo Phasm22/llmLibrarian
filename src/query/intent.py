@@ -151,14 +151,20 @@ def route_intent(query: str) -> str:
             q,
         )
     )
+    has_tax_specific = bool(
+        re.search(
+            r"\b(tax|taxes|withheld|witheld|withholding|federal\s+income\s+tax|federal\s+wages?\s+withh?eld|w-?2|1099|1040|box\s*\d{1,2}|payroll|state\s+tax)\b",
+            q,
+        )
+    )
     has_year_only = bool(re.search(r"\b20\d{2}\b", q))
     lacks_line = not has_line
     lacks_form = not has_form
-    if has_year_only and (has_income or has_make_earn) and lacks_line and lacks_form:
+    if has_year_only and (has_income or has_make_earn) and lacks_line and lacks_form and not has_tax_specific:
         return INTENT_MONEY_YEAR_TOTAL
     # TAX_QUERY: deterministic tax-domain resolver (box lookups, withholding/tax phrasing).
     if has_year_only and re.search(
-        r"\b(tax|taxes|withheld|withholding|w-?2|1099|1040|box\s*\d{1,2}|payroll|state\s+tax)\b",
+        r"\b(tax|taxes|withheld|witheld|withholding|federal\s+income\s+tax|federal|w-?2|1099|1040|box\s*\d{1,2}|payroll|state\s+tax)\b",
         q,
     ):
         return INTENT_TAX_QUERY

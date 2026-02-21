@@ -63,6 +63,18 @@ Trace includes `answer_kind` (`catalog_artifact`, `guardrail`, or `rag`).
   - resolved value with cited sources, or
   - abstain/disambiguation with reason category.
 - LLM does not generate numeric tax values.
+- Tax QA Hardening v2 includes an in-place real-life W-2 phrasing harness in unit and integration tests.
+
+## Tax QA TODOs
+
+- Normalize weak/no-data behavior for year-scoped total-income asks so outputs are consistent across years.
+- Prevent cross-year leakage in tax-year filters (for example, 2022 asks pulling 2021 return pages).
+- Tighten 1040 line extraction to reject line-number artifacts (for example, `1.00` on line 9).
+- Disambiguate multi-page same-form conflicts (same tax year + same form but duplicate/worksheet variants).
+- Keep tax response sources grounded and clickable (absolute source paths), and suppress empty source sections.
+- Ensure tax-year derivation prefers filename year over parent-folder year (`/Tax/2022/2021_TaxReturn.pdf` should map to 2021).
+- For total-income asks, avoid using worksheet-only pages (for example, Form 8615 worksheet pages) as line-9 evidence.
+- Add diagnostics that list candidate extracted values during tax conflicts so users can see why abstain happened.
 
 ## OCR Observability
 
