@@ -13,6 +13,9 @@ METRIC_PAYROLL_TAXES = "payroll_taxes"
 METRIC_STATE_TAX = "state_income_tax"
 METRIC_WAGES = "wages"
 METRIC_W2_BOX = "w2_box"
+METRIC_INTEREST_INCOME = "interest_income"
+METRIC_DIVIDENDS = "dividends"
+METRIC_1099_MIN_REPORTING_THRESHOLD = "1099_min_reporting_threshold"
 
 _EMPLOYER_STOPWORDS = {
     "the",
@@ -94,9 +97,27 @@ def _parse_employer(query: str, year: int | None) -> tuple[str | None, tuple[str
 def _is_tax_domain(query: str) -> bool:
     q = query.lower()
     return bool(
-        re.search(r"\b(tax|w-?2|1099|1040|box\s*\d{1,2}|withheld|witheld|withholding|income|agi|wages|payroll|federal)\b", q)
+        re.search(
+            r"\b(tax|w-?2|1099|1040|box\s*\d{1,2}|withheld|witheld|withholding|income|agi|wages|payroll|federal|interest|dividends?)\b",
+            q,
+        )
         or re.search(r"\bhow\s+much\b[\s\S]{0,80}\b(make|made|earn|earned|pay|paid)\b", q)
     )
+
+
+def _parse_1099_form_hint(query: str) -> str | None:
+    q = query.lower()
+    has_int = bool(re.search(r"\b1099[-\s]*int\b", q))
+    has_div = bool(re.search(r"\b1099[-\s]*div\b", q))
+    if has_int and not has_div:
+        return "1099-INT"
+    if has_div and not has_int:
+        return "1099-DIV"
+    if has_int and has_div:
+        return "1099"
+    if "1099" in q:
+        return "1099"
+    return None
 
 
 def parse_tax_query(query: str) -> TaxQuery | None:
@@ -137,6 +158,49 @@ def parse_tax_query(query: str) -> TaxQuery | None:
 
     if re.search(r"\badjusted\s+gross\s+income|\bagi\b|\bline\s*11\b", q):
         return TaxQuery(raw, year, METRIC_AGI, "1040", "f1040_line_11_agi", employer, employer_tokens, None, None)
+
+    if (
+        re.search(r"\b(min(?:imum)?|threshold|required|at\s+least)\b", q)
+        and re.search(r"\b(file|issue|send|report)\b", q)
+        and re.search(r"\b1099\b", q)
+    ):
+        return TaxQuery(
+            raw,
+            year,
+            METRIC_1099_MIN_REPORTING_THRESHOLD,
+            _parse_1099_form_hint(q),
+            None,
+            None,
+            tuple(),
+            None,
+            None,
+        )
+
+    if re.search(r"\binterest\b", q):
+        return TaxQuery(
+            raw,
+            year,
+            METRIC_INTEREST_INCOME,
+            "1099-INT",
+            "f1099_int_box_1_interest_income",
+            employer,
+            employer_tokens,
+            None,
+            None,
+        )
+
+    if re.search(r"\bdividend", q):
+        return TaxQuery(
+            raw,
+            year,
+            METRIC_DIVIDENDS,
+            "1099-DIV",
+            "f1099_div_box_1a_total_ordinary_dividends",
+            employer,
+            employer_tokens,
+            None,
+            None,
+        )
 
     if re.search(
         r"\btaxes?\s+paid\b|\bpay\s+in\s+taxes\b|\bfederal\s+tax\s+withh?eld\b|\bfederal\s+wages?\s+withh?eld\b|\bwithh?eld\b|\bwitheld\b|\bwithholding\b",

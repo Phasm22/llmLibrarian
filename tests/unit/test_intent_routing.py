@@ -112,6 +112,11 @@ def test_route_intent_tax_query_with_misspelled_withheld_phrase():
     assert route_intent(q) == INTENT_TAX_QUERY
 
 
+def test_route_intent_tax_query_1099_threshold_without_year():
+    q = "what is generally the minimum interest required to file form 1099-div for interest"
+    assert route_intent(q) == INTENT_TAX_QUERY
+
+
 def test_route_intent_project_count():
     q = "how many coding projects have i done in this folder"
     assert route_intent(q) == INTENT_PROJECT_COUNT

@@ -1,7 +1,10 @@
 import pytest
 
 from tax.query_contract import (
+    METRIC_1099_MIN_REPORTING_THRESHOLD,
+    METRIC_DIVIDENDS,
     METRIC_FEDERAL_WITHHELD,
+    METRIC_INTEREST_INCOME,
     METRIC_PAYROLL_TAXES,
     METRIC_STATE_TAX,
     METRIC_TOTAL_INCOME,
@@ -94,3 +97,26 @@ def test_parse_tax_query_top10_real_life_taxes_paid_includes_interpretation():
     assert req is not None
     assert req.metric == METRIC_FEDERAL_WITHHELD
     assert req.interpretation is not None
+
+
+def test_parse_tax_query_interest_income():
+    req = parse_tax_query("how much interest did i earn in 2025")
+    assert req is not None
+    assert req.metric == METRIC_INTEREST_INCOME
+    assert req.tax_year == 2025
+    assert req.field_code_hint == "f1099_int_box_1_interest_income"
+
+
+def test_parse_tax_query_dividend_income():
+    req = parse_tax_query("what were my dividends in 2025")
+    assert req is not None
+    assert req.metric == METRIC_DIVIDENDS
+    assert req.tax_year == 2025
+    assert req.field_code_hint == "f1099_div_box_1a_total_ordinary_dividends"
+
+
+def test_parse_tax_query_1099_threshold_question():
+    req = parse_tax_query("what is the minimum to file form 1099-div")
+    assert req is not None
+    assert req.metric == METRIC_1099_MIN_REPORTING_THRESHOLD
+    assert req.form_type_hint == "1099-DIV"

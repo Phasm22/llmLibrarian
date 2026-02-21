@@ -13,7 +13,10 @@ from tax.ledger import load_tax_ledger_rows
 from tax.normalize import format_money_decimal, parse_decimal, source_tokens
 from tax.query_contract import (
     METRIC_AGI,
+    METRIC_DIVIDENDS,
     METRIC_FEDERAL_WITHHELD,
+    METRIC_INTEREST_INCOME,
+    METRIC_1099_MIN_REPORTING_THRESHOLD,
     METRIC_PAYROLL_TAXES,
     METRIC_STATE_TAX,
     METRIC_TOTAL_INCOME,
@@ -42,6 +45,9 @@ def run_tax_resolver(
     request = parse_tax_query(query)
     if request is None:
         return None
+
+    if request.metric == METRIC_1099_MIN_REPORTING_THRESHOLD:
+        return _resolve_1099_min_reporting_threshold(request, source_label, no_color)
 
     if request.tax_year is None:
         return _abstain_response(
@@ -138,6 +144,26 @@ def run_tax_resolver(
             no_color=no_color,
             form_type="W2",
         )
+    if request.metric == METRIC_INTEREST_INCOME:
+        return _resolve_sum_metric(
+            request,
+            rows,
+            field_codes=["f1099_int_box_1_interest_income"],
+            label="Interest income",
+            source_label=source_label,
+            no_color=no_color,
+            form_type="1099-INT",
+        )
+    if request.metric == METRIC_DIVIDENDS:
+        return _resolve_sum_metric(
+            request,
+            rows,
+            field_codes=["f1099_div_box_1a_total_ordinary_dividends"],
+            label="Dividend income",
+            source_label=source_label,
+            no_color=no_color,
+            form_type="1099-DIV",
+        )
     if request.metric == METRIC_W2_BOX:
         if request.box_number is None:
             return _abstain_response(
@@ -220,6 +246,31 @@ def _resolve_total_income(
         rows=wages["rows"],
         interpretation=None,
         fallback_prefix=None,
+    )
+
+
+def _resolve_1099_min_reporting_threshold(
+    request: TaxQuery,
+    source_label: str,
+    no_color: bool,
+) -> dict[str, Any]:
+    form_hint = (request.form_type_hint or "").upper()
+    if form_hint == "1099-INT":
+        line = "1099-INT reporting threshold: generally $10+ of interest (or any amount with backup withholding)."
+    elif form_hint == "1099-DIV":
+        line = "1099-DIV reporting threshold: generally $10+ of dividends/distributions (or any amount with backup withholding)."
+    else:
+        line = "1099-INT/1099-DIV reporting threshold: generally $10+ (or any amount with backup withholding)."
+    return _final_response(
+        line=line,
+        source_label=source_label,
+        no_color=no_color,
+        metric="1099_reporting_threshold",
+        form_type=request.form_type_hint or "1099",
+        tax_year=request.tax_year,
+        rows=[],
+        guardrail_no_match=False,
+        guardrail_reason="tax_reference_threshold",
     )
 
 
@@ -307,6 +358,7 @@ def _filter_rows(
             if not _looks_like_w2_label_number_artifact(field_code, str(i.get("normalized_decimal") or ""))
             and not _looks_like_w2_year_artifact(field_code, str(i.get("normalized_decimal") or ""))
             and not _looks_like_1040_line_artifact(field_code, str(i.get("normalized_decimal") or ""))
+            and not _looks_like_1099_form_number_artifact(field_code, str(i.get("normalized_decimal") or ""))
         ]
         if not items:
             continue
@@ -375,6 +427,9 @@ def _looks_like_1040_line_artifact(field_code: str, normalized_decimal: str) -> 
         # Common worksheet artifacts are tiny integers around the referenced line label.
         if value <= 50 and abs(value - line_num) <= 3:
             return True
+    # "Form 1040" and related header tokens often leak as numeric artifacts.
+    if value in {104, 1040}:
+        return True
     # Income/tax lines should not resolve to tiny worksheet marker values.
     if field_code in {"f1040_line_9_total_income", "f1040_line_11_agi", "f1040_line_24_total_tax"} and value <= 50:
         return True
@@ -389,6 +444,30 @@ def _looks_like_w2_year_artifact(field_code: str, normalized_decimal: str) -> bo
         return False
     year_like = int(dec)
     return 1900 <= year_like <= 2099
+
+
+def _looks_like_1099_form_number_artifact(field_code: str, normalized_decimal: str) -> bool:
+    if field_code not in {
+        "f1099_int_box_1_interest_income",
+        "f1099_int_box_4_federal_income_tax_withheld",
+        "f1099_div_box_1a_total_ordinary_dividends",
+        "f1099_div_box_2a_total_capital_gain",
+    }:
+        return False
+    dec = parse_decimal(normalized_decimal)
+    if dec is None or dec != dec.to_integral_value():
+        return False
+    if int(dec) == 1099:
+        return True
+    if field_code == "f1099_int_box_1_interest_income":
+        value = int(dec)
+        if 1900 <= value <= 2099:
+            return True
+        if value in {1, 3, 4}:
+            return True
+    if dec >= Decimal("1000000"):
+        return True
+    return False
 
 
 def _choose_w2_box1_candidate(items: list[dict[str, Any]]) -> dict[str, Any] | None:

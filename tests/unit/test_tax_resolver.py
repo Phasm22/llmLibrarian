@@ -441,3 +441,207 @@ def test_tax_resolver_ignores_w2_box1_year_artifact(monkeypatch):
     assert out is not None
     assert out["guardrail_no_match"] is True
     assert "Abstain [no_match]" in out["response"]
+
+
+def test_tax_resolver_ignores_1040_header_artifact_1040(monkeypatch):
+    rows = [
+        _base_row(
+            record_id="h1",
+            source="/Users/x/Tax/2020/2020_TaxReturn.pdf",
+            tax_year=2020,
+            form_type="1040",
+            field_code="f1040_line_9_total_income",
+            field_label="Form 1040 line 9 total income",
+            normalized_decimal="1040.00",
+            raw_value="1040",
+            confidence=0.90,
+        ),
+        _base_row(
+            record_id="w1",
+            source="/Users/x/Tax/2020/W-2 2020.pdf",
+            tax_year=2020,
+            form_type="W2",
+            field_code="w2_box_1_wages",
+            field_label="W-2 Box 1 wages",
+            normalized_decimal="15128.97",
+            raw_value="15,128.97",
+            confidence=0.72,
+        ),
+    ]
+    monkeypatch.setattr(
+        "query.tax_resolver.load_tax_ledger_rows",
+        lambda db_path, silo=None, tax_year=None: rows,
+    )
+    out = run_tax_resolver(
+        query="how much did i make in total in 2020",
+        intent="MONEY_YEAR_TOTAL",
+        db_path="/tmp/db",
+        use_unified=True,
+        silo="tax",
+        source_label="Tax Professional",
+        no_color=True,
+    )
+    assert out is not None
+    assert out["guardrail_no_match"] is False
+    assert "15,128.97" in out["response"]
+
+
+def test_tax_resolver_interest_income_uses_1099_int_rows(monkeypatch):
+    rows = [
+        _base_row(
+            record_id="i1",
+            source="/Users/x/Tax/2025/TaxStatement_2025_1099INT_1.pdf",
+            tax_year=2025,
+            form_type="1099-INT",
+            field_code="f1099_int_box_1_interest_income",
+            field_label="Form 1099-INT box 1 interest income",
+            normalized_decimal="120.11",
+            raw_value="120.11",
+            confidence=0.90,
+            entity_tokens=["ally"],
+        ),
+        _base_row(
+            record_id="i2",
+            source="/Users/x/Tax/2025/TaxStatement_2025_1099INT_2.pdf",
+            tax_year=2025,
+            form_type="1099-INT",
+            field_code="f1099_int_box_1_interest_income",
+            field_label="Form 1099-INT box 1 interest income",
+            normalized_decimal="34.89",
+            raw_value="34.89",
+            confidence=0.88,
+            entity_tokens=["vanguard"],
+        ),
+    ]
+    monkeypatch.setattr(
+        "query.tax_resolver.load_tax_ledger_rows",
+        lambda db_path, silo=None, tax_year=None: rows,
+    )
+    out = run_tax_resolver(
+        query="how much interest did i earn in 2025",
+        intent="MONEY_YEAR_TOTAL",
+        db_path="/tmp/db",
+        use_unified=True,
+        silo="tax",
+        source_label="Tax Professional",
+        no_color=True,
+    )
+    assert out is not None
+    assert out["guardrail_no_match"] is False
+    assert "Interest income (2025): 155.00" in out["response"]
+
+
+def test_tax_resolver_1099_threshold_does_not_require_year(monkeypatch):
+    monkeypatch.setattr(
+        "query.tax_resolver.load_tax_ledger_rows",
+        lambda db_path, silo=None, tax_year=None: [],
+    )
+    out = run_tax_resolver(
+        query="what is the minimum to file form 1099-div",
+        intent="TAX_QUERY",
+        db_path="/tmp/db",
+        use_unified=True,
+        silo="tax",
+        source_label="Tax Professional",
+        no_color=True,
+    )
+    assert out is not None
+    assert out["guardrail_no_match"] is False
+    assert "1099-DIV reporting threshold: generally $10+" in out["response"]
+
+
+def test_tax_resolver_ignores_1099_form_number_artifact(monkeypatch):
+    rows = [
+        _base_row(
+            record_id="d1",
+            source="/Users/x/Tax/2025/2025-CORE-4385-Consolidated-Form-1099.pdf",
+            tax_year=2025,
+            form_type="1099-DIV",
+            field_code="f1099_div_box_1a_total_ordinary_dividends",
+            field_label="Form 1099-DIV box 1a total ordinary dividends",
+            normalized_decimal="1099.00",
+            raw_value="1099",
+            confidence=0.90,
+        ),
+        _base_row(
+            record_id="d2",
+            source="/Users/x/Tax/2025/2025-CORE-4385-Consolidated-Form-1099.pdf",
+            tax_year=2025,
+            form_type="1099-DIV",
+            field_code="f1099_div_box_1a_total_ordinary_dividends",
+            field_label="Form 1099-DIV box 1a total ordinary dividends",
+            normalized_decimal="222.14",
+            raw_value="222.14",
+            confidence=0.90,
+        ),
+    ]
+    monkeypatch.setattr(
+        "query.tax_resolver.load_tax_ledger_rows",
+        lambda db_path, silo=None, tax_year=None: rows,
+    )
+    out = run_tax_resolver(
+        query="what were my dividends in 2025",
+        intent="TAX_QUERY",
+        db_path="/tmp/db",
+        use_unified=True,
+        silo="tax",
+        source_label="Tax Professional",
+        no_color=True,
+    )
+    assert out is not None
+    assert out["guardrail_no_match"] is False
+    assert "Dividend income (2025): 222.14" in out["response"]
+
+
+def test_tax_resolver_interest_filters_year_and_large_id_artifacts(monkeypatch):
+    rows = [
+        _base_row(
+            record_id="i1",
+            source="/Users/x/Tax/2025/ally1099.pdf",
+            tax_year=2025,
+            form_type="1099-INT",
+            field_code="f1099_int_box_1_interest_income",
+            field_label="Form 1099-INT box 1 interest income",
+            normalized_decimal="2025.00",
+            raw_value="2025",
+            confidence=0.90,
+        ),
+        _base_row(
+            record_id="i2",
+            source="/Users/x/Tax/2025/ally1099.pdf",
+            tax_year=2025,
+            form_type="1099-INT",
+            field_code="f1099_int_box_1_interest_income",
+            field_label="Form 1099-INT box 1 interest income",
+            normalized_decimal="2223182698.00",
+            raw_value="2223182698",
+            confidence=0.90,
+        ),
+        _base_row(
+            record_id="i3",
+            source="/Users/x/Tax/2025/vanguard_1099.pdf",
+            tax_year=2025,
+            form_type="1099-INT",
+            field_code="f1099_int_box_1_interest_income",
+            field_label="Form 1099-INT box 1 interest income",
+            normalized_decimal="16.12",
+            raw_value="16.12",
+            confidence=0.90,
+        ),
+    ]
+    monkeypatch.setattr(
+        "query.tax_resolver.load_tax_ledger_rows",
+        lambda db_path, silo=None, tax_year=None: rows,
+    )
+    out = run_tax_resolver(
+        query="how much interest did i earn in 2025",
+        intent="MONEY_YEAR_TOTAL",
+        db_path="/tmp/db",
+        use_unified=True,
+        silo="tax",
+        source_label="Tax Professional",
+        no_color=True,
+    )
+    assert out is not None
+    assert out["guardrail_no_match"] is False
+    assert "Interest income (2025): 16.12" in out["response"]

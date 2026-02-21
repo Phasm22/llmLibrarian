@@ -162,6 +162,12 @@ def route_intent(query: str) -> str:
     lacks_form = not has_form
     if has_year_only and (has_income or has_make_earn) and lacks_line and lacks_form and not has_tax_specific:
         return INTENT_MONEY_YEAR_TOTAL
+    if (
+        re.search(r"\b(min(?:imum)?|threshold|required|at\s+least)\b", q)
+        and re.search(r"\b(file|issue|send|report)\b", q)
+        and re.search(r"\b1099\b", q)
+    ):
+        return INTENT_TAX_QUERY
     # TAX_QUERY: deterministic tax-domain resolver (box lookups, withholding/tax phrasing).
     if has_year_only and re.search(
         r"\b(tax|taxes|withheld|witheld|withholding|federal\s+income\s+tax|federal|w-?2|1099|1040|box\s*\d{1,2}|payroll|state\s+tax)\b",
