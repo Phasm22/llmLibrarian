@@ -1,0 +1,529 @@
+"""Deterministic tax resolver backed by ingest-time tax ledger rows."""
+from __future__ import annotations
+
+from collections import defaultdict
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+from style import bold, dim, label_style
+
+from tax.ledger import load_tax_ledger_rows
+from tax.normalize import format_money_decimal, parse_decimal, source_tokens
+from tax.query_contract import (
+    METRIC_AGI,
+    METRIC_FEDERAL_WITHHELD,
+    METRIC_PAYROLL_TAXES,
+    METRIC_STATE_TAX,
+    METRIC_TOTAL_INCOME,
+    METRIC_TOTAL_TAX_LIABILITY,
+    METRIC_W2_BOX,
+    METRIC_WAGES,
+    TaxQuery,
+    parse_tax_query,
+)
+from tax.schema import W2_BOX_FIELD_CODES
+
+_MIN_CONFIDENCE = 0.55
+
+
+def run_tax_resolver(
+    *,
+    query: str,
+    intent: str,
+    db_path: str,
+    use_unified: bool,
+    silo: str | None,
+    source_label: str,
+    no_color: bool,
+) -> dict[str, Any] | None:
+    """Resolve tax asks from ledger rows only. Returns guardrail payload or None if not tax-domain."""
+    request = parse_tax_query(query)
+    if request is None:
+        return None
+
+    if request.tax_year is None:
+        return _abstain_response(
+            source_label=source_label,
+            no_color=no_color,
+            category="ambiguous_scope",
+            message="Include a tax year (for example: 2025).",
+            metric=None,
+            form_type=request.form_type_hint,
+            tax_year=None,
+            rows=[],
+        )
+
+    rows = load_tax_ledger_rows(
+        db_path,
+        silo=(silo if (use_unified and silo) else None),
+        tax_year=request.tax_year,
+    )
+    if not rows:
+        if intent != "TAX_QUERY":
+            # Compatibility fallback for older indexes/unit tests that do not have ledger rows yet.
+            return None
+        return _abstain_response(
+            source_label=source_label,
+            no_color=no_color,
+            category="no_match",
+            message=f"No tax ledger rows found for {request.tax_year} in this scope.",
+            metric=request.field_code_hint,
+            form_type=request.form_type_hint,
+            tax_year=request.tax_year,
+            rows=[],
+        )
+
+    if request.metric == METRIC_TOTAL_INCOME:
+        return _resolve_total_income(request, rows, source_label, no_color)
+    if request.metric == METRIC_AGI:
+        return _resolve_single_field_metric(
+            request,
+            rows,
+            field_codes=["f1040_line_11_agi"],
+            label="Adjusted gross income",
+            source_label=source_label,
+            no_color=no_color,
+            form_type="1040",
+        )
+    if request.metric == METRIC_TOTAL_TAX_LIABILITY:
+        return _resolve_single_field_metric(
+            request,
+            rows,
+            field_codes=["f1040_line_24_total_tax"],
+            label="Total tax liability",
+            source_label=source_label,
+            no_color=no_color,
+            form_type="1040",
+        )
+    if request.metric == METRIC_FEDERAL_WITHHELD:
+        return _resolve_sum_metric(
+            request,
+            rows,
+            field_codes=["w2_box_2_federal_income_tax_withheld"],
+            label="Federal income tax withheld",
+            source_label=source_label,
+            no_color=no_color,
+            form_type="W2",
+            interpretation=request.interpretation,
+        )
+    if request.metric == METRIC_STATE_TAX:
+        return _resolve_sum_metric(
+            request,
+            rows,
+            field_codes=["w2_box_17_state_income_tax"],
+            label="State income tax withheld",
+            source_label=source_label,
+            no_color=no_color,
+            form_type="W2",
+        )
+    if request.metric == METRIC_PAYROLL_TAXES:
+        return _resolve_sum_metric(
+            request,
+            rows,
+            field_codes=["w2_box_4_social_security_tax_withheld", "w2_box_6_medicare_tax_withheld"],
+            label="Payroll taxes withheld (SS + Medicare)",
+            source_label=source_label,
+            no_color=no_color,
+            form_type="W2",
+        )
+    if request.metric == METRIC_WAGES:
+        return _resolve_sum_metric(
+            request,
+            rows,
+            field_codes=["w2_box_1_wages"],
+            label="W-2 wages",
+            source_label=source_label,
+            no_color=no_color,
+            form_type="W2",
+        )
+    if request.metric == METRIC_W2_BOX:
+        if request.box_number is None:
+            return _abstain_response(
+                source_label=source_label,
+                no_color=no_color,
+                category="ambiguous_scope",
+                message="Specify a valid W-2 box number.",
+                metric=request.field_code_hint,
+                form_type="W2",
+                tax_year=request.tax_year,
+                rows=[],
+            )
+        box_meta = W2_BOX_FIELD_CODES.get(request.box_number)
+        if box_meta is None:
+            return _abstain_response(
+                source_label=source_label,
+                no_color=no_color,
+                category="no_match",
+                message=f"W-2 box {request.box_number} is not supported in v1.",
+                metric=request.field_code_hint,
+                form_type="W2",
+                tax_year=request.tax_year,
+                rows=[],
+            )
+        field_code, field_label = box_meta
+        return _resolve_single_field_metric(
+            request,
+            rows,
+            field_codes=[field_code],
+            label=field_label,
+            source_label=source_label,
+            no_color=no_color,
+            form_type="W2",
+        )
+
+    return _abstain_response(
+        source_label=source_label,
+        no_color=no_color,
+        category="no_match",
+        message="Could not map query to a supported deterministic tax metric.",
+        metric=request.field_code_hint,
+        form_type=request.form_type_hint,
+        tax_year=request.tax_year,
+        rows=[],
+    )
+
+
+def _resolve_total_income(
+    request: TaxQuery,
+    rows: list[dict[str, Any]],
+    source_label: str,
+    no_color: bool,
+) -> dict[str, Any]:
+    primary = _filter_rows(rows, request=request, field_codes=["f1040_line_9_total_income"])
+    if primary["status"] == "ok":
+        return _single_value_response(
+            request=request,
+            source_label=source_label,
+            no_color=no_color,
+            label="Total income",
+            form_type="1040",
+            field_code="f1040_line_9_total_income",
+            rows=primary["rows"],
+            interpretation=request.interpretation,
+        )
+    if primary["status"] in {"conflict", "low_confidence_extraction"}:
+        return _status_to_abstain(primary, request, source_label, no_color, "f1040_line_9_total_income", "1040")
+
+    wages = _filter_rows(rows, request=request, field_codes=["w2_box_1_wages"])
+    if wages["status"] != "ok":
+        return _status_to_abstain(wages, request, source_label, no_color, "w2_box_1_wages", "W2")
+
+    return _sum_value_response(
+        request=request,
+        source_label=source_label,
+        no_color=no_color,
+        label="Total income",
+        form_type="W2",
+        field_code="w2_box_1_wages",
+        rows=wages["rows"],
+        interpretation=(request.interpretation or "Fallback: sum of W-2 Box 1 wages."),
+        fallback_prefix="[fallback: sum of W-2 Box 1 wages]",
+    )
+
+
+def _resolve_single_field_metric(
+    request: TaxQuery,
+    rows: list[dict[str, Any]],
+    *,
+    field_codes: list[str],
+    label: str,
+    source_label: str,
+    no_color: bool,
+    form_type: str,
+) -> dict[str, Any]:
+    status = _filter_rows(rows, request=request, field_codes=field_codes)
+    if status["status"] != "ok":
+        return _status_to_abstain(status, request, source_label, no_color, field_codes[0], form_type)
+    return _single_value_response(
+        request=request,
+        source_label=source_label,
+        no_color=no_color,
+        label=label,
+        form_type=form_type,
+        field_code=field_codes[0],
+        rows=status["rows"],
+        interpretation=request.interpretation,
+    )
+
+
+def _resolve_sum_metric(
+    request: TaxQuery,
+    rows: list[dict[str, Any]],
+    *,
+    field_codes: list[str],
+    label: str,
+    source_label: str,
+    no_color: bool,
+    form_type: str,
+    interpretation: str | None = None,
+) -> dict[str, Any]:
+    status = _filter_rows(rows, request=request, field_codes=field_codes)
+    if status["status"] != "ok":
+        field_code = field_codes[0] if len(field_codes) == 1 else "+".join(field_codes)
+        return _status_to_abstain(status, request, source_label, no_color, field_code, form_type)
+    return _sum_value_response(
+        request=request,
+        source_label=source_label,
+        no_color=no_color,
+        label=label,
+        form_type=form_type,
+        field_code=(field_codes[0] if len(field_codes) == 1 else "+".join(field_codes)),
+        rows=status["rows"],
+        interpretation=interpretation,
+    )
+
+
+def _filter_rows(
+    rows: list[dict[str, Any]],
+    *,
+    request: TaxQuery,
+    field_codes: list[str],
+) -> dict[str, Any]:
+    candidates = [r for r in rows if str(r.get("field_code") or "") in set(field_codes)]
+    if request.employer_tokens:
+        candidates = [r for r in candidates if _row_matches_employer(r, request.employer_tokens)]
+        if not candidates:
+            return {"status": "no_match", "message": f"No rows matched employer '{request.employer or ''}'.", "rows": []}
+
+    if not candidates:
+        return {"status": "no_match", "message": "No matching field rows found.", "rows": []}
+
+    high_conf = [r for r in candidates if float(r.get("confidence") or 0.0) >= _MIN_CONFIDENCE]
+    if not high_conf:
+        return {"status": "low_confidence_extraction", "message": "Extraction confidence was too low.", "rows": candidates}
+
+    grouped: dict[tuple[str, int, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in high_conf:
+        grouped[(str(row.get("source") or ""), int(row.get("page") or 1), str(row.get("field_code") or ""))].append(row)
+
+    resolved: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    for _k, items in grouped.items():
+        values = {str(i.get("normalized_decimal") or "") for i in items if str(i.get("normalized_decimal") or "")}
+        if len(values) > 1:
+            conflicts.extend(items)
+            continue
+        chosen = sorted(items, key=lambda r: float(r.get("confidence") or 0.0), reverse=True)[0]
+        resolved.append(chosen)
+
+    if conflicts:
+        return {"status": "conflict", "message": "Conflicting extracted values found.", "rows": conflicts}
+
+    if not resolved:
+        return {"status": "no_match", "message": "No resolved value rows.", "rows": []}
+
+    return {"status": "ok", "rows": resolved}
+
+
+def _row_matches_employer(row: dict[str, Any], employer_tokens: tuple[str, ...]) -> bool:
+    row_tokens = {str(t).lower() for t in (row.get("entity_tokens") or [])}
+    if employer_tokens and set(employer_tokens).issubset(row_tokens):
+        return True
+    src_tokens = set(source_tokens(str(row.get("source") or "")))
+    return bool(employer_tokens and set(employer_tokens).issubset(src_tokens))
+
+
+def _single_value_response(
+    *,
+    request: TaxQuery,
+    source_label: str,
+    no_color: bool,
+    label: str,
+    form_type: str,
+    field_code: str,
+    rows: list[dict[str, Any]],
+    interpretation: str | None = None,
+) -> dict[str, Any]:
+    values = sorted({str(r.get("normalized_decimal") or "") for r in rows if str(r.get("normalized_decimal") or "")})
+    if len(values) != 1:
+        return _abstain_response(
+            source_label=source_label,
+            no_color=no_color,
+            category="conflict",
+            message="Conflicting values found for requested field.",
+            metric=field_code,
+            form_type=form_type,
+            tax_year=request.tax_year,
+            rows=rows,
+        )
+
+    value = format_money_decimal(values[0])
+    employer_segment = f" at {request.employer}" if request.employer else ""
+    line = f"{label}{employer_segment} ({request.tax_year}): {value}"
+    if interpretation:
+        line = f"{line} [{interpretation}]"
+
+    return _final_response(
+        line=line,
+        source_label=source_label,
+        no_color=no_color,
+        metric=field_code,
+        form_type=form_type,
+        tax_year=request.tax_year,
+        rows=rows,
+        guardrail_no_match=False,
+        guardrail_reason="tax_resolved",
+    )
+
+
+def _sum_value_response(
+    *,
+    request: TaxQuery,
+    source_label: str,
+    no_color: bool,
+    label: str,
+    form_type: str,
+    field_code: str,
+    rows: list[dict[str, Any]],
+    interpretation: str | None = None,
+    fallback_prefix: str | None = None,
+) -> dict[str, Any]:
+    total = Decimal("0")
+    used_rows: list[dict[str, Any]] = []
+    for row in rows:
+        dec = parse_decimal(str(row.get("normalized_decimal") or ""))
+        if dec is None:
+            continue
+        total += dec
+        used_rows.append(row)
+
+    if not used_rows:
+        return _abstain_response(
+            source_label=source_label,
+            no_color=no_color,
+            category="no_match",
+            message="No numeric values were extractable.",
+            metric=field_code,
+            form_type=form_type,
+            tax_year=request.tax_year,
+            rows=rows,
+        )
+
+    employer_segment = f" at {request.employer}" if request.employer else ""
+    prefix = f" {fallback_prefix}" if fallback_prefix else ""
+    line = f"{label}{employer_segment} ({request.tax_year}){prefix}: {format_money_decimal(str(total))}"
+    if interpretation:
+        line = f"{line} [{interpretation}]"
+
+    return _final_response(
+        line=line,
+        source_label=source_label,
+        no_color=no_color,
+        metric=field_code,
+        form_type=form_type,
+        tax_year=request.tax_year,
+        rows=used_rows,
+        guardrail_no_match=False,
+        guardrail_reason="tax_resolved",
+    )
+
+
+def _status_to_abstain(
+    status: dict[str, Any],
+    request: TaxQuery,
+    source_label: str,
+    no_color: bool,
+    metric: str,
+    form_type: str,
+) -> dict[str, Any]:
+    category = str(status.get("status") or "no_match")
+    message = str(status.get("message") or "No matching rows found.")
+    if category == "ok":
+        category = "no_match"
+    return _abstain_response(
+        source_label=source_label,
+        no_color=no_color,
+        category=category,
+        message=message,
+        metric=metric,
+        form_type=form_type,
+        tax_year=request.tax_year,
+        rows=status.get("rows") or [],
+    )
+
+
+def _abstain_response(
+    *,
+    source_label: str,
+    no_color: bool,
+    category: str,
+    message: str,
+    metric: str | None,
+    form_type: str | None,
+    tax_year: int | None,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    line = f"Abstain [{category}]: {message}"
+    return _final_response(
+        line=line,
+        source_label=source_label,
+        no_color=no_color,
+        metric=metric,
+        form_type=form_type,
+        tax_year=tax_year,
+        rows=rows,
+        guardrail_no_match=True,
+        guardrail_reason=f"tax_{category}",
+    )
+
+
+def _final_response(
+    *,
+    line: str,
+    source_label: str,
+    no_color: bool,
+    metric: str | None,
+    form_type: str | None,
+    tax_year: int | None,
+    rows: list[dict[str, Any]],
+    guardrail_no_match: bool,
+    guardrail_reason: str,
+) -> dict[str, Any]:
+    out = [line, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}"), ""]
+    metric_str = metric or "n/a"
+    form_str = form_type or "n/a"
+    year_str = str(tax_year) if tax_year is not None else "n/a"
+    out.append(f"Metric: field_code={metric_str} | form_type={form_str} | tax_year={year_str}")
+    out.append("")
+    out.append(bold(no_color, "Sources:"))
+    for src in _compact_sources(rows):
+        out.append(f"  • {src}")
+
+    receipt_metas = [
+        {
+            "source": str(r.get("source") or ""),
+            "page": int(r.get("page") or 1),
+            "field_code": str(r.get("field_code") or ""),
+        }
+        for r in rows[:8]
+    ]
+
+    return {
+        "response": "\n".join(out),
+        "guardrail_no_match": guardrail_no_match,
+        "guardrail_reason": guardrail_reason,
+        "requested_year": year_str if year_str != "n/a" else None,
+        "requested_form": form_str if form_str != "n/a" else None,
+        "requested_line": metric_str if metric_str != "n/a" else None,
+        "num_docs": len(rows),
+        "receipt_metas": receipt_metas,
+    }
+
+
+def _compact_sources(rows: list[dict[str, Any]]) -> list[str]:
+    seen: set[tuple[str, int]] = set()
+    out: list[str] = []
+    for row in rows:
+        source = str(row.get("source") or "")
+        if not source:
+            continue
+        page = int(row.get("page") or 1)
+        key = (source, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f"{Path(source).name} (page {page})")
+    if not out:
+        out.append("(no grounded source rows)")
+    return out

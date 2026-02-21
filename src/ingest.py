@@ -329,6 +329,7 @@ from processors import (
     DocumentExtractionError,
     PDFExtractionError,
 )
+from tax.ledger import extract_tax_rows_from_chunks, replace_tax_rows_for_sources
 
 _pdf_proc = PDFProcessor()
 _docx_proc = DOCXProcessor()
@@ -900,6 +901,51 @@ def _make_log_writer(log_path: str | Path | None) -> tuple[Any, Any]:
     return (log_line, close_fn)
 
 
+def _flatten_collection_list(values: list[Any] | None) -> list[Any]:
+    if not values:
+        return []
+    if values and isinstance(values[0], list):
+        return values[0]  # type: ignore[index]
+    return values
+
+
+def _clone_chunks_from_existing_silo(
+    *,
+    collection: Any,
+    from_silo: str,
+    source_path: str,
+    target_silo: str,
+) -> list[ChunkTuple]:
+    """
+    Best-effort chunk clone for cross-silo dedupe.
+    Returns chunk tuples shaped like process_one_file output.
+    """
+    try:
+        result = collection.get(
+            where={"$and": [{"silo": from_silo}, {"source": source_path}]},
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        return []
+    docs = _flatten_collection_list(result.get("documents"))
+    metas = _flatten_collection_list(result.get("metadatas"))
+    out: list[ChunkTuple] = []
+    for i, doc_raw in enumerate(docs):
+        doc = str(doc_raw or "")
+        if not doc:
+            continue
+        meta_raw = metas[i] if i < len(metas) else {}
+        meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
+        src = str(meta.get("source") or "")
+        if src != source_path:
+            continue
+        cloned_meta = dict(meta)
+        cloned_meta["silo"] = target_silo
+        chunk_id = str(meta.get("chunk_hash") or f"clone-{i}-{source_path}")
+        out.append((chunk_id, doc, cloned_meta))
+    return out
+
+
 def run_index(
     archetype_id: str,
     config_path: str | Path | None = None,
@@ -1176,6 +1222,7 @@ def run_add(
     manifest = _read_file_manifest(db_path) if incremental else {"silos": {}}
     silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
     manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
+    ledger_sources_to_replace: set[str] = set()
     current_paths: set[str] = set()
     if incremental:
         for zp in zips:
@@ -1184,6 +1231,7 @@ def run_add(
             except OSError:
                 current_paths.add(str(zp))
     skipped = 0
+    precloned_by_path: dict[str, tuple[str, list[ChunkTuple]]] = {}
     for p, k in regular:
         try:
             p_res = p.resolve()
@@ -1205,6 +1253,22 @@ def run_add(
                     )
                     if existing_same:
                         continue
+            if h:
+                existing_entries = _file_registry_get(db_path, h)
+                clone_from = next(
+                    (str(e.get("silo") or "") for e in existing_entries if str(e.get("silo") or "") != silo_slug),
+                    "",
+                )
+                if clone_from:
+                    cloned = _clone_chunks_from_existing_silo(
+                        collection=collection,
+                        from_silo=clone_from,
+                        source_path=str(p_res),
+                        target_silo=silo_slug,
+                    )
+                    if cloned:
+                        precloned_by_path[str(p_res)] = (h, cloned)
+                        continue
             if not h:
                 regular_with_hash.append((p, k, "", p_res))
                 continue
@@ -1218,6 +1282,7 @@ def run_add(
             if p_res is None:
                 continue
             path_str = str(p_res)
+            ledger_sources_to_replace.add(path_str)
             if path_str in manifest_files:
                 try:
                     collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
@@ -1227,6 +1292,7 @@ def run_add(
                 _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
     all_chunks = []
+    tax_rows: list[dict[str, Any]] = []
     files_indexed = 0
     failures = []
     to_register: list[tuple[str, str]] = []  # (file_hash, path_str) for main-thread registry update
@@ -1234,6 +1300,7 @@ def run_add(
     if incremental and isinstance(manifest_files, dict):
         removed = [path_str for path_str in manifest_files.keys() if path_str not in current_paths]
         for path_str in removed:
+            ledger_sources_to_replace.add(path_str)
             try:
                 collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
             except Exception as e:
@@ -1244,6 +1311,24 @@ def run_add(
                 pass
             prev = manifest_files.get(path_str) or {}
             _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
+
+    if precloned_by_path:
+        for path_str, (fhash, cloned_chunks) in precloned_by_path.items():
+            cloned_norm = [
+                (
+                    hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20],
+                    doc,
+                    {**meta, "silo": silo_slug},
+                )
+                for cid, doc, meta in cloned_chunks
+            ]
+            if not cloned_norm:
+                continue
+            all_chunks.extend(cloned_norm)
+            tax_rows.extend(extract_tax_rows_from_chunks(cloned_norm))
+            files_indexed += 1
+            if fhash:
+                to_register.append((fhash, path_str))
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_item = {
@@ -1272,6 +1357,7 @@ def run_add(
                     for cid, doc, meta in chunks
                 ]
                 all_chunks.extend(chunks)
+                tax_rows.extend(extract_tax_rows_from_chunks(chunks))
                 files_indexed += 1
                 if fhash:
                     to_register.append((fhash, str(p)))
@@ -1290,6 +1376,7 @@ def run_add(
     for zip_path in zips:
         if zip_path.stat().st_size > max_archive_bytes:
             continue
+        ledger_sources_to_replace.add(str(zip_path))
         if incremental:
             try:
                 zstat = zip_path.stat()
@@ -1324,7 +1411,13 @@ def run_add(
                 for cid, doc, meta in chunks
             ]
             all_chunks.extend(chunks)
+            tax_rows.extend(extract_tax_rows_from_chunks(chunks))
             files_indexed += 1
+
+    if regular_with_hash:
+        for _p, _k, _h, p_res in regular_with_hash:
+            if p_res is not None:
+                ledger_sources_to_replace.add(str(p_res))
 
     if incremental:
         def _update_manifest(manifest_data: dict) -> None:
@@ -1379,6 +1472,15 @@ def run_add(
             no_color=no_color,
             embedding_fn=ef,
             embedding_workers=embedding_workers,
+        )
+
+    if (not incremental) or ledger_sources_to_replace or tax_rows:
+        replace_tax_rows_for_sources(
+            db_path,
+            silo=silo_slug,
+            sources=ledger_sources_to_replace,
+            new_rows=tax_rows,
+            replace_all_in_silo=(not incremental),
         )
 
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1523,6 +1625,10 @@ def remove_single_file(
 ) -> tuple[str, str]:
     """Remove a single file from a silo (chunks, manifest, registry). Returns (status, path)."""
     db_path = db_path or DB_PATH
+    try:
+        Path(db_path).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     p = Path(path).resolve()
     path_str = str(p)
 
@@ -1555,6 +1661,12 @@ def remove_single_file(
             del files_map[path_str]
 
     _update_file_manifest(db_path, _update_manifest)
+    replace_tax_rows_for_sources(
+        db_path,
+        silo=silo_slug,
+        sources={path_str},
+        new_rows=[],
+    )
     if update_counts:
         update_silo_counts(db_path, silo_slug)
     return ("removed" if prev else "skipped", path_str)
@@ -1574,6 +1686,10 @@ def update_single_file(
     status: updated|unchanged|removed|skipped|duplicate|error
     """
     db_path = db_path or DB_PATH
+    try:
+        Path(db_path).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     p = Path(path)
     if p.is_symlink() and not follow_symlinks:
         return ("skipped", str(p))
@@ -1611,6 +1727,7 @@ def update_single_file(
     prev = manifest_files.get(path_str) if isinstance(manifest_files, dict) else None
 
     file_hash = ""
+    existing: list[dict[str, Any]] = []
     if kind != "zip":
         file_hash = get_file_hash(p)
         if prev and prev.get("mtime") == mtime and prev.get("size") == size:
@@ -1658,10 +1775,22 @@ def update_single_file(
         except Exception:
             chunks = []
     else:
-        try:
-            chunks = process_one_file(p, kind, file_hash or None, follow_symlinks, p)
-        except Exception:
-            chunks = []
+        clone_from = next(
+            (str(e.get("silo") or "") for e in existing if str(e.get("silo") or "") != silo_slug),
+            "",
+        )
+        if clone_from and file_hash:
+            chunks = _clone_chunks_from_existing_silo(
+                collection=collection,
+                from_silo=clone_from,
+                source_path=path_str,
+                target_silo=silo_slug,
+            )
+        if not chunks:
+            try:
+                chunks = process_one_file(p, kind, file_hash or None, follow_symlinks, p)
+            except Exception:
+                chunks = []
 
     if chunks:
         chunks = [
@@ -1690,6 +1819,7 @@ def update_single_file(
         )
         if file_hash:
             _file_registry_add(db_path, file_hash, silo_slug, path_str)
+    tax_rows = extract_tax_rows_from_chunks(chunks) if chunks else []
 
     def _update_manifest(manifest_data: dict) -> None:
         silos = manifest_data.setdefault("silos", {})
@@ -1701,6 +1831,12 @@ def update_single_file(
         files_map[path_str] = {"mtime": mtime, "size": size, "hash": file_hash if kind != "zip" else ""}
 
     _update_file_manifest(db_path, _update_manifest)
+    replace_tax_rows_for_sources(
+        db_path,
+        silo=silo_slug,
+        sources={path_str},
+        new_rows=tax_rows,
+    )
     if update_counts:
         update_silo_counts(db_path, silo_slug)
     return ("updated", path_str)

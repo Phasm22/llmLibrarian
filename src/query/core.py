@@ -30,6 +30,7 @@ from query.intent import (
     INTENT_LOOKUP,
     INTENT_FIELD_LOOKUP,
     INTENT_MONEY_YEAR_TOTAL,
+    INTENT_TAX_QUERY,
     INTENT_PROJECT_COUNT,
     INTENT_EVIDENCE_PROFILE,
     INTENT_AGGREGATE,
@@ -119,6 +120,7 @@ from query.guardrails import (
     run_csv_rank_lookup_guardrail,
     run_direct_value_consistency_guardrail,
 )
+from query.tax_resolver import run_tax_resolver
 from query.project_count import compute_project_count, format_project_count
 from query.timeline import parse_timeline_request, build_timeline_from_manifest, format_timeline_answer
 from query.metadata import parse_metadata_request, aggregate_metadata, format_metadata_answer
@@ -1184,6 +1186,41 @@ def run_ask(
             answer_kind="catalog_artifact",
         )
         return response
+
+    # TAX_QUERY: terminal deterministic resolver against ingest-time tax ledger.
+    if intent == INTENT_TAX_QUERY:
+        tax_guardrail = run_tax_resolver(
+            query=query,
+            intent=intent,
+            db_path=db,
+            use_unified=use_unified,
+            silo=silo,
+            source_label=source_label,
+            no_color=no_color,
+        )
+        if tax_guardrail is not None:
+            time_ms = (time.perf_counter() - t0) * 1000
+            write_trace(
+                intent=(INTENT_TAX_QUERY if intent != INTENT_TAX_QUERY else intent),
+                n_stage1=0,
+                n_results=0,
+                model=model,
+                silo=silo,
+                source_label=source_label,
+                num_docs=tax_guardrail.get("num_docs", 0),
+                time_ms=time_ms,
+                query_len=len(query),
+                hybrid_used=False,
+                receipt_metas=tax_guardrail.get("receipt_metas"),
+                guardrail_no_match=tax_guardrail.get("guardrail_no_match"),
+                guardrail_reason=tax_guardrail.get("guardrail_reason"),
+                requested_year=tax_guardrail.get("requested_year"),
+                requested_form=tax_guardrail.get("requested_form"),
+                requested_line=tax_guardrail.get("requested_line"),
+                answer_kind="guardrail",
+            )
+            response_text = str(tax_guardrail["response"])
+            return _quiet_text_only(response_text) if quiet else response_text
 
     n_effective = effective_k(intent, n_results)
     if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE):

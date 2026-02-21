@@ -7,6 +7,7 @@ from query.intent import (
     INTENT_FILE_LIST,
     INTENT_STRUCTURE,
     INTENT_MONEY_YEAR_TOTAL,
+    INTENT_TAX_QUERY,
     INTENT_PROJECT_COUNT,
     INTENT_LOOKUP,
     INTENT_REFLECT,
@@ -79,6 +80,16 @@ def test_route_intent_money_year_total_make_phrase():
 def test_route_intent_money_year_total_earn_phrase():
     q = "how much did i earn in 2025"
     assert route_intent(q) == INTENT_MONEY_YEAR_TOTAL
+
+
+def test_route_intent_tax_query_box_lookup():
+    q = "box 2 deloitte 2025"
+    assert route_intent(q) == INTENT_TAX_QUERY
+
+
+def test_route_intent_tax_query_taxes_paid_phrase():
+    q = "how much did i pay in taxes at deloitte in 2025"
+    assert route_intent(q) == INTENT_TAX_QUERY
 
 
 def test_route_intent_project_count():

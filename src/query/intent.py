@@ -8,6 +8,7 @@ import re
 INTENT_LOOKUP = "LOOKUP"
 INTENT_FIELD_LOOKUP = "FIELD_LOOKUP"
 INTENT_MONEY_YEAR_TOTAL = "MONEY_YEAR_TOTAL"
+INTENT_TAX_QUERY = "TAX_QUERY"
 INTENT_PROJECT_COUNT = "PROJECT_COUNT"
 INTENT_EVIDENCE_PROFILE = "EVIDENCE_PROFILE"
 INTENT_AGGREGATE = "AGGREGATE"
@@ -27,7 +28,7 @@ K_AGGREGATE_MAX = 128
 
 
 def route_intent(query: str) -> str:
-    """Silent router: LOOKUP | FIELD_LOOKUP | MONEY_YEAR_TOTAL | PROJECT_COUNT | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES | FILE_LIST | STRUCTURE."""
+    """Silent router: LOOKUP | FIELD_LOOKUP | MONEY_YEAR_TOTAL | TAX_QUERY | PROJECT_COUNT | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES | FILE_LIST | STRUCTURE."""
     q = query.strip().lower()
     if not q:
         return INTENT_LOOKUP
@@ -146,7 +147,7 @@ def route_intent(query: str) -> str:
     )
     has_make_earn = bool(
         re.search(
-            r"\bhow\s+much\b[^\n]{0,80}\b(?:make|made|earn|earned|paid)\b",
+            r"\bhow\s+much\b[^\n]{0,80}\b(?:make|made|earn|earned)\b",
             q,
         )
     )
@@ -155,6 +156,12 @@ def route_intent(query: str) -> str:
     lacks_form = not has_form
     if has_year_only and (has_income or has_make_earn) and lacks_line and lacks_form:
         return INTENT_MONEY_YEAR_TOTAL
+    # TAX_QUERY: deterministic tax-domain resolver (box lookups, withholding/tax phrasing).
+    if has_year_only and re.search(
+        r"\b(tax|taxes|withheld|withholding|w-?2|1099|1040|box\s*\d{1,2}|payroll|state\s+tax)\b",
+        q,
+    ):
+        return INTENT_TAX_QUERY
     # PROJECT_COUNT: how many coding projects in this folder/silo
     if re.search(r"\bhow\s+(many|much)\b", q) and re.search(r"\bprojects?\b", q):
         return INTENT_PROJECT_COUNT

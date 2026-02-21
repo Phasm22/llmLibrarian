@@ -19,7 +19,7 @@ Current deterministic query families:
 - Project count
 - File-list by year
 - Structure snapshots (`outline`, `recent`, `inventory`, extension counts)
-- Income-year guardrails (1040 line 9/11 and employer-scoped W-2 wage extraction)
+- Tax ledger resolver (W-2/1040/1099 key fields; employer/year-scoped lookups)
 - Direct value guardrails (when extraction is confident)
 
 For deterministic structure asks:
@@ -50,6 +50,19 @@ Lock files:
 
 If `LLMLIBRARIAN_TRACE` is set, asks append JSON-lines traces.
 Trace includes `answer_kind` (`catalog_artifact`, `guardrail`, or `rag`).
+
+## Tax Ledger Architecture
+
+- Ingest writes normalized tax rows with provenance:
+  - `source`, `page`, `tax_year`, `form_type`, `field_code`, `normalized_decimal`, `extractor_tier`, `confidence`.
+- Extraction is tiered:
+  - Tier A: direct form-field labels (`form_field`)
+  - Tier B: layout label/value matching (`layout`)
+  - Tier C: OCR text + layout matching (`ocr_layout`)
+- Tax query handling is terminal and deterministic:
+  - resolved value with cited sources, or
+  - abstain/disambiguation with reason category.
+- LLM does not generate numeric tax values.
 
 ## OCR Observability
 

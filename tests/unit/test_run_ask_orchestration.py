@@ -7,6 +7,7 @@ from query.intent import (
     INTENT_FIELD_LOOKUP,
     INTENT_FILE_LIST,
     INTENT_MONEY_YEAR_TOTAL,
+    INTENT_TAX_QUERY,
     INTENT_STRUCTURE,
     INTENT_LOOKUP,
 )
@@ -1559,6 +1560,36 @@ def test_run_ask_income_employer_guardrail_short_circuits_llm(monkeypatch, mock_
     assert "W-2 wages for YMCA (2025): 4,626.76 [Box 1]" in out
     assert mock_ollama["calls"] == []
     assert not any(name == "query" for name, _kwargs in mock_collection.calls)
+
+
+def test_run_ask_tax_resolver_short_circuits_llm(monkeypatch, mock_ollama):
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_TAX_QUERY)
+    monkeypatch.setattr(
+        "query.core.run_tax_resolver",
+        lambda **_kwargs: {
+            "response": "Federal income tax withheld at Deloitte (2025): 4,723.31",
+            "guardrail_no_match": False,
+            "guardrail_reason": "tax_resolved",
+            "requested_year": "2025",
+            "requested_form": "W2",
+            "requested_line": "w2_box_2_federal_income_tax_withheld",
+            "num_docs": 1,
+            "receipt_metas": [{"source": "/tmp/deloitte.pdf", "page": 1}],
+        },
+    )
+    monkeypatch.setattr(
+        "query.core.chromadb.PersistentClient",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("tax resolver should bypass chroma retrieval")),
+    )
+    out = run_ask(
+        archetype_id=None,
+        query="box 2 deloitte 2025",
+        no_color=True,
+        use_reranker=False,
+        silo="tax",
+    )
+    assert "4,723.31" in out
+    assert mock_ollama["calls"] == []
 
 
 def test_run_ask_csv_rank_guardrail_short_circuits_llm(monkeypatch, mock_collection, mock_ollama):

@@ -1,0 +1,1 @@
+"""Tiered tax extractors."""
