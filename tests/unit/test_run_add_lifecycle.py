@@ -199,3 +199,21 @@ def test_run_add_incremental_skips_unchanged_files(monkeypatch, tmp_path):
     assert files_indexed == 0
     assert failures == 0
     assert called["process"] == 0
+
+
+def test_run_add_prints_effective_worker_settings(monkeypatch, tmp_path, capsys):
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "a.txt").write_text("hello world", encoding="utf-8")
+    coll = _FakeCollection()
+    _patch_runtime(monkeypatch, coll)
+    monkeypatch.setenv("LLMLIBRARIAN_MAX_WORKERS", "3")
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_WORKERS", "5")
+    monkeypatch.delenv("LLMLIBRARIAN_QUIET", raising=False)
+
+    files_indexed, failures = run_add(root, db_path=tmp_path / "db", allow_cloud=True, no_color=True)
+    captured = capsys.readouterr()
+
+    assert files_indexed >= 1
+    assert failures == 0
+    assert "Workers: file=3, embedding=5" in captured.out

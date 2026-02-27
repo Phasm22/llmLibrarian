@@ -1,5 +1,6 @@
 from query.guardrails import field_lookup_candidates_from_scope
 from query.retrieval import (
+    academic_source_priority_score,
     all_dists_above_threshold,
     dedup_by_chunk_hash,
     diversify_by_silo,
@@ -12,6 +13,7 @@ from query.retrieval import (
     extract_scope_tokens,
     resolve_subscope,
     rrf_merge,
+    sort_by_academic_priority,
     extract_direct_lexical_terms,
     sort_by_source_priority,
     source_extension_rank_map,
@@ -277,6 +279,35 @@ def test_sort_by_source_priority_promotes_canonical_sources():
     )
     assert docs[0] == "canonical answer"
     assert (metas[0] or {}).get("source", "").endswith("canonical-hours.md")
+
+
+def test_academic_source_priority_prefers_transcript_rows_over_plan_guides():
+    transcript_score = academic_source_priority_score(
+        {"record_type": "transcript_row", "doc_type": "transcript", "source": "/tmp/Uccs_Transcript.pdf"},
+        "Course row: CS 2060 | C Programming",
+        {"mode": "classes_taken"},
+    )
+    plan_score = academic_source_priority_score(
+        {"record_type": "plan_row", "doc_type": "other", "source": "/tmp/BC CSBA-Cyber 23-24 agreement.pdf"},
+        "Suggested courses for transfer",
+        {"mode": "classes_taken"},
+    )
+    assert transcript_score > plan_score
+
+
+def test_sort_by_academic_priority_softly_promotes_transcript_but_keeps_non_transcript():
+    docs, metas, dists = sort_by_academic_priority(
+        docs=["plan text", "transcript row text", "audit text"],
+        metas=[
+            {"source": "/tmp/transfer-plan.pdf", "record_type": "plan_row", "doc_type": "other"},
+            {"source": "/tmp/Uccs_Transcript.pdf", "record_type": "transcript_row", "doc_type": "transcript"},
+            {"source": "/tmp/degree-audit.pdf", "record_type": "audit_row", "doc_type": "audit"},
+        ],
+        dists=[0.1, 0.2, 0.3],
+        query_contract={"mode": "classes_taken"},
+    )
+    assert docs[0] == "transcript row text"
+    assert set(docs) == {"plan text", "transcript row text", "audit text"}
 
 
 def test_source_extension_rank_map_prefers_extension_at_source_level():

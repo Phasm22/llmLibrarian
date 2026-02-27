@@ -556,6 +556,7 @@ class PDFProcessor:
                     )
             with fitz.open(stream=data, filetype="pdf") as doc:
                 out: list[tuple[str, int]] = []
+                pages_without_text_or_ocr: list[int] = []
                 for page in doc:
                     raw_text = page.get_text()
                     ocr_text: str | None = None
@@ -578,13 +579,7 @@ class PDFProcessor:
                                 backend=backend,
                             )
                         else:
-                            _log_processor_event(
-                                "WARN",
-                                "PDF page has no extractable text and OCR produced no text",
-                                path=source_path,
-                                page=page.number + 1,
-                                available_ocr_backends=_available_ocr_backends(),
-                            )
+                            pages_without_text_or_ocr.append(page.number + 1)
                     page_tables = tables_by_page[page.number] if page.number < len(tables_by_page) else []
                     hints: list[str] = []
                     md_tables: list[str] = []
@@ -598,6 +593,15 @@ class PDFProcessor:
                             md_tables.append(md)
                     text = _merge_pdf_page_content(raw_text, "\n\n".join(md_tables), hints, ocr_text=ocr_text)
                     out.append((text, page.number + 1))
+                if pages_without_text_or_ocr:
+                    _log_processor_event(
+                        "WARN",
+                        "PDF pages have no extractable text and OCR produced no text",
+                        path=source_path,
+                        pages=pages_without_text_or_ocr,
+                        page_count=len(pages_without_text_or_ocr),
+                        available_ocr_backends=_available_ocr_backends(),
+                    )
                 return out
         except Exception as e:
             raise PDFExtractionError(str(e)) from e

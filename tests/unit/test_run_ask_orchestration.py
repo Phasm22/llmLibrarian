@@ -1,6 +1,7 @@
 import json
 
 from query.intent import (
+    INTENT_ACADEMIC_HISTORY,
     INTENT_CAPABILITIES,
     INTENT_CODE_LANGUAGE,
     INTENT_EVIDENCE_PROFILE,
@@ -1590,6 +1591,121 @@ def test_run_ask_tax_resolver_short_circuits_llm(monkeypatch, mock_ollama):
     )
     assert "4,723.31" in out
     assert mock_ollama["calls"] == []
+
+
+def test_run_ask_academic_resolver_short_circuits_llm(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_ACADEMIC_HISTORY)
+    monkeypatch.setattr(
+        "query.core.parse_academic_query",
+        lambda _q: {
+            "mode": "classes_taken",
+            "completed_only": True,
+            "requested_school": "UCCS",
+            "requested_term": None,
+            "requested_year": None,
+        },
+    )
+    monkeypatch.setattr(
+        "query.core.run_academic_resolver",
+        lambda **_kwargs: {
+            "response": "Here are the classes found in your indexed academic records:\n1. [High] CS 2060 C Programming",
+            "guardrail_no_match": False,
+            "guardrail_reason": "academic_history_rows",
+            "requested_year": None,
+            "requested_form": "academic_history",
+            "requested_line": None,
+            "num_docs": 1,
+            "receipt_metas": [{"source": "/tmp/Uccs_Transcript.pdf", "record_type": "transcript_row"}],
+            "academic_transcript_hits": 1,
+            "academic_evidence_rows": 1,
+        },
+    )
+    out = run_ask(
+        archetype_id=None,
+        query="what classes have i taken at uccs",
+        no_color=True,
+        use_reranker=False,
+        silo="old-school",
+    )
+    assert "classes found in your indexed academic records" in out
+    assert mock_ollama["calls"] == []
+    assert not any(name == "query" for name, _kwargs in mock_collection.calls)
+
+
+def test_run_ask_academic_resolver_miss_falls_back_with_academic_low_confidence(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_ACADEMIC_HISTORY)
+    monkeypatch.setattr(
+        "query.core.parse_academic_query",
+        lambda _q: {
+            "mode": "classes_taken",
+            "completed_only": True,
+            "requested_school": "UCCS",
+            "requested_term": None,
+            "requested_year": None,
+        },
+    )
+    monkeypatch.setattr("query.core.run_academic_resolver", lambda **_kwargs: None)
+    mock_collection.query_result = {
+        "documents": [["UCCS transfer guide and agreement references classes."]],
+        "metadatas": [[{"source": "/tmp/BC CSBA-Cyber 23-24 agreement.pdf", "doc_type": "other", "is_local": 1}]],
+        "distances": [[0.82]],
+        "ids": [["id-1"]],
+    }
+    out = run_ask(
+        archetype_id=None,
+        query="what classes have i taken at uccs",
+        no_color=True,
+        use_reranker=False,
+        silo="old-school",
+    )
+    assert "Low confidence: class-history query is not grounded in transcript/audit course rows in this scope." in out
+    assert len(mock_ollama["calls"]) == 1
+
+
+def test_run_ask_academic_trace_fields_present(monkeypatch, tmp_path, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    trace_path = tmp_path / "trace.jsonl"
+    monkeypatch.setenv("LLMLIBRARIAN_TRACE", str(trace_path))
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_ACADEMIC_HISTORY)
+    monkeypatch.setattr(
+        "query.core.parse_academic_query",
+        lambda _q: {
+            "mode": "classes_taken",
+            "completed_only": True,
+            "requested_school": "UCCS",
+            "requested_term": None,
+            "requested_year": None,
+        },
+    )
+    monkeypatch.setattr(
+        "query.core.run_academic_resolver",
+        lambda **_kwargs: {
+            "response": "Here are the classes found in your indexed academic records:\n1. [High] CS 2060 C Programming",
+            "guardrail_no_match": False,
+            "guardrail_reason": "academic_history_rows",
+            "requested_year": None,
+            "requested_form": "academic_history",
+            "requested_line": None,
+            "num_docs": 1,
+            "receipt_metas": [{"source": "/tmp/Uccs_Transcript.pdf", "record_type": "transcript_row"}],
+            "academic_transcript_hits": 1,
+            "academic_evidence_rows": 1,
+        },
+    )
+    run_ask(
+        archetype_id=None,
+        query="what classes have i taken at uccs",
+        no_color=True,
+        use_reranker=False,
+        silo="old-school",
+    )
+    payload = json.loads(trace_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert payload.get("academic_mode") is True
+    assert payload.get("academic_rerank_applied") is False
+    assert payload.get("academic_transcript_hits") == 1
+    assert payload.get("academic_evidence_rows") == 1
 
 
 def test_run_ask_csv_rank_guardrail_short_circuits_llm(monkeypatch, mock_collection, mock_ollama):

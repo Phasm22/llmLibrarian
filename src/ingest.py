@@ -522,15 +522,96 @@ def _chunks_from_csv_text(
     return out
 
 
-def _chunks_from_pdf(
+_TRANSCRIPT_TERM_RE = re.compile(r"\b(Spring|Summer|Fall|Winter)\s+(20\d{2})\b", re.IGNORECASE)
+_TRANSCRIPT_CODE_RE = re.compile(
+    r"^\s*(?:[A-Z]\s+)?(?P<code>[A-Z]{2,4}\s*-?\s*\d{3,4}[A-Z]?)\b"
+)
+_TRANSCRIPT_GRADES = frozenset({"A+", "A", "A-", "B+", "B", "B-", "C+", "C", "C-", "D+", "D", "D-", "F", "P", "NP", "S", "U", "W", "I"})
+_TRANSCRIPT_LEVELS = frozenset({"UG", "GR", "LD", "UD"})
+_TRANSCRIPT_CREDITS_RE = re.compile(r"^\d{1,2}(?:\.\d{1,3})?$")
+
+
+def _parse_transcript_body(body: str) -> tuple[str, str, str]:
+    tokens = [t for t in (body or "").split() if t]
+    if not tokens:
+        return ("", "", "")
+    grade = ""
+    credits = ""
+    if len(tokens) >= 2:
+        last = tokens[-1].upper()
+        prev = tokens[-2].upper()
+        if last in _TRANSCRIPT_GRADES and _TRANSCRIPT_CREDITS_RE.match(tokens[-2]):
+            grade = tokens[-1].upper()
+            credits = tokens[-2]
+            tokens = tokens[:-2]
+        elif _TRANSCRIPT_CREDITS_RE.match(tokens[-1]) and prev in _TRANSCRIPT_GRADES:
+            grade = tokens[-2].upper()
+            credits = tokens[-1]
+            tokens = tokens[:-2]
+        elif last in _TRANSCRIPT_GRADES:
+            grade = tokens[-1].upper()
+            tokens = tokens[:-1]
+        elif _TRANSCRIPT_CREDITS_RE.match(tokens[-1]):
+            credits = tokens[-1]
+            tokens = tokens[:-1]
+    title = " ".join(tokens).strip(" -|:")
+    return (title, grade, credits)
+
+
+def _extract_transcript_rows(page_text: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    current_term = ""
+    for raw_line in (page_text or "").splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line:
+            continue
+        term_match = _TRANSCRIPT_TERM_RE.search(line)
+        if term_match:
+            current_term = f"{term_match.group(1).title()} {term_match.group(2)}"
+        code_match = _TRANSCRIPT_CODE_RE.match(line)
+        if not code_match:
+            continue
+        code = " ".join((code_match.group("code") or "").replace("-", " ").split())
+        body = line[code_match.end() :].strip()
+        if not body:
+            continue
+        body_tokens = body.split()
+        if body_tokens and body_tokens[0].upper() in _TRANSCRIPT_LEVELS:
+            body = " ".join(body_tokens[1:]).strip()
+        title, grade, credits = _parse_transcript_body(body)
+        if not title:
+            continue
+        rows.append(
+            {
+                "course_code": code,
+                "course_title": title,
+                "course_term": current_term,
+                "course_grade": grade,
+                "course_credits": credits,
+            }
+        )
+    return rows
+
+
+def _format_transcript_row_doc(row: dict[str, str]) -> str:
+    parts = [f"Course row: {row.get('course_code', '').strip()} | {row.get('course_title', '').strip()}"]
+    if row.get("course_term"):
+        parts.append(f"Term: {row['course_term']}")
+    if row.get("course_credits"):
+        parts.append(f"Credits: {row['course_credits']}")
+    if row.get("course_grade"):
+        parts.append(f"Grade: {row['course_grade']}")
+    return " | ".join(parts)
+
+
+def _chunks_from_pdf_pages(
     file_id: str,
-    pdf_bytes: bytes,
+    pages: list[tuple[str, int]],
     source_path: str,
     mtime: float,
     file_hash: str | None = None,
 ) -> list[ChunkTuple]:
-    """Build chunk list (id, doc, meta) for PDF by page. doc_type from first page content overrides path when not 'other'."""
-    pages = get_text_from_pdf_bytes(pdf_bytes, source_path=source_path)
+    """Build chunk list (id, doc, meta) for already-extracted PDF page tuples."""
     first_page_text = (pages[0][0] if pages else "")[:CONTENT_SAMPLE_LEN]
     content_type = _doc_type_from_content(first_page_text)
     doc_type = content_type if content_type != "other" else _doc_type_from_path(source_path)
@@ -538,6 +619,33 @@ def _chunks_from_pdf(
     for page_text, page_num in pages:
         if not page_text.strip():
             continue
+        if doc_type == "transcript":
+            transcript_rows = _extract_transcript_rows(page_text)
+            if transcript_rows:
+                for row_index, row in enumerate(transcript_rows, start=1):
+                    doc = _format_transcript_row_doc(row)
+                    chunk_id = _stable_chunk_id(source_path, mtime, page_num * 1000 + row_index)
+                    meta: dict[str, Any] = {
+                        "source": source_path,
+                        "source_path": source_path,
+                        "mtime": mtime,
+                        "chunk_hash": _chunk_hash(doc),
+                        "file_id": file_id,
+                        "page": page_num,
+                        "is_local": _is_local(source_path),
+                        "doc_type": doc_type,
+                        "content_extracted": 1,
+                        "record_type": "transcript_row",
+                        "course_code": row.get("course_code", ""),
+                        "course_title": row.get("course_title", ""),
+                        "course_term": row.get("course_term", ""),
+                        "course_grade": row.get("course_grade", ""),
+                        "course_credits": row.get("course_credits", ""),
+                    }
+                    if file_hash:
+                        meta["file_hash"] = file_hash
+                    out.append((chunk_id, doc, meta))
+                continue
         chunk_id = _stable_chunk_id(source_path, mtime, page_num)
         meta = {
             "source": source_path,
@@ -554,6 +662,18 @@ def _chunks_from_pdf(
             meta["file_hash"] = file_hash
         out.append((chunk_id, page_text, meta))
     return out
+
+
+def _chunks_from_pdf(
+    file_id: str,
+    pdf_bytes: bytes,
+    source_path: str,
+    mtime: float,
+    file_hash: str | None = None,
+) -> list[ChunkTuple]:
+    """Build chunk list (id, doc, meta) for PDF by page. doc_type from first page content overrides path when not 'other'."""
+    pages = get_text_from_pdf_bytes(pdf_bytes, source_path=source_path)
+    return _chunks_from_pdf_pages(file_id, pages, source_path, mtime, file_hash=file_hash)
 
 
 def _tag_zip_meta(chunks: list[ChunkTuple], zip_path: Path) -> list[ChunkTuple]:
@@ -683,13 +803,9 @@ def process_one_file(
             extractor=getattr(processor, "format_label", "unknown"),
         )
         return []
-    # PDF: returns list of (page_text, page_num) — use _chunks_from_pdf
+    # PDF: returns list of (page_text, page_num); build chunks from already extracted pages.
     if isinstance(result, list):
-        try:
-            return _chunks_from_pdf(file_id, data, path_str, mtime, file_hash=file_hash)
-        except PDFExtractionError as e:
-            _log_event("ERROR", "PDF extraction failed", path=path_str, error=str(e))
-            return []
+        return _chunks_from_pdf_pages(file_id, result, path_str, mtime, file_hash=file_hash)
     # Extraction returned None — library not available; emit metadata-only chunk
     if result is None:
         return _chunk_metadata_only(
@@ -1187,6 +1303,7 @@ def run_add(
     max_archive_bytes = int((limits_cfg.get("max_archive_size_mb") or 100) * 1024 * 1024)
     max_files_per_zip = int(limits_cfg.get("max_files_per_zip") or DEFAULT_MAX_FILES_PER_ZIP)
     max_extracted_per_zip = int(limits_cfg.get("max_extracted_bytes_per_zip") or DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP)
+    quiet = os.environ.get("LLMLIBRARIAN_QUIET", "").strip().lower() in ("1", "true", "yes")
 
     file_list = collect_files(
         path,
@@ -1205,6 +1322,13 @@ def run_add(
     except (TypeError, ValueError):
         pass
     workers = max(1, min(workers, 32))
+    try:
+        embedding_workers = int(os.environ.get("LLMLIBRARIAN_EMBEDDING_WORKERS", "8"))
+    except (TypeError, ValueError):
+        embedding_workers = 1
+    embedding_workers = max(1, min(embedding_workers, 32))
+    if not quiet:
+        print(dim(no_color, f"  Workers: file={workers}, embedding={embedding_workers}"))
 
     ef = get_embedding_function()
     client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
@@ -1457,11 +1581,6 @@ def run_add(
         except (TypeError, ValueError):
             pass
         batch_size = max(1, min(batch_size, 2000))
-        try:
-            embedding_workers = int(os.environ.get("LLMLIBRARIAN_EMBEDDING_WORKERS", "1"))
-        except (TypeError, ValueError):
-            embedding_workers = 1
-        embedding_workers = max(1, min(embedding_workers, 32))
         total_batches = (len(all_chunks) + batch_size - 1) // batch_size
         if not _should_use_tqdm():
             print(dim(no_color, f"  Adding {len(all_chunks)} chunks in {total_batches} batches (batch_size={batch_size})..."))
@@ -1470,7 +1589,7 @@ def run_add(
             all_chunks,
             batch_size=batch_size,
             no_color=no_color,
-            embedding_fn=ef,
+
             embedding_workers=embedding_workers,
         )
 
@@ -1520,7 +1639,6 @@ def run_add(
     set_last_failures(db_path, failures)
 
     # Summary: trust + usability (per-file FAIL still printed above)
-    quiet = os.environ.get("LLMLIBRARIAN_QUIET", "").strip().lower() in ("1", "true", "yes")
     if not quiet:
         if failures:
             print(warn_style(no_color, f"Indexed {files_indexed} files ({len(failures)} failed). pal log or llmli log --last to see failures."), file=sys.stderr)

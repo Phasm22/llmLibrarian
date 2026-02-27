@@ -39,6 +39,10 @@ def write_trace(
     confidence_overlap_support: float | None = None,
     confidence_reason: str | None = None,
     confidence_banner_emitted: bool | None = None,
+    academic_mode: bool | None = None,
+    academic_rerank_applied: bool | None = None,
+    academic_transcript_hits: int | None = None,
+    academic_evidence_rows: int | None = None,
 ) -> None:
     """Append one JSON-line to LLMLIBRARIAN_TRACE file (if set). Optional receipt: source paths and chunk hashes for chunks sent to the LLM. No-op if env unset. Does not raise."""
     path = os.environ.get("LLMLIBRARIAN_TRACE")
@@ -106,6 +110,14 @@ def write_trace(
         payload["confidence_reason"] = str(confidence_reason)
     if confidence_banner_emitted is not None:
         payload["confidence_banner_emitted"] = bool(confidence_banner_emitted)
+    if academic_mode is not None:
+        payload["academic_mode"] = bool(academic_mode)
+    if academic_rerank_applied is not None:
+        payload["academic_rerank_applied"] = bool(academic_rerank_applied)
+    if academic_transcript_hits is not None:
+        payload["academic_transcript_hits"] = int(academic_transcript_hits)
+    if academic_evidence_rows is not None:
+        payload["academic_evidence_rows"] = int(academic_evidence_rows)
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")

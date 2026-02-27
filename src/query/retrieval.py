@@ -556,6 +556,86 @@ def sort_by_source_priority(
     )
 
 
+_ACADEMIC_DEPRIORITIZED_TOKENS = (
+    "transfer",
+    "best choices",
+    "agreement",
+    "articulation",
+    "four-year plan",
+    "four year plan",
+    "degree plan",
+    "suggested",
+)
+
+
+def academic_source_priority_score(
+    meta: dict | None,
+    doc: str,
+    query_contract: dict[str, Any] | None,
+) -> int:
+    """
+    Bounded academic source-priority score.
+    Promotes transcript/audit records and softly deprioritizes plan/guide sources.
+    """
+    del query_contract  # reserved for future query-specific boosts; keeps signature stable.
+    m = meta or {}
+    source = str(m.get("source") or "").lower()
+    record_type = str(m.get("record_type") or "").lower()
+    doc_type = str(m.get("doc_type") or "").lower()
+    text = (doc or "").lower()
+
+    score = 0
+    if record_type == "transcript_row":
+        score += 12
+    elif record_type == "audit_row":
+        score += 8
+    elif record_type == "plan_row":
+        score += 2
+
+    if doc_type == "transcript":
+        score += 4
+    elif doc_type == "audit":
+        score += 2
+
+    if "course row:" in text:
+        score += 2
+
+    if any(tok in source for tok in _ACADEMIC_DEPRIORITIZED_TOKENS):
+        score -= 4
+    if "plan_row" == record_type:
+        score -= 2
+
+    return max(-12, min(24, score))
+
+
+def sort_by_academic_priority(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    query_contract: dict[str, Any] | None,
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    """Stable rerank for class-history fallback queries. Never excludes sources."""
+    combined = list(zip(docs, metas, dists))
+
+    def _k(item: tuple[str, dict | None, float | None]) -> tuple[int, float, str, str, str]:
+        doc, meta, dist = item
+        m = meta or {}
+        return (
+            -academic_source_priority_score(meta, doc, query_contract),
+            float(dist) if dist is not None else 999.0,
+            str(m.get("source") or ""),
+            str(m.get("page") or ""),
+            str(m.get("line_start") or ""),
+        )
+
+    combined.sort(key=_k)
+    return (
+        [x[0] for x in combined],
+        [x[1] for x in combined],
+        [x[2] for x in combined],
+    )
+
+
 def source_extension_rank_map(
     metas: list[dict | None],
     dists: list[float | None],

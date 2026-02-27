@@ -12,6 +12,7 @@ INTENT_TAX_QUERY = "TAX_QUERY"
 INTENT_PROJECT_COUNT = "PROJECT_COUNT"
 INTENT_EVIDENCE_PROFILE = "EVIDENCE_PROFILE"
 INTENT_AGGREGATE = "AGGREGATE"
+INTENT_ACADEMIC_HISTORY = "ACADEMIC_HISTORY"
 INTENT_REFLECT = "REFLECT"
 INTENT_CODE_LANGUAGE = "CODE_LANGUAGE"
 INTENT_CAPABILITIES = "CAPABILITIES"
@@ -28,7 +29,7 @@ K_AGGREGATE_MAX = 128
 
 
 def route_intent(query: str) -> str:
-    """Silent router: LOOKUP | FIELD_LOOKUP | MONEY_YEAR_TOTAL | TAX_QUERY | PROJECT_COUNT | EVIDENCE_PROFILE | AGGREGATE | REFLECT | CODE_LANGUAGE | CAPABILITIES | FILE_LIST | STRUCTURE."""
+    """Silent router: LOOKUP | FIELD_LOOKUP | MONEY_YEAR_TOTAL | TAX_QUERY | PROJECT_COUNT | EVIDENCE_PROFILE | AGGREGATE | ACADEMIC_HISTORY | REFLECT | CODE_LANGUAGE | CAPABILITIES | FILE_LIST | STRUCTURE."""
     q = query.strip().lower()
     if not q:
         return INTENT_LOOKUP
@@ -187,6 +188,17 @@ def route_intent(query: str) -> str:
         q,
     ):
         return INTENT_EVIDENCE_PROFILE
+    # ACADEMIC_HISTORY: deterministic class-history / completed-course asks.
+    asks_course_words = bool(re.search(r"\b(classes?|courses?)\b", q))
+    asks_history_words = bool(
+        re.search(
+            r"\b(course\s+history|transcript|completed|taken|have\s+i\s+taken|did\s+i\s+take)\b",
+            q,
+        )
+    )
+    asks_planning_words = bool(re.search(r"\b(should|recommend|suggest(?:ed)?)\b", q))
+    if asks_course_words and asks_history_words and not asks_planning_words:
+        return INTENT_ACADEMIC_HISTORY
     # AGGREGATE: totals, lists across docs
     if re.search(
         r"\ball (?:my )?(?:income|sources|documents|files)\b|\btotal\b|\bsum\s+of\b|\blist\s+(?:every|all)\b|"
@@ -202,6 +214,8 @@ def effective_k(intent: str, n_results: int) -> int:
     if intent == INTENT_EVIDENCE_PROFILE:
         return min(K_PROFILE_MAX, max(K_PROFILE_MIN, n_results))
     if intent == INTENT_AGGREGATE:
+        return min(K_AGGREGATE_MAX, max(K_AGGREGATE_MIN, n_results))
+    if intent == INTENT_ACADEMIC_HISTORY:
         return min(K_AGGREGATE_MAX, max(K_AGGREGATE_MIN, n_results))
     if intent == INTENT_REFLECT:
         return min(24, max(n_results, 12))

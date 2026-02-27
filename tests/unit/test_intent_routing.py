@@ -2,6 +2,7 @@ import pytest
 
 from query.intent import (
     INTENT_AGGREGATE,
+    INTENT_ACADEMIC_HISTORY,
     INTENT_CAPABILITIES,
     INTENT_CODE_LANGUAGE,
     INTENT_EVIDENCE_PROFILE,
@@ -75,6 +76,18 @@ def test_route_intent_evidence_profile_query():
 
 def test_route_intent_aggregate_query():
     assert route_intent("list every source and total docs") == INTENT_AGGREGATE
+
+
+def test_route_intent_academic_history_query():
+    assert route_intent("what classes have i taken at uccs") == INTENT_ACADEMIC_HISTORY
+
+
+def test_route_intent_academic_history_course_history_query():
+    assert route_intent("show my course history") == INTENT_ACADEMIC_HISTORY
+
+
+def test_route_intent_academic_history_does_not_capture_planning():
+    assert route_intent("what classes should i take at uccs") == INTENT_LOOKUP
 
 
 def test_route_intent_field_lookup_with_total_keyword():
@@ -172,6 +185,11 @@ def test_effective_k_profile_clamps_to_range():
 def test_effective_k_aggregate_clamps_to_range():
     assert effective_k(INTENT_AGGREGATE, 2) == K_AGGREGATE_MIN
     assert effective_k(INTENT_AGGREGATE, 9_999) == K_AGGREGATE_MAX
+
+
+def test_effective_k_academic_history_clamps_to_range():
+    assert effective_k(INTENT_ACADEMIC_HISTORY, 2) == K_AGGREGATE_MIN
+    assert effective_k(INTENT_ACADEMIC_HISTORY, 9_999) == K_AGGREGATE_MAX
 
 
 def test_effective_k_reflect_clamps_to_range():

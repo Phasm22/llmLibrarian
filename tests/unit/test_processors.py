@@ -271,6 +271,8 @@ def test_pdf_processor_keeps_empty_text_when_no_ocr_backend(monkeypatch):
     fitz = pytest.importorskip("fitz")
     doc = fitz.open()
     doc.new_page()
+    doc.new_page()
+    doc.new_page()
     data = doc.tobytes()
     doc.close()
 
@@ -287,9 +289,16 @@ def test_pdf_processor_keeps_empty_text_when_no_ocr_backend(monkeypatch):
 
     proc = PDFProcessor()
     pages = proc.extract(data, "scan.pdf")
-    text, _page_num = pages[0]
-    assert text == ""
-    assert any("OCR produced no text" in e.get("message", "") for e in events)
+    assert len(pages) == 3
+    assert all((text == "" and page_num in (1, 2, 3)) for text, page_num in pages)
+    warn_events = [e for e in events if "OCR produced no text" in e.get("message", "")]
+    assert len(warn_events) == 1
+    warning = warn_events[0]
+    assert warning.get("message") == "PDF pages have no extractable text and OCR produced no text"
+    assert warning.get("path") == "scan.pdf"
+    assert warning.get("pages") == [1, 2, 3]
+    assert warning.get("page_count") == 3
+    assert warning.get("available_ocr_backends") == []
 
 
 @pytest.mark.parametrize(

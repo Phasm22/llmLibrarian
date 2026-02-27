@@ -34,6 +34,7 @@ from query.intent import (
     INTENT_PROJECT_COUNT,
     INTENT_EVIDENCE_PROFILE,
     INTENT_AGGREGATE,
+    INTENT_ACADEMIC_HISTORY,
     INTENT_REFLECT,
     INTENT_CODE_LANGUAGE,
     INTENT_CAPABILITIES,
@@ -53,6 +54,7 @@ from query.retrieval import (
     rrf_merge,
     extract_direct_lexical_terms,
     sort_by_source_priority,
+    sort_by_academic_priority,
     source_extension_rank_map,
     source_priority_score,
     filter_by_triggers,
@@ -121,6 +123,8 @@ from query.guardrails import (
     run_direct_value_consistency_guardrail,
 )
 from query.tax_resolver import run_tax_resolver
+from query.academic import parse_academic_query
+from query.academic_resolver import run_academic_resolver
 from query.project_count import compute_project_count, format_project_count
 from query.timeline import parse_timeline_request, build_timeline_from_manifest, format_timeline_answer
 from query.metadata import parse_metadata_request, aggregate_metadata, format_metadata_answer
@@ -446,6 +450,21 @@ def _query_overlap_support(query: str, docs: list[str], metas: list[dict | None]
     return best
 
 
+def _academic_support_stats(metas: list[dict | None]) -> tuple[int, int]:
+    """Return (transcript_or_audit_hits, academic_row_count) from retrieved metas."""
+    support_hits = 0
+    row_count = 0
+    for meta in metas:
+        m = meta or {}
+        record_type = str(m.get("record_type") or "").lower()
+        doc_type = str(m.get("doc_type") or "").lower()
+        if record_type in {"transcript_row", "audit_row", "plan_row"}:
+            row_count += 1
+        if record_type in {"transcript_row", "audit_row"} or doc_type in {"transcript", "audit"}:
+            support_hits += 1
+    return (support_hits, row_count)
+
+
 def _confidence_assessment(
     dists: list[float | None],
     metas: list[dict | None],
@@ -457,6 +476,8 @@ def _confidence_assessment(
     confidence_relaxation_enabled: bool = True,
     filetype_hints: list[str] | None = None,
     answer_text: str | None = None,
+    academic_mode: bool = False,
+    academic_transcript_hits: int = 0,
 ) -> dict[str, Any]:
     """Return confidence warning + diagnostics used for trace observability."""
     non_none = [float(d) for d in dists if d is not None]
@@ -527,6 +548,10 @@ def _confidence_assessment(
         warning = "Single source: answer is based on one document only."
         reason = "single_source"
 
+    if academic_mode and warning and academic_transcript_hits <= 0:
+        warning = "Low confidence: class-history query is not grounded in transcript/audit course rows in this scope."
+        reason = "academic_no_transcript_support"
+
     # If the model's answer is uncertainty/absence language and evidence quality is mixed,
     # force the standard low-confidence banner for user-facing consistency.
     if answer_text and _UNCERTAINTY_ANSWER_PATTERN.search(answer_text):
@@ -561,6 +586,8 @@ def _confidence_signal(
     confidence_relaxation_enabled: bool = True,
     filetype_hints: list[str] | None = None,
     answer_text: str | None = None,
+    academic_mode: bool = False,
+    academic_transcript_hits: int = 0,
 ) -> str | None:
     """Emit a lightweight confidence warning when retrieval quality is weak."""
     assessment = _confidence_assessment(
@@ -574,6 +601,8 @@ def _confidence_signal(
         confidence_relaxation_enabled=confidence_relaxation_enabled,
         filetype_hints=filetype_hints,
         answer_text=answer_text,
+        academic_mode=academic_mode,
+        academic_transcript_hits=academic_transcript_hits,
     )
     return assessment.get("warning")
 
@@ -826,6 +855,11 @@ def run_ask(
     code_activity_year_lookup = bool(intent == INTENT_LOOKUP and _is_code_activity_year_lookup(query))
     code_activity_requested_year = _single_year_from_query(query) if code_activity_year_lookup else None
     code_activity_sources: list[str] = []
+    academic_mode = bool(intent == INTENT_ACADEMIC_HISTORY)
+    academic_contract = parse_academic_query(query) if academic_mode else None
+    academic_rerank_applied = False
+    academic_transcript_hits = 0
+    academic_evidence_rows = 0
     ownership_framing_requested = _query_requests_ownership_framing(query)
     recency_hints_requested = _query_requests_recency_hints(query)
     unified_analytical_query = False
@@ -1223,7 +1257,7 @@ def run_ask(
             return _quiet_text_only(response_text) if quiet else response_text
 
     n_effective = effective_k(intent, n_results)
-    if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE):
+    if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE, INTENT_ACADEMIC_HISTORY):
         n_stage1 = max(n_effective, RERANK_STAGE1_N if use_reranker else 60)
     elif intent == INTENT_REFLECT:
         n_stage1 = n_effective
@@ -1245,6 +1279,14 @@ def run_ask(
         system_prompt = (
             system_prompt.rstrip()
             + "\n\nIf the question asks for a list or total across documents, list each item and cite its source."
+        )
+    elif intent == INTENT_ACADEMIC_HISTORY:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nFor class-history questions, list classes in one numbered list."
+            + " Confidence labels must be grounded to evidence type only:"
+            + " transcript_row=High, audit_row=Medium, plan_row=Low."
+            + " Do not infer completed/taken status from plan/suggested evidence."
         )
     elif intent == INTENT_REFLECT:
         system_prompt = (
@@ -1326,6 +1368,48 @@ def run_ask(
             answer_kind="guardrail",
         )
         return format_code_language_answer(by_ext, sample_paths, source_label, no_color)
+
+    # ACADEMIC_HISTORY: trust-first deterministic resolver from ingest-time course rows.
+    if academic_mode:
+        contract = academic_contract or parse_academic_query(query)
+        if contract is not None:
+            academic_guardrail = run_academic_resolver(
+                query_contract=contract,
+                collection=collection,
+                use_unified=use_unified,
+                silo=silo,
+                source_label=source_label,
+                no_color=no_color,
+            )
+            if academic_guardrail is not None:
+                time_ms = (time.perf_counter() - t0) * 1000
+                academic_transcript_hits = int(academic_guardrail.get("academic_transcript_hits") or 0)
+                academic_evidence_rows = int(academic_guardrail.get("academic_evidence_rows") or 0)
+                write_trace(
+                    intent=intent,
+                    n_stage1=0,
+                    n_results=0,
+                    model=model,
+                    silo=silo,
+                    source_label=source_label,
+                    num_docs=academic_guardrail.get("num_docs", 0),
+                    time_ms=time_ms,
+                    query_len=len(query),
+                    hybrid_used=False,
+                    receipt_metas=academic_guardrail.get("receipt_metas"),
+                    guardrail_no_match=academic_guardrail.get("guardrail_no_match"),
+                    guardrail_reason=academic_guardrail.get("guardrail_reason"),
+                    requested_year=academic_guardrail.get("requested_year"),
+                    requested_form=academic_guardrail.get("requested_form"),
+                    requested_line=academic_guardrail.get("requested_line"),
+                    answer_kind="guardrail",
+                    academic_mode=True,
+                    academic_rerank_applied=False,
+                    academic_transcript_hits=academic_transcript_hits,
+                    academic_evidence_rows=academic_evidence_rows,
+                )
+                response_text = str(academic_guardrail["response"])
+                return _quiet_text_only(response_text) if quiet else response_text
 
     # Catalog sub-scope: when unified and no CLI silo, try to restrict to paths matching query tokens.
     subscope_where: dict[str, Any] | None = None
@@ -1590,6 +1674,8 @@ def run_ask(
             direct_canonical_available=direct_canonical_available,
             confidence_relaxation_enabled=confidence_relaxation_enabled,
             filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
+            academic_mode=academic_mode,
+            academic_transcript_hits=academic_transcript_hits,
         )
         top_d = _top_distance(dists)
         weak_scope_gate = bool((low_conf_first is not None and low_conf_first.startswith("Low confidence")) or (top_d is not None and top_d > WEAK_SCOPE_TOP_DISTANCE))
@@ -1776,6 +1862,15 @@ def run_ask(
         metas = [c[1] for c in combined]
         dists = [c[2] for c in combined]
 
+    if academic_mode and docs:
+        docs, metas, dists = sort_by_academic_priority(
+            docs,
+            metas,
+            dists,
+            query_contract=academic_contract,
+        )
+        academic_rerank_applied = True
+
     # Filetype hinting at source-level (not per chunk) to avoid chunk-count bias.
     preferred_exts = [str(e) for e in (filetype_hints.get("extensions") or [])]
     if docs and preferred_exts:
@@ -1939,6 +2034,9 @@ def run_ask(
         metas = [x[2] for x in combined_list]
         dists = [x[3] for x in combined_list]
 
+    if academic_mode:
+        academic_transcript_hits, academic_evidence_rows = _academic_support_stats(metas)
+
     if not docs:
         if code_activity_year_lookup and code_activity_requested_year is not None and code_activity_sources:
             lang_counts: dict[str, int] = {}
@@ -2004,6 +2102,37 @@ def run_ask(
     )
     has_evidence_overlap = _has_query_evidence_overlap(query, docs, metas)
     if all_dists_above_threshold(dists, threshold) and not unscoped_soft_low_conf and not has_evidence_overlap:
+        if academic_mode:
+            warning_text = "Low confidence: class-history query is not grounded in transcript/audit course rows in this scope."
+            time_ms = (time.perf_counter() - t0) * 1000
+            write_trace(
+                intent=intent,
+                n_stage1=n_stage1,
+                n_results=n_results,
+                model=model,
+                silo=silo,
+                source_label=source_label,
+                num_docs=len(docs),
+                time_ms=time_ms,
+                query_len=len(query),
+                hybrid_used=hybrid_used,
+                guardrail_no_match=True,
+                guardrail_reason="academic_low_confidence_no_rows",
+                answer_kind="guardrail",
+                academic_mode=True,
+                academic_rerank_applied=academic_rerank_applied,
+                academic_transcript_hits=academic_transcript_hits,
+                academic_evidence_rows=academic_evidence_rows,
+            )
+            if quiet:
+                return warning_text
+            return (
+                warning_text
+                + "\n\n"
+                + dim(no_color, "---")
+                + "\n"
+                + label_style(no_color, f"Answered by: {source_label}")
+            )
         # Low confidence - provide structure outline as fallback
         if intent == INTENT_LOOKUP and use_unified and silo:
             struct_result = build_structure_outline(db, silo, cap=50)
@@ -2127,6 +2256,8 @@ def run_ask(
             direct_canonical_available=direct_canonical_available,
             confidence_relaxation_enabled=confidence_relaxation_enabled,
             filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
+            academic_mode=academic_mode,
+            academic_transcript_hits=academic_transcript_hits,
         )
     )
     if predicted_confidence_warning and not strict:
@@ -2192,6 +2323,8 @@ def run_ask(
         confidence_relaxation_enabled=confidence_relaxation_enabled,
         filetype_hints=[str(e) for e in (filetype_hints.get("extensions") or [])],
         answer_text=raw_answer,
+        academic_mode=academic_mode,
+        academic_transcript_hits=academic_transcript_hits,
     )
     confidence_warning = str(confidence_assessment.get("warning") or "") or None
     raw_answer = normalize_uncertainty_tone(
@@ -2257,6 +2390,10 @@ def run_ask(
         confidence_overlap_support=confidence_assessment.get("overlap_support"),
         confidence_reason=confidence_assessment.get("reason"),
         confidence_banner_emitted=bool(confidence_warning),
+        academic_mode=academic_mode,
+        academic_rerank_applied=academic_rerank_applied if academic_mode else None,
+        academic_transcript_hits=academic_transcript_hits if academic_mode else None,
+        academic_evidence_rows=academic_evidence_rows if academic_mode else None,
     )
     return "\n".join(out)
 
