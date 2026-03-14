@@ -316,6 +316,7 @@ def test_tax_resolver_sources_emit_osc_links_when_tty(monkeypatch):
         silo="tax",
         source_label="Tax Professional",
         no_color=False,
+        explain=True,
     )
     assert out is not None
     assert out["guardrail_no_match"] is False

@@ -40,6 +40,9 @@ pal = "pal:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+dev-mode-dirs = ["src"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
 
@@ -47,3 +50,4 @@ packages = ["src"]
 "cli.py" = "cli.py"
 "pal.py" = "pal.py"
 "archetypes.yaml" = "archetypes.yaml"
+"src/vision_ocr.swift" = "src/vision_ocr.swift"

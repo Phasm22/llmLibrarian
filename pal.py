@@ -13,6 +13,7 @@ import time
 import threading
 import getpass
 import re
+from contextlib import contextmanager
 from pathlib import Path
 
 import typer
@@ -20,6 +21,57 @@ import typer
 PAL_HOME = Path(os.environ.get("PAL_HOME", os.path.expanduser("~/.pal")))
 REGISTRY_PATH = PAL_HOME / "registry.json"
 WATCH_LOCKS_DIR = PAL_HOME / "watch_locks"
+
+
+def _iter_editable_roots(site_root: Path) -> list[Path]:
+    roots: list[Path] = []
+    for pth_path in sorted(site_root.glob("*llmlibrarian*.pth")):
+        try:
+            for raw_line in pth_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or line.startswith("import "):
+                    continue
+                candidate = Path(line).expanduser()
+                if candidate.exists():
+                    roots.append(candidate.resolve())
+        except Exception:
+            continue
+    return roots
+
+
+def _bootstrap_src_path() -> None:
+    root = Path(__file__).resolve().parent
+    candidates: list[Path] = []
+
+    cwd = Path.cwd().resolve()
+    cwd_src = cwd / "src"
+    if cwd_src.is_dir():
+        candidates.append(cwd_src)
+
+    root_src = root / "src"
+    if (root_src / "state.py").exists():
+        candidates.append(root_src)
+    if (root / "state.py").exists():
+        candidates.append(root)
+
+    for editable_root in _iter_editable_roots(root):
+        editable_src = editable_root / "src"
+        if (editable_src / "state.py").exists():
+            candidates.append(editable_src.resolve())
+        elif (editable_root / "state.py").exists():
+            candidates.append(editable_root.resolve())
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
+
+
+_bootstrap_src_path()
 
 
 def _ensure_pal_home() -> None:
@@ -534,6 +586,13 @@ def _resolve_llmli_paths() -> tuple[Path, Path]:
     cwd_src = cwd / "src"
     if cwd_cli.exists() and cwd_src.is_dir():
         return cwd_cli, cwd_src
+    for editable_root in _iter_editable_roots(root):
+        editable_cli = editable_root / "cli.py"
+        editable_src = editable_root / "src"
+        if editable_cli.exists() and editable_src.is_dir():
+            return editable_cli, editable_src
+    if (root / "state.py").exists():
+        return root / "cli.py", root
     return root / "cli.py", root / "src"
 
 
@@ -546,10 +605,31 @@ def _prepend_pythonpath(env: dict[str, str], src_dir: Path) -> None:
         env["PYTHONPATH"] = str(src_dir)
 
 
-def _run_llmli(args: list[str]) -> int:
+@contextmanager
+def _temporary_env(overrides: dict[str, str | None]):
+    previous: dict[str, str | None] = {}
+    try:
+        for key, value in overrides.items():
+            previous[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _run_llmli(args: list[str], extra_env: dict[str, str] | None = None) -> int:
     """Run llmli as subprocess; return exit code."""
     cli_path, src_path = _resolve_llmli_paths()
     env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     _prepend_pythonpath(env, src_path)
     cmd = [sys.executable, str(cli_path)] + args
     r = subprocess.run(cmd, env=env)
@@ -1038,9 +1118,22 @@ class SiloWatcher:
         self.allow_cloud = allow_cloud
         self.label = label
         self.startup_message = startup_message
+        watch_env = {
+            "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
+            "LLMLIBRARIAN_INGEST_LOG_LEVEL": "FATAL",
+            "LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS": "1",
+        }
 
-        self._update_single_file = update_single_file
-        self._remove_single_file = remove_single_file
+        def _quiet_update_single_file(*args, **kwargs):
+            with _temporary_env(watch_env):
+                return update_single_file(*args, **kwargs)
+
+        def _quiet_remove_single_file(*args, **kwargs):
+            with _temporary_env(watch_env):
+                return remove_single_file(*args, **kwargs)
+
+        self._update_single_file = _quiet_update_single_file
+        self._remove_single_file = _quiet_remove_single_file
         self._update_silo_counts = update_silo_counts
         self._read_manifest = _read_file_manifest
         self._load_limits_config = _load_limits_config
@@ -1109,7 +1202,9 @@ class SiloWatcher:
                     del self._queue[path]
         if not due:
             return 0
-        processed = 0
+        updated = 0
+        removed = 0
+        skipped = 0
         for path, action in due:
             with self._lock:
                 if action == "delete":
@@ -1120,8 +1215,9 @@ class SiloWatcher:
                         update_counts=True,
                     )
                     if status == "removed":
-                        self._log(f"{self.label}: removed {path}")
-                        processed += 1
+                        removed += 1
+                    else:
+                        skipped += 1
                 else:
                     status, _ = self._update_single_file(
                         path,
@@ -1133,11 +1229,14 @@ class SiloWatcher:
                         update_counts=True,
                     )
                     if status == "updated":
-                        self._log(f"{self.label}: updated {path}")
-                        processed += 1
+                        updated += 1
                     elif status == "removed":
-                        self._log(f"{self.label}: removed {path}")
-                        processed += 1
+                        removed += 1
+                    else:
+                        skipped += 1
+        processed = updated + removed
+        if processed or skipped:
+            self._log(f"{self.label}: +{updated} updated, -{removed} removed, {skipped} skipped")
         return processed
 
     def _process_loop(self) -> None:
@@ -1310,6 +1409,7 @@ def _pull_path_mode(
     full: bool = False,
     prompt: str | None = None,
     clear_prompt: bool = False,
+    extra_env: dict[str, str] | None = None,
 ) -> int:
     path = Path(path_input).resolve()
     if not path.is_dir():
@@ -1323,7 +1423,7 @@ def _pull_path_mode(
     if follow_symlinks:
         llmli_args.append("--follow-symlinks")
     llmli_args.append(str(path))
-    code = _run_llmli(llmli_args)
+    code = _run_llmli(llmli_args, extra_env=extra_env)
     if code == 0:
         _record_source_path(path)
         if prompt is not None or clear_prompt:
@@ -1346,32 +1446,60 @@ def _pull_watch_path_mode(
         print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
         return 1
     path = Path(path_input).resolve()
-    rc = _pull_path_mode(
-        path,
-        allow_cloud=allow_cloud,
-        follow_symlinks=follow_symlinks,
-        full=False,
-        prompt=prompt,
-        clear_prompt=clear_prompt,
-    )
-    if rc != 0:
-        return rc
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
-    llmli_registry = _read_llmli_registry(db_path)
-    slug = _resolve_llmli_silo_by_path(llmli_registry, path)
-    if slug is None:
-        print("Error: unable to resolve silo slug for watched folder.", file=sys.stderr)
-        return 1
-    watcher = SiloWatcher(
-        path,
-        db_path,
-        interval=interval,
-        debounce=debounce,
-        silo_slug=slug,
-        allow_cloud=allow_cloud,
-        label="this folder",
-    )
-    return _run_watcher(watcher, db_path, slug)
+    watch_env = {
+        "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
+        "LLMLIBRARIAN_INGEST_LOG_LEVEL": "FATAL",
+        "LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS": "1",
+    }
+    previous_env = {key: os.environ.get(key) for key in watch_env}
+    try:
+        os.environ.update(watch_env)
+        rc = _pull_path_mode(
+            path,
+            allow_cloud=allow_cloud,
+            follow_symlinks=follow_symlinks,
+            full=False,
+            prompt=prompt,
+            clear_prompt=clear_prompt,
+            extra_env=watch_env,
+        )
+        if rc != 0:
+            return rc
+        db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+        llmli_registry = _read_llmli_registry(db_path)
+        slug = _resolve_llmli_silo_by_path(llmli_registry, path)
+        if slug is None:
+            print("Error: unable to resolve silo slug for watched folder.", file=sys.stderr)
+            return 1
+        watcher = SiloWatcher(
+            path,
+            db_path,
+            interval=interval,
+            debounce=debounce,
+            silo_slug=slug,
+            allow_cloud=allow_cloud,
+            label="this folder",
+        )
+        return _run_watcher(watcher, db_path, slug)
+    finally:
+        for key, previous in previous_env.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+
+def _argv_requests_watch_pull(argv: list[str]) -> bool:
+    args = [str(a).strip() for a in argv if str(a).strip()]
+    if not args or args[0] != "pull":
+        return False
+    return "--watch" in args
+
+
+def _apply_watch_process_env() -> None:
+    os.environ["LLMLIBRARIAN_PROCESSOR_LOG_LEVEL"] = "ERROR"
+    os.environ["LLMLIBRARIAN_INGEST_LOG_LEVEL"] = "FATAL"
+    os.environ["LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS"] = "1"
 
 
 def _pull_watch_status_mode(path_input: str | None, json_output: bool, prune_stale: bool) -> int:
@@ -1946,6 +2074,15 @@ def tool_command(
 
 
 def main() -> int:
+    if _argv_requests_watch_pull(sys.argv[1:]) and os.environ.get("LLMLIBRARIAN_WATCH_ENV_APPLIED") != "1":
+        env = os.environ.copy()
+        env["LLMLIBRARIAN_PROCESSOR_LOG_LEVEL"] = "ERROR"
+        env["LLMLIBRARIAN_INGEST_LOG_LEVEL"] = "FATAL"
+        env["LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS"] = "1"
+        env["LLMLIBRARIAN_WATCH_ENV_APPLIED"] = "1"
+        os.execvpe(sys.argv[0], sys.argv, env)
+    if _argv_requests_watch_pull(sys.argv[1:]):
+        _apply_watch_process_env()
     app()
     return 0
 

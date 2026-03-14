@@ -447,7 +447,7 @@ def build_query_suite() -> list[QuerySpec]:
 
 
 def _split_answer_and_sources(output: str) -> tuple[str, list[str]]:
-    parts = output.split("\n\nSources:\n", 1)
+    parts = output.split("\n\nSources:", 1)
     answer = parts[0].strip()
     if len(parts) == 1:
         return answer, []
@@ -691,6 +691,7 @@ def run_adversarial_eval(
                 strict=strict_mode,
                 config_path=eval_config_path,
                 quiet=False,
+                explain=True,
             )
             answer, sources = _split_answer_and_sources(out)
             records.append(score_query(spec, answer, sources))

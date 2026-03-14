@@ -9,7 +9,18 @@ from typing import Any
 from style import bold, dim, label_style
 
 from query.context import query_mentioned_years
-from query.formatting import format_source, style_answer
+from query.formatting import render_sources_footer, style_answer
+
+
+def _footer_sources(
+    source_rows: list[tuple[str, dict[str, Any] | None]],
+    *,
+    no_color: bool,
+    detailed: bool = False,
+) -> list[str]:
+    docs = [doc for doc, _meta in source_rows]
+    metas = [meta for _doc, meta in source_rows]
+    return render_sources_footer(docs, metas, [None for _ in source_rows], no_color=no_color, detailed=detailed)
 
 
 DIRECT_VALUE_METRIC_KEYWORDS = (
@@ -287,6 +298,7 @@ def run_csv_rank_lookup_guardrail(
     query: str,
     source_label: str,
     no_color: bool,
+    explain: bool = False,
 ) -> dict[str, Any] | None:
     """Deterministic rank lookup over CSV row chunks, or None when not applicable."""
     req = parse_csv_rank_request(query)
@@ -346,10 +358,8 @@ def run_csv_rank_lookup_guardrail(
         "",
         dim(no_color, "---"),
         label_style(no_color, f"Answered by: {source_label}"),
-        "",
-        bold(no_color, "Sources:"),
-        format_source(chosen_doc, chosen_meta, None, no_color=no_color),
     ]
+    out.extend([""] + _footer_sources([(chosen_doc, chosen_meta)], no_color=no_color, detailed=explain))
     return {
         "response": "\n".join(out),
         "guardrail_no_match": False,
@@ -371,6 +381,7 @@ def run_direct_value_consistency_guardrail(
     no_color: bool,
     canonical_tokens: list[str],
     deprioritized_tokens: list[str],
+    explain: bool = False,
 ) -> dict[str, Any] | None:
     """Deterministic value-consistency guardrail for direct factual lookups."""
     signals = extract_numeric_or_key_values_from_query(query)
@@ -390,12 +401,15 @@ def run_direct_value_consistency_guardrail(
             "",
             dim(no_color, "---"),
             label_style(no_color, f"Answered by: {source_label}"),
-            "",
-            bold(no_color, "Sources:"),
         ]
-        # Include top sources for debuggable grounding even on abstain.
-        for c in candidates[:2]:
-            out.append(format_source(str(c.get("doc") or ""), c.get("meta"), None, no_color=no_color))
+        out.extend(
+            [""]
+            + _footer_sources(
+                [(str(c.get("doc") or ""), c.get("meta")) for c in candidates[:2]],
+                no_color=no_color,
+                detailed=explain,
+            )
+        )
         return {
             "response": "\n".join(out),
             "guardrail_no_match": True,
@@ -419,10 +433,8 @@ def run_direct_value_consistency_guardrail(
         "",
         dim(no_color, "---"),
         label_style(no_color, f"Answered by: {source_label}"),
-        "",
-        bold(no_color, "Sources:"),
-        format_source(doc, meta, None, no_color=no_color),
     ]
+    out.extend([""] + _footer_sources([(doc, meta)], no_color=no_color, detailed=explain))
     return {
         "response": "\n".join(out),
         "guardrail_no_match": False,
@@ -712,6 +724,7 @@ def run_field_lookup_guardrail(
     query: str,
     source_label: str,
     no_color: bool,
+    explain: bool = False,
 ) -> dict[str, Any] | None:
     """Return deterministic guardrail answer for explicit field lookups, or None if not applicable."""
     req = parse_field_lookup_request(query)
@@ -763,10 +776,8 @@ def run_field_lookup_guardrail(
             "",
             dim(no_color, "---"),
             label_style(no_color, f"Answered by: {source_label}"),
-            "",
-            bold(no_color, "Sources:"),
-            format_source(doc or "", meta, None, no_color=no_color),
         ]
+        out.extend([""] + _footer_sources([(doc or "", meta)], no_color=no_color, detailed=explain))
         return {
             "response": "\n".join(out),
             "guardrail_no_match": False,
@@ -801,6 +812,7 @@ def run_income_year_total_guardrail(
     query: str,
     source_label: str,
     no_color: bool,
+    explain: bool = False,
 ) -> dict[str, Any] | None:
     """Deterministic income lookup for year-scoped queries (no cross-year, no LLM)."""
     years = query_mentioned_years(query)
@@ -940,16 +952,15 @@ def run_income_year_total_guardrail(
                 "",
                 dim(no_color, "---"),
                 label_style(no_color, f"Answered by: {source_label}"),
-                "",
-                bold(no_color, "Sources:"),
-                format_source(
-                    str(selected["doc"]),
-                    selected.get("meta"),
-                    None,
-                    include_snippet=False,
-                    no_color=no_color,
-                ),
             ]
+            out.extend(
+                [""]
+                + _footer_sources(
+                    [(str(selected["doc"]), selected.get("meta"))],
+                    no_color=no_color,
+                    detailed=explain,
+                )
+            )
             return {
                 "response": "\n".join(out),
                 "guardrail_no_match": False,
@@ -972,20 +983,15 @@ def run_income_year_total_guardrail(
             "",
             dim(no_color, "---"),
             label_style(no_color, f"Answered by: {source_label}"),
-            "",
-            bold(no_color, "Sources:"),
         ]
-        for g in ranked[:4]:
-            row = g["row"]
-            out.append(
-                format_source(
-                    str(row["doc"]),
-                    row.get("meta"),
-                    None,
-                    include_snippet=False,
-                    no_color=no_color,
-                )
+        out.extend(
+            [""]
+            + _footer_sources(
+                [(str(g["row"]["doc"]), g["row"].get("meta")) for g in ranked[:4]],
+                no_color=no_color,
+                detailed=explain,
             )
+        )
         return {
             "response": "\n".join(out),
             "guardrail_no_match": True,
@@ -1019,13 +1025,7 @@ def run_income_year_total_guardrail(
             label_style(no_color, f"Answered by: {source_label}"),
         ]
         if meta9:
-            out.extend(
-                [
-                    "",
-                    bold(no_color, "Sources:"),
-                    format_source("", meta9, None, no_color=no_color),
-                ]
-            )
+            out.extend([""] + _footer_sources([("", meta9)], no_color=no_color, detailed=explain))
         return {
             "response": "\n".join(out),
             "guardrail_no_match": False,
@@ -1054,11 +1054,7 @@ def run_income_year_total_guardrail(
                 label_style(no_color, f"Answered by: {source_label}"),
             ]
             if source_rows:
-                out.extend(["", bold(no_color, "Sources:")])
-                for doc, meta in source_rows[:8]:
-                    out.append(format_source(doc, meta, None, include_snippet=False, no_color=no_color))
-                if len(source_rows) > 8:
-                    out.append(dim(no_color, f"... ({len(source_rows) - 8} more W-2 sources omitted)"))
+                out.extend([""] + _footer_sources(source_rows[:8], no_color=no_color, detailed=explain))
             return {
                 "response": "\n".join(out),
                 "guardrail_no_match": False,
@@ -1082,9 +1078,7 @@ def run_income_year_total_guardrail(
                 label_style(no_color, f"Answered by: {source_label}"),
             ]
             if conflict_sources:
-                out.extend(["", bold(no_color, "Sources:")])
-                for doc, meta in conflict_sources[:8]:
-                    out.append(format_source(doc, meta, None, include_snippet=False, no_color=no_color))
+                out.extend([""] + _footer_sources(conflict_sources[:8], no_color=no_color, detailed=explain))
             return {
                 "response": "\n".join(out),
                 "guardrail_no_match": True,
@@ -1107,13 +1101,7 @@ def run_income_year_total_guardrail(
                 label_style(no_color, f"Answered by: {source_label}"),
             ]
             if meta11:
-                out.extend(
-                    [
-                        "",
-                        bold(no_color, "Sources:"),
-                        format_source("", meta11, None, no_color=no_color),
-                    ]
-                )
+                out.extend([""] + _footer_sources([("", meta11)], no_color=no_color, detailed=explain))
             return {
                 "response": "\n".join(out),
                 "guardrail_no_match": False,

@@ -79,9 +79,15 @@ Trace includes `answer_kind` (`catalog_artifact`, `guardrail`, or `rag`).
 ## OCR Observability
 
 - PDF extraction uses PyMuPDF text first.
-- For image-only pages, OCR fallback is attempted in deterministic order:
+- Standalone image files (`.png`, `.jpg`, `.jpeg`, `.heic`, `.heif`, `.tif`, `.tiff`) are first-class indexed inputs and use the shared OCR path.
+- In auto mode on macOS, OCR is attempted in deterministic order:
+  1) Vision (via a cached Swift helper), then
+  2) PaddleOCR (if installed), then
+  3) `tesseract` CLI (if available).
+- In auto mode off macOS, OCR is attempted in deterministic order:
   1) PaddleOCR (if installed), then
   2) `tesseract` CLI (if available).
+- `LLMLIBRARIAN_OCR_BACKEND` can pin OCR to `vision`, `paddleocr`, or `tesseract`; pinned mode disables fallback.
 - OCR availability/fallback outcomes are logged as structured processor events.
 - Missing OCR backends do not fail ingestion; indexing continues with warnings.
 
@@ -92,6 +98,7 @@ Trace includes `answer_kind` (`catalog_artifact`, `guardrail`, or `rag`).
 - `LLMLIBRARIAN_MODEL`
 - `LLMLIBRARIAN_TRACE`
 - `LLMLIBRARIAN_RERANK`
+- `LLMLIBRARIAN_OCR_BACKEND`
 - `PAL_DEBUG`
 
 ## Source of Truth Priority

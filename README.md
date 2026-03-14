@@ -206,8 +206,8 @@ Watcher locks live at `~/.pal/watch_locks`.
 
 4. `no extractable text` for PDFs
 - Meaning: scanned/image PDF or unreadable structure.
-- Current behavior: llmLibrarian attempts OCR fallback in this order: PaddleOCR (if installed), then `tesseract` (if available on PATH).
-- Fix when still failing: install `paddleocr` or `tesseract`, then re-run `pal pull <path>`.
+- Current behavior: on macOS, llmLibrarian attempts OCR in this order: Vision (via the system Swift toolchain), then PaddleOCR (if installed), then `tesseract` (if available on PATH). On non-macOS, it uses PaddleOCR, then `tesseract`.
+- Fix when still failing: on macOS, ensure `swiftc` is available. Otherwise install `paddleocr` or `tesseract`, then re-run `pal pull <path>`.
 - Note: OpenCV is not required for the baseline OCR fallback.
 
 5. stale catalog + `--force`

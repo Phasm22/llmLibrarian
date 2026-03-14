@@ -71,6 +71,7 @@ ADD_DEFAULT_INCLUDE = [
     "*.py", "*.ts", "*.tsx", "*.js", "*.go", "*.rs", "*.sh", "*.md", "*.txt",
     "*.yml", "*.yaml", "*.json", "*.csv", "*.xml", "*.html", "*.rst", "*.toml", "*.ini", "*.cfg", "*.sql",
     "*.pdf", "*.docx", "*.xlsx", "*.pptx",
+    "*.png", "*.jpg", "*.jpeg", "*.heic", "*.heif", "*.tif", "*.tiff",
 ]
 ADD_DEFAULT_EXCLUDE = [
     "node_modules/", ".venv/", "venv/", "env/", "__pycache__/", "vendor", "dist", "build", ".git",
@@ -89,32 +90,31 @@ ADD_CODE_EXTENSIONS = frozenset(
 ZIP_TEXT_EXTENSIONS = frozenset(
     {".txt", ".md", ".json", ".csv", ".xml", ".html", ".rst", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".sql", ".py", ".js", ".ts", ".tsx", ".sh", ".go", ".rs"}
 )
+_INGEST_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "FATAL": 50}
 
 
 def get_capabilities_text() -> str:
     """Deterministic report: supported extensions and document extractors. Source of truth for llmli capabilities and ask routing."""
+    from processors import ocr_backend_chain_for_capabilities
+
     exts = sorted({p.replace("*", "") for p in ADD_DEFAULT_INCLUDE if p.startswith("*.")})
     lines = ["Supported file extensions (indexed by llmli add):", "  " + ", ".join(exts), ""]
     lines.append("Document extractors:")
     lines.append("  PDF: yes (pymupdf)")
-    has_paddle = False
-    try:
-        import importlib.util
-
-        has_paddle = importlib.util.find_spec("paddleocr") is not None
-    except Exception:
-        has_paddle = False
-    has_tesseract = bool(shutil.which("tesseract"))
-    if has_paddle and has_tesseract:
-        lines.append("  PDF OCR fallback: yes (paddleocr -> tesseract)")
-    elif has_paddle:
-        lines.append("  PDF OCR fallback: partial (paddleocr only; tesseract not found)")
-    elif has_tesseract:
-        lines.append("  PDF OCR fallback: partial (tesseract only; paddleocr not installed)")
+    ocr_backends = ocr_backend_chain_for_capabilities()
+    if ocr_backends:
+        chain = " -> ".join(ocr_backends)
+        lines.append(f"  PDF OCR fallback: yes ({chain})")
+        lines.append(f"  Image OCR: yes ({chain})")
     else:
-        lines.append("  PDF OCR fallback: no (install paddleocr or tesseract for scanned/image PDFs)")
+        if sys.platform == "darwin":
+            lines.append("  PDF OCR fallback: no (Vision needs the macOS Swift toolchain; otherwise install paddleocr or tesseract)")
+            lines.append("  Image OCR: no (Vision needs the macOS Swift toolchain; otherwise install paddleocr or tesseract)")
+        else:
+            lines.append("  PDF OCR fallback: no (install paddleocr or tesseract for scanned/image PDFs)")
+            lines.append("  Image OCR: no (install paddleocr or tesseract for image files)")
     lines.append("  DOCX: yes (python-docx)")
-    lines.append("  ZIP: yes (PDF/DOCX/XLSX/PPTX + text inside)")
+    lines.append("  ZIP: yes (PDF/DOCX/XLSX/PPTX/images + text inside)")
     try:
         import openpyxl  # noqa: F401
         lines.append("  XLSX: yes (openpyxl)")
@@ -156,8 +156,12 @@ def _doc_type_from_content(sample: str) -> str:
     # Tax forms / returns
     if re.search(r"\bForm\s+1040\b|Schedule\s+[A-C]\b|W-2|1099|IRS|adjusted\s+gross\s+income\b", s, re.IGNORECASE):
         return "tax_return"
-    # Transcript / academic record
-    if re.search(r"\btranscript\b|credit\s+hours?\b|Grade\s+[A-F]|GPA|course\s+history\b", s, re.IGNORECASE):
+    # Transcript / academic record (use specific transcript anchors; avoid broad course-planning docs)
+    if re.search(
+        r"\b(unofficial\s+transcript|official\s+transcript|course\s+history|academic\s+standing|term\s+totals?|quality\s+points|last\s+academic\s+standing|transcript)\b",
+        s,
+        re.IGNORECASE,
+    ):
         return "transcript"
     # Syllabus
     if re.search(r"\bsyllabus\b|office\s+hours\b|course\s+objectives\b|prerequisite", s, re.IGNORECASE):
@@ -183,13 +187,32 @@ def get_file_hash(path: Path) -> str:
 
 def _log_event(level: str, message: str, **fields: Any) -> None:
     """Structured log line for ingest errors. Writes JSON to stderr."""
-    event = {"ts": datetime.now(timezone.utc).isoformat(), "level": level, "message": message}
+    normalized_level = str(level or "INFO").upper()
+    if normalized_level == "WARNING":
+        normalized_level = "WARN"
+    min_level = (os.environ.get("LLMLIBRARIAN_INGEST_LOG_LEVEL") or "WARN").strip().upper()
+    if min_level == "WARNING":
+        min_level = "WARN"
+    if min_level not in _INGEST_LOG_LEVELS:
+        min_level = "WARN"
+    if _INGEST_LOG_LEVELS.get(normalized_level, 20) < _INGEST_LOG_LEVELS[min_level]:
+        return
+    event = {"ts": datetime.now(timezone.utc).isoformat(), "level": normalized_level, "message": message}
     if fields:
         event.update(fields)
     try:
         print(json.dumps(event, ensure_ascii=False), file=sys.stderr)
     except Exception:
         pass
+
+
+def _suppress_recoverable_warnings() -> bool:
+    return (os.environ.get("LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 # Path components that indicate a cloud-sync root (OneDrive, iCloud, Dropbox, etc.).
@@ -324,10 +347,14 @@ from processors import (
     DOCXProcessor,
     XLSXProcessor,
     PPTXProcessor,
+    ImageProcessor,
     PROCESSORS,
     DEFAULT_PROCESSOR,
     DocumentExtractionError,
+    DocumentProcessor,
     PDFExtractionError,
+    ExtractedPage,
+    ExtractedText,
 )
 from tax.ledger import extract_tax_rows_from_chunks, replace_tax_rows_for_sources
 
@@ -335,10 +362,11 @@ _pdf_proc = PDFProcessor()
 _docx_proc = DOCXProcessor()
 _xlsx_proc = XLSXProcessor()
 _pptx_proc = PPTXProcessor()
+_img_proc = ImageProcessor()
 
 
-def get_text_from_pdf_bytes(pdf_bytes: bytes, source_path: str = "") -> list[tuple[str, int]]:
-    """Returns list of (page_text, page_number) for per-page chunks. Raises PDFExtractionError on failure."""
+def get_text_from_pdf_bytes(pdf_bytes: bytes, source_path: str = "") -> list[ExtractedPage]:
+    """Returns extracted PDF pages. Raises PDFExtractionError on failure."""
     result = _pdf_proc.extract(pdf_bytes, source_path)
     if not isinstance(result, list):
         raise PDFExtractionError("PDF extractor returned unexpected result.")
@@ -377,6 +405,16 @@ def get_text_from_pptx_bytes(data: bytes) -> tuple[str | None, bool]:
     if result is None:
         return (None, False)
     return (result, True)
+
+
+def get_text_from_image_bytes(data: bytes, source_path: str) -> ExtractedText | None:
+    """Delegates to ImageProcessor."""
+    try:
+        result = _img_proc.extract(data, source_path)
+    except DocumentExtractionError as e:
+        _log_event("ERROR", "Image extraction failed", error=str(e), path=source_path)
+        return None
+    return result if isinstance(result, ExtractedText) else None
 
 
 def _chunk_metadata_only(
@@ -446,6 +484,7 @@ def _chunks_from_content(
     prefix: str = "",
     file_hash: str | None = None,
     content_extracted: bool = True,
+    extra_meta: dict[str, Any] | None = None,
 ) -> list[ChunkTuple]:
     """Build chunk list (id, doc, meta). doc_type from content (first 500 chars) overrides path when not 'other'."""
     content_type = _doc_type_from_content(text[:CONTENT_SAMPLE_LEN])
@@ -469,6 +508,8 @@ def _chunks_from_content(
             meta["file_hash"] = file_hash
         if page is not None:
             meta["page"] = page
+        if extra_meta:
+            meta.update(extra_meta)
         out.append((cid, chunk, meta))
     return out
 
@@ -529,6 +570,40 @@ _TRANSCRIPT_CODE_RE = re.compile(
 _TRANSCRIPT_GRADES = frozenset({"A+", "A", "A-", "B+", "B", "B-", "C+", "C", "C-", "D+", "D", "D-", "F", "P", "NP", "S", "U", "W", "I"})
 _TRANSCRIPT_LEVELS = frozenset({"UG", "GR", "LD", "UD"})
 _TRANSCRIPT_CREDITS_RE = re.compile(r"^\d{1,2}(?:\.\d{1,3})?$")
+_TRANSCRIPT_STUDENT_NAME_RE = re.compile(r"\bNAME\s*:\s*([^\n]+)", re.IGNORECASE)
+_TRANSCRIPT_TITLE_SKIP_RE = re.compile(
+    r"\b("
+    r"course\s+title|crse\s+nr|units|grade|pnts|"
+    r"att|earned|gpahrs|gpapts|gpa|"
+    r"cumulative\s+credits|term\s+totals?|"
+    r"degrees?,?\s+certificates?|other\s+institutions|"
+    r"transfer,?test|end\s+of\s+academic\s+record|"
+    r"page\s+\d+\s+of\s+\d+"
+    r")\b",
+    re.IGNORECASE,
+)
+_TRANSCRIPT_SCHOOL_ALIAS_RE = re.compile(
+    r"\b("
+    r"uccs|"
+    r"cu\s+colo(?:rado)?\s+springs|"
+    r"university\s+of\s+colorado(?:\s+colorado\s+springs)?"
+    r")\b",
+    re.IGNORECASE,
+)
+_TRANSCRIPT_PAGE_ANCHOR_RE = re.compile(
+    r"\b("
+    r"unofficial\s+transcript|"
+    r"official\s+transcript|"
+    r"course\s+history|"
+    r"academic\s+standing|"
+    r"term\s+totals?|"
+    r"quality\s+points|"
+    r"institution\s+credits|"
+    r"transfer\s+credits|"
+    r"last\s+academic\s+standing"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_transcript_body(body: str) -> tuple[str, str, str]:
@@ -558,28 +633,139 @@ def _parse_transcript_body(body: str) -> tuple[str, str, str]:
     return (title, grade, credits)
 
 
-def _extract_transcript_rows(page_text: str) -> list[dict[str, str]]:
+def _normalize_person_name(raw_name: str) -> str:
+    name = " ".join((raw_name or "").split()).strip(" ,;:-")
+    if not name:
+        return ""
+    name = re.split(
+        r"\b(STUDENT\s*NR|BIRTHDATE|PRINT\s+DATE|PAGE\s+\d+\s+OF\s+\d+)\b",
+        name,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" ,;:-")
+    if "," in name:
+        last, rest = name.split(",", 1)
+        ordered = [tok for tok in rest.split() if tok] + [last.strip()]
+        name = " ".join(tok for tok in ordered if tok)
+    name = re.sub(r"[^A-Za-z' -]", " ", name)
+    return " ".join(name.split())
+
+
+def _extract_transcript_student_name(page_text: str) -> str:
+    match = _TRANSCRIPT_STUDENT_NAME_RE.search(page_text or "")
+    if not match:
+        return ""
+    return _normalize_person_name(match.group(1))
+
+
+def _normalize_school_label(value: str) -> str:
+    school = " ".join((value or "").split()).strip(" -|:")
+    if not school:
+        return ""
+    # Keep a stable canonical display label when UCCS aliases are detected.
+    if _TRANSCRIPT_SCHOOL_ALIAS_RE.search(school):
+        return "University of Colorado Colorado Springs"
+    return school
+
+
+def _extract_default_transcript_school(page_text: str, source_path: str) -> str:
+    src = (source_path or "").lower()
+    if "uccs" in src:
+        return "University of Colorado Colorado Springs"
+    match = _TRANSCRIPT_SCHOOL_ALIAS_RE.search(page_text or "")
+    if not match:
+        return ""
+    return _normalize_school_label(match.group(0))
+
+
+def _is_transcript_title_candidate(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if _TRANSCRIPT_TERM_RE.search(s):
+        return False
+    if _TRANSCRIPT_CODE_RE.match(s):
+        return False
+    if _TRANSCRIPT_TITLE_SKIP_RE.search(s):
+        return False
+    if re.fullmatch(r"[-=]{3,}", s):
+        return False
+    # Titles are typically alpha-heavy and short enough to avoid headers/noise.
+    digit_count = sum(ch.isdigit() for ch in s)
+    if digit_count >= 4:
+        return False
+    return bool(re.search(r"[A-Za-z]{3,}", s))
+
+
+def _extract_grade_credits_from_lookahead(lines: list[str], start_idx: int) -> tuple[str, str]:
+    grade = ""
+    credits = ""
+    for idx in range(start_idx, min(len(lines), start_idx + 4)):
+        line = (lines[idx] or "").strip()
+        if not line:
+            continue
+        for token in line.split():
+            token_u = token.upper()
+            if not grade and token_u in _TRANSCRIPT_GRADES:
+                grade = token_u
+            if not credits and _TRANSCRIPT_CREDITS_RE.match(token):
+                credits = token
+        if grade and credits:
+            break
+    return grade, credits
+
+
+def _course_status_from_grade(grade: str) -> str:
+    if (grade or "").upper() in {"W", "I", "NP", "U"}:
+        return "attempted_not_completed"
+    return "attempted"
+
+
+def _extract_transcript_rows(page_text: str, *, source_path: str = "") -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     current_term = ""
-    for raw_line in (page_text or "").splitlines():
-        line = " ".join(raw_line.split()).strip()
+    current_school = _extract_default_transcript_school(page_text, source_path)
+    student_name = _extract_transcript_student_name(page_text)
+    pending_title = ""
+    normalized_lines = [" ".join(raw_line.split()).strip() for raw_line in (page_text or "").splitlines()]
+    for idx, line in enumerate(normalized_lines):
         if not line:
             continue
         term_match = _TRANSCRIPT_TERM_RE.search(line)
         if term_match:
             current_term = f"{term_match.group(1).title()} {term_match.group(2)}"
+            school_tail = _normalize_school_label(line[term_match.end() :])
+            if school_tail:
+                current_school = school_tail
+            pending_title = ""
+            continue
+        school_match = _TRANSCRIPT_SCHOOL_ALIAS_RE.search(line)
+        if school_match:
+            current_school = _normalize_school_label(school_match.group(0))
         code_match = _TRANSCRIPT_CODE_RE.match(line)
         if not code_match:
+            pending_title = line if _is_transcript_title_candidate(line) else ""
             continue
         code = " ".join((code_match.group("code") or "").replace("-", " ").split())
         body = line[code_match.end() :].strip()
-        if not body:
-            continue
-        body_tokens = body.split()
-        if body_tokens and body_tokens[0].upper() in _TRANSCRIPT_LEVELS:
-            body = " ".join(body_tokens[1:]).strip()
-        title, grade, credits = _parse_transcript_body(body)
+        title = ""
+        grade = ""
+        credits = ""
+        if body:
+            body_tokens = body.split()
+            if body_tokens and body_tokens[0].upper() in _TRANSCRIPT_LEVELS:
+                body = " ".join(body_tokens[1:]).strip()
+            title, grade, credits = _parse_transcript_body(body)
+        if not title and pending_title:
+            title = pending_title
+        if not grade or not credits:
+            look_grade, look_credits = _extract_grade_credits_from_lookahead(normalized_lines, idx + 1)
+            if not grade:
+                grade = look_grade
+            if not credits:
+                credits = look_credits
         if not title:
+            pending_title = ""
             continue
         rows.append(
             {
@@ -588,8 +774,12 @@ def _extract_transcript_rows(page_text: str) -> list[dict[str, str]]:
                 "course_term": current_term,
                 "course_grade": grade,
                 "course_credits": credits,
+                "course_school": current_school,
+                "student_name": student_name,
+                "course_status": _course_status_from_grade(grade),
             }
         )
+        pending_title = ""
     return rows
 
 
@@ -597,6 +787,8 @@ def _format_transcript_row_doc(row: dict[str, str]) -> str:
     parts = [f"Course row: {row.get('course_code', '').strip()} | {row.get('course_title', '').strip()}"]
     if row.get("course_term"):
         parts.append(f"Term: {row['course_term']}")
+    if row.get("course_school"):
+        parts.append(f"School: {row['course_school']}")
     if row.get("course_credits"):
         parts.append(f"Credits: {row['course_credits']}")
     if row.get("course_grade"):
@@ -604,23 +796,42 @@ def _format_transcript_row_doc(row: dict[str, str]) -> str:
     return " | ".join(parts)
 
 
+def _should_extract_transcript_rows(source_path: str, page_text: str, doc_type: str) -> bool:
+    if doc_type != "transcript":
+        return False
+    src = (source_path or "").lower()
+    if "transcript" in src:
+        return True
+    return bool(_TRANSCRIPT_PAGE_ANCHOR_RE.search(page_text or ""))
+
+
 def _chunks_from_pdf_pages(
     file_id: str,
-    pages: list[tuple[str, int]],
+    pages: list[ExtractedPage] | list[tuple[str, int]],
     source_path: str,
     mtime: float,
     file_hash: str | None = None,
 ) -> list[ChunkTuple]:
     """Build chunk list (id, doc, meta) for already-extracted PDF page tuples."""
-    first_page_text = (pages[0][0] if pages else "")[:CONTENT_SAMPLE_LEN]
+    if pages and isinstance(pages[0], ExtractedPage):
+        first_page_text = pages[0].text[:CONTENT_SAMPLE_LEN]
+    else:
+        first_page_text = (pages[0][0] if pages else "")[:CONTENT_SAMPLE_LEN]
     content_type = _doc_type_from_content(first_page_text)
     doc_type = content_type if content_type != "other" else _doc_type_from_path(source_path)
     out: list[ChunkTuple] = []
-    for page_text, page_num in pages:
+    for page in pages:
+        page_extra_meta: dict[str, Any] = {}
+        if isinstance(page, ExtractedPage):
+            page_text = page.text
+            page_num = page.page_num
+            page_extra_meta = dict(page.meta or {})
+        else:
+            page_text, page_num = page
         if not page_text.strip():
             continue
-        if doc_type == "transcript":
-            transcript_rows = _extract_transcript_rows(page_text)
+        if _should_extract_transcript_rows(source_path, page_text, doc_type):
+            transcript_rows = _extract_transcript_rows(page_text, source_path=source_path)
             if transcript_rows:
                 for row_index, row in enumerate(transcript_rows, start=1):
                     doc = _format_transcript_row_doc(row)
@@ -641,9 +852,14 @@ def _chunks_from_pdf_pages(
                         "course_term": row.get("course_term", ""),
                         "course_grade": row.get("course_grade", ""),
                         "course_credits": row.get("course_credits", ""),
+                        "course_school": row.get("course_school", ""),
+                        "student_name": row.get("student_name", ""),
+                        "course_status": row.get("course_status", ""),
                     }
                     if file_hash:
                         meta["file_hash"] = file_hash
+                    if page_extra_meta:
+                        meta.update(page_extra_meta)
                     out.append((chunk_id, doc, meta))
                 continue
         chunk_id = _stable_chunk_id(source_path, mtime, page_num)
@@ -660,6 +876,8 @@ def _chunks_from_pdf_pages(
         }
         if file_hash:
             meta["file_hash"] = file_hash
+        if page_extra_meta:
+            meta.update(page_extra_meta)
         out.append((chunk_id, page_text, meta))
     return out
 
@@ -674,6 +892,45 @@ def _chunks_from_pdf(
     """Build chunk list (id, doc, meta) for PDF by page. doc_type from first page content overrides path when not 'other'."""
     pages = get_text_from_pdf_bytes(pdf_bytes, source_path=source_path)
     return _chunks_from_pdf_pages(file_id, pages, source_path, mtime, file_hash=file_hash)
+
+
+def _chunks_from_processor_text(
+    file_id: str,
+    result: str | ExtractedText,
+    source_path: str,
+    mtime: float,
+    suffix: str,
+    file_hash: str | None = None,
+) -> list[ChunkTuple]:
+    if isinstance(result, ExtractedText):
+        text = result.text
+        extra_meta = dict(result.meta or {})
+    else:
+        text = result
+        extra_meta = None
+    if suffix == ".csv":
+        return _chunks_from_csv_text(file_id, text, source_path, mtime, file_hash=file_hash)
+    return _chunks_from_content(file_id, text, source_path, mtime, prefix="", file_hash=file_hash, extra_meta=extra_meta)
+
+
+def _chunks_from_processor_result(
+    file_id: str,
+    result: str | ExtractedText | list[ExtractedPage] | None,
+    source_path: str,
+    mtime: float,
+    suffix: str,
+    processor: DocumentProcessor,
+    file_hash: str | None = None,
+) -> list[ChunkTuple]:
+    if isinstance(result, list):
+        return _chunks_from_pdf_pages(file_id, result, source_path, mtime, file_hash=file_hash)
+    if result is None:
+        return _chunk_metadata_only(
+            file_id, source_path, mtime,
+            processor.format_label, processor.install_hint,
+            file_hash=file_hash,
+        )
+    return _chunks_from_processor_text(file_id, result, source_path, mtime, suffix, file_hash=file_hash)
 
 
 def _tag_zip_meta(chunks: list[ChunkTuple], zip_path: Path) -> list[ChunkTuple]:
@@ -803,20 +1060,7 @@ def process_one_file(
             extractor=getattr(processor, "format_label", "unknown"),
         )
         return []
-    # PDF: returns list of (page_text, page_num); build chunks from already extracted pages.
-    if isinstance(result, list):
-        return _chunks_from_pdf_pages(file_id, result, path_str, mtime, file_hash=file_hash)
-    # Extraction returned None — library not available; emit metadata-only chunk
-    if result is None:
-        return _chunk_metadata_only(
-            file_id, path_str, mtime,
-            processor.format_label, processor.install_hint,
-            file_hash=file_hash,
-        )
-    if suffix == ".csv":
-        return _chunks_from_csv_text(file_id, result, path_str, mtime, file_hash=file_hash)
-    # String result — use _chunks_from_content
-    return _chunks_from_content(file_id, result, path_str, mtime, prefix="", file_hash=file_hash)
+    return _chunks_from_processor_result(file_id, result, path_str, mtime, suffix, processor, file_hash=file_hash)
 
 
 def collect_files(
@@ -942,32 +1186,32 @@ def process_zip_to_chunks(
                 file_id = f"{zip_path.name}/{Path(info.filename).name}"
                 mtime = 0.0
                 suf = Path(info.filename).suffix.lower()
-                if suf == ".pdf":
+                processor = PROCESSORS.get(suf)
+                if processor is not None:
                     try:
-                        out.extend(_tag_zip_meta(_chunks_from_pdf(file_id, data, source_label, mtime), zip_path))
-                    except PDFExtractionError as e:
+                        result = processor.extract(data, source_label)
+                        out.extend(
+                            _tag_zip_meta(
+                                _chunks_from_processor_result(
+                                    file_id,
+                                    result,
+                                    source_label,
+                                    mtime,
+                                    suf,
+                                    processor,
+                                ),
+                                zip_path,
+                            )
+                        )
+                    except DocumentExtractionError as e:
                         _log_event(
                             "ERROR",
-                            "PDF extraction failed in ZIP",
+                            "Document extraction failed in ZIP",
                             path=str(zip_path),
                             entry=info.filename,
                             error=str(e),
+                            extractor=getattr(processor, "format_label", "unknown"),
                         )
-                elif suf == ".docx":
-                    text = get_text_from_docx_bytes(data)
-                    out.extend(_tag_zip_meta(_chunks_from_content(file_id, text, source_label, mtime, prefix=""), zip_path))
-                elif suf == ".xlsx":
-                    text, ok = get_text_from_xlsx_bytes(data)
-                    if ok and text:
-                        out.extend(_tag_zip_meta(_chunks_from_content(file_id, text, source_label, mtime, prefix=""), zip_path))
-                    else:
-                        out.extend(_tag_zip_meta(_chunk_metadata_only(file_id, source_label, mtime, "Spreadsheet", "openpyxl"), zip_path))
-                elif suf == ".pptx":
-                    text, ok = get_text_from_pptx_bytes(data)
-                    if ok and text:
-                        out.extend(_tag_zip_meta(_chunks_from_content(file_id, text, source_label, mtime, prefix=""), zip_path))
-                    else:
-                        out.extend(_tag_zip_meta(_chunk_metadata_only(file_id, source_label, mtime, "Presentation", "python-pptx"), zip_path))
                 elif suf == ".csv":
                     try:
                         text = data.decode("utf-8", errors="replace")
@@ -1173,7 +1417,7 @@ def run_index(
                 all_chunks.extend(chunks)
                 files_indexed += 1
                 print(success_style(no_color, f"  ✅ {path.name} ({len(chunks)} chunks)"))
-            elif kind == "pdf":
+            elif kind == "pdf" and not _suppress_recoverable_warnings():
                 print(
                     warn_style(
                         no_color,
@@ -1485,7 +1729,7 @@ def run_add(
                 files_indexed += 1
                 if fhash:
                     to_register.append((fhash, str(p)))
-            elif kind == "pdf":
+            elif kind == "pdf" and not _suppress_recoverable_warnings():
                 print(
                     warn_style(
                         no_color,

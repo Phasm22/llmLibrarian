@@ -73,10 +73,13 @@ def get_archetype_optional(config: AppConfig, archetype_id: str) -> ArchetypeCon
 def get_query_options(config: AppConfig | dict | None) -> dict[str, object]:
     """Return query behavior options with stable defaults."""
     q = ((config or {}).get("query") or {}) if isinstance(config, dict) else {}
+    user_name_raw = q.get("user_name")
+    user_name = str(user_name_raw).strip() if isinstance(user_name_raw, str) else ""
     return {
         "auto_scope_binding": bool(q.get("auto_scope_binding", True)),
         "direct_decisive_mode": bool(q.get("direct_decisive_mode", False)),
         "canonical_filename_tokens": list(q.get("canonical_filename_tokens") or ["canonical", "official"]),
         "deprioritized_tokens": list(q.get("deprioritized_tokens") or ["draft", "archive", "stale", "deprecated"]),
         "confidence_relaxation_enabled": bool(q.get("confidence_relaxation_enabled", True)),
+        "user_name": (user_name or None),
     }

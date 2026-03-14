@@ -4,8 +4,10 @@ source URL generation, and snippet previews.
 """
 import os
 import re
+from statistics import median
 from urllib.parse import quote
 from pathlib import Path
+from typing import Any
 
 from constants import SNIPPET_MAX_LEN
 from style import bold, dim, code_style, code_block_style, link_style
@@ -385,3 +387,84 @@ def format_source(
         snippet_part = dim(no_color, snippet)
         return f"  \u2022 {path_part}{meta_part}\n    {snippet_part}"
     return f"  \u2022 {path_part}{meta_part}"
+
+
+def _aggregate_footer_sources(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+) -> list[tuple[str, dict[str, Any], float | None]]:
+    """De-duplicate footer sources by source path and aggregate line/page markers."""
+    by_source: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else None
+        dist = dists[i] if i < len(dists) else None
+        source = ((meta or {}).get("source") or "").strip() or f"__unknown_{i}"
+        if source not in by_source:
+            by_source[source] = {
+                "doc": doc,
+                "meta": dict(meta) if isinstance(meta, dict) else (meta or {}),
+                "dist": dist,
+                "lines": set(),
+                "pages": set(),
+            }
+            order.append(source)
+        entry = by_source[source]
+        if dist is not None and (entry["dist"] is None or float(dist) < float(entry["dist"])):
+            entry["dist"] = dist
+        m = meta or {}
+        line = m.get("line_start")
+        page = m.get("page")
+        if line is not None:
+            entry["lines"].add(str(line))
+        if page is not None:
+            entry["pages"].add(str(page))
+
+    out: list[tuple[str, dict[str, Any], float | None]] = []
+    for source in order:
+        entry = by_source[source]
+        meta = dict(entry["meta"] or {})
+        lines = sorted(entry["lines"], key=lambda x: (len(x), x))
+        pages = sorted(entry["pages"], key=lambda x: (len(x), x))
+        if lines:
+            meta["line_start"] = ", ".join(lines)
+        if pages:
+            meta["page"] = ", ".join(pages)
+        out.append((entry["doc"], meta, entry["dist"]))
+    return out
+
+
+def render_sources_footer(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    *,
+    no_color: bool,
+    detailed: bool = False,
+    max_items: int = 8,
+) -> list[str]:
+    """Render a compact sources footer, optionally with per-file detail for explain/debug flows."""
+    rows = _aggregate_footer_sources(docs, metas, dists)
+    if not rows:
+        return []
+
+    summary = f"Sources: {len(rows)} source{'s' if len(rows) != 1 else ''}"
+    scores = []
+    for _doc, _meta, dist in rows:
+        if dist is None:
+            continue
+        try:
+            scores.append(1.0 / (1.0 + float(dist)))
+        except (TypeError, ValueError):
+            continue
+    if scores:
+        summary += f" | median match {median(scores):.2f}"
+
+    out = [bold(no_color, summary)]
+    if detailed:
+        for doc, meta, dist in rows[:max_items]:
+            out.append(format_source(doc, meta, dist, include_snippet=False, no_color=no_color))
+        if len(rows) > max_items:
+            out.append(dim(no_color, f"... ({len(rows) - max_items} more sources omitted)"))
+    return out

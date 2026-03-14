@@ -6,8 +6,8 @@ from decimal import Decimal
 import re
 from typing import Any
 
-from style import bold, dim, label_style
-from query.formatting import format_source
+from style import dim, label_style
+from query.formatting import render_sources_footer
 
 from tax.ledger import load_tax_ledger_rows
 from tax.normalize import format_money_decimal, parse_decimal, source_tokens
@@ -40,6 +40,7 @@ def run_tax_resolver(
     silo: str | None,
     source_label: str,
     no_color: bool,
+    explain: bool = False,
 ) -> dict[str, Any] | None:
     """Resolve tax asks from ledger rows only. Returns guardrail payload or None if not tax-domain."""
     request = parse_tax_query(query)
@@ -47,7 +48,7 @@ def run_tax_resolver(
         return None
 
     if request.metric == METRIC_1099_MIN_REPORTING_THRESHOLD:
-        return _resolve_1099_min_reporting_threshold(request, source_label, no_color)
+        return _resolve_1099_min_reporting_threshold(request, source_label, no_color, explain=explain)
 
     if request.tax_year is None:
         return _abstain_response(
@@ -59,6 +60,7 @@ def run_tax_resolver(
             form_type=request.form_type_hint,
             tax_year=None,
             rows=[],
+            explain=explain,
         )
 
     rows = load_tax_ledger_rows(
@@ -79,10 +81,11 @@ def run_tax_resolver(
             form_type=request.form_type_hint,
             tax_year=request.tax_year,
             rows=[],
+            explain=explain,
         )
 
     if request.metric == METRIC_TOTAL_INCOME:
-        return _resolve_total_income(request, rows, source_label, no_color)
+        return _resolve_total_income(request, rows, source_label, no_color, explain=explain)
     if request.metric == METRIC_AGI:
         return _resolve_single_field_metric(
             request,
@@ -92,6 +95,7 @@ def run_tax_resolver(
             source_label=source_label,
             no_color=no_color,
             form_type="1040",
+            explain=explain,
         )
     if request.metric == METRIC_TOTAL_TAX_LIABILITY:
         return _resolve_single_field_metric(
@@ -102,6 +106,7 @@ def run_tax_resolver(
             source_label=source_label,
             no_color=no_color,
             form_type="1040",
+            explain=explain,
         )
     if request.metric == METRIC_FEDERAL_WITHHELD:
         return _resolve_sum_metric(
@@ -113,6 +118,7 @@ def run_tax_resolver(
             no_color=no_color,
             form_type="W2",
             interpretation=request.interpretation,
+            explain=explain,
         )
     if request.metric == METRIC_STATE_TAX:
         return _resolve_sum_metric(
@@ -123,6 +129,7 @@ def run_tax_resolver(
             source_label=source_label,
             no_color=no_color,
             form_type="W2",
+            explain=explain,
         )
     if request.metric == METRIC_PAYROLL_TAXES:
         return _resolve_sum_metric(
@@ -133,6 +140,7 @@ def run_tax_resolver(
             source_label=source_label,
             no_color=no_color,
             form_type="W2",
+            explain=explain,
         )
     if request.metric == METRIC_WAGES:
         return _resolve_sum_metric(
@@ -143,6 +151,7 @@ def run_tax_resolver(
             source_label=source_label,
             no_color=no_color,
             form_type="W2",
+            explain=explain,
         )
     if request.metric == METRIC_INTEREST_INCOME:
         return _resolve_sum_metric(
@@ -153,6 +162,7 @@ def run_tax_resolver(
             source_label=source_label,
             no_color=no_color,
             form_type="1099-INT",
+            explain=explain,
         )
     if request.metric == METRIC_DIVIDENDS:
         return _resolve_sum_metric(
@@ -163,6 +173,7 @@ def run_tax_resolver(
             source_label=source_label,
             no_color=no_color,
             form_type="1099-DIV",
+            explain=explain,
         )
     if request.metric == METRIC_W2_BOX:
         if request.box_number is None:
@@ -175,6 +186,7 @@ def run_tax_resolver(
                 form_type="W2",
                 tax_year=request.tax_year,
                 rows=[],
+                explain=explain,
             )
         box_meta = W2_BOX_FIELD_CODES.get(request.box_number)
         if box_meta is None:
@@ -187,6 +199,7 @@ def run_tax_resolver(
                 form_type="W2",
                 tax_year=request.tax_year,
                 rows=[],
+                explain=explain,
             )
         field_code, field_label = box_meta
         return _resolve_single_field_metric(
@@ -197,6 +210,7 @@ def run_tax_resolver(
             source_label=source_label,
             no_color=no_color,
             form_type="W2",
+            explain=explain,
         )
 
     return _abstain_response(
@@ -208,6 +222,7 @@ def run_tax_resolver(
         form_type=request.form_type_hint,
         tax_year=request.tax_year,
         rows=[],
+        explain=explain,
     )
 
 
@@ -216,6 +231,7 @@ def _resolve_total_income(
     rows: list[dict[str, Any]],
     source_label: str,
     no_color: bool,
+    explain: bool = False,
 ) -> dict[str, Any]:
     primary = _filter_rows(rows, request=request, field_codes=["f1040_line_9_total_income"])
     if primary["status"] == "ok":
@@ -228,13 +244,22 @@ def _resolve_total_income(
             field_code="f1040_line_9_total_income",
             rows=primary["rows"],
             interpretation=None,
+            explain=explain,
         )
     if primary["status"] in {"conflict", "low_confidence_extraction"}:
-        return _status_to_abstain(primary, request, source_label, no_color, "f1040_line_9_total_income", "1040")
+        return _status_to_abstain(
+            primary,
+            request,
+            source_label,
+            no_color,
+            "f1040_line_9_total_income",
+            "1040",
+            explain=explain,
+        )
 
     wages = _filter_rows(rows, request=request, field_codes=["w2_box_1_wages"])
     if wages["status"] != "ok":
-        return _status_to_abstain(wages, request, source_label, no_color, "w2_box_1_wages", "W2")
+        return _status_to_abstain(wages, request, source_label, no_color, "w2_box_1_wages", "W2", explain=explain)
 
     return _sum_value_response(
         request=request,
@@ -246,6 +271,7 @@ def _resolve_total_income(
         rows=wages["rows"],
         interpretation=None,
         fallback_prefix=None,
+        explain=explain,
     )
 
 
@@ -253,6 +279,7 @@ def _resolve_1099_min_reporting_threshold(
     request: TaxQuery,
     source_label: str,
     no_color: bool,
+    explain: bool = False,
 ) -> dict[str, Any]:
     form_hint = (request.form_type_hint or "").upper()
     if form_hint == "1099-INT":
@@ -271,6 +298,7 @@ def _resolve_1099_min_reporting_threshold(
         rows=[],
         guardrail_no_match=False,
         guardrail_reason="tax_reference_threshold",
+        explain=explain,
     )
 
 
@@ -283,10 +311,11 @@ def _resolve_single_field_metric(
     source_label: str,
     no_color: bool,
     form_type: str,
+    explain: bool = False,
 ) -> dict[str, Any]:
     status = _filter_rows(rows, request=request, field_codes=field_codes)
     if status["status"] != "ok":
-        return _status_to_abstain(status, request, source_label, no_color, field_codes[0], form_type)
+        return _status_to_abstain(status, request, source_label, no_color, field_codes[0], form_type, explain=explain)
     return _single_value_response(
         request=request,
         source_label=source_label,
@@ -296,6 +325,7 @@ def _resolve_single_field_metric(
         field_code=field_codes[0],
         rows=status["rows"],
         interpretation=request.interpretation,
+        explain=explain,
     )
 
 
@@ -309,11 +339,12 @@ def _resolve_sum_metric(
     no_color: bool,
     form_type: str,
     interpretation: str | None = None,
+    explain: bool = False,
 ) -> dict[str, Any]:
     status = _filter_rows(rows, request=request, field_codes=field_codes)
     if status["status"] != "ok":
         field_code = field_codes[0] if len(field_codes) == 1 else "+".join(field_codes)
-        return _status_to_abstain(status, request, source_label, no_color, field_code, form_type)
+        return _status_to_abstain(status, request, source_label, no_color, field_code, form_type, explain=explain)
     return _sum_value_response(
         request=request,
         source_label=source_label,
@@ -323,6 +354,7 @@ def _resolve_sum_metric(
         field_code=(field_codes[0] if len(field_codes) == 1 else "+".join(field_codes)),
         rows=status["rows"],
         interpretation=interpretation,
+        explain=explain,
     )
 
 
@@ -558,6 +590,7 @@ def _single_value_response(
     field_code: str,
     rows: list[dict[str, Any]],
     interpretation: str | None = None,
+    explain: bool = False,
 ) -> dict[str, Any]:
     values = sorted({str(r.get("normalized_decimal") or "") for r in rows if str(r.get("normalized_decimal") or "")})
     if len(values) != 1:
@@ -574,6 +607,7 @@ def _single_value_response(
             form_type=form_type,
             tax_year=request.tax_year,
             rows=rows,
+            explain=explain,
         )
 
     value = format_money_decimal(values[0])
@@ -592,6 +626,7 @@ def _single_value_response(
         rows=rows,
         guardrail_no_match=False,
         guardrail_reason="tax_resolved",
+        explain=explain,
     )
 
 
@@ -606,6 +641,7 @@ def _sum_value_response(
     rows: list[dict[str, Any]],
     interpretation: str | None = None,
     fallback_prefix: str | None = None,
+    explain: bool = False,
 ) -> dict[str, Any]:
     total = Decimal("0")
     used_rows: list[dict[str, Any]] = []
@@ -626,6 +662,7 @@ def _sum_value_response(
             form_type=form_type,
             tax_year=request.tax_year,
             rows=rows,
+            explain=explain,
         )
 
     employer_segment = f" at {request.employer}" if request.employer else ""
@@ -644,6 +681,7 @@ def _sum_value_response(
         rows=used_rows,
         guardrail_no_match=False,
         guardrail_reason="tax_resolved",
+        explain=explain,
     )
 
 
@@ -654,6 +692,7 @@ def _status_to_abstain(
     no_color: bool,
     metric: str,
     form_type: str,
+    explain: bool = False,
 ) -> dict[str, Any]:
     category = str(status.get("status") or "no_match")
     message = str(status.get("message") or "No matching rows found.")
@@ -672,6 +711,7 @@ def _status_to_abstain(
         form_type=form_type,
         tax_year=request.tax_year,
         rows=status.get("rows") or [],
+        explain=explain,
     )
 
 
@@ -685,6 +725,7 @@ def _abstain_response(
     form_type: str | None,
     tax_year: int | None,
     rows: list[dict[str, Any]],
+    explain: bool = False,
 ) -> dict[str, Any]:
     line = f"Abstain [{category}]: {message}"
     return _final_response(
@@ -697,6 +738,7 @@ def _abstain_response(
         rows=rows,
         guardrail_no_match=True,
         guardrail_reason=f"tax_{category}",
+        explain=explain,
     )
 
 
@@ -711,6 +753,7 @@ def _final_response(
     rows: list[dict[str, Any]],
     guardrail_no_match: bool,
     guardrail_reason: str,
+    explain: bool = False,
 ) -> dict[str, Any]:
     out = [line, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")]
     metric_str = metric or "n/a"
@@ -718,9 +761,16 @@ def _final_response(
     year_str = str(tax_year) if tax_year is not None else "n/a"
     source_metas = _compact_source_metas(rows)
     if source_metas:
-        out.extend(["", bold(no_color, "Sources:")])
-        for meta in source_metas:
-            out.append(format_source("", meta, None, include_snippet=False, no_color=no_color))
+        out.extend(
+            [""]
+            + render_sources_footer(
+                ["" for _ in source_metas],
+                source_metas,
+                [None for _ in source_metas],
+                no_color=no_color,
+                detailed=explain,
+            )
+        )
 
     receipt_metas = [
         {

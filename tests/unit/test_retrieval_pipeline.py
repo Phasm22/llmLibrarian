@@ -310,6 +310,46 @@ def test_sort_by_academic_priority_softly_promotes_transcript_but_keeps_non_tran
     assert set(docs) == {"plan text", "transcript row text", "audit text"}
 
 
+def test_academic_source_priority_demotes_suspicious_transcript_row_sources():
+    suspicious = academic_source_priority_score(
+        {"record_type": "transcript_row", "doc_type": "transcript", "source": "/tmp/BC CSBA-Cyber agreement.pdf"},
+        "Course row: CSC 160 | Computer Science",
+        {"mode": "classes_taken"},
+    )
+    clean = academic_source_priority_score(
+        {"record_type": "transcript_row", "doc_type": "transcript", "source": "/tmp/Uccs_Transcript.pdf"},
+        "Course row: CSC 160 | Computer Science",
+        {"mode": "classes_taken"},
+    )
+    assert clean > suspicious
+
+
+def test_academic_source_priority_boosts_identity_and_school_matches():
+    matched = academic_source_priority_score(
+        {
+            "record_type": "transcript_row",
+            "doc_type": "transcript",
+            "source": "/tmp/Uccs_Transcript.pdf",
+            "student_name": "Tandon Kelvon Jenkins",
+            "course_school": "University of Colorado Colorado Springs",
+        },
+        "Course row: CS 2060 | C Programming",
+        {"mode": "classes_taken", "user_name": "Tandon Kelvon Jenkins", "requested_school": "UCCS"},
+    )
+    mismatched = academic_source_priority_score(
+        {
+            "record_type": "transcript_row",
+            "doc_type": "transcript",
+            "source": "/tmp/Other_Transcript.pdf",
+            "student_name": "Different Person",
+            "course_school": "Other School",
+        },
+        "Course row: CS 2060 | C Programming",
+        {"mode": "classes_taken", "user_name": "Tandon Kelvon Jenkins", "requested_school": "UCCS"},
+    )
+    assert matched > mismatched
+
+
 def test_source_extension_rank_map_prefers_extension_at_source_level():
     metas = [
         {"source": "/tmp/notes.docx"},

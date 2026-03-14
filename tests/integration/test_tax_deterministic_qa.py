@@ -85,7 +85,7 @@ def test_tax_deterministic_box_lookup_and_no_cross_year_leakage(tmp_path):
         use_reranker=False,
     )
     assert "4,723.31" in out
-    assert "Federal_Colorado_deloitte2025.txt" in out
+    assert "Sources: 1 source" in out
 
     taxes_paid = run_ask(
         archetype_id=None,

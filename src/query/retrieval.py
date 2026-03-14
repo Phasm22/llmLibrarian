@@ -566,6 +566,37 @@ _ACADEMIC_DEPRIORITIZED_TOKENS = (
     "degree plan",
     "suggested",
 )
+_ACADEMIC_TRANSCRIPT_SOURCE_DENYLIST = ("syllabus", "agreement", "transfer", "best choices", "four-year plan", "four year plan")
+
+
+def _person_tokens(name: str) -> set[str]:
+    return {tok for tok in re.findall(r"[a-z]{2,}", (name or "").lower())}
+
+
+def _names_overlap(lhs: str, rhs: str) -> bool:
+    left = _person_tokens(lhs)
+    right = _person_tokens(rhs)
+    if not left or not right:
+        return False
+    overlap = left & right
+    if len(overlap) >= 2:
+        return True
+    return bool(overlap and (len(left) == 1 or len(right) == 1))
+
+
+def _normalize_school_key(value: str) -> str:
+    raw = (value or "").lower()
+    key = re.sub(r"[^a-z0-9]", "", raw)
+    if not key:
+        return ""
+    if (
+        "uccs" in key
+        or "cucolosprings" in key
+        or "cucoloradosprings" in key
+        or "universityofcoloradocoloradosprings" in key
+    ):
+        return "uccs"
+    return key
 
 
 def academic_source_priority_score(
@@ -577,12 +608,14 @@ def academic_source_priority_score(
     Bounded academic source-priority score.
     Promotes transcript/audit records and softly deprioritizes plan/guide sources.
     """
-    del query_contract  # reserved for future query-specific boosts; keeps signature stable.
     m = meta or {}
     source = str(m.get("source") or "").lower()
     record_type = str(m.get("record_type") or "").lower()
     doc_type = str(m.get("doc_type") or "").lower()
     text = (doc or "").lower()
+    contract = query_contract or {}
+    user_name = str(contract.get("user_name") or "").strip()
+    requested_school = str(contract.get("requested_school") or "").strip()
 
     score = 0
     if record_type == "transcript_row":
@@ -600,10 +633,35 @@ def academic_source_priority_score(
     if "course row:" in text:
         score += 2
 
+    if record_type == "transcript_row" and any(tok in source for tok in _ACADEMIC_TRANSCRIPT_SOURCE_DENYLIST):
+        # Suspicious transcript_row from clearly non-transcript docs.
+        score -= 18
+
     if any(tok in source for tok in _ACADEMIC_DEPRIORITIZED_TOKENS):
         score -= 4
     if "plan_row" == record_type:
         score -= 2
+
+    if user_name:
+        student_name = str(m.get("student_name") or "")
+        if record_type == "transcript_row":
+            if student_name and _names_overlap(student_name, user_name):
+                score += 6
+            else:
+                score -= 6
+        elif student_name and _names_overlap(student_name, user_name):
+            score += 2
+
+    if requested_school:
+        requested_key = _normalize_school_key(requested_school)
+        school_key = _normalize_school_key(str(m.get("course_school") or ""))
+        if not school_key:
+            school_key = _normalize_school_key(source)
+        if requested_key and school_key:
+            if school_key == requested_key:
+                score += 4
+            else:
+                score -= 3
 
     return max(-12, min(24, score))
 

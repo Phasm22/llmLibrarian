@@ -117,7 +117,13 @@ def test_pull_command_rejects_blank_prompt():
 
 def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     watched = {}
-    monkeypatch.setattr("pal._pull_path_mode", lambda *a, **k: 0)
+    def _fake_pull_path_mode(*args, **kwargs):
+        watched["processor_log_level"] = os.environ.get("LLMLIBRARIAN_PROCESSOR_LOG_LEVEL")
+        watched["ingest_log_level"] = os.environ.get("LLMLIBRARIAN_INGEST_LOG_LEVEL")
+        watched["suppress_recoverable"] = os.environ.get("LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS")
+        return 0
+
+    monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path_mode)
     monkeypatch.setattr(
         "pal._read_llmli_registry",
         lambda _db: {"folder-slug": {"path": str(Path('/tmp/folder').resolve())}},
@@ -133,6 +139,7 @@ def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     def _fake_run_watcher(_watcher, db_path, silo_slug):
         watched["db_path"] = db_path
         watched["run_silo_slug"] = silo_slug
+        watched["watcher_processor_log_level"] = os.environ.get("LLMLIBRARIAN_PROCESSOR_LOG_LEVEL")
         return 0
 
     monkeypatch.setattr("pal.SiloWatcher", _DummyWatcher)
@@ -146,6 +153,27 @@ def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     assert watched["interval"] == 12
     assert watched["debounce"] == 2
     assert watched["root"] == str(Path("/tmp/folder").resolve())
+    assert watched["processor_log_level"] == "ERROR"
+    assert watched["ingest_log_level"] == "FATAL"
+    assert watched["suppress_recoverable"] == "1"
+    assert watched["watcher_processor_log_level"] == "ERROR"
+
+
+def test_temporary_env_restores_previous_values(monkeypatch):
+    monkeypatch.setenv("LLMLIBRARIAN_PROCESSOR_LOG_LEVEL", "WARN")
+    monkeypatch.delenv("LLMLIBRARIAN_INGEST_LOG_LEVEL", raising=False)
+
+    with pal._temporary_env(
+        {
+            "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
+            "LLMLIBRARIAN_INGEST_LOG_LEVEL": "FATAL",
+        }
+    ):
+        assert os.environ["LLMLIBRARIAN_PROCESSOR_LOG_LEVEL"] == "ERROR"
+        assert os.environ["LLMLIBRARIAN_INGEST_LOG_LEVEL"] == "FATAL"
+
+    assert os.environ["LLMLIBRARIAN_PROCESSOR_LOG_LEVEL"] == "WARN"
+    assert "LLMLIBRARIAN_INGEST_LOG_LEVEL" not in os.environ
 
 
 def test_pull_with_path_calls_path_mode(monkeypatch):
@@ -250,7 +278,7 @@ def test_pull_with_path_passes_clear_prompt_option(monkeypatch):
 
 def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
-    monkeypatch.setattr("pal._run_llmli", lambda _args: 0)
+    monkeypatch.setattr("pal._run_llmli", lambda _args, extra_env=None: 0)
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
     calls = {}
 
@@ -268,7 +296,7 @@ def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
 
 def test_pull_path_mode_errors_when_prompt_override_target_missing(monkeypatch):
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
-    monkeypatch.setattr("pal._run_llmli", lambda _args: 0)
+    monkeypatch.setattr("pal._run_llmli", lambda _args, extra_env=None: 0)
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
     monkeypatch.setattr("pal._set_silo_prompt_for_path", lambda *_a, **_k: False)
 

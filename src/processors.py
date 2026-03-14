@@ -2,6 +2,7 @@
 Document processor abstraction for llmLibrarian ingestion.
 Each processor handles extraction for a specific file type.
 """
+import hashlib
 import io
 import importlib.util
 import json
@@ -12,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -20,13 +22,26 @@ from typing import Any, Protocol
 ChunkTuple = tuple[str, str, dict[str, Any]]
 
 
+@dataclass(frozen=True)
+class ExtractedText:
+    text: str
+    meta: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ExtractedPage:
+    text: str
+    page_num: int
+    meta: dict[str, Any] | None = None
+
+
 class DocumentProcessor(Protocol):
     """Protocol for document processors. Each handles one file type."""
 
-    def extract(self, data: bytes, source_path: str) -> str | list[tuple[str, int]] | None:
+    def extract(self, data: bytes, source_path: str) -> str | ExtractedText | list[ExtractedPage] | None:
         """Extract text from file bytes. Returns:
-        - str for plain text content
-        - list[(page_text, page_num)] for paged documents (PDF)
+        - str/ExtractedText for plain text content
+        - list[ExtractedPage] for paged documents (PDF)
         - None if extraction failed or library unavailable
         """
         ...
@@ -50,6 +65,10 @@ class XLSXExtractionError(DocumentExtractionError):
 
 class PPTXExtractionError(DocumentExtractionError):
     """Raised when PPTX extraction fails."""
+
+
+class ImageExtractionError(DocumentExtractionError):
+    """Raised when image OCR extraction fails."""
 
 
 class TextExtractionError(DocumentExtractionError):
@@ -76,6 +95,10 @@ _PADDLE_OCR_INIT_ATTEMPTED = False
 _PADDLE_OCR_USE_ANGLE: bool | None = None
 _OCR_PREPROCESS_WARNED: set[str] = set()
 _PROCESSOR_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+_VALID_OCR_BACKENDS = frozenset({"auto", "vision", "paddleocr", "tesseract"})
+_VISION_HELPER_BINARY: Path | None = None
+_VISION_HELPER_READY: bool | None = None
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff")
 
 
 def _processor_min_log_level() -> str:
@@ -120,6 +143,40 @@ def _ocr_preprocess_enabled() -> bool:
     return val not in ("0", "false", "no")
 
 
+def _configured_ocr_backend() -> str:
+    raw = (os.environ.get("LLMLIBRARIAN_OCR_BACKEND") or "auto").strip().lower()
+    return raw if raw in _VALID_OCR_BACKENDS else "auto"
+
+
+def _vision_helper_source_path() -> Path:
+    return Path(__file__).with_name("vision_ocr.swift")
+
+
+def _vision_prereqs_available() -> bool:
+    return (
+        sys.platform == "darwin"
+        and bool(shutil.which("swiftc"))
+        and _vision_helper_source_path().exists()
+    )
+
+
+def _vision_ocr_available() -> bool:
+    if _VISION_HELPER_READY is not None:
+        return _VISION_HELPER_READY
+    return _vision_prereqs_available()
+
+
+def _preferred_ocr_backends() -> list[str]:
+    configured = _configured_ocr_backend()
+    if configured != "auto":
+        return [configured]
+    ordered: list[str] = []
+    if sys.platform == "darwin":
+        ordered.append("vision")
+    ordered.extend(["paddleocr", "tesseract"])
+    return ordered
+
+
 def _paddleocr_available() -> bool:
     """True when paddleocr is importable in the current environment."""
     try:
@@ -136,14 +193,24 @@ def _tesseract_available() -> bool:
     return bool(shutil.which("tesseract"))
 
 
+def _ocr_backend_available(name: str) -> bool:
+    if name == "vision":
+        return _vision_ocr_available()
+    if name == "paddleocr":
+        return _paddleocr_available()
+    if name == "tesseract":
+        return _tesseract_available()
+    return False
+
+
 def _available_ocr_backends() -> list[str]:
     """Return available OCR backends in deterministic priority order."""
-    out: list[str] = []
-    if _paddleocr_available():
-        out.append("paddleocr")
-    if _tesseract_available():
-        out.append("tesseract")
-    return out
+    return [backend for backend in _preferred_ocr_backends() if _ocr_backend_available(backend)]
+
+
+def ocr_backend_chain_for_capabilities() -> list[str]:
+    """Backends that would be attempted in auto mode on this machine."""
+    return _available_ocr_backends()
 
 
 def _alnum_ratio(s: str) -> float:
@@ -292,17 +359,109 @@ def _extract_paddleocr_text(result: Any) -> str:
     return " ".join(deduped).strip()
 
 
-def _ocr_with_paddle(image_png: bytes) -> str | None:
+def _vision_helper_binary_path() -> Path:
+    source = _vision_helper_source_path()
+    try:
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
+    except OSError:
+        digest = "missing"
+    cache_dir = Path(tempfile.gettempdir()) / "llmlibrarian-vision"
+    return cache_dir / f"vision-ocr-{digest}"
+
+
+def _ensure_vision_helper_binary() -> str | None:
+    global _VISION_HELPER_BINARY, _VISION_HELPER_READY
+    if _VISION_HELPER_READY and _VISION_HELPER_BINARY is not None and _VISION_HELPER_BINARY.exists():
+        return str(_VISION_HELPER_BINARY)
+    if not _vision_prereqs_available():
+        _VISION_HELPER_READY = False
+        _VISION_HELPER_BINARY = None
+        return None
+
+    source = _vision_helper_source_path()
+    binary = _vision_helper_binary_path()
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    if binary.exists():
+        _VISION_HELPER_BINARY = binary
+        _VISION_HELPER_READY = True
+        _log_processor_event("DEBUG", "Vision OCR helper available", extractor="vision", binary=str(binary))
+        return str(binary)
+
+    tmp_binary = binary.with_suffix(".tmp")
+    cmd = ["swiftc", "-O", str(source), "-o", str(tmp_binary)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if proc.returncode != 0:
+            _VISION_HELPER_READY = False
+            _VISION_HELPER_BINARY = None
+            _log_processor_event(
+                "WARN",
+                "Vision OCR helper compile failed",
+                extractor="vision",
+                error=(proc.stderr or proc.stdout or "").strip()[:400],
+            )
+            return None
+        os.replace(tmp_binary, binary)
+        binary.chmod(0o755)
+        _VISION_HELPER_BINARY = binary
+        _VISION_HELPER_READY = True
+        _log_processor_event("DEBUG", "Vision OCR helper available", extractor="vision", binary=str(binary))
+        return str(binary)
+    except Exception as e:
+        _VISION_HELPER_READY = False
+        _VISION_HELPER_BINARY = None
+        _log_processor_event(
+            "WARN",
+            "Vision OCR helper compile failed",
+            extractor="vision",
+            error=str(e),
+        )
+        return None
+
+
+def _ocr_with_vision_path(image_path: str) -> str | None:
+    """Run OCR with Apple's Vision framework when available."""
+    helper = _ensure_vision_helper_binary()
+    if helper is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [helper, image_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            _log_processor_event(
+                "WARN",
+                "Vision OCR failed",
+                extractor="vision",
+                error=(proc.stderr or proc.stdout or "").strip()[:400],
+                image_path=image_path,
+            )
+            return None
+        payload = json.loads((proc.stdout or "{}").strip() or "{}")
+        text = str(payload.get("text") or "").strip()
+        return text or None
+    except Exception as e:
+        _log_processor_event(
+            "WARN",
+            "Vision OCR invocation failed",
+            extractor="vision",
+            error=str(e),
+            image_path=image_path,
+        )
+        return None
+
+
+def _ocr_with_paddle_path(image_path: str) -> str | None:
     """Run OCR with PaddleOCR when available. Returns extracted text or None."""
     engine = _get_paddle_ocr_engine()
     if engine is None:
         return None
     try:
-        with tempfile.TemporaryDirectory() as td:
-            image_path = Path(td) / "page.png"
-            image_path.write_bytes(image_png)
-            use_angle = _ocr_preprocess_enabled()
-            result = engine.ocr(str(image_path), cls=use_angle)
+        use_angle = _ocr_preprocess_enabled()
+        result = engine.ocr(str(image_path), cls=use_angle)
         text = _extract_paddleocr_text(result)
         return text or None
     except Exception as e:
@@ -315,16 +474,30 @@ def _ocr_with_paddle(image_png: bytes) -> str | None:
         return None
 
 
-def _ocr_with_tesseract(image_png: bytes) -> str | None:
-    """Run OCR with tesseract CLI when available. Returns extracted text or None."""
-    if not _tesseract_available():
-        return None
+def _ocr_with_paddle(image_png: bytes) -> str | None:
+    """Backwards-compatible byte wrapper around PaddleOCR."""
     try:
         with tempfile.TemporaryDirectory() as td:
             image_path = Path(td) / "page.png"
             image_path.write_bytes(image_png)
+            return _ocr_with_paddle_path(str(image_path))
+    except Exception as e:
+        _log_processor_event(
+            "WARN",
+            "PaddleOCR inference failed",
+            error=str(e),
+            extractor="paddleocr",
+        )
+        return None
 
-            def _run_tesseract(psm: str) -> str | None:
+
+def _ocr_with_tesseract_path(image_path: str) -> str | None:
+    """Run OCR with tesseract CLI when available. Returns extracted text or None."""
+    if not _tesseract_available():
+        return None
+    try:
+        def _run_tesseract(psm: str) -> str | None:
+            with tempfile.TemporaryDirectory() as td:
                 output_base = Path(td) / f"ocr_out_psm{psm}"
                 cmd = [
                     "tesseract",
@@ -351,28 +524,28 @@ def _ocr_with_tesseract(image_png: bytes) -> str | None:
                 text = out_path.read_text(encoding="utf-8", errors="replace").strip()
                 return text or None
 
-            if not _ocr_preprocess_enabled():
-                return _run_tesseract("6")
+        if not _ocr_preprocess_enabled():
+            return _run_tesseract("6")
 
-            text_6 = _run_tesseract("6")
-            text_11 = _run_tesseract("11")
-            ratio_6 = _alnum_ratio(text_6 or "")
-            ratio_11 = _alnum_ratio(text_11 or "")
+        text_6 = _run_tesseract("6")
+        text_11 = _run_tesseract("11")
+        ratio_6 = _alnum_ratio(text_6 or "")
+        ratio_11 = _alnum_ratio(text_11 or "")
 
-            chosen_psm = "6"
-            chosen_text = text_6
-            if text_11 and (not chosen_text or ratio_11 > ratio_6):
-                chosen_psm = "11"
-                chosen_text = text_11
+        chosen_psm = "6"
+        chosen_text = text_6
+        if text_11 and (not chosen_text or ratio_11 > ratio_6):
+            chosen_psm = "11"
+            chosen_text = text_11
 
-            _log_processor_event(
-                "DEBUG",
-                "tesseract OCR PSM comparison",
-                psm_6_ratio=round(ratio_6, 4),
-                psm_11_ratio=round(ratio_11, 4),
-                chosen_psm=chosen_psm if chosen_text else None,
-            )
-            return chosen_text
+        _log_processor_event(
+            "DEBUG",
+            "tesseract OCR PSM comparison",
+            psm_6_ratio=round(ratio_6, 4),
+            psm_11_ratio=round(ratio_11, 4),
+            chosen_psm=chosen_psm if chosen_text else None,
+        )
+        return chosen_text
     except Exception as e:
         _log_processor_event(
             "WARN",
@@ -381,6 +554,116 @@ def _ocr_with_tesseract(image_png: bytes) -> str | None:
             extractor="tesseract",
         )
         return None
+
+
+def _ocr_with_tesseract(image_png: bytes) -> str | None:
+    """Backwards-compatible byte wrapper around tesseract."""
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            image_path = Path(td) / "page.png"
+            image_path.write_bytes(image_png)
+            return _ocr_with_tesseract_path(str(image_path))
+    except Exception as e:
+        _log_processor_event(
+            "WARN",
+            "tesseract OCR invocation failed",
+            error=str(e),
+            extractor="tesseract",
+        )
+        return None
+
+
+def _ocr_image_path(image_path: str, source_path: str, ocr_mode: str) -> tuple[str | None, str | None]:
+    configured = _configured_ocr_backend()
+    preferred = _preferred_ocr_backends()
+    for idx, backend in enumerate(preferred):
+        if not _ocr_backend_available(backend):
+            level = "WARN" if configured != "auto" else "DEBUG"
+            _log_processor_event(
+                level,
+                "OCR backend unavailable",
+                path=source_path,
+                backend=backend,
+                ocr_mode=ocr_mode,
+            )
+            if configured != "auto":
+                return None, None
+            continue
+
+        text: str | None = None
+        if backend == "vision":
+            text = _ocr_with_vision_path(image_path)
+        elif backend == "paddleocr":
+            text = _ocr_with_paddle_path(image_path)
+        elif backend == "tesseract":
+            text = _ocr_with_tesseract_path(image_path)
+
+        if text:
+            _log_processor_event(
+                "INFO",
+                "OCR backend selected",
+                path=source_path,
+                backend=backend,
+                ocr_mode=ocr_mode,
+            )
+            return text, backend
+
+        level = "WARN" if configured != "auto" else "INFO"
+        _log_processor_event(
+            level,
+            "OCR backend produced no text",
+            path=source_path,
+            backend=backend,
+            ocr_mode=ocr_mode,
+        )
+        if configured == "auto":
+            for next_backend in preferred[idx + 1 :]:
+                if _ocr_backend_available(next_backend):
+                    _log_processor_event(
+                        "INFO",
+                        "OCR backend fallback",
+                        path=source_path,
+                        from_backend=backend,
+                        to_backend=next_backend,
+                        ocr_mode=ocr_mode,
+                    )
+                    break
+            continue
+        return None, None
+    return None, None
+
+
+def _ocr_image_bytes(
+    image_bytes: bytes,
+    source_path: str,
+    ocr_mode: str,
+    preferred_suffix: str = ".png",
+) -> tuple[str | None, str | None]:
+    payload = _preprocess_image_for_ocr(image_bytes) if _ocr_preprocess_enabled() else image_bytes
+    suffix = preferred_suffix if preferred_suffix.startswith(".") else f".{preferred_suffix}"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            image_path = Path(td) / f"ocr-input{suffix}"
+            image_path.write_bytes(payload)
+            return _ocr_image_path(str(image_path), source_path, ocr_mode)
+    except Exception as e:
+        _log_processor_event(
+            "WARN",
+            "OCR image staging failed",
+            path=source_path,
+            error=str(e),
+            ocr_mode=ocr_mode,
+        )
+        return None, None
+
+
+def _ocr_image_file(data: bytes, source_path: str, ocr_mode: str = "image_file") -> tuple[str | None, str | None]:
+    suffix = Path(source_path).suffix.lower() or ".png"
+    if _ocr_preprocess_enabled():
+        return _ocr_image_bytes(data, source_path, ocr_mode=ocr_mode, preferred_suffix=".png")
+    if Path(source_path).exists():
+        return _ocr_image_path(source_path, source_path, ocr_mode)
+    return _ocr_image_bytes(data, source_path, ocr_mode=ocr_mode, preferred_suffix=suffix)
 
 
 def _ocr_pdf_page_text(page: Any, source_path: str) -> tuple[str | None, str | None]:
@@ -399,20 +682,7 @@ def _ocr_pdf_page_text(page: Any, source_path: str) -> tuple[str | None, str | N
         )
         return None, None
 
-    if use_preprocess:
-        image_png = _preprocess_image_for_ocr(image_png)
-
-    if _paddleocr_available():
-        paddle_text = _ocr_with_paddle(image_png)
-        if paddle_text:
-            return paddle_text, "paddleocr"
-
-    if _tesseract_available():
-        tess_text = _ocr_with_tesseract(image_png)
-        if tess_text:
-            return tess_text, "tesseract"
-
-    return None, None
+    return _ocr_image_bytes(image_png, source_path, ocr_mode="pdf_scan_fallback", preferred_suffix=".png")
 
 
 def _normalize_table_rows(rows: list[list[str | None]]) -> list[list[str]]:
@@ -539,7 +809,7 @@ class PDFProcessor:
     format_label = "PDF"
     install_hint = "pymupdf"
 
-    def extract(self, data: bytes, source_path: str) -> list[tuple[str, int]]:
+    def extract(self, data: bytes, source_path: str) -> list[ExtractedPage]:
         try:
             import fitz
             tables_by_page: list[list[list[str | None]]] = []
@@ -555,11 +825,12 @@ class PDFProcessor:
                         extractor="pdfplumber",
                     )
             with fitz.open(stream=data, filetype="pdf") as doc:
-                out: list[tuple[str, int]] = []
+                out: list[ExtractedPage] = []
                 pages_without_text_or_ocr: list[int] = []
                 for page in doc:
                     raw_text = page.get_text()
                     ocr_text: str | None = None
+                    page_meta: dict[str, Any] = {}
                     try:
                         for w in page.widgets():
                             name = getattr(w, "field_name", None) or ""
@@ -571,6 +842,8 @@ class PDFProcessor:
                     if not raw_text.strip():
                         ocr_text, backend = _ocr_pdf_page_text(page, source_path)
                         if ocr_text:
+                            if backend:
+                                page_meta = {"ocr_backend": backend, "ocr_mode": "pdf_scan_fallback"}
                             _log_processor_event(
                                 "INFO",
                                 "PDF OCR fallback applied",
@@ -592,7 +865,7 @@ class PDFProcessor:
                         if md:
                             md_tables.append(md)
                     text = _merge_pdf_page_content(raw_text, "\n\n".join(md_tables), hints, ocr_text=ocr_text)
-                    out.append((text, page.number + 1))
+                    out.append(ExtractedPage(text=text, page_num=page.number + 1, meta=page_meta or None))
                 if pages_without_text_or_ocr:
                     _log_processor_event(
                         "WARN",
@@ -668,6 +941,20 @@ class PPTXProcessor:
             raise PPTXExtractionError("Failed to extract PPTX content.")
 
 
+class ImageProcessor:
+    format_label = "Image"
+    install_hint = "macOS Vision or paddleocr/tesseract"
+
+    def extract(self, data: bytes, source_path: str) -> ExtractedText | None:
+        try:
+            text, backend = _ocr_image_file(data, source_path, ocr_mode="image_file")
+            if not text or not backend:
+                return None
+            return ExtractedText(text=text, meta={"ocr_backend": backend, "ocr_mode": "image_file"})
+        except Exception as e:
+            raise ImageExtractionError(str(e)) from e
+
+
 class TextProcessor:
     format_label = "Text"
     install_hint = ""
@@ -685,6 +972,13 @@ PROCESSORS: dict[str, DocumentProcessor] = {
     ".docx": DOCXProcessor(),  # type: ignore[dict-item]
     ".xlsx": XLSXProcessor(),  # type: ignore[dict-item]
     ".pptx": PPTXProcessor(),  # type: ignore[dict-item]
+    ".png": ImageProcessor(),  # type: ignore[dict-item]
+    ".jpg": ImageProcessor(),  # type: ignore[dict-item]
+    ".jpeg": ImageProcessor(),  # type: ignore[dict-item]
+    ".heic": ImageProcessor(),  # type: ignore[dict-item]
+    ".heif": ImageProcessor(),  # type: ignore[dict-item]
+    ".tif": ImageProcessor(),  # type: ignore[dict-item]
+    ".tiff": ImageProcessor(),  # type: ignore[dict-item]
 }
 
 # Default processor for code/text files

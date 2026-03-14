@@ -10,15 +10,56 @@ import re
 import sys
 from pathlib import Path
 
-# Ensure src is on path when running from project root
 _ROOT = Path(__file__).resolve().parent
-_SRC = _ROOT / "src"
-_CWD_SRC = Path.cwd() / "src"
-if _CWD_SRC.exists() and str(_CWD_SRC) not in sys.path:
-    # Supports invoking an installed `llmli` shim while working inside this repo.
-    sys.path.insert(0, str(_CWD_SRC))
-if str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+
+
+def _iter_editable_roots(site_root: Path) -> list[Path]:
+    roots: list[Path] = []
+    for pth_path in sorted(site_root.glob("*llmlibrarian*.pth")):
+        try:
+            for raw_line in pth_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or line.startswith("import "):
+                    continue
+                candidate = Path(line).expanduser()
+                if candidate.exists():
+                    roots.append(candidate.resolve())
+        except Exception:
+            continue
+    return roots
+
+
+def _bootstrap_src_path() -> None:
+    candidates: list[Path] = []
+    cwd_src = Path.cwd() / "src"
+    if cwd_src.is_dir():
+        candidates.append(cwd_src.resolve())
+
+    root_src = _ROOT / "src"
+    if (root_src / "state.py").exists():
+        candidates.append(root_src.resolve())
+
+    if (_ROOT / "state.py").exists():
+        candidates.append(_ROOT)
+
+    for editable_root in _iter_editable_roots(_ROOT):
+        editable_src = editable_root / "src"
+        if (editable_src / "state.py").exists():
+            candidates.append(editable_src.resolve())
+        elif (editable_root / "state.py").exists():
+            candidates.append(editable_root.resolve())
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
+
+
+_bootstrap_src_path()
 
 def _db_path(args: argparse.Namespace) -> Path:
     return Path(getattr(args, "db", None) or os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"))

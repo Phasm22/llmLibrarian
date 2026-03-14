@@ -105,6 +105,7 @@ from query.formatting import (
     normalize_inline_numbered_lists,
     linkify_sources_in_answer,
     format_source,
+    render_sources_footer,
 )
 from query.code_language import (
     CODE_EXTENSIONS,
@@ -496,6 +497,20 @@ def _confidence_assessment(
     unique_sources = _distinct_source_count(metas)
     overlap_support = _query_overlap_support(query, docs or [], metas)
     query_overlap = _has_query_evidence_overlap(query, docs or [], metas)
+    structured_support = any(
+        bool((m or {}).get("field_code"))
+        or bool((m or {}).get("extractor_tier"))
+        or bool((m or {}).get("record_type"))
+        or bool((m or {}).get("ocr_mode"))
+        for m in metas
+    )
+    if not structured_support:
+        ql = (query or "").lower()
+        if re.search(r"\b(w-?2|1099|1040|tax|box\s+\d+|line\s+\d+)\b", ql):
+            structured_support = any(
+                re.search(r"\b(form\s+1040|w-?2|1099|box\s+\d+|line\s+\d+)\b", str(doc or ""), re.IGNORECASE)
+                for doc in (docs or [])[:4]
+            )
 
     warning: str | None = None
     reason: str | None = None
@@ -511,11 +526,14 @@ def _confidence_assessment(
             and query_overlap
             and not explicit_unified
             and top_distance is not None
-            and top_distance <= 0.6
-            and overlap_support >= 0.34
+            and top_distance <= 0.85
+            and overlap_support >= 0.18
         ):
             warning = None
             reason = "relaxed_overlap"
+        elif structured_support and (query_overlap or direct_canonical_available):
+            warning = None
+            reason = "relaxed_structured"
         else:
             ql = (query or "").lower()
             is_broad_synthesis = bool(
@@ -545,8 +563,12 @@ def _confidence_assessment(
         warning = None
         reason = "field_lookup_suppressed"
     elif unique_sources == 1:
-        warning = "Single source: answer is based on one document only."
-        reason = "single_source"
+        if direct_canonical_available or query_overlap or structured_support:
+            warning = None
+            reason = "single_source_relaxed"
+        else:
+            warning = "Single source: answer is based on one document only."
+            reason = "single_source"
 
     if academic_mode and warning and academic_transcript_hits <= 0:
         warning = "Low confidence: class-history query is not grounded in transcript/audit course rows in this scope."
@@ -605,52 +627,6 @@ def _confidence_signal(
         academic_transcript_hits=academic_transcript_hits,
     )
     return assessment.get("warning")
-
-
-def _aggregate_sources_for_footer(
-    docs: list[str],
-    metas: list[dict | None],
-    dists: list[float | None],
-) -> list[tuple[str, dict | None, float | None]]:
-    """De-duplicate footer sources by source path and aggregate line/page markers."""
-    by_source: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for i, doc in enumerate(docs):
-        meta = metas[i] if i < len(metas) else None
-        dist = dists[i] if i < len(dists) else None
-        source = ((meta or {}).get("source") or "").strip() or f"__unknown_{i}"
-        if source not in by_source:
-            by_source[source] = {
-                "doc": doc,
-                "meta": dict(meta) if isinstance(meta, dict) else (meta or {}),
-                "dist": dist,
-                "lines": set(),
-                "pages": set(),
-            }
-            order.append(source)
-        entry = by_source[source]
-        if dist is not None and (entry["dist"] is None or float(dist) < float(entry["dist"])):
-            entry["dist"] = dist
-        m = meta or {}
-        line = m.get("line_start")
-        page = m.get("page")
-        if line is not None:
-            entry["lines"].add(str(line))
-        if page is not None:
-            entry["pages"].add(str(page))
-
-    out: list[tuple[str, dict | None, float | None]] = []
-    for source in order:
-        entry = by_source[source]
-        meta = dict(entry["meta"] or {})
-        lines = sorted(entry["lines"], key=lambda x: (len(x), x))
-        pages = sorted(entry["pages"], key=lambda x: (len(x), x))
-        if lines:
-            meta["line_start"] = ", ".join(lines)
-        if pages:
-            meta["page"] = ", ".join(pages)
-        out.append((entry["doc"], meta, entry["dist"]))
-    return out
 
 
 def _quiet_text_only(text: str) -> str:
@@ -845,6 +821,7 @@ def run_ask(
     canonical_tokens = [str(x) for x in (query_opts.get("canonical_filename_tokens") or [])]
     deprioritized_tokens = [str(x) for x in (query_opts.get("deprioritized_tokens") or [])]
     confidence_relaxation_enabled = bool(query_opts.get("confidence_relaxation_enabled", True))
+    academic_identity_name = str(query_opts.get("user_name") or "").strip() or None
     direct_canonical_available = False
     explicit_silo = silo
     scope_binding_reason: str | None = None
@@ -857,9 +834,15 @@ def run_ask(
     code_activity_sources: list[str] = []
     academic_mode = bool(intent == INTENT_ACADEMIC_HISTORY)
     academic_contract = parse_academic_query(query) if academic_mode else None
+    academic_rank_contract: dict[str, Any] | None = (dict(academic_contract) if academic_contract else None)
+    if academic_rank_contract is not None and academic_identity_name:
+        academic_rank_contract["user_name"] = academic_identity_name
     academic_rerank_applied = False
     academic_transcript_hits = 0
     academic_evidence_rows = 0
+    academic_identity_rows = 0
+    academic_school_rows = 0
+    academic_rows_pre_filter = 0
     ownership_framing_requested = _query_requests_ownership_framing(query)
     recency_hints_requested = _query_requests_recency_hints(query)
     unified_analytical_query = False
@@ -1110,9 +1093,16 @@ def run_ask(
         ]
         for p in files:
             lines.append(f"  • {p}")
-        lines.extend(["", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}"), "", bold(no_color, "Sources:")])
-        for p in files:
-            lines.append(format_source("catalog match", {"source": p, "silo": silo}, None, no_color=no_color))
+        lines.extend(["", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")])
+        lines.extend(
+            [""] + render_sources_footer(
+                ["catalog match" for _ in files],
+                [{"source": p, "silo": silo} for p in files],
+                [None for _ in files],
+                no_color=no_color,
+                detailed=explain,
+            )
+        )
         time_ms = (time.perf_counter() - t0) * 1000
         write_trace(
             intent=intent,
@@ -1231,6 +1221,7 @@ def run_ask(
             silo=silo,
             source_label=source_label,
             no_color=no_color,
+            explain=explain,
         )
         if tax_guardrail is not None:
             time_ms = (time.perf_counter() - t0) * 1000
@@ -1287,6 +1278,9 @@ def run_ask(
             + " Confidence labels must be grounded to evidence type only:"
             + " transcript_row=High, audit_row=Medium, plan_row=Low."
             + " Do not infer completed/taken status from plan/suggested evidence."
+            + " Answer the asked scope only (for example, requested school/term) and do not include biography,"
+            + " high-school history, transfer-plan summaries, or degree-requirement narrative."
+            + " Output only the numbered class list."
         )
     elif intent == INTENT_REFLECT:
         system_prompt = (
@@ -1373,6 +1367,10 @@ def run_ask(
     if academic_mode:
         contract = academic_contract or parse_academic_query(query)
         if contract is not None:
+            academic_rank_contract = dict(contract)
+            if academic_identity_name:
+                academic_rank_contract["user_name"] = academic_identity_name
+        if contract is not None:
             academic_guardrail = run_academic_resolver(
                 query_contract=contract,
                 collection=collection,
@@ -1380,11 +1378,16 @@ def run_ask(
                 silo=silo,
                 source_label=source_label,
                 no_color=no_color,
+                user_name=academic_identity_name,
+                explain=explain,
             )
             if academic_guardrail is not None:
                 time_ms = (time.perf_counter() - t0) * 1000
                 academic_transcript_hits = int(academic_guardrail.get("academic_transcript_hits") or 0)
                 academic_evidence_rows = int(academic_guardrail.get("academic_evidence_rows") or 0)
+                academic_identity_rows = int(academic_guardrail.get("academic_identity_rows") or 0)
+                academic_school_rows = int(academic_guardrail.get("academic_school_rows") or 0)
+                academic_rows_pre_filter = int(academic_guardrail.get("academic_rows_pre_filter") or 0)
                 write_trace(
                     intent=intent,
                     n_stage1=0,
@@ -1407,6 +1410,10 @@ def run_ask(
                     academic_rerank_applied=False,
                     academic_transcript_hits=academic_transcript_hits,
                     academic_evidence_rows=academic_evidence_rows,
+                    academic_identity_name=academic_identity_name,
+                    academic_identity_rows=academic_identity_rows,
+                    academic_school_rows=academic_school_rows,
+                    academic_rows_pre_filter=academic_rows_pre_filter,
                 )
                 response_text = str(academic_guardrail["response"])
                 return _quiet_text_only(response_text) if quiet else response_text
@@ -1466,6 +1473,7 @@ def run_ask(
             query=query,
             source_label=source_label,
             no_color=no_color,
+            explain=explain,
         )
         if guardrail is not None:
             time_ms = (time.perf_counter() - t0) * 1000
@@ -1501,6 +1509,7 @@ def run_ask(
             query=query,
             source_label=source_label,
             no_color=no_color,
+            explain=explain,
         )
         if csv_guardrail is not None:
             time_ms = (time.perf_counter() - t0) * 1000
@@ -1537,6 +1546,7 @@ def run_ask(
             query=query,
             source_label=source_label,
             no_color=no_color,
+            explain=explain,
         )
         if guardrail is not None:
             time_ms = (time.perf_counter() - t0) * 1000
@@ -1867,7 +1877,7 @@ def run_ask(
             docs,
             metas,
             dists,
-            query_contract=academic_contract,
+            query_contract=academic_rank_contract,
         )
         academic_rerank_applied = True
 
@@ -2036,6 +2046,12 @@ def run_ask(
 
     if academic_mode:
         academic_transcript_hits, academic_evidence_rows = _academic_support_stats(metas)
+        if academic_rows_pre_filter <= 0:
+            academic_rows_pre_filter = academic_evidence_rows
+        if academic_identity_rows <= 0:
+            academic_identity_rows = academic_evidence_rows
+        if academic_school_rows <= 0:
+            academic_school_rows = academic_evidence_rows
 
     if not docs:
         if code_activity_year_lookup and code_activity_requested_year is not None and code_activity_sources:
@@ -2082,9 +2098,8 @@ def run_ask(
         )
         if quiet:
             return summary
-        out = [summary, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}"), "", bold(no_color, "Sources:")]
-        for doc, meta, dist in _aggregate_sources_for_footer(docs, metas, dists):
-            out.append(format_source(doc, meta, dist, no_color=no_color))
+        out = [summary, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label}")]
+        out.extend([""] + render_sources_footer(docs, metas, dists, no_color=no_color, detailed=explain))
         return "\n".join(out)
 
     # Relevance gate: fall back to structure info on low confidence
@@ -2123,6 +2138,10 @@ def run_ask(
                 academic_rerank_applied=academic_rerank_applied,
                 academic_transcript_hits=academic_transcript_hits,
                 academic_evidence_rows=academic_evidence_rows,
+                academic_identity_name=academic_identity_name,
+                academic_identity_rows=academic_identity_rows,
+                academic_school_rows=academic_school_rows,
+                academic_rows_pre_filter=academic_rows_pre_filter,
             )
             if quiet:
                 return warning_text
@@ -2357,11 +2376,8 @@ def run_ask(
         "",
         dim(no_color, "---"),
         label_style(no_color, f"Answered by: {source_label}"),
-        "",
-        bold(no_color, "Sources:"),
     ])
-    for doc, meta, dist in _aggregate_sources_for_footer(docs, metas, dists):
-        out.append(format_source(doc, meta, dist, no_color=no_color))
+    out.extend([""] + render_sources_footer(docs, metas, dists, no_color=no_color, detailed=explain))
 
     time_ms = (time.perf_counter() - t0) * 1000
     write_trace(
@@ -2394,6 +2410,10 @@ def run_ask(
         academic_rerank_applied=academic_rerank_applied if academic_mode else None,
         academic_transcript_hits=academic_transcript_hits if academic_mode else None,
         academic_evidence_rows=academic_evidence_rows if academic_mode else None,
+        academic_identity_name=academic_identity_name if academic_mode else None,
+        academic_identity_rows=academic_identity_rows if academic_mode else None,
+        academic_school_rows=academic_school_rows if academic_mode else None,
+        academic_rows_pre_filter=academic_rows_pre_filter if academic_mode else None,
     )
     return "\n".join(out)
 

@@ -43,6 +43,10 @@ def write_trace(
     academic_rerank_applied: bool | None = None,
     academic_transcript_hits: int | None = None,
     academic_evidence_rows: int | None = None,
+    academic_identity_name: str | None = None,
+    academic_identity_rows: int | None = None,
+    academic_school_rows: int | None = None,
+    academic_rows_pre_filter: int | None = None,
 ) -> None:
     """Append one JSON-line to LLMLIBRARIAN_TRACE file (if set). Optional receipt: source paths and chunk hashes for chunks sent to the LLM. No-op if env unset. Does not raise."""
     path = os.environ.get("LLMLIBRARIAN_TRACE")
@@ -118,6 +122,14 @@ def write_trace(
         payload["academic_transcript_hits"] = int(academic_transcript_hits)
     if academic_evidence_rows is not None:
         payload["academic_evidence_rows"] = int(academic_evidence_rows)
+    if academic_identity_name:
+        payload["academic_identity_name"] = str(academic_identity_name)
+    if academic_identity_rows is not None:
+        payload["academic_identity_rows"] = int(academic_identity_rows)
+    if academic_school_rows is not None:
+        payload["academic_school_rows"] = int(academic_school_rows)
+    if academic_rows_pre_filter is not None:
+        payload["academic_rows_pre_filter"] = int(academic_rows_pre_filter)
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")

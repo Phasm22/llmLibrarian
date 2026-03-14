@@ -7,13 +7,18 @@ from pathlib import Path
 import pytest
 
 import processors
-from processors import DOCXProcessor, PDFProcessor, PPTXProcessor, TextProcessor, XLSXProcessor
+from processors import DOCXProcessor, ImageProcessor, PDFProcessor, PPTXProcessor, TextProcessor, XLSXProcessor
 
 
 def _reset_paddle_cache() -> None:
     processors._PADDLE_OCR_ENGINE = None
     processors._PADDLE_OCR_INIT_ATTEMPTED = False
     processors._PADDLE_OCR_USE_ANGLE = None
+
+
+def _reset_vision_cache() -> None:
+    processors._VISION_HELPER_BINARY = None
+    processors._VISION_HELPER_READY = None
 
 
 def test_log_processor_event_default_warn_level_suppresses_info(monkeypatch, capsys):
@@ -61,7 +66,8 @@ def test_pdf_processor_extracts_pages_with_numbers():
     proc = PDFProcessor()
     pages = proc.extract(data, "a.pdf")
     assert pages
-    text, page_num = pages[0]
+    text = pages[0].text
+    page_num = pages[0].page_num
     assert page_num == 1
     assert "hello pdf" in text
 
@@ -169,7 +175,7 @@ def test_pdf_processor_enriches_with_table_hints(monkeypatch):
 
     proc = PDFProcessor()
     pages = proc.extract(data, "a.pdf")
-    text, _page_num = pages[0]
+    text = pages[0].text
     assert "line 9: 7,522." in text
     assert "| 9 | 7,522. |" in text
     assert "Form 1040 sample" in text
@@ -191,7 +197,7 @@ def test_pdf_processor_falls_back_when_table_extraction_raises(monkeypatch):
     monkeypatch.setattr(processors, "_extract_pdf_tables_by_page", _boom)
     proc = PDFProcessor()
     pages = proc.extract(data, "a.pdf")
-    text, _page_num = pages[0]
+    text = pages[0].text
     assert "raw only" in text
     assert "Structured values:" not in text
 
@@ -212,7 +218,7 @@ def test_pdf_processor_skips_table_enrichment_when_disabled(monkeypatch):
     monkeypatch.setattr(processors, "_extract_pdf_tables_by_page", _boom)
     proc = PDFProcessor()
     pages = proc.extract(data, "a.pdf")
-    text, _page_num = pages[0]
+    text = pages[0].text
     assert "raw only" in text
     assert "Structured values:" not in text
 
@@ -224,25 +230,28 @@ def test_pdf_processor_uses_paddle_ocr_when_page_text_is_empty(monkeypatch):
     data = doc.tobytes()
     doc.close()
 
+    monkeypatch.setattr(processors, "_vision_ocr_available", lambda: False)
     monkeypatch.setattr(processors, "_paddleocr_available", lambda: True)
     monkeypatch.setattr(processors, "_tesseract_available", lambda: True)
     monkeypatch.setattr(
         processors,
-        "_ocr_with_paddle",
+        "_ocr_with_paddle_path",
         lambda _img: "Form W-2 Wage and Tax Statement Employer YMCA Box 1: 4,626.76",
     )
     monkeypatch.setattr(
         processors,
-        "_ocr_with_tesseract",
+        "_ocr_with_tesseract_path",
         lambda _img: (_ for _ in ()).throw(AssertionError("tesseract should not run when paddle succeeds")),
     )
 
     proc = PDFProcessor()
     pages = proc.extract(data, "scan.pdf")
-    text, page_num = pages[0]
+    text = pages[0].text
+    page_num = pages[0].page_num
     assert page_num == 1
     assert "OCR text (scan fallback):" in text
     assert "4,626.76" in text
+    assert pages[0].meta == {"ocr_backend": "paddleocr", "ocr_mode": "pdf_scan_fallback"}
 
 
 def test_pdf_processor_falls_back_to_tesseract_when_paddle_unavailable(monkeypatch):
@@ -252,19 +261,21 @@ def test_pdf_processor_falls_back_to_tesseract_when_paddle_unavailable(monkeypat
     data = doc.tobytes()
     doc.close()
 
+    monkeypatch.setattr(processors, "_vision_ocr_available", lambda: False)
     monkeypatch.setattr(processors, "_paddleocr_available", lambda: False)
     monkeypatch.setattr(processors, "_tesseract_available", lambda: True)
     monkeypatch.setattr(
         processors,
-        "_ocr_with_tesseract",
+        "_ocr_with_tesseract_path",
         lambda _img: "Gross Pay $4,626.76",
     )
 
     proc = PDFProcessor()
     pages = proc.extract(data, "scan.pdf")
-    text, _page_num = pages[0]
+    text = pages[0].text
     assert "OCR text (scan fallback):" in text
     assert "4,626.76" in text
+    assert pages[0].meta == {"ocr_backend": "tesseract", "ocr_mode": "pdf_scan_fallback"}
 
 
 def test_pdf_processor_keeps_empty_text_when_no_ocr_backend(monkeypatch):
@@ -283,6 +294,7 @@ def test_pdf_processor_keeps_empty_text_when_no_ocr_backend(monkeypatch):
         payload.update(fields)
         events.append(payload)
 
+    monkeypatch.setattr(processors, "_vision_ocr_available", lambda: False)
     monkeypatch.setattr(processors, "_paddleocr_available", lambda: False)
     monkeypatch.setattr(processors, "_tesseract_available", lambda: False)
     monkeypatch.setattr(processors, "_log_processor_event", _capture_event)
@@ -290,7 +302,7 @@ def test_pdf_processor_keeps_empty_text_when_no_ocr_backend(monkeypatch):
     proc = PDFProcessor()
     pages = proc.extract(data, "scan.pdf")
     assert len(pages) == 3
-    assert all((text == "" and page_num in (1, 2, 3)) for text, page_num in pages)
+    assert all((page.text == "" and page.page_num in (1, 2, 3)) for page in pages)
     warn_events = [e for e in events if "OCR produced no text" in e.get("message", "")]
     assert len(warn_events) == 1
     warning = warn_events[0]
@@ -366,6 +378,49 @@ def test_get_paddle_ocr_engine_uses_angle_mode_from_env(monkeypatch):
 
     assert calls[0]["use_angle_cls"] is False
     assert calls[1]["use_angle_cls"] is True
+
+
+def test_available_ocr_backends_prefers_vision_on_darwin(monkeypatch):
+    monkeypatch.setattr(processors.sys, "platform", "darwin")
+    monkeypatch.setattr(processors, "_vision_ocr_available", lambda: True)
+    monkeypatch.setattr(processors, "_paddleocr_available", lambda: True)
+    monkeypatch.setattr(processors, "_tesseract_available", lambda: True)
+    monkeypatch.delenv("LLMLIBRARIAN_OCR_BACKEND", raising=False)
+    assert processors._available_ocr_backends() == ["vision", "paddleocr", "tesseract"]
+
+
+def test_pinned_ocr_backend_does_not_fallback(monkeypatch):
+    events: list[dict] = []
+
+    def _capture_event(level, message, **fields):
+        payload = {"level": level, "message": message}
+        payload.update(fields)
+        events.append(payload)
+
+    monkeypatch.setenv("LLMLIBRARIAN_OCR_BACKEND", "paddleocr")
+    monkeypatch.setattr(processors, "_paddleocr_available", lambda: True)
+    monkeypatch.setattr(processors, "_tesseract_available", lambda: True)
+    monkeypatch.setattr(processors, "_ocr_with_paddle_path", lambda _img: None)
+    monkeypatch.setattr(
+        processors,
+        "_ocr_with_tesseract_path",
+        lambda _img: (_ for _ in ()).throw(AssertionError("tesseract should not run when backend is pinned")),
+    )
+    monkeypatch.setattr(processors, "_log_processor_event", _capture_event)
+
+    text, backend = processors._ocr_image_path("/tmp/example.png", "/tmp/example.png", "image_file")
+    assert text is None
+    assert backend is None
+    assert any(e.get("message") == "OCR backend produced no text" and e.get("backend") == "paddleocr" for e in events)
+
+
+def test_image_processor_returns_text_and_ocr_metadata(monkeypatch):
+    monkeypatch.setattr(processors, "_ocr_image_file", lambda _data, _source, ocr_mode="image_file": ("hello image", "vision"))
+    proc = ImageProcessor()
+    out = proc.extract(b"image-bytes", "receipt.png")
+    assert out is not None
+    assert out.text == "hello image"
+    assert out.meta == {"ocr_backend": "vision", "ocr_mode": "image_file"}
 
 
 def test_get_paddle_ocr_engine_falls_back_when_show_log_is_unsupported(monkeypatch):

@@ -460,7 +460,8 @@ def test_run_ask_lookup_calls_ollama(monkeypatch, mock_collection, mock_ollama):
         "ids": [["id-1"]],
     }
     out = run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False)
-    assert "Sources:" in out
+    assert "Sources: 1 source | median match 0.91" in out
+    assert "a.txt (line 3)" not in out
     assert len(mock_ollama["calls"]) == 1
     messages = mock_ollama["calls"][0]["messages"]
     assert "[START CONTEXT]" in messages[1]["content"]
@@ -718,7 +719,7 @@ def test_run_ask_explicit_single_silo_does_not_apply_silo_diversification(monkey
         use_reranker=False,
         silo="tax-1234",
     )
-    assert "Sources:" in out
+    assert "Sources: 1 source | median match 0.91" in out
     assert len(mock_ollama["calls"]) == 1
 
 
@@ -915,7 +916,21 @@ def test_run_ask_adds_confidence_warning_when_single_source(monkeypatch, mock_co
         "ids": [["id-1"]],
     }
     out = run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False)
-    assert "Single source: answer is based on one document only." in out
+    assert "Single source: answer is based on one document only." not in out
+
+
+def test_run_ask_explain_keeps_compact_per_file_source_lines(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["alpha context"]],
+        "metadatas": [[{"source": "/tmp/a.txt", "line_start": 3, "is_local": 1, "silo": "s1"}]],
+        "distances": [[0.1]],
+        "ids": [["id-1"]],
+    }
+    out = run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, explain=True)
+    assert "Sources: 1 source | median match 0.91" in out
+    assert "a.txt (line 3) · 0.91" in out
 
 
 def test_run_ask_strict_mode_adds_strict_instruction(monkeypatch, mock_collection, mock_ollama):
@@ -1534,7 +1549,7 @@ def test_run_ask_field_lookup_exact_match_is_value_first(monkeypatch, mock_colle
         silo="tax-123",
     )
     assert "Form 1040 line 9 (2024): 7,522." in out
-    assert "2024 Federal Income Tax Return.pdf" in out
+    assert "Sources: 1 source" in out
     assert mock_ollama["calls"] == []
 
 
@@ -1596,6 +1611,7 @@ def test_run_ask_tax_resolver_short_circuits_llm(monkeypatch, mock_ollama):
 def test_run_ask_academic_resolver_short_circuits_llm(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_ACADEMIC_HISTORY)
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"user_name": "Tandon Kelvon Jenkins"}})
     monkeypatch.setattr(
         "query.core.parse_academic_query",
         lambda _q: {
@@ -1606,10 +1622,12 @@ def test_run_ask_academic_resolver_short_circuits_llm(monkeypatch, mock_collecti
             "requested_year": None,
         },
     )
-    monkeypatch.setattr(
-        "query.core.run_academic_resolver",
-        lambda **_kwargs: {
-            "response": "Here are the classes found in your indexed academic records:\n1. [High] CS 2060 C Programming",
+    seen = {}
+
+    def _resolver(**kwargs):
+        seen.update(kwargs)
+        return {
+            "response": "1. [High] CS 2060 C Programming",
             "guardrail_no_match": False,
             "guardrail_reason": "academic_history_rows",
             "requested_year": None,
@@ -1619,8 +1637,13 @@ def test_run_ask_academic_resolver_short_circuits_llm(monkeypatch, mock_collecti
             "receipt_metas": [{"source": "/tmp/Uccs_Transcript.pdf", "record_type": "transcript_row"}],
             "academic_transcript_hits": 1,
             "academic_evidence_rows": 1,
-        },
-    )
+            "academic_identity_name": "Tandon Kelvon Jenkins",
+            "academic_identity_rows": 1,
+            "academic_school_rows": 1,
+            "academic_rows_pre_filter": 1,
+        }
+
+    monkeypatch.setattr("query.core.run_academic_resolver", _resolver)
     out = run_ask(
         archetype_id=None,
         query="what classes have i taken at uccs",
@@ -1628,7 +1651,8 @@ def test_run_ask_academic_resolver_short_circuits_llm(monkeypatch, mock_collecti
         use_reranker=False,
         silo="old-school",
     )
-    assert "classes found in your indexed academic records" in out
+    assert "1. [High] CS 2060 C Programming" in out
+    assert seen.get("user_name") == "Tandon Kelvon Jenkins"
     assert mock_ollama["calls"] == []
     assert not any(name == "query" for name, _kwargs in mock_collection.calls)
 
@@ -1664,11 +1688,44 @@ def test_run_ask_academic_resolver_miss_falls_back_with_academic_low_confidence(
     assert len(mock_ollama["calls"]) == 1
 
 
+def test_run_ask_academic_fallback_prompt_is_question_scoped_list_only(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_ACADEMIC_HISTORY)
+    monkeypatch.setattr(
+        "query.core.parse_academic_query",
+        lambda _q: {
+            "mode": "classes_taken",
+            "completed_only": True,
+            "requested_school": "UCCS",
+            "requested_term": None,
+            "requested_year": None,
+        },
+    )
+    monkeypatch.setattr("query.core.run_academic_resolver", lambda **_kwargs: None)
+    mock_collection.query_result = {
+        "documents": [["Course row: CS 2060 | C Programming"]],
+        "metadatas": [[{"source": "/tmp/Uccs_Transcript.pdf", "record_type": "transcript_row", "doc_type": "transcript", "is_local": 1}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    run_ask(
+        archetype_id=None,
+        query="what classes have i taken at uccs",
+        no_color=True,
+        use_reranker=False,
+        silo="old-school",
+    )
+    system_prompt = mock_ollama["calls"][-1]["messages"][0]["content"]
+    assert "Output only the numbered class list." in system_prompt
+    assert "do not include biography" in system_prompt.lower()
+
+
 def test_run_ask_academic_trace_fields_present(monkeypatch, tmp_path, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     trace_path = tmp_path / "trace.jsonl"
     monkeypatch.setenv("LLMLIBRARIAN_TRACE", str(trace_path))
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_ACADEMIC_HISTORY)
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"user_name": "Tandon Kelvon Jenkins"}})
     monkeypatch.setattr(
         "query.core.parse_academic_query",
         lambda _q: {
@@ -1682,7 +1739,7 @@ def test_run_ask_academic_trace_fields_present(monkeypatch, tmp_path, mock_colle
     monkeypatch.setattr(
         "query.core.run_academic_resolver",
         lambda **_kwargs: {
-            "response": "Here are the classes found in your indexed academic records:\n1. [High] CS 2060 C Programming",
+            "response": "1. [High] CS 2060 C Programming",
             "guardrail_no_match": False,
             "guardrail_reason": "academic_history_rows",
             "requested_year": None,
@@ -1692,6 +1749,10 @@ def test_run_ask_academic_trace_fields_present(monkeypatch, tmp_path, mock_colle
             "receipt_metas": [{"source": "/tmp/Uccs_Transcript.pdf", "record_type": "transcript_row"}],
             "academic_transcript_hits": 1,
             "academic_evidence_rows": 1,
+            "academic_identity_name": "Tandon Kelvon Jenkins",
+            "academic_identity_rows": 1,
+            "academic_school_rows": 1,
+            "academic_rows_pre_filter": 1,
         },
     )
     run_ask(
@@ -1706,6 +1767,10 @@ def test_run_ask_academic_trace_fields_present(monkeypatch, tmp_path, mock_colle
     assert payload.get("academic_rerank_applied") is False
     assert payload.get("academic_transcript_hits") == 1
     assert payload.get("academic_evidence_rows") == 1
+    assert payload.get("academic_identity_name") == "Tandon Kelvon Jenkins"
+    assert payload.get("academic_identity_rows") == 1
+    assert payload.get("academic_school_rows") == 1
+    assert payload.get("academic_rows_pre_filter") == 1
 
 
 def test_run_ask_csv_rank_guardrail_short_circuits_llm(monkeypatch, mock_collection, mock_ollama):
@@ -1888,7 +1953,7 @@ def test_run_ask_footer_dedupes_duplicate_source_with_aggregated_lines(monkeypat
         "distances": [[0.2, 0.3]],
         "ids": [["id-1", "id-2"]],
     }
-    out = run_ask(archetype_id=None, query="main idea", no_color=True, use_reranker=False)
+    out = run_ask(archetype_id=None, query="main idea", no_color=True, use_reranker=False, explain=True)
     assert out.count("APT Simulation and Analysis.pptx (line") == 1
     assert "(line 1, 23)" in out
 
@@ -1910,6 +1975,7 @@ def test_run_ask_filetype_floor_filters_unrelated_presentations(monkeypatch, moc
         query="main idea of the apt simulation powerpoint",
         no_color=True,
         use_reranker=False,
+        explain=True,
     )
     assert "APT Simulation and Analysis.pptx" in out
     assert "Chapter 4 Loops.pptx" not in out

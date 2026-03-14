@@ -63,5 +63,5 @@ def test_tax_field_lookup_returns_exact_2024_value(tmp_path):
         use_reranker=False,
     )
     assert "Form 1040 line 9 (2024): 7,522." in out
-    assert "2024 Federal Income Tax Return.txt" in out
+    assert "Sources: 1 source" in out
     assert "99,999" not in out

@@ -31,6 +31,8 @@ def test_watch_debounce_collapses_updates(monkeypatch, tmp_path: Path):
     target.write_text("x", encoding="utf-8")
 
     watcher = _make_watcher(monkeypatch, root)
+    logged = []
+    watcher._log = lambda message: logged.append(message)
 
     calls = []
     watcher._update_single_file = lambda path, **_kwargs: (calls.append(path) or ("updated", path))
@@ -41,6 +43,7 @@ def test_watch_debounce_collapses_updates(monkeypatch, tmp_path: Path):
     assert calls == []
     watcher._drain_due(now=now + 2.0)
     assert calls == [str(target.resolve())]
+    assert logged == ["this folder: +1 updated, -0 removed, 0 skipped"]
 
 
 def test_reconcile_removes_missing(monkeypatch, tmp_path: Path):

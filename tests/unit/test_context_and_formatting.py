@@ -7,7 +7,7 @@ from query.context import (
     query_mentioned_years,
     recency_score,
 )
-from query.formatting import format_source, shorten_path, snippet_preview, style_answer
+from query.formatting import format_source, render_sources_footer, shorten_path, snippet_preview, style_answer
 
 
 def test_recency_score_prefers_newer_mtime():
@@ -101,6 +101,32 @@ def test_format_source_omits_blank_snippet_line_when_doc_empty():
     assert "test.txt" in out or "/tmp/test.txt" in out
     assert "(line 7)" in out
     assert "\n    " not in out
+
+
+def test_render_sources_footer_defaults_to_summary_only():
+    out = render_sources_footer(
+        docs=["alpha context", "beta context"],
+        metas=[
+            {"source": "/tmp/a.txt", "line_start": 7},
+            {"source": "/tmp/b.txt", "line_start": 11},
+        ],
+        dists=[1.0, 3.0],
+        no_color=True,
+    )
+    assert out == ["Sources: 2 sources | median match 0.38"]
+
+
+def test_render_sources_footer_detailed_mode_uses_compact_file_lines():
+    out = render_sources_footer(
+        docs=["alpha context"],
+        metas=[{"source": "/tmp/a.txt", "line_start": 7}],
+        dists=[1.0],
+        no_color=True,
+        detailed=True,
+    )
+    assert out[0] == "Sources: 1 source | median match 0.50"
+    assert "a.txt" in out[1]
+    assert "alpha context" not in out[1]
 
 
 def test_snippet_preview_truncates_and_flattens():
