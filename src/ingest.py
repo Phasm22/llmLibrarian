@@ -93,6 +93,8 @@ ADD_DEFAULT_EXCLUDE = [
 ADD_CODE_EXTENSIONS = frozenset(
     {".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".sh", ".bash", ".zsh", ".php", ".kt", ".sql"}
 )
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"})
+_PREVIEW_SKIPPED_EXTENSIONS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".wav", ".mp3", ".aac"})
 # Text extensions we decode as UTF-8 when found inside ZIPs (no binary handling).
 ZIP_TEXT_EXTENSIONS = frozenset(
     {".txt", ".md", ".json", ".csv", ".xml", ".html", ".rst", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".sql", ".py", ".js", ".ts", ".tsx", ".sh", ".go", ".rs"}
@@ -142,7 +144,7 @@ def get_capabilities_text() -> str:
 
 
 def _requires_standalone_image_enrichment(file_list: list[tuple[Path, str]]) -> bool:
-    return any(p.suffix.lower() in {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"} for p, _kind in file_list)
+    return any(p.suffix.lower() in IMAGE_EXTENSIONS for p, _kind in file_list)
 
 
 def _doc_type_from_path(path_str: str) -> str:
@@ -489,6 +491,32 @@ def _write_image_artifact(
     return relpath
 
 
+def _read_image_artifact(db_path: str | Path | None, relpath: str | None) -> dict[str, Any] | None:
+    if not db_path or not relpath:
+        return None
+    artifact_path = Path(db_path) / relpath
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _update_image_artifact(
+    db_path: str | Path | None,
+    relpath: str | None,
+    payload: dict[str, Any],
+) -> str | None:
+    if not db_path or not relpath or not payload:
+        return None
+    artifact_path = Path(db_path) / relpath
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = artifact_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, artifact_path)
+    return relpath
+
+
 # --- Indexing ---
 def _chunk_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
@@ -614,7 +642,8 @@ def _chunks_from_image_result(
             "record_type": "image_summary",
             "region_index": 0,
             "region_role": "image_summary",
-            "needs_vision_enrichment": True,
+            "needs_vision_enrichment": bool(base_meta.get("needs_vision_enrichment")),
+            "summary_status": base_meta.get("summary_status"),
             "chunk_hash": _chunk_hash(summary_text),
         }
     )
@@ -637,6 +666,7 @@ def _chunks_from_image_result(
                 "bbox_w": float(region.w),
                 "bbox_h": float(region.h),
                 "needs_vision_enrichment": bool(region.needs_vision_enrichment),
+                "summary_status": base_meta.get("summary_status"),
                 "chunk_hash": _chunk_hash(doc),
             }
         )
@@ -684,6 +714,7 @@ def _image_vector_from_chunks(
         "image_artifact_relpath": meta.get("image_artifact_relpath"),
         "image_embedding_backend": image_embedding_backend_name(),
         "needs_vision_enrichment": meta.get("needs_vision_enrichment"),
+        "summary_status": meta.get("summary_status"),
         "is_local": meta.get("is_local"),
     }
     vector_meta = {k: v for k, v in vector_meta.items() if v is not None}
@@ -1270,10 +1301,11 @@ def collect_files(
     max_file_bytes: int,
     current_depth: int = 0,
     follow_symlinks: bool = False,
+    stats: dict[str, Any] | None = None,
 ) -> list[tuple[Path, str]]:
     """
     Walk tree and return list of (path, kind) for files to index.
-    kind: 'code' | 'pdf' | 'docx' | 'zip'. Does not read file contents.
+    kind: 'code' | 'pdf' | 'docx' | 'xlsx' | 'pptx' | 'zip' | 'image'. Does not read file contents.
     """
     out: list[tuple[Path, str]] = []
     if current_depth > max_depth:
@@ -1297,10 +1329,16 @@ def collect_files(
                         max_file_bytes,
                         current_depth + 1,
                         follow_symlinks=follow_symlinks,
+                        stats=stats,
                     )
                 )
             else:
                 if not should_index(path_str, include, exclude):
+                    if stats is not None:
+                        suf = item.suffix.lower()
+                        if suf in _PREVIEW_SKIPPED_EXTENSIONS:
+                            skipped = stats.setdefault("skipped_ext", {})
+                            skipped[suf] = int(skipped.get(suf, 0)) + 1
                     continue
                 try:
                     if item.stat().st_size > max_file_bytes:
@@ -1309,22 +1347,104 @@ def collect_files(
                     continue
                 suf = item.suffix.lower()
                 if suf == ".zip":
-                    out.append((item, "zip"))
+                    kind = "zip"
                 elif suf == ".pdf":
-                    out.append((item, "pdf"))
+                    kind = "pdf"
                 elif suf == ".docx":
-                    out.append((item, "docx"))
+                    kind = "docx"
                 elif suf == ".xlsx":
-                    out.append((item, "xlsx"))
+                    kind = "xlsx"
                 elif suf == ".pptx":
-                    out.append((item, "pptx"))
+                    kind = "pptx"
+                elif suf in IMAGE_EXTENSIONS:
+                    kind = "image"
                 else:
-                    out.append((item, "code"))
+                    kind = "code"
+                out.append((item, kind))
+                if stats is not None:
+                    supported = stats.setdefault("supported_kind", {})
+                    supported[kind] = int(supported.get(kind, 0)) + 1
     except PermissionError:
         pass
     except OSError:
         pass
     return out
+
+
+def _format_preflight_summary(file_list: list[tuple[Path, str]], stats: dict[str, Any] | None) -> str:
+    if not file_list:
+        return "  No supported files found."
+    def _count_label(count: int, singular: str, plural: str | None = None) -> str:
+        word = singular if count == 1 else (plural or f"{singular}s")
+        return f"{count} {word}"
+
+    supported = dict((stats or {}).get("supported_kind") or {})
+    parts: list[str] = []
+    image_count = int(supported.get("image") or 0)
+    if image_count:
+        parts.append(_count_label(image_count, "image"))
+    zip_count = int(supported.get("zip") or 0)
+    if zip_count:
+        parts.append(_count_label(zip_count, "zip"))
+    doc_count = sum(int(supported.get(kind) or 0) for kind in ("pdf", "docx", "xlsx", "pptx"))
+    if doc_count:
+        parts.append(_count_label(doc_count, "doc"))
+    code_count = int(supported.get("code") or 0)
+    if code_count:
+        parts.append(_count_label(code_count, "text/code"))
+    if not parts:
+        parts.append(f"{len(file_list)} supported files")
+    msg = "  Preflight: " + ", ".join(parts)
+    skipped = dict((stats or {}).get("skipped_ext") or {})
+    skipped_parts = [
+        f"{_count_label(int(count), ext.lstrip('.'))} skipped"
+        for ext, count in sorted(skipped.items(), key=lambda kv: (-int(kv[1]), kv[0]))
+        if int(count) > 0
+    ]
+    if skipped_parts:
+        msg += " | " + ", ".join(skipped_parts[:4])
+    return msg
+
+
+def _image_progress_snapshot(chunks: list[ChunkTuple]) -> tuple[str | None, bool]:
+    summary_status: str | None = None
+    has_image = False
+    for _cid, _doc, meta in chunks:
+        if str((meta or {}).get("source_modality") or "") != "image":
+            continue
+        has_image = True
+        if str((meta or {}).get("record_type") or "") == "image_summary":
+            summary_status = str((meta or {}).get("summary_status") or "") or None
+            break
+    return summary_status, has_image
+
+
+def _print_image_progress(
+    *,
+    image_done: int,
+    image_total: int,
+    eager_count: int,
+    deferred_count: int,
+    embeddings_complete: int,
+    started_at: float,
+    no_color: bool,
+) -> None:
+    if image_total <= 0:
+        return
+    elapsed = max(0.001, time.perf_counter() - started_at)
+    rate = image_done / elapsed if image_done else 0.0
+    remaining = max(0, image_total - image_done)
+    eta = remaining / rate if rate > 0 else 0.0
+    msg = (
+        "  Image progress: "
+        f"{image_done}/{image_total} | "
+        f"ocr complete={image_done} | "
+        f"eager summaries={eager_count} | "
+        f"deferred summaries={deferred_count} | "
+        f"image embeddings complete={embeddings_complete} | "
+        f"elapsed={elapsed:.1f}s | eta={eta:.1f}s"
+    )
+    print(dim(no_color, msg))
 
 
 def process_zip_to_chunks(
@@ -1861,6 +1981,7 @@ def run_add(
     max_extracted_per_zip = int(limits_cfg.get("max_extracted_bytes_per_zip") or DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP)
     quiet = os.environ.get("LLMLIBRARIAN_QUIET", "").strip().lower() in ("1", "true", "yes")
 
+    collect_stats: dict[str, Any] = {}
     file_list = collect_files(
         path,
         ADD_DEFAULT_INCLUDE,
@@ -1868,6 +1989,7 @@ def run_add(
         max_depth,
         max_file_bytes,
         follow_symlinks=follow_symlinks,
+        stats=collect_stats,
     )
     if _requires_standalone_image_enrichment(file_list):
         ensure_vision_model_ready()
@@ -1887,6 +2009,7 @@ def run_add(
         embedding_workers = 1
     embedding_workers = max(1, min(embedding_workers, 32))
     if not quiet:
+        print(dim(no_color, _format_preflight_summary(file_list, collect_stats)))
         print(dim(no_color, f"  Workers: file={workers}, embedding={embedding_workers}"))
 
     ef = get_embedding_function()
@@ -1994,6 +2117,13 @@ def run_add(
     files_indexed = 0
     failures = []
     to_register: list[tuple[str, str]] = []  # (file_hash, path_str) for main-thread registry update
+    image_total = sum(1 for _p, kind in regular if kind == "image")
+    image_done = 0
+    eager_summaries = 0
+    deferred_summaries = 0
+    image_embeddings_complete = 0
+    extraction_started_at = time.perf_counter()
+    last_image_progress_at = extraction_started_at
 
     if incremental and isinstance(manifest_files, dict):
         removed = [path_str for path_str in manifest_files.keys() if path_str not in current_paths]
@@ -2024,6 +2154,13 @@ def run_add(
             cloned_vectors = precloned_image_vectors_by_path.get(path_str) or []
             if cloned_vectors:
                 all_image_vectors.extend(cloned_vectors)
+            summary_status, has_image = _image_progress_snapshot(cloned_norm)
+            if has_image:
+                image_done += 1
+                if summary_status == "eager":
+                    eager_summaries += 1
+                else:
+                    deferred_summaries += 1
             tax_rows.extend(extract_tax_rows_from_chunks(cloned_norm))
             files_indexed += 1
             if fhash:
@@ -2056,12 +2193,33 @@ def run_add(
                     for cid, doc, meta in chunks
                 ]
                 all_chunks.extend(chunks)
-                if any(str((meta or {}).get("source_modality") or "") == "image" for _cid, _doc, meta in chunks):
+                summary_status, has_image = _image_progress_snapshot(chunks)
+                if has_image:
                     source_path = str((chunks[0][2] or {}).get("source") or p)
                     vector_row = _image_vector_from_chunks(source_path=source_path, chunks=chunks)
                     if vector_row is not None:
                         vid, vpath, vdoc, vmeta = vector_row
                         all_image_vectors.append((vid, vpath, vdoc, {**vmeta, "silo": silo_slug}))
+                    image_done += 1
+                    if summary_status == "eager":
+                        eager_summaries += 1
+                    else:
+                        deferred_summaries += 1
+                    if not quiet:
+                        now = time.perf_counter()
+                        if image_done == image_total or (now - last_image_progress_at) >= 2.5:
+                            _print_image_progress(
+                                image_done=image_done,
+                                image_total=image_total,
+                                eager_count=eager_summaries,
+                                deferred_count=deferred_summaries,
+                                embeddings_complete=image_embeddings_complete,
+                                started_at=extraction_started_at,
+                                no_color=no_color,
+                            )
+                            last_image_progress_at = now
+                elif kind == "image":
+                    image_done += 1
                 tax_rows.extend(extract_tax_rows_from_chunks(chunks))
                 files_indexed += 1
                 if fhash:
@@ -2074,6 +2232,8 @@ def run_add(
                     ),
                     file=sys.stderr,
                 )
+            elif kind == "image":
+                image_done += 1
 
     for fhash, path_str in to_register:
         _file_registry_add(db_path, fhash, silo_slug, path_str)
@@ -2181,6 +2341,17 @@ def run_add(
             batch_size=max(1, min(64, ADD_BATCH_SIZE)),
             no_color=no_color,
         )
+        image_embeddings_complete = len(all_image_vectors)
+        if not quiet and image_total:
+            _print_image_progress(
+                image_done=image_done,
+                image_total=image_total,
+                eager_count=eager_summaries,
+                deferred_count=deferred_summaries,
+                embeddings_complete=image_embeddings_complete,
+                started_at=extraction_started_at,
+                no_color=no_color,
+            )
 
     if (not incremental) or ledger_sources_to_replace or tax_rows:
         replace_tax_rows_for_sources(
@@ -2321,6 +2492,8 @@ def _detect_kind(path: Path) -> str:
         return "xlsx"
     if suf == ".pptx":
         return "pptx"
+    if suf in IMAGE_EXTENSIONS:
+        return "image"
     return "code"
 
 

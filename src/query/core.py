@@ -22,6 +22,7 @@ from constants import (
 )
 from embeddings import get_embedding_function
 from image_embeddings import get_image_embedding_adapter, image_collection_name
+from processors import _build_image_summary_text, _summarize_image_with_vision_model
 from load_config import load_config, get_archetype, get_archetype_optional, get_query_options
 from state import get_silo_prompt_override, get_silo_display_name
 from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chunks
@@ -134,9 +135,11 @@ from query.metadata import parse_metadata_request, aggregate_metadata, format_me
 from query.trace import write_trace
 
 try:
-    from ingest import get_paths_by_silo
+    from ingest import get_paths_by_silo, _read_image_artifact, _update_image_artifact
 except ImportError:
     get_paths_by_silo = None  # type: ignore[misc, assignment]
+    _read_image_artifact = None  # type: ignore[misc, assignment]
+    _update_image_artifact = None  # type: ignore[misc, assignment]
 
 
 class QueryPolicyError(Exception):
@@ -273,6 +276,80 @@ def _query_is_image_relevant(query: str, docs: list[str], metas: list[dict | Non
     return any(str((meta or {}).get("source_modality") or "") == "image" for meta in metas[:4]) or not docs
 
 
+def _hydrate_single_image_summary_doc(
+    *,
+    doc: str,
+    meta: dict[str, Any] | None,
+    db_path: str,
+) -> tuple[str, dict[str, Any] | None]:
+    meta_dict = dict(meta or {})
+    if str(meta_dict.get("record_type") or "") != "image_summary":
+        return doc, meta
+    relpath = str(meta_dict.get("image_artifact_relpath") or "")
+    if not relpath or _read_image_artifact is None:
+        return doc, meta
+    artifact = _read_image_artifact(db_path, relpath)
+    if not artifact:
+        return doc, meta
+
+    summary_status = str(artifact.get("summary_status") or meta_dict.get("summary_status") or "").strip().lower()
+    visible_text = str(artifact.get("visible_text") or "")
+    summary_text = str(artifact.get("summary") or "").strip()
+    if summary_status in {"eager", "cached_query_time"} and summary_text:
+        meta_dict["summary_status"] = summary_status
+        meta_dict["needs_vision_enrichment"] = False
+        if artifact.get("vision_model"):
+            meta_dict["vision_model"] = artifact.get("vision_model")
+        return _build_image_summary_text(summary_text, visible_text), meta_dict
+
+    if summary_status != "deferred":
+        return doc, meta
+
+    source_path = str(meta_dict.get("source") or artifact.get("source_path") or "").strip()
+    if not source_path:
+        return doc, meta
+    try:
+        image_bytes = Path(source_path).read_bytes()
+    except OSError:
+        return doc, meta
+    try:
+        summary_text, vision_model = _summarize_image_with_vision_model(image_bytes, source_path, visible_text)
+    except Exception:
+        return doc, meta
+
+    artifact["summary"] = summary_text
+    artifact["summary_status"] = "cached_query_time"
+    artifact["vision_model"] = vision_model or artifact.get("vision_model")
+    artifact["query_time_summary_cached_at"] = datetime.now(timezone.utc).isoformat()
+    if _update_image_artifact is not None:
+        _update_image_artifact(db_path, relpath, artifact)
+
+    meta_dict["summary_status"] = "cached_query_time"
+    meta_dict["needs_vision_enrichment"] = False
+    if vision_model:
+        meta_dict["vision_model"] = vision_model
+    return _build_image_summary_text(summary_text, visible_text), meta_dict
+
+
+def _hydrate_image_summary_docs(
+    *,
+    docs: list[str],
+    metas: list[dict | None],
+    db_path: str,
+) -> tuple[list[str], list[dict | None]]:
+    out_docs: list[str] = []
+    out_metas: list[dict | None] = []
+    for idx, doc in enumerate(docs):
+        hydrated_doc, hydrated_meta = _hydrate_single_image_summary_doc(
+            doc=doc,
+            meta=metas[idx] if idx < len(metas) else None,
+            db_path=db_path,
+        )
+        out_docs.append(hydrated_doc)
+        out_metas.append(hydrated_meta)
+    return out_docs, out_metas
+
+
 def _query_image_collection(
     *,
     collection: Any,
@@ -281,6 +358,7 @@ def _query_image_collection(
     query_text: str,
     n_results: int,
     base_where: dict[str, Any] | None,
+    db_path: str,
 ) -> tuple[list[str], list[dict | None], list[float | None]]:
     query_kw: dict[str, Any] = {
         "query_embeddings": image_adapter.embed_texts([query_text]),
@@ -320,6 +398,11 @@ def _query_image_collection(
         dists = (text_results.get("distances") or [[]])[0] or []
         if not docs:
             continue
+        docs, metas = _hydrate_image_summary_docs(
+            docs=list(docs),
+            metas=list(metas),
+            db_path=db_path,
+        )
         docs, metas, dists = sort_by_image_chunk_priority(docs, metas, dists)
         for j, doc in enumerate(docs[:2]):
             out_docs.append(doc)
@@ -1824,6 +1907,7 @@ def run_ask(
             query_text=query_for_retrieval,
             n_results=max(2, min(4, n_results)),
             base_where=query_kw.get("where") if isinstance(query_kw.get("where"), dict) else None,
+            db_path=db,
         )
         if image_docs:
             docs = image_docs + docs

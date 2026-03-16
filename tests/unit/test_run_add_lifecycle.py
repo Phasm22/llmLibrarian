@@ -245,3 +245,55 @@ def test_run_add_prints_effective_worker_settings(monkeypatch, tmp_path, capsys)
     assert files_indexed >= 1
     assert failures == 0
     assert "Workers: file=3, embedding=5" in captured.out
+
+
+def test_run_add_prints_image_preflight_and_progress(monkeypatch, tmp_path, capsys):
+    root = tmp_path / "photos"
+    root.mkdir()
+    image_path = root / "cat.jpg"
+    image_path.write_bytes(b"fake-image")
+    (root / "clip.mp4").write_bytes(b"fake-video")
+
+    coll = _FakeCollection()
+    _patch_runtime(monkeypatch, coll)
+    monkeypatch.setattr("ingest.ensure_vision_model_ready", lambda: "llava:test")
+    monkeypatch.setattr("ingest.ensure_image_embedding_adapter_ready", lambda: object())
+    monkeypatch.setattr("ingest._batch_add_image_vectors", lambda *a, **k: None)
+
+    def _fake_process(path, kind, *args, **kwargs):
+        assert kind == "image"
+        resolved = path.resolve()
+        return [
+            (
+                "id-1",
+                "Image summary: Photo image with deferred visual summary; no reliable OCR text.",
+                {
+                    "source": str(resolved),
+                    "source_path": str(resolved),
+                    "mtime": resolved.stat().st_mtime,
+                    "chunk_hash": "h",
+                    "file_id": resolved.name,
+                    "is_local": 1,
+                    "doc_type": "other",
+                    "content_extracted": 1,
+                    "source_modality": "image",
+                    "record_type": "image_summary",
+                    "parent_image_id": "img-1",
+                    "summary_status": "deferred",
+                    "needs_vision_enrichment": True,
+                },
+            )
+        ]
+
+    monkeypatch.setattr("ingest.process_one_file", _fake_process)
+    monkeypatch.delenv("LLMLIBRARIAN_QUIET", raising=False)
+
+    files_indexed, failures = run_add(root, db_path=tmp_path / "db", allow_cloud=True, no_color=True)
+    captured = capsys.readouterr()
+
+    assert files_indexed == 1
+    assert failures == 0
+    assert "Preflight: 1 image | 1 mp4 skipped" in captured.out
+    assert "Image progress: 1/1" in captured.out
+    assert "deferred summaries=1" in captured.out
+    assert "image embeddings complete=1" in captured.out

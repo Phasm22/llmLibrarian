@@ -265,8 +265,8 @@ def test_chunks_from_image_result_writes_artifact(tmp_path: Path):
         summary="Image summary: dog photo",
         visible_text="",
         regions=(ImageRegion(text="A blurry black dog", role="full_frame_summary", x=0.0, y=0.0, w=1.0, h=1.0, needs_vision_enrichment=True),),
-        meta={"source_modality": "image", "vision_model": "llava:test"},
-        artifact={"summary": "dog photo"},
+        meta={"source_modality": "image", "vision_model": "llava:test", "summary_status": "deferred", "needs_vision_enrichment": True},
+        artifact={"summary": "dog photo", "summary_status": "deferred", "ocr_signal_score": 0.12},
     )
     chunks = ingest._chunks_from_image_result(
         "dog.jpg",
@@ -281,7 +281,10 @@ def test_chunks_from_image_result_writes_artifact(tmp_path: Path):
     assert artifact_path.exists()
     payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert payload["summary"] == "dog photo"
+    assert payload["summary_status"] == "deferred"
+    assert payload["ocr_signal_score"] == 0.12
     assert chunks[0][2]["image_artifact_relpath"] == "image_artifacts/abc123.json"
+    assert chunks[0][2]["summary_status"] == "deferred"
     assert chunks[1][2]["parent_image_id"] == "abc123"
 
 
@@ -302,6 +305,7 @@ def test_image_vector_from_chunks_uses_summary_metadata():
                 "image_artifact_relpath": "image_artifacts/abc123.json",
                 "vision_model": "llava:test",
                 "needs_vision_enrichment": True,
+                "summary_status": "deferred",
             },
         )
     ]
@@ -313,3 +317,4 @@ def test_image_vector_from_chunks_uses_summary_metadata():
     assert "black dog" in doc
     assert meta["record_type"] == "image_vector"
     assert meta["parent_image_id"] == "abc123"
+    assert meta["summary_status"] == "deferred"

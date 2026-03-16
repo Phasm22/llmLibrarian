@@ -12,6 +12,7 @@ from query.intent import (
     INTENT_STRUCTURE,
     INTENT_LOOKUP,
 )
+import query.core as query_core
 from query.core import QueryPolicyError, run_ask
 
 
@@ -104,6 +105,149 @@ def test_run_ask_uses_image_vector_hits_to_pull_image_context(monkeypatch, mock_
     out = run_ask(archetype_id=None, query="black dog photo", no_color=True, use_reranker=False, quiet=True)
     assert "Ok" in out
     assert any((call.get("where") or {}).get("parent_image_id") == "img-1" for call in text_queries[1:])
+
+
+def test_query_image_collection_lazy_caches_deferred_summary(monkeypatch, tmp_path):
+    image_path = tmp_path / "cat.jpg"
+    image_path.write_bytes(b"fake-image")
+    writes = []
+
+    class _TextCollection:
+        def query(self, **kwargs):
+            assert (kwargs.get("where") or {}).get("parent_image_id") == "img-1"
+            return {
+                "documents": [["Image summary: Photo image with deferred visual summary; no reliable OCR text."]],
+                "metadatas": [[{
+                    "source": str(image_path),
+                    "record_type": "image_summary",
+                    "source_modality": "image",
+                    "parent_image_id": "img-1",
+                    "region_index": 0,
+                    "summary_status": "deferred",
+                    "needs_vision_enrichment": True,
+                    "image_artifact_relpath": "image_artifacts/img-1.json",
+                }]],
+                "distances": [[0.18]],
+                "ids": [["s1"]],
+            }
+
+    class _ImageCollection:
+        def query(self, **_kwargs):
+            return {
+                "documents": [["Image vector"]],
+                "metadatas": [[{"source": str(image_path), "record_type": "image_vector", "source_modality": "image", "parent_image_id": "img-1"}]],
+                "distances": [[0.08]],
+                "ids": [["iv1"]],
+            }
+
+    class _Adapter:
+        def embed_texts(self, texts):
+            assert texts == ["what color is my cat"]
+            return [[0.1, 0.2, 0.3]]
+
+    monkeypatch.setattr(
+        query_core,
+        "_read_image_artifact",
+        lambda _db, _rel: {
+            "source_path": str(image_path),
+            "visible_text": "",
+            "summary": "Photo image with deferred visual summary; no reliable OCR text.",
+            "summary_status": "deferred",
+        },
+    )
+    monkeypatch.setattr(
+        query_core,
+        "_update_image_artifact",
+        lambda _db, _rel, payload: writes.append(payload) or _rel,
+    )
+    monkeypatch.setattr(
+        query_core,
+        "_summarize_image_with_vision_model",
+        lambda _bytes, _source, _visible: ("An orange tabby cat lying on a bed.", "llava:test"),
+    )
+
+    docs, metas, dists = query_core._query_image_collection(
+        collection=_TextCollection(),
+        image_collection=_ImageCollection(),
+        image_adapter=_Adapter(),
+        query_text="what color is my cat",
+        n_results=2,
+        base_where=None,
+        db_path=str(tmp_path / "db"),
+    )
+
+    assert "orange tabby cat" in docs[0].lower()
+    assert metas[0]["summary_status"] == "cached_query_time"
+    assert metas[0]["vision_model"] == "llava:test"
+    assert dists[0] is not None
+    assert writes and writes[0]["summary_status"] == "cached_query_time"
+    assert writes[0]["summary"].startswith("An orange tabby cat")
+
+
+def test_query_image_collection_reuses_cached_summary_without_resummarizing(monkeypatch, tmp_path):
+    image_path = tmp_path / "cat.jpg"
+    image_path.write_bytes(b"fake-image")
+
+    class _TextCollection:
+        def query(self, **kwargs):
+            return {
+                "documents": [["Image summary: Photo image with deferred visual summary; no reliable OCR text."]],
+                "metadatas": [[{
+                    "source": str(image_path),
+                    "record_type": "image_summary",
+                    "source_modality": "image",
+                    "parent_image_id": "img-1",
+                    "region_index": 0,
+                    "summary_status": "deferred",
+                    "needs_vision_enrichment": True,
+                    "image_artifact_relpath": "image_artifacts/img-1.json",
+                }]],
+                "distances": [[0.18]],
+                "ids": [["s1"]],
+            }
+
+    class _ImageCollection:
+        def query(self, **_kwargs):
+            return {
+                "documents": [["Image vector"]],
+                "metadatas": [[{"source": str(image_path), "record_type": "image_vector", "source_modality": "image", "parent_image_id": "img-1"}]],
+                "distances": [[0.08]],
+                "ids": [["iv1"]],
+            }
+
+    class _Adapter:
+        def embed_texts(self, _texts):
+            return [[0.1, 0.2, 0.3]]
+
+    monkeypatch.setattr(
+        query_core,
+        "_read_image_artifact",
+        lambda _db, _rel: {
+            "source_path": str(image_path),
+            "visible_text": "",
+            "summary": "A gray cat curled up on a blanket.",
+            "summary_status": "cached_query_time",
+            "vision_model": "llava:test",
+        },
+    )
+    monkeypatch.setattr(
+        query_core,
+        "_summarize_image_with_vision_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cached summaries should not re-run vision")),
+    )
+
+    docs, metas, _dists = query_core._query_image_collection(
+        collection=_TextCollection(),
+        image_collection=_ImageCollection(),
+        image_adapter=_Adapter(),
+        query_text="what kind of cat do i have",
+        n_results=2,
+        base_where=None,
+        db_path=str(tmp_path / "db"),
+    )
+
+    assert "gray cat" in docs[0].lower()
+    assert metas[0]["summary_status"] == "cached_query_time"
 
 
 def test_run_ask_file_list_short_circuits_without_retrieval_or_llm(monkeypatch, mock_ollama):

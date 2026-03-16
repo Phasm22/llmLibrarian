@@ -420,10 +420,19 @@ def test_image_processor_returns_structured_image_result(monkeypatch):
         processors,
         "_ocr_image_file_detailed",
         lambda _data, _source, ocr_mode="image_file": processors._OCRResult(
-            text="hello image",
+            text="They really put me to work.\nMANDALAY BAY CONVENTION CENTER",
             backend="vision",
-            observations=({"text": "hello image", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.1},),
-            raw_payload={"text": "hello image", "observations": [{"text": "hello image", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.1}]},
+            observations=(
+                {"text": "They really put me to work.", "x": 0.1, "y": 0.2, "w": 0.45, "h": 0.08},
+                {"text": "MANDALAY BAY CONVENTION CENTER", "x": 0.1, "y": 0.1, "w": 0.55, "h": 0.08},
+            ),
+            raw_payload={
+                "text": "They really put me to work.\nMANDALAY BAY CONVENTION CENTER",
+                "observations": [
+                    {"text": "They really put me to work.", "x": 0.1, "y": 0.2, "w": 0.45, "h": 0.08},
+                    {"text": "MANDALAY BAY CONVENTION CENTER", "x": 0.1, "y": 0.1, "w": 0.55, "h": 0.08},
+                ],
+            },
         ),
     )
     monkeypatch.setattr(processors, "_summarize_image_with_vision_model", lambda *_args, **_kwargs: ("A short summary", "llava:test"))
@@ -432,14 +441,63 @@ def test_image_processor_returns_structured_image_result(monkeypatch):
     assert out is not None
     assert isinstance(out, ExtractedImage)
     assert out.summary.startswith("Image summary: A short summary")
-    assert out.visible_text == "hello image"
+    assert "MANDALAY BAY" in out.visible_text
     assert out.meta == {
         "ocr_backend": "vision",
         "ocr_mode": "image_file",
         "source_modality": "image",
+        "summary_status": "eager",
+        "needs_vision_enrichment": False,
         "vision_model": "llava:test",
     }
     assert out.regions[0].role == "ocr_block"
+
+
+def test_image_ocr_signal_assessment_prefers_text_heavy_images():
+    signal = processors._image_ocr_signal_assessment(
+        processors._OCRResult(
+            text="They really put me to work.\nMANDALAY BAY CONVENTION CENTER",
+            backend="vision",
+            observations=(
+                {"text": "They really put me to work.", "x": 0.1, "y": 0.8, "w": 0.6, "h": 0.08},
+                {"text": "MANDALAY BAY CONVENTION CENTER", "x": 0.1, "y": 0.68, "w": 0.7, "h": 0.09},
+            ),
+        )
+    )
+    assert signal["eager_summary"] is True
+    assert signal["keep_visible_text"] is True
+    assert signal["ocr_signal_score"] >= 0.55
+
+
+def test_image_processor_defers_natural_photo_and_suppresses_low_signal_ocr(monkeypatch):
+    monkeypatch.setattr(
+        processors,
+        "_ocr_image_file_detailed",
+        lambda _data, _source, ocr_mode="image_file": processors._OCRResult(
+            text="3 | q Ba oh) (ehicsy | as 3 i | - - C4",
+            backend="vision",
+            observations=(),
+            raw_payload={"text": "3 | q Ba oh) (ehicsy | as 3 i | - - C4", "observations": []},
+        ),
+    )
+    monkeypatch.setattr(
+        processors,
+        "_summarize_image_with_vision_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("deferred images should not summarize at ingest")),
+    )
+
+    out = ImageProcessor().extract(b"image-bytes", "dog.jpg")
+    assert out is not None
+    assert out.visible_text == ""
+    assert out.meta is not None
+    assert out.meta["summary_status"] == "deferred"
+    assert out.meta["needs_vision_enrichment"] is True
+    assert "deferred visual summary" in out.summary.lower()
+    assert out.regions[0].role == "full_frame_summary"
+    assert out.regions[0].needs_vision_enrichment is True
+    assert out.artifact is not None
+    assert out.artifact["ocr_signal_score"] < 0.55
+    assert out.artifact["visible_text"] == ""
 
 
 def test_get_paddle_ocr_engine_falls_back_when_show_log_is_unsupported(monkeypatch):
@@ -656,6 +714,14 @@ def test_ocr_quality_assessment_rejects_symbol_heavy_gibberish():
     assert ok is False
     assert reasons
     assert stats["token_count"] >= 1
+
+
+def test_ocr_quality_assessment_rejects_single_char_dense_photo_noise():
+    ok, reasons, _stats = processors._ocr_quality_assessment(
+        "us A = x ; a y moe d a ww Aa time ia comp Mite A y ae Dib ESS a YD oy be F aa"
+    )
+    assert ok is False
+    assert "too_many_single_char_tokens" in reasons or "low_meaningful_word_ratio" in reasons
 
 
 def test_ocr_image_path_detailed_drops_low_quality_fallback(monkeypatch):

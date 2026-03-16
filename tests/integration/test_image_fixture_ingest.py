@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import chromadb
@@ -6,6 +7,7 @@ from chromadb.config import Settings
 
 import ingest
 import processors
+import query.core as query_core
 
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "sample_images"
@@ -63,6 +65,7 @@ def _patch_multimodal(monkeypatch):
         return ("A social media story overlay with visible caption text.", "llava:test")
 
     monkeypatch.setattr(processors, "_summarize_image_with_vision_model", _summary)
+    monkeypatch.setattr(query_core, "_summarize_image_with_vision_model", _summary)
 
 
 def test_overlay_fixture_indexes_visible_text_regions(tmp_path):
@@ -94,11 +97,11 @@ def test_laptop_fixture_indexes_multiple_regions(tmp_path):
     docs = rows.get("documents") or []
     metas = rows.get("metadatas") or []
     assert len(docs) >= 3
-    assert any((m or {}).get("record_type") == "image_summary" for m in metas)
+    assert any((m or {}).get("record_type") == "image_summary" and (m or {}).get("summary_status") == "eager" for m in metas)
     assert any("thousand eyes" in (doc or "").lower() for doc in docs)
 
 
-def test_dog_fixture_drops_gibberish_and_keeps_caption(tmp_path):
+def test_dog_fixture_drops_gibberish_and_defers_summary(tmp_path):
     db = tmp_path / "db"
     path = FIXTURES / "2022-08-23_8C991D97-B8DD-4960-8850-BDF55B99DE2D-main.jpg"
     status, _ = ingest.update_single_file(path, db_path=db, silo_slug="photos", allow_cloud=True, update_counts=False)
@@ -109,8 +112,8 @@ def test_dog_fixture_drops_gibberish_and_keeps_caption(tmp_path):
     docs = rows.get("documents") or []
     metas = rows.get("metadatas") or []
     assert docs
-    assert any("blurry black dog" in (doc or "").lower() for doc in docs)
-    assert any((m or {}).get("record_type") == "image_summary" for m in metas)
+    assert any("deferred visual summary" in (doc or "").lower() for doc in docs)
+    assert any((m or {}).get("record_type") == "image_summary" and (m or {}).get("summary_status") == "deferred" for m in metas)
     assert not any("ehicsy" in (doc or "").lower() for doc in docs)
 
 
@@ -125,6 +128,37 @@ def test_dog_fixture_populates_image_vector_collection(tmp_path):
     docs = (rows.get("documents") or [[]])[0] or []
     metas = (rows.get("metadatas") or [[]])[0] or []
     assert docs
-    assert "black dog" in docs[0].lower()
+    assert "deferred visual summary" in docs[0].lower()
     assert metas[0]["record_type"] == "image_vector"
     assert metas[0]["source"] == str(path.resolve())
+
+
+def test_dog_fixture_lazy_query_summary_is_cached(tmp_path):
+    db = tmp_path / "db"
+    path = FIXTURES / "2022-08-23_8C991D97-B8DD-4960-8850-BDF55B99DE2D-main.jpg"
+    status, _ = ingest.update_single_file(path, db_path=db, silo_slug="photos", allow_cloud=True, update_counts=False)
+    assert status == "updated"
+
+    class _Adapter:
+        def embed_texts(self, texts):
+            assert texts == ["black dog photo"]
+            return [[1.0, 0.0, 0.0]]
+
+    docs, metas, _dists = query_core._query_image_collection(
+        collection=_collection(db),
+        image_collection=_image_collection(db),
+        image_adapter=_Adapter(),
+        query_text="black dog photo",
+        n_results=1,
+        base_where={"silo": "photos"},
+        db_path=str(db),
+    )
+
+    assert any("black dog" in (doc or "").lower() for doc in docs)
+    summary_meta = next(m for m in metas if (m or {}).get("record_type") == "image_summary")
+    assert summary_meta["summary_status"] == "cached_query_time"
+    artifact_path = db / str(summary_meta["image_artifact_relpath"])
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert payload["summary_status"] == "cached_query_time"
+    assert payload["query_time_summary_cached_at"]
+    assert "black dog" in payload["summary"].lower()

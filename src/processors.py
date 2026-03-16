@@ -288,14 +288,80 @@ def _ocr_quality_assessment(text: str) -> tuple[bool, tuple[str, ...], dict[str,
         reasons.append("high_symbol_ratio")
     if len(tokens) >= 5 and len(multi_char_alpha) < 2 and digit_chars < 4:
         reasons.append("missing_multi_char_words")
-    if len(tokens) >= 6 and single_char_tokens > max(3, len(tokens) // 2):
+    if len(tokens) >= 12 and single_char_tokens >= max(6, int(len(tokens) * 0.4)):
         reasons.append("too_many_single_char_tokens")
     if len(raw) >= 40 and len(alpha_tokens) >= 4 and len(multi_char_alpha) == 0:
         reasons.append("alpha_tokens_too_short")
+    if len(alpha_tokens) >= 12 and len(multi_char_alpha) < max(3, int(len(alpha_tokens) * 0.35)):
+        reasons.append("low_meaningful_word_ratio")
     if len(raw) < 12 and alnum_ratio >= 0.7:
         reasons = []
 
     return (not reasons, tuple(reasons), stats)
+
+
+def _image_summary_placeholder(visible_text: str) -> str:
+    cleaned = (visible_text or "").strip()
+    if cleaned:
+        return "Text-forward image with deferred visual summary."
+    return "Photo image with deferred visual summary; no reliable OCR text."
+
+
+def _image_ocr_signal_assessment(ocr_result: _OCRResult | None) -> dict[str, Any]:
+    visible_text = (ocr_result.text if ocr_result else "").strip()
+    observations = list(ocr_result.observations) if ocr_result else []
+    quality_ok, reasons, stats = _ocr_quality_assessment(visible_text)
+    multi_char_alpha = int(stats.get("multi_char_alpha_count") or 0)
+    token_count = int(stats.get("token_count") or 0)
+    text_len = len(visible_text)
+    observation_count = len(observations)
+    coverage = 0.0
+    if observations:
+        coverage = sum(
+            max(0.0, min(1.0, float(o.get("w") or 0.0))) * max(0.0, min(1.0, float(o.get("h") or 0.0)))
+            for o in observations
+            if isinstance(o, dict)
+        )
+        coverage = min(1.0, coverage)
+
+    score = 0.0
+    if quality_ok:
+        score += 0.3
+    score += min(0.3, multi_char_alpha * 0.06)
+    score += min(0.18, observation_count * 0.04)
+    score += min(0.16, text_len / 300.0)
+    score += min(0.16, coverage * 1.6)
+    score = round(min(1.0, score), 4)
+
+    eager_summary = bool(
+        quality_ok
+        and (
+            score >= 0.55
+            or (multi_char_alpha >= 4 and text_len >= 40)
+            or (multi_char_alpha >= 2 and text_len >= 24)
+            or (observation_count >= 4 and coverage >= 0.03)
+        )
+    )
+    keep_visible_text = bool(
+        visible_text
+        and quality_ok
+        and (
+            score >= 0.4
+            or multi_char_alpha >= 2
+            or (observation_count >= 2 and text_len >= 18)
+            or text_len < 16
+        )
+    )
+    return {
+        "ocr_signal_score": score,
+        "quality_ok": quality_ok,
+        "quality_reasons": reasons,
+        "quality_stats": stats,
+        "observation_count": observation_count,
+        "coverage": round(coverage, 4),
+        "eager_summary": eager_summary,
+        "keep_visible_text": keep_visible_text,
+    }
 
 
 def ensure_vision_model_ready() -> str:
@@ -618,6 +684,7 @@ def _summarize_image_with_vision_model(image_bytes: bytes, source_path: str, vis
                     "content": (
                         "Summarize this image for local retrieval in 1-2 concise sentences. "
                         "Mention the main subject, scene, and any obvious UI/app context. "
+                        "Include obvious colors, physical traits, or other salient visual attributes when clearly visible. "
                         "Do not invent unreadable text or identities."
                         f"{visible_section}"
                     ),
@@ -1321,12 +1388,14 @@ class ImageProcessor:
     ) -> ExtractedImage | None:
         try:
             ocr_result = _ocr_image_file_detailed(data, source_path, ocr_mode="image_file")
-            visible_text = (ocr_result.text if ocr_result else "").strip()
+            signal = _image_ocr_signal_assessment(ocr_result)
+            raw_visible_text = (ocr_result.text if ocr_result else "").strip()
+            visible_text = raw_visible_text if signal["keep_visible_text"] else ""
             backend = ocr_result.backend if ocr_result else None
 
             regions: list[ImageRegion] = []
             raw_payload: dict[str, Any] | None = None
-            if ocr_result and ocr_result.backend == "vision" and ocr_result.observations:
+            if ocr_result and ocr_result.backend == "vision" and ocr_result.observations and signal["keep_visible_text"]:
                 regions = _merge_observation_rows(list(ocr_result.observations))
                 raw_payload = dict(ocr_result.raw_payload or {})
             elif visible_text:
@@ -1344,8 +1413,13 @@ class ImageProcessor:
 
             summary_text = ""
             vision_model = ""
+            summary_status = "deferred"
             if enable_multimodal:
-                summary_text, vision_model = _summarize_image_with_vision_model(data, source_path, visible_text)
+                if signal["eager_summary"]:
+                    summary_text, vision_model = _summarize_image_with_vision_model(data, source_path, visible_text)
+                    summary_status = "eager"
+                else:
+                    summary_text = _image_summary_placeholder(visible_text)
             elif not visible_text:
                 return None
 
@@ -1361,7 +1435,7 @@ class ImageProcessor:
                         y=0.0,
                         w=1.0,
                         h=1.0,
-                        needs_vision_enrichment=True,
+                        needs_vision_enrichment=(summary_status != "eager"),
                     )
                 ]
 
@@ -1370,7 +1444,18 @@ class ImageProcessor:
                 "ocr_backend": backend,
                 "ocr_mode": "image_file",
                 "visible_text": visible_text,
+                "raw_visible_text": raw_visible_text,
                 "summary": summary_text,
+                "summary_status": summary_status,
+                "ocr_signal_score": signal["ocr_signal_score"],
+                "query_time_summary_cached_at": None,
+                "ocr_signal": {
+                    "observation_count": signal["observation_count"],
+                    "coverage": signal["coverage"],
+                    "quality_ok": signal["quality_ok"],
+                    "quality_reasons": list(signal["quality_reasons"]),
+                    **dict(signal["quality_stats"]),
+                },
                 "vision_model": vision_model or None,
                 "regions": [
                     {
@@ -1391,6 +1476,8 @@ class ImageProcessor:
                 "ocr_backend": backend,
                 "ocr_mode": "image_file",
                 "source_modality": "image",
+                "summary_status": summary_status,
+                "needs_vision_enrichment": summary_status != "eager",
             }
             if vision_model:
                 meta["vision_model"] = vision_model
