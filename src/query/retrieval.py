@@ -556,6 +556,45 @@ def sort_by_source_priority(
     )
 
 
+def sort_by_image_chunk_priority(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    """
+    Keep source ordering stable, but within one image source prefer:
+    image_summary first, then the best matching image_region chunks.
+    """
+    if not docs:
+        return docs, metas, dists
+    source_first_index: dict[str, int] = {}
+    for i, meta in enumerate(metas):
+        source = str(((meta or {}).get("source") or f"__unknown_{i}"))
+        if source not in source_first_index:
+            source_first_index[source] = i
+
+    combined = list(zip(docs, metas, dists, range(len(docs))))
+
+    def _k(item: tuple[str, dict | None, float | None, int]) -> tuple[int, int, float, int, int]:
+        _doc, meta, dist, idx = item
+        m = meta or {}
+        source = str(m.get("source") or f"__unknown_{idx}")
+        source_rank = source_first_index.get(source, idx)
+        if str(m.get("source_modality") or "") != "image":
+            return (source_rank, 0, float(dist) if dist is not None else 999.0, 0, idx)
+        record_type = str(m.get("record_type") or "").lower()
+        type_rank = 0 if record_type == "image_summary" else 1 if record_type == "image_region" else 2
+        region_index = int(m.get("region_index") or 0)
+        return (source_rank, type_rank, float(dist) if dist is not None else 999.0, region_index, idx)
+
+    combined.sort(key=_k)
+    return (
+        [x[0] for x in combined],
+        [x[1] for x in combined],
+        [x[2] for x in combined],
+    )
+
+
 _ACADEMIC_DEPRIORITIZED_TOKENS = (
     "transfer",
     "best choices",

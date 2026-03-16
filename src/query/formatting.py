@@ -81,6 +81,19 @@ def source_url(source: str, line: int | None = None, page: int | None = None) ->
         return ""
 
 
+def _format_meta_location(meta: dict[str, Any] | None) -> str:
+    line = (meta or {}).get("line_start")
+    page = (meta or {}).get("page")
+    region = (meta or {}).get("region_index")
+    if page is not None:
+        return f" (page {page})"
+    if line is not None:
+        return f" (line {line})"
+    if region is not None:
+        return f" (region {region})"
+    return ""
+
+
 def style_answer(answer: str, no_color: bool) -> str:
     """Apply TTY styles: **bold**, *italic*, `code`, fenced code blocks (dim). Respects style.use_color when no_color is False."""
     from style import use_color
@@ -102,6 +115,7 @@ def style_answer(answer: str, no_color: bool) -> str:
     out = re.sub(r"\*([^*]+)\*", lambda m: dim(no_color, m.group(1)), out)
     # Inline `code`
     out = re.sub(r"`([^`]+)`", lambda m: code_style(no_color, m.group(1)), out)
+    out = _space_numbered_list(out)
     return out
 
 
@@ -299,6 +313,21 @@ def normalize_sentence_start(answer: str) -> str:
     return "".join(chars)
 
 
+def _space_numbered_list(text: str) -> str:
+    """Add blank line between consecutive numbered-list lines (1. ... \n2. ...)."""
+    lines = text.splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        out.append(line)
+        if (
+            re.match(r"^\d+\.", line.lstrip())
+            and i + 1 < len(lines)
+            and re.match(r"^\d+\.", lines[i + 1].lstrip())
+        ):
+            out.append("")
+    return "\n".join(out)
+
+
 def normalize_inline_numbered_lists(answer: str) -> str:
     """
     Reflow single-line numbered lists like "1. ... 2. ..." into multi-line lists.
@@ -319,6 +348,8 @@ def normalize_inline_numbered_lists(answer: str) -> str:
             end = markers[idx + 1].start() if (idx + 1) < len(markers) else len(raw)
             item = raw[start:end].strip()
             if item:
+                if idx > 0:
+                    out_lines.append("")
                 out_lines.append(item)
     return "\n".join(out_lines)
 
@@ -368,11 +399,7 @@ def format_source(
     line = (meta or {}).get("line_start")
     page = (meta or {}).get("page")
     snippet = snippet_preview(doc or "") if include_snippet else ""
-    loc = ""
-    if page is not None:
-        loc = f" (page {page})"
-    elif line is not None:
-        loc = f" (line {line})"
+    loc = _format_meta_location(meta)
     score_str = ""
     if distance is not None:
         try:
@@ -408,6 +435,7 @@ def _aggregate_footer_sources(
                 "dist": dist,
                 "lines": set(),
                 "pages": set(),
+                "regions": set(),
             }
             order.append(source)
         entry = by_source[source]
@@ -416,10 +444,13 @@ def _aggregate_footer_sources(
         m = meta or {}
         line = m.get("line_start")
         page = m.get("page")
+        region = m.get("region_index")
         if line is not None:
             entry["lines"].add(str(line))
         if page is not None:
             entry["pages"].add(str(page))
+        if region is not None:
+            entry["regions"].add(str(region))
 
     out: list[tuple[str, dict[str, Any], float | None]] = []
     for source in order:
@@ -427,10 +458,13 @@ def _aggregate_footer_sources(
         meta = dict(entry["meta"] or {})
         lines = sorted(entry["lines"], key=lambda x: (len(x), x))
         pages = sorted(entry["pages"], key=lambda x: (len(x), x))
+        regions = sorted(entry["regions"], key=lambda x: (len(x), x))
         if lines:
             meta["line_start"] = ", ".join(lines)
         if pages:
             meta["page"] = ", ".join(pages)
+        if regions:
+            meta["region_index"] = ", ".join(regions)
         out.append((entry["doc"], meta, entry["dist"]))
     return out
 

@@ -23,6 +23,14 @@ class _DummyClient:
         return self._collection
 
 
+class _NamedClient:
+    def __init__(self, collections):
+        self._collections = collections
+
+    def get_or_create_collection(self, **kwargs):
+        return self._collections[kwargs["name"]]
+
+
 def _patch_query_runtime(monkeypatch, mock_collection):
     monkeypatch.setattr("query.core.get_embedding_function", lambda: None)
     monkeypatch.setattr("query.core.chromadb.PersistentClient", lambda *a, **k: _DummyClient(mock_collection))
@@ -33,6 +41,69 @@ def test_run_ask_capabilities_bypasses_llm(monkeypatch, mock_ollama):
     out = run_ask(archetype_id=None, query="what can you index?", no_color=True, use_reranker=False)
     assert "Supported file extensions" in out
     assert mock_ollama["calls"] == []
+
+
+def test_run_ask_uses_image_vector_hits_to_pull_image_context(monkeypatch, mock_ollama):
+    text_collection = _DummyClient.__new__(_DummyClient)  # type: ignore[misc]
+    text_collection = type("TextCollection", (), {})()
+    image_collection = type("ImageCollection", (), {})()
+
+    text_queries = []
+
+    def _text_query(**kwargs):
+        text_queries.append(kwargs)
+        where = kwargs.get("where") or {}
+        if isinstance(where, dict) and where.get("parent_image_id") == "img-1":
+            return {
+                "documents": [["Image summary: black dog", "Image region: full_frame_summary\nA blurry black dog being held indoors."]],
+                "metadatas": [[
+                    {"source": "/tmp/dog.jpg", "record_type": "image_summary", "source_modality": "image", "parent_image_id": "img-1", "region_index": 0},
+                    {"source": "/tmp/dog.jpg", "record_type": "image_region", "source_modality": "image", "parent_image_id": "img-1", "region_index": 1},
+                ]],
+                "distances": [[0.12, 0.18]],
+                "ids": [["s1", "r1"]],
+            }
+        return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+
+    text_collection.query = _text_query
+    text_collection.get = lambda **_kwargs: {"ids": [], "documents": [], "metadatas": []}
+
+    def _image_query(**kwargs):
+        return {
+            "documents": [["Image summary: black dog"]],
+            "metadatas": [[{"source": "/tmp/dog.jpg", "record_type": "image_vector", "source_modality": "image", "parent_image_id": "img-1"}]],
+            "distances": [[0.08]],
+            "ids": [["iv1"]],
+        }
+
+    image_collection.query = _image_query
+    image_collection.get = lambda **_kwargs: {"ids": [], "documents": [], "metadatas": []}
+
+    monkeypatch.setattr("query.core.get_embedding_function", lambda: None)
+    monkeypatch.setattr(
+        "query.core.chromadb.PersistentClient",
+        lambda *a, **k: _NamedClient({"llmli": text_collection, "llmli_image": image_collection}),
+    )
+
+    class _FakeAdapter:
+        def embed_texts(self, texts):
+            assert texts == ["black dog photo"]
+            return [[0.1, 0.2, 0.3]]
+
+    monkeypatch.setattr("query.core.get_image_embedding_adapter", lambda: _FakeAdapter())
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    monkeypatch.setattr("query.core.load_config", lambda *a, **k: {})
+    monkeypatch.setattr("query.core.resolve_subscope", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "query.core.bind_scope_from_query",
+        lambda *_a, **_k: {"reason": None, "confidence": 0.0, "cleaned_query": None, "bound_slug": None, "bound_display_name": None},
+    )
+    monkeypatch.setattr("query.core.is_reranker_enabled", lambda: False)
+    monkeypatch.setattr("query.core.get_query_options", lambda *_a, **_k: {})
+
+    out = run_ask(archetype_id=None, query="black dog photo", no_color=True, use_reranker=False, quiet=True)
+    assert "Ok" in out
+    assert any((call.get("where") or {}).get("parent_image_id") == "img-1" for call in text_queries[1:])
 
 
 def test_run_ask_file_list_short_circuits_without_retrieval_or_llm(monkeypatch, mock_ollama):

@@ -53,6 +53,21 @@ def test_context_block_contains_file_header_fields():
     assert "hello world" in block
 
 
+def test_context_block_uses_region_when_line_and_page_absent():
+    block = context_block(
+        doc="image snippet",
+        meta={
+            "source": "/tmp/file.jpg",
+            "region_index": 2,
+            "mtime": 1700000000,
+            "silo": "photos",
+            "doc_type": "other",
+        },
+        show_silo=False,
+    )
+    assert "(region 2)" in block
+
+
 def test_style_answer_returns_original_when_no_color():
     text = "**bold** and `code`"
     assert style_answer(text, no_color=True) == text
@@ -76,6 +91,17 @@ def test_format_source_includes_location_and_score():
     assert "test.txt" in out or "/tmp/test.txt" in out
     assert "(line 7)" in out
     assert "0.50" in out
+
+
+def test_format_source_supports_region_location():
+    out = format_source(
+        doc="region text",
+        meta={"source": "/tmp/test.jpg", "region_index": 3, "source_modality": "image"},
+        distance=1.0,
+        no_color=True,
+    )
+    assert "test.jpg" in out or "/tmp/test.jpg" in out
+    assert "(region 3)" in out
 
 
 def test_format_source_can_omit_snippet():
@@ -127,6 +153,22 @@ def test_render_sources_footer_detailed_mode_uses_compact_file_lines():
     assert out[0] == "Sources: 1 source | median match 0.50"
     assert "a.txt" in out[1]
     assert "alpha context" not in out[1]
+
+
+def test_render_sources_footer_aggregates_image_regions():
+    out = render_sources_footer(
+        docs=["summary", "region one", "region two"],
+        metas=[
+            {"source": "/tmp/a.jpg", "region_index": 0, "source_modality": "image"},
+            {"source": "/tmp/a.jpg", "region_index": 1, "source_modality": "image"},
+            {"source": "/tmp/a.jpg", "region_index": 2, "source_modality": "image"},
+        ],
+        dists=[0.1, 0.2, 0.3],
+        no_color=True,
+        detailed=True,
+    )
+    assert out[0] == "Sources: 1 source | median match 0.91"
+    assert "(region 0, 1, 2)" in out[1]
 
 
 def test_snippet_preview_truncates_and_flattens():

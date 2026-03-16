@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import processors
-from processors import DOCXProcessor, ImageProcessor, PDFProcessor, PPTXProcessor, TextProcessor, XLSXProcessor
+from processors import DOCXProcessor, ExtractedImage, ImageProcessor, PDFProcessor, PPTXProcessor, TextProcessor, XLSXProcessor
 
 
 def _reset_paddle_cache() -> None:
@@ -19,6 +19,7 @@ def _reset_paddle_cache() -> None:
 def _reset_vision_cache() -> None:
     processors._VISION_HELPER_BINARY = None
     processors._VISION_HELPER_READY = None
+    processors._VISION_MODEL_READY = {}
 
 
 def test_log_processor_event_default_warn_level_suppresses_info(monkeypatch, capsys):
@@ -414,13 +415,31 @@ def test_pinned_ocr_backend_does_not_fallback(monkeypatch):
     assert any(e.get("message") == "OCR backend produced no text" and e.get("backend") == "paddleocr" for e in events)
 
 
-def test_image_processor_returns_text_and_ocr_metadata(monkeypatch):
-    monkeypatch.setattr(processors, "_ocr_image_file", lambda _data, _source, ocr_mode="image_file": ("hello image", "vision"))
+def test_image_processor_returns_structured_image_result(monkeypatch):
+    monkeypatch.setattr(
+        processors,
+        "_ocr_image_file_detailed",
+        lambda _data, _source, ocr_mode="image_file": processors._OCRResult(
+            text="hello image",
+            backend="vision",
+            observations=({"text": "hello image", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.1},),
+            raw_payload={"text": "hello image", "observations": [{"text": "hello image", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.1}]},
+        ),
+    )
+    monkeypatch.setattr(processors, "_summarize_image_with_vision_model", lambda *_args, **_kwargs: ("A short summary", "llava:test"))
     proc = ImageProcessor()
     out = proc.extract(b"image-bytes", "receipt.png")
     assert out is not None
-    assert out.text == "hello image"
-    assert out.meta == {"ocr_backend": "vision", "ocr_mode": "image_file"}
+    assert isinstance(out, ExtractedImage)
+    assert out.summary.startswith("Image summary: A short summary")
+    assert out.visible_text == "hello image"
+    assert out.meta == {
+        "ocr_backend": "vision",
+        "ocr_mode": "image_file",
+        "source_modality": "image",
+        "vision_model": "llava:test",
+    }
+    assert out.regions[0].role == "ocr_block"
 
 
 def test_get_paddle_ocr_engine_falls_back_when_show_log_is_unsupported(monkeypatch):
@@ -630,3 +649,55 @@ def test_preprocess_image_for_ocr_returns_processed_bytes(monkeypatch):
     out = processors._preprocess_image_for_ocr(b"input")
     assert out == b"\x01\x02\x03\x04"
     assert any("OCR preprocessing applied" in e.get("message", "") for e in events)
+
+
+def test_ocr_quality_assessment_rejects_symbol_heavy_gibberish():
+    ok, reasons, stats = processors._ocr_quality_assessment("3 | q Ba oh) (ehicsy | as 3 i | - - C4")
+    assert ok is False
+    assert reasons
+    assert stats["token_count"] >= 1
+
+
+def test_ocr_image_path_detailed_drops_low_quality_fallback(monkeypatch):
+    events: list[dict] = []
+
+    def _capture_event(level, message, **fields):
+        payload = {"level": level, "message": message}
+        payload.update(fields)
+        events.append(payload)
+
+    monkeypatch.setattr(processors, "_vision_ocr_available", lambda: False)
+    monkeypatch.setattr(processors, "_paddleocr_available", lambda: False)
+    monkeypatch.setattr(processors, "_tesseract_available", lambda: True)
+    monkeypatch.setattr(processors, "_ocr_with_tesseract_detail_path", lambda _img: processors._OCRResult(text="3 | q Ba oh) (ehicsy | as 3 i", backend="tesseract"))
+    monkeypatch.setattr(processors, "_log_processor_event", _capture_event)
+
+    out = processors._ocr_image_path_detailed("/tmp/example.png", "/tmp/example.png", "image_file")
+    assert out is None
+    assert any(e.get("message") == "OCR text dropped by quality gate" for e in events)
+
+
+def test_merge_observation_rows_groups_adjacent_lines():
+    regions = processors._merge_observation_rows(
+        [
+            {"text": "Hello", "x": 0.1, "y": 0.8, "w": 0.1, "h": 0.04},
+            {"text": "world", "x": 0.22, "y": 0.8, "w": 0.12, "h": 0.04},
+            {"text": "Second", "x": 0.1, "y": 0.73, "w": 0.12, "h": 0.04},
+            {"text": "line", "x": 0.24, "y": 0.73, "w": 0.08, "h": 0.04},
+        ]
+    )
+    assert len(regions) == 1
+    assert "Hello world" in regions[0].text
+    assert "Second line" in regions[0].text
+
+
+def test_ensure_vision_model_ready_requires_vision_capability(monkeypatch):
+    class _Show:
+        capabilities = ["completion"]
+
+    fake = types.SimpleNamespace(show=lambda _model: _Show())
+    monkeypatch.setitem(sys.modules, "ollama", fake)
+    monkeypatch.setenv("LLMLIBRARIAN_VISION_MODEL", "text-only")
+    _reset_vision_cache()
+    with pytest.raises(processors.ImageExtractionError):
+        processors.ensure_vision_model_ready()

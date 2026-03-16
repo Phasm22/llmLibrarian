@@ -42,7 +42,27 @@ do {
         return text.isEmpty ? nil : text
     }
 
-    let payload = ["text": lines.joined(separator: "\n")]
+    // Build structured observations with bbox for column-aware reconstruction
+    var obs_array: [[String: Any]] = []
+    for observation in observations {
+        guard let candidate = observation.topCandidates(1).first else { continue }
+        let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { continue }
+        let bb = observation.boundingBox
+        obs_array.append([
+            "text": text,
+            "x": Double(bb.minX),
+            "y": Double(bb.minY),
+            "w": Double(bb.width),
+            "h": Double(bb.height),
+            "confidence": Double(candidate.confidence),
+        ])
+    }
+
+    let payload: [String: Any] = [
+        "text": lines.joined(separator: "\n"),
+        "observations": obs_array,
+    ]
     let data = try JSONSerialization.data(withJSONObject: payload, options: [])
     FileHandle.standardOutput.write(data)
 } catch {

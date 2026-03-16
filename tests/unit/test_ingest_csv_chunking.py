@@ -1,9 +1,10 @@
 import zipfile
 from pathlib import Path
+import json
 
 import ingest
 from ingest import process_one_file, process_zip_to_chunks
-from processors import ExtractedText
+from processors import ExtractedImage, ImageRegion
 
 
 def test_process_one_file_csv_emits_row_chunks(tmp_path: Path):
@@ -181,21 +182,38 @@ def test_process_one_file_image_emits_ocr_metadata(monkeypatch, tmp_path: Path):
     p = tmp_path / "w2.png"
     p.write_bytes(b"fake-image")
 
-    def _fake_extract(self, data, source_path):
+    def _fake_extract(self, data, source_path, *, enable_multimodal=True):
         assert data == b"fake-image"
         assert source_path == str(p.resolve())
-        return ExtractedText(
-            "Form W-2 Wage and Tax Statement\nEmployer: YMCA\nBox 1 of W-2: 4,626.76",
-            {"ocr_backend": "vision", "ocr_mode": "image_file"},
+        assert enable_multimodal is True
+        return ExtractedImage(
+            summary="Image summary: W-2 wage statement",
+            visible_text="Form W-2 Wage and Tax Statement\nEmployer: YMCA\nBox 1 of W-2: 4,626.76",
+            regions=(
+                ImageRegion(
+                    text="Employer: YMCA\nBox 1 of W-2: 4,626.76",
+                    role="ocr_block",
+                    x=0.1,
+                    y=0.2,
+                    w=0.3,
+                    h=0.2,
+                ),
+            ),
+            meta={"ocr_backend": "vision", "ocr_mode": "image_file", "source_modality": "image", "vision_model": "llava:test"},
         )
 
     monkeypatch.setattr(ingest.ImageProcessor, "extract", _fake_extract)
 
     chunks = process_one_file(p, "image")
-    assert len(chunks) == 1
-    assert "4,626.76" in chunks[0][1]
-    assert chunks[0][2]["ocr_backend"] == "vision"
-    assert chunks[0][2]["ocr_mode"] == "image_file"
+    assert len(chunks) == 2
+    assert chunks[0][2]["record_type"] == "image_summary"
+    assert chunks[0][2]["vision_model"] == "llava:test"
+    assert chunks[1][2]["record_type"] == "image_region"
+    assert chunks[1][2]["ocr_backend"] == "vision"
+    assert chunks[1][2]["ocr_mode"] == "image_file"
+    assert chunks[1][2]["source_modality"] == "image"
+    assert chunks[1][2]["region_role"] == "ocr_block"
+    assert "4,626.76" in chunks[1][1]
 
 
 def test_process_zip_to_chunks_image_uses_ocr_processor(monkeypatch, tmp_path: Path):
@@ -203,10 +221,16 @@ def test_process_zip_to_chunks_image_uses_ocr_processor(monkeypatch, tmp_path: P
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("images/paystub.png", b"fake-image")
 
-    def _fake_extract(self, data, source_path):
+    def _fake_extract(self, data, source_path, *, enable_multimodal=True):
         assert data == b"fake-image"
         assert source_path.endswith("bundle.zip > images/paystub.png")
-        return ExtractedText("Gross Pay $4,626.76", {"ocr_backend": "vision", "ocr_mode": "image_file"})
+        assert enable_multimodal is False
+        return ExtractedImage(
+            summary="Image summary: paystub snippet",
+            visible_text="Gross Pay $4,626.76",
+            regions=(ImageRegion(text="Gross Pay $4,626.76", role="ocr_block", x=0.0, y=0.0, w=1.0, h=1.0),),
+            meta={"ocr_backend": "vision", "ocr_mode": "image_file", "source_modality": "image"},
+        )
 
     monkeypatch.setattr(ingest.ImageProcessor, "extract", _fake_extract)
 
@@ -219,15 +243,73 @@ def test_process_zip_to_chunks_image_uses_ocr_processor(monkeypatch, tmp_path: P
         max_files_per_zip=100,
         max_extracted_per_zip=10 * 1024 * 1024,
     )
-    assert len(chunks) == 1
-    assert "4,626.76" in chunks[0][1]
-    assert chunks[0][2]["ocr_backend"] == "vision"
-    assert chunks[0][2]["ocr_mode"] == "image_file"
+    assert len(chunks) == 2
+    assert chunks[1][2]["ocr_backend"] == "vision"
+    assert chunks[1][2]["ocr_mode"] == "image_file"
+    assert chunks[1][2]["record_type"] == "image_region"
 
 
 def test_capabilities_reports_image_ocr_and_extensions(monkeypatch):
     monkeypatch.setattr("processors.ocr_backend_chain_for_capabilities", lambda: ["vision", "paddleocr", "tesseract"])
+    monkeypatch.setattr("ingest.image_embedding_backend_name", lambda: "open_clip")
     out = ingest.get_capabilities_text()
     assert ".png" in out
     assert ".heic" in out
     assert "Image OCR: yes (vision -> paddleocr -> tesseract)" in out
+    assert "Image summaries: requires LLMLIBRARIAN_VISION_MODEL" in out
+    assert "Image embeddings: yes (open_clip -> llmli_image)" in out
+
+
+def test_chunks_from_image_result_writes_artifact(tmp_path: Path):
+    result = ExtractedImage(
+        summary="Image summary: dog photo",
+        visible_text="",
+        regions=(ImageRegion(text="A blurry black dog", role="full_frame_summary", x=0.0, y=0.0, w=1.0, h=1.0, needs_vision_enrichment=True),),
+        meta={"source_modality": "image", "vision_model": "llava:test"},
+        artifact={"summary": "dog photo"},
+    )
+    chunks = ingest._chunks_from_image_result(
+        "dog.jpg",
+        result,
+        "/tmp/dog.jpg",
+        123.0,
+        db_path=tmp_path,
+        file_hash="abc123",
+    )
+    assert len(chunks) == 2
+    artifact_path = tmp_path / "image_artifacts" / "abc123.json"
+    assert artifact_path.exists()
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert payload["summary"] == "dog photo"
+    assert chunks[0][2]["image_artifact_relpath"] == "image_artifacts/abc123.json"
+    assert chunks[1][2]["parent_image_id"] == "abc123"
+
+
+def test_image_vector_from_chunks_uses_summary_metadata():
+    chunks = [
+        (
+            "id-1",
+            "Image summary: black dog",
+            {
+                "source": "/tmp/dog.jpg",
+                "source_path": "/tmp/dog.jpg",
+                "record_type": "image_summary",
+                "source_modality": "image",
+                "parent_image_id": "abc123",
+                "doc_type": "other",
+                "file_id": "dog.jpg",
+                "mtime": 123.0,
+                "image_artifact_relpath": "image_artifacts/abc123.json",
+                "vision_model": "llava:test",
+                "needs_vision_enrichment": True,
+            },
+        )
+    ]
+    row = ingest._image_vector_from_chunks(source_path="/tmp/dog.jpg", chunks=chunks)
+    assert row is not None
+    row_id, source_path, doc, meta = row
+    assert row_id
+    assert source_path == "/tmp/dog.jpg"
+    assert "black dog" in doc
+    assert meta["record_type"] == "image_vector"
+    assert meta["parent_image_id"] == "abc123"

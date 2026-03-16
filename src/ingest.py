@@ -26,10 +26,12 @@ from typing import Any
 
 # Chunk tuple: (id, document, metadata)
 ChunkTuple = tuple[str, str, dict[str, Any]]
+ImageVectorTuple = tuple[str, str, str, dict[str, Any]]
 
 from constants import (
     DB_PATH,
     LLMLI_COLLECTION,
+    LLMLI_IMAGE_COLLECTION,
     CHUNK_SIZE,
     CHUNK_OVERLAP,
     ADD_BATCH_SIZE,
@@ -44,6 +46,11 @@ except Exception:
     tqdm = None  # type: ignore[assignment]
 
 from embeddings import get_embedding_function
+from image_embeddings import (
+    ensure_image_embedding_adapter_ready,
+    image_collection_name,
+    image_embedding_backend_name,
+)
 from file_registry import (
     _file_manifest_path,
     _read_file_manifest,
@@ -106,6 +113,12 @@ def get_capabilities_text() -> str:
         chain = " -> ".join(ocr_backends)
         lines.append(f"  PDF OCR fallback: yes ({chain})")
         lines.append(f"  Image OCR: yes ({chain})")
+        lines.append("  Image summaries: requires LLMLIBRARIAN_VISION_MODEL (vision-capable Ollama model)")
+        backend = image_embedding_backend_name()
+        if backend:
+            lines.append(f"  Image embeddings: yes ({backend} -> {LLMLI_IMAGE_COLLECTION})")
+        else:
+            lines.append(f"  Image embeddings: no (run `uv sync` to install the multimodal embedding backend for {LLMLI_IMAGE_COLLECTION})")
     else:
         if sys.platform == "darwin":
             lines.append("  PDF OCR fallback: no (Vision needs the macOS Swift toolchain; otherwise install paddleocr or tesseract)")
@@ -126,6 +139,10 @@ def get_capabilities_text() -> str:
     except ImportError:
         lines.append("  PPTX: no (install python-pptx for text extraction)")
     return "\n".join(lines)
+
+
+def _requires_standalone_image_enrichment(file_list: list[tuple[Path, str]]) -> bool:
+    return any(p.suffix.lower() in {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"} for p, _kind in file_list)
 
 
 def _doc_type_from_path(path_str: str) -> str:
@@ -354,7 +371,10 @@ from processors import (
     DocumentProcessor,
     PDFExtractionError,
     ExtractedPage,
+    ExtractedImage,
+    ImageRegion,
     ExtractedText,
+    ensure_vision_model_ready,
 )
 from tax.ledger import extract_tax_rows_from_chunks, replace_tax_rows_for_sources
 
@@ -407,14 +427,19 @@ def get_text_from_pptx_bytes(data: bytes) -> tuple[str | None, bool]:
     return (result, True)
 
 
-def get_text_from_image_bytes(data: bytes, source_path: str) -> ExtractedText | None:
+def get_text_from_image_bytes(
+    data: bytes,
+    source_path: str,
+    *,
+    enable_multimodal: bool = True,
+) -> ExtractedImage | None:
     """Delegates to ImageProcessor."""
     try:
-        result = _img_proc.extract(data, source_path)
+        result = _img_proc.extract(data, source_path, enable_multimodal=enable_multimodal)
     except DocumentExtractionError as e:
         _log_event("ERROR", "Image extraction failed", error=str(e), path=source_path)
         return None
-    return result if isinstance(result, ExtractedText) else None
+    return result if isinstance(result, ExtractedImage) else None
 
 
 def _chunk_metadata_only(
@@ -442,6 +467,26 @@ def _chunk_metadata_only(
     if file_hash:
         meta["file_hash"] = file_hash
     return [(cid, doc, meta)]
+
+
+def _image_artifact_relpath(file_hash: str) -> str:
+    return f"image_artifacts/{file_hash}.json"
+
+
+def _write_image_artifact(
+    db_path: str | Path | None,
+    file_hash: str | None,
+    payload: dict[str, Any] | None,
+) -> str | None:
+    if not db_path or not file_hash or not payload:
+        return None
+    relpath = _image_artifact_relpath(file_hash)
+    artifact_path = Path(db_path) / relpath
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = artifact_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, artifact_path)
+    return relpath
 
 
 # --- Indexing ---
@@ -512,6 +557,137 @@ def _chunks_from_content(
             meta.update(extra_meta)
         out.append((cid, chunk, meta))
     return out
+
+
+def _image_parent_id(source_path: str, file_hash: str | None, mtime: float) -> str:
+    if file_hash:
+        return file_hash
+    return hashlib.sha256(f"image|{source_path}|{mtime}".encode()).hexdigest()[:20]
+
+
+def _image_doc_type_from_text(source_path: str, *parts: str) -> str:
+    sample = "\n".join(part for part in parts if part).strip()
+    content_type = _doc_type_from_content(sample[:CONTENT_SAMPLE_LEN])
+    return content_type if content_type != "other" else _doc_type_from_path(source_path)
+
+
+def _chunks_from_image_result(
+    file_id: str,
+    result: ExtractedImage,
+    source_path: str,
+    mtime: float,
+    *,
+    db_path: str | Path | None = None,
+    file_hash: str | None = None,
+) -> list[ChunkTuple]:
+    parent_image_id = _image_parent_id(source_path, file_hash, mtime)
+    artifact_relpath = _write_image_artifact(db_path, file_hash, result.artifact)
+    summary_text = (result.summary or "").strip()
+    visible_text = (result.visible_text or "").strip()
+    doc_type = _image_doc_type_from_text(source_path, summary_text, visible_text)
+    base_meta: dict[str, Any] = {
+        "source": source_path,
+        "source_path": source_path,
+        "mtime": mtime,
+        "file_id": file_id,
+        "is_local": _is_local(source_path),
+        "doc_type": doc_type,
+        "content_extracted": 1,
+        "source_modality": "image",
+        "parent_image_id": parent_image_id,
+        "bbox_x": 0.0,
+        "bbox_y": 0.0,
+        "bbox_w": 1.0,
+        "bbox_h": 1.0,
+    }
+    if file_hash:
+        base_meta["file_hash"] = file_hash
+    if artifact_relpath:
+        base_meta["image_artifact_relpath"] = artifact_relpath
+    if result.meta:
+        base_meta.update({k: v for k, v in result.meta.items() if v is not None})
+
+    out: list[ChunkTuple] = []
+    summary_meta = dict(base_meta)
+    summary_meta.update(
+        {
+            "record_type": "image_summary",
+            "region_index": 0,
+            "region_role": "image_summary",
+            "needs_vision_enrichment": True,
+            "chunk_hash": _chunk_hash(summary_text),
+        }
+    )
+    summary_meta = {k: v for k, v in summary_meta.items() if v is not None}
+    out.append((_stable_chunk_id(source_path, mtime, 0), summary_text, summary_meta))
+
+    for idx, region in enumerate(result.regions, start=1):
+        region_text = (region.text or "").strip()
+        if not region_text:
+            continue
+        doc = f"Image region: {region.role}\n{region_text}"
+        region_meta = dict(base_meta)
+        region_meta.update(
+            {
+                "record_type": "image_region",
+                "region_index": idx,
+                "region_role": region.role,
+                "bbox_x": float(region.x),
+                "bbox_y": float(region.y),
+                "bbox_w": float(region.w),
+                "bbox_h": float(region.h),
+                "needs_vision_enrichment": bool(region.needs_vision_enrichment),
+                "chunk_hash": _chunk_hash(doc),
+            }
+        )
+        region_extra = dict(region.meta or {})
+        if region_extra:
+            region_meta.update({k: v for k, v in region_extra.items() if v is not None})
+        region_meta = {k: v for k, v in region_meta.items() if v is not None}
+        out.append((_stable_chunk_id(source_path, mtime, idx), doc, region_meta))
+    return out
+
+
+def _image_vector_id(parent_image_id: str) -> str:
+    return hashlib.sha256(f"image-vector|{parent_image_id}".encode("utf-8")).hexdigest()[:20]
+
+
+def _image_vector_from_chunks(
+    *,
+    source_path: str,
+    chunks: list[ChunkTuple],
+) -> ImageVectorTuple | None:
+    summary: tuple[str, str, dict[str, Any]] | None = None
+    for cid, doc, meta in chunks:
+        if str((meta or {}).get("record_type") or "") == "image_summary":
+            summary = (cid, doc, meta)
+            break
+    if summary is None:
+        return None
+    _cid, doc, meta = summary
+    parent_image_id = str(meta.get("parent_image_id") or "")
+    if not parent_image_id:
+        return None
+    vector_meta = {
+        "source": source_path,
+        "source_path": source_path,
+        "source_modality": "image",
+        "record_type": "image_vector",
+        "parent_image_id": parent_image_id,
+        "doc_type": meta.get("doc_type"),
+        "file_id": meta.get("file_id"),
+        "mtime": meta.get("mtime"),
+        "file_hash": meta.get("file_hash"),
+        "ocr_backend": meta.get("ocr_backend"),
+        "ocr_mode": meta.get("ocr_mode"),
+        "vision_model": meta.get("vision_model"),
+        "image_artifact_relpath": meta.get("image_artifact_relpath"),
+        "image_embedding_backend": image_embedding_backend_name(),
+        "needs_vision_enrichment": meta.get("needs_vision_enrichment"),
+        "is_local": meta.get("is_local"),
+    }
+    vector_meta = {k: v for k, v in vector_meta.items() if v is not None}
+    return (_image_vector_id(parent_image_id), source_path, doc, vector_meta)
 
 
 def _chunks_from_csv_text(
@@ -915,15 +1091,25 @@ def _chunks_from_processor_text(
 
 def _chunks_from_processor_result(
     file_id: str,
-    result: str | ExtractedText | list[ExtractedPage] | None,
+    result: str | ExtractedText | ExtractedImage | list[ExtractedPage] | None,
     source_path: str,
     mtime: float,
     suffix: str,
     processor: DocumentProcessor,
     file_hash: str | None = None,
+    db_path: str | Path | None = None,
 ) -> list[ChunkTuple]:
     if isinstance(result, list):
         return _chunks_from_pdf_pages(file_id, result, source_path, mtime, file_hash=file_hash)
+    if isinstance(result, ExtractedImage):
+        return _chunks_from_image_result(
+            file_id,
+            result,
+            source_path,
+            mtime,
+            db_path=db_path,
+            file_hash=file_hash,
+        )
     if result is None:
         return _chunk_metadata_only(
             file_id, source_path, mtime,
@@ -1026,6 +1212,7 @@ def process_one_file(
     file_hash: str | None = None,
     follow_symlinks: bool = False,
     path_resolved: Path | None = None,
+    db_path: str | Path | None = None,
 ) -> list[ChunkTuple]:
     """
     Read file and return list of (id, doc, meta). Runs in worker thread.
@@ -1049,7 +1236,10 @@ def process_one_file(
     suffix = path_resolved.suffix.lower()
     processor = PROCESSORS.get(suffix, DEFAULT_PROCESSOR)
     try:
-        result = processor.extract(data, path_str)
+        if isinstance(processor, ImageProcessor):
+            result = processor.extract(data, path_str, enable_multimodal=True)
+        else:
+            result = processor.extract(data, path_str)
     except DocumentExtractionError as e:
         _log_event(
             "ERROR",
@@ -1060,7 +1250,16 @@ def process_one_file(
             extractor=getattr(processor, "format_label", "unknown"),
         )
         return []
-    return _chunks_from_processor_result(file_id, result, path_str, mtime, suffix, processor, file_hash=file_hash)
+    return _chunks_from_processor_result(
+        file_id,
+        result,
+        path_str,
+        mtime,
+        suffix,
+        processor,
+        file_hash=file_hash,
+        db_path=db_path,
+    )
 
 
 def collect_files(
@@ -1136,6 +1335,7 @@ def process_zip_to_chunks(
     max_file_bytes: int,
     max_files_per_zip: int,
     max_extracted_per_zip: int,
+    db_path: str | Path | None = None,
 ) -> list[ChunkTuple]:
     """
     Extract supported files from ZIP: PDF, DOCX, XLSX, PPTX + text (by extension). Limits and skip encrypted.
@@ -1189,7 +1389,10 @@ def process_zip_to_chunks(
                 processor = PROCESSORS.get(suf)
                 if processor is not None:
                     try:
-                        result = processor.extract(data, source_label)
+                        if isinstance(processor, ImageProcessor):
+                            result = processor.extract(data, source_label, enable_multimodal=False)
+                        else:
+                            result = processor.extract(data, source_label)
                         out.extend(
                             _tag_zip_meta(
                                 _chunks_from_processor_result(
@@ -1199,6 +1402,7 @@ def process_zip_to_chunks(
                                     mtime,
                                     suf,
                                     processor,
+                                    db_path=db_path,
                                 ),
                                 zip_path,
                             )
@@ -1269,6 +1473,60 @@ def _flatten_collection_list(values: list[Any] | None) -> list[Any]:
     return values
 
 
+def _get_image_collection(client: Any, base_collection_name: str = LLMLI_COLLECTION) -> Any:
+    return client.get_or_create_collection(name=image_collection_name(base_collection_name))
+
+
+def _delete_source_from_collections(
+    *,
+    collection: Any,
+    image_collection: Any | None,
+    silo_slug: str,
+    source_path: str,
+) -> None:
+    try:
+        collection.delete(where={"$and": [{"silo": silo_slug}, {"source": source_path}]})
+    except Exception as e:
+        _log_event("WARN", "Failed to delete updated file chunks", path=source_path, error=str(e))
+    try:
+        collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": source_path}]})
+    except Exception:
+        pass
+    if image_collection is None:
+        return
+    try:
+        image_collection.delete(where={"$and": [{"silo": silo_slug}, {"source": source_path}]})
+    except Exception as e:
+        _log_event("WARN", "Failed to delete image vector rows", path=source_path, error=str(e))
+
+
+def _batch_add_image_vectors(
+    collection: Any,
+    rows: list[ImageVectorTuple],
+    *,
+    batch_size: int = ADD_BATCH_SIZE,
+    no_color: bool = False,
+    log_line: Any = None,
+) -> None:
+    if not rows:
+        return
+    adapter = ensure_image_embedding_adapter_ready()
+    total_batches = (len(rows) + batch_size - 1) // batch_size
+    for i in range(0, len(rows), batch_size):
+        batch = rows[i : i + batch_size]
+        batch_num = i // batch_size + 1
+        msg = f"  Adding image batch {batch_num}/{total_batches} ({len(batch)} images)..."
+        print(dim(no_color, msg))
+        if log_line:
+            log_line(msg.strip())
+        ids_b = [row[0] for row in batch]
+        paths_b = [row[1] for row in batch]
+        docs_b = [row[2] for row in batch]
+        metas_b = [row[3] for row in batch]
+        embeddings = adapter.embed_image_paths(paths_b)
+        collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b, embeddings=embeddings)
+
+
 def _clone_chunks_from_existing_silo(
     *,
     collection: Any,
@@ -1303,6 +1561,37 @@ def _clone_chunks_from_existing_silo(
         cloned_meta["silo"] = target_silo
         chunk_id = str(meta.get("chunk_hash") or f"clone-{i}-{source_path}")
         out.append((chunk_id, doc, cloned_meta))
+    return out
+
+
+def _clone_image_vectors_from_existing_silo(
+    *,
+    collection: Any,
+    from_silo: str,
+    source_path: str,
+    target_silo: str,
+) -> list[ImageVectorTuple]:
+    try:
+        result = collection.get(
+            where={"$and": [{"silo": from_silo}, {"source": source_path}]},
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        return []
+    docs = _flatten_collection_list(result.get("documents"))
+    metas = _flatten_collection_list(result.get("metadatas"))
+    out: list[ImageVectorTuple] = []
+    for i, doc_raw in enumerate(docs):
+        doc = str(doc_raw or "")
+        meta_raw = metas[i] if i < len(metas) else {}
+        meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
+        src = str(meta.get("source") or "")
+        if src != source_path:
+            continue
+        cloned_meta = dict(meta)
+        cloned_meta["silo"] = target_silo
+        row_id = str(meta.get("parent_image_id") or meta.get("chunk_hash") or f"image-clone-{i}-{source_path}")
+        out.append((_image_vector_id(row_id), source_path, doc, cloned_meta))
     return out
 
 
@@ -1348,10 +1637,15 @@ def run_index(
         client.delete_collection(name=collection_name)
     except Exception:
         pass  # collection may not exist
+    try:
+        client.delete_collection(name=image_collection_name(collection_name))
+    except Exception:
+        pass
     collection = client.get_or_create_collection(
         name=collection_name,
         embedding_function=ef,
     )
+    image_collection = _get_image_collection(client, collection_name)
 
     log_line, log_close = _make_log_writer(log_path)
     t0 = time.perf_counter()
@@ -1381,11 +1675,15 @@ def run_index(
         file_list.extend(collect_files(p, include, exclude, max_depth, max_file_bytes, follow_symlinks=follow_symlinks))
 
     log(f"Collected {len(file_list)} files")
+    if _requires_standalone_image_enrichment(file_list):
+        ensure_vision_model_ready()
+        ensure_image_embedding_adapter_ready()
     # 2. Split: regular files (parallel) vs zips (main thread, limits)
     regular = [(path, kind) for path, kind in file_list if kind != "zip"]
     zips = [path for path, kind in file_list if kind == "zip"]
 
     all_chunks: list[ChunkTuple] = []
+    all_image_vectors: list[ImageVectorTuple] = []
     files_indexed = 0
 
     # 3. Process regular files in parallel
@@ -1415,6 +1713,11 @@ def run_index(
                 continue
             if chunks:
                 all_chunks.extend(chunks)
+                if any(str((meta or {}).get("source_modality") or "") == "image" for _cid, _doc, meta in chunks):
+                    source_path = str((chunks[0][2] or {}).get("source") or path)
+                    vector_row = _image_vector_from_chunks(source_path=source_path, chunks=chunks)
+                    if vector_row is not None:
+                        all_image_vectors.append(vector_row)
                 files_indexed += 1
                 print(success_style(no_color, f"  ✅ {path.name} ({len(chunks)} chunks)"))
             elif kind == "pdf" and not _suppress_recoverable_warnings():
@@ -1461,6 +1764,7 @@ def run_index(
             max_file_bytes,
             max_files_per_zip,
             max_extracted_per_zip,
+            db_path=DB_PATH,
         )
         if chunks:
             all_chunks.extend(chunks)
@@ -1490,6 +1794,14 @@ def run_index(
             log_line=log_line,
             embedding_fn=ef,
             embedding_workers=embedding_workers,
+        )
+    if all_image_vectors:
+        _batch_add_image_vectors(
+            image_collection,
+            all_image_vectors,
+            batch_size=max(1, min(64, ADD_BATCH_SIZE)),
+            no_color=no_color,
+            log_line=log_line,
         )
 
     elapsed = time.perf_counter() - t0
@@ -1557,6 +1869,9 @@ def run_add(
         max_file_bytes,
         follow_symlinks=follow_symlinks,
     )
+    if _requires_standalone_image_enrichment(file_list):
+        ensure_vision_model_ready()
+        ensure_image_embedding_adapter_ready()
     regular = [(p, k) for p, k in file_list if k != "zip"]
     zips = [p for p, k in file_list if k == "zip"]
 
@@ -1577,12 +1892,17 @@ def run_add(
     ef = get_embedding_function()
     client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+    image_collection = _get_image_collection(client)
 
     if not incremental:
         try:
             collection.delete(where={"silo": silo_slug})
         except Exception:
             pass  # no chunks for this silo yet
+        try:
+            image_collection.delete(where={"silo": silo_slug})
+        except Exception:
+            pass
         _file_registry_remove_silo(db_path, silo_slug)
 
     # Pre-pass: resolve paths, hash, skip duplicates (same file already indexed in any silo)
@@ -1600,6 +1920,7 @@ def run_add(
                 current_paths.add(str(zp))
     skipped = 0
     precloned_by_path: dict[str, tuple[str, list[ChunkTuple]]] = {}
+    precloned_image_vectors_by_path: dict[str, list[ImageVectorTuple]] = {}
     for p, k in regular:
         try:
             p_res = p.resolve()
@@ -1636,6 +1957,12 @@ def run_add(
                     )
                     if cloned:
                         precloned_by_path[str(p_res)] = (h, cloned)
+                        precloned_image_vectors_by_path[str(p_res)] = _clone_image_vectors_from_existing_silo(
+                            collection=image_collection,
+                            from_silo=clone_from,
+                            source_path=str(p_res),
+                            target_silo=silo_slug,
+                        )
                         continue
             if not h:
                 regular_with_hash.append((p, k, "", p_res))
@@ -1652,14 +1979,17 @@ def run_add(
             path_str = str(p_res)
             ledger_sources_to_replace.add(path_str)
             if path_str in manifest_files:
-                try:
-                    collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
-                except Exception as e:
-                    _log_event("WARN", "Failed to delete updated file chunks", path=path_str, error=str(e))
+                _delete_source_from_collections(
+                    collection=collection,
+                    image_collection=image_collection,
+                    silo_slug=silo_slug,
+                    source_path=path_str,
+                )
                 prev = manifest_files.get(path_str) or {}
                 _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
     all_chunks = []
+    all_image_vectors: list[ImageVectorTuple] = []
     tax_rows: list[dict[str, Any]] = []
     files_indexed = 0
     failures = []
@@ -1669,14 +1999,12 @@ def run_add(
         removed = [path_str for path_str in manifest_files.keys() if path_str not in current_paths]
         for path_str in removed:
             ledger_sources_to_replace.add(path_str)
-            try:
-                collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
-            except Exception as e:
-                _log_event("WARN", "Failed to delete removed file chunks", path=path_str, error=str(e))
-            try:
-                collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": path_str}]})
-            except Exception:
-                pass
+            _delete_source_from_collections(
+                collection=collection,
+                image_collection=image_collection,
+                silo_slug=silo_slug,
+                source_path=path_str,
+            )
             prev = manifest_files.get(path_str) or {}
             _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
@@ -1693,6 +2021,9 @@ def run_add(
             if not cloned_norm:
                 continue
             all_chunks.extend(cloned_norm)
+            cloned_vectors = precloned_image_vectors_by_path.get(path_str) or []
+            if cloned_vectors:
+                all_image_vectors.extend(cloned_vectors)
             tax_rows.extend(extract_tax_rows_from_chunks(cloned_norm))
             files_indexed += 1
             if fhash:
@@ -1700,7 +2031,7 @@ def run_add(
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_item = {
-            executor.submit(process_one_file, p, k, h, follow_symlinks, p_res): (p, k, h)
+            executor.submit(process_one_file, p, k, h, follow_symlinks, p_res, db_path): (p, k, h)
             for p, k, h, p_res in regular_with_hash
         }
         for future in as_completed(future_to_item):
@@ -1725,6 +2056,12 @@ def run_add(
                     for cid, doc, meta in chunks
                 ]
                 all_chunks.extend(chunks)
+                if any(str((meta or {}).get("source_modality") or "") == "image" for _cid, _doc, meta in chunks):
+                    source_path = str((chunks[0][2] or {}).get("source") or p)
+                    vector_row = _image_vector_from_chunks(source_path=source_path, chunks=chunks)
+                    if vector_row is not None:
+                        vid, vpath, vdoc, vmeta = vector_row
+                        all_image_vectors.append((vid, vpath, vdoc, {**vmeta, "silo": silo_slug}))
                 tax_rows.extend(extract_tax_rows_from_chunks(chunks))
                 files_indexed += 1
                 if fhash:
@@ -1761,6 +2098,7 @@ def run_add(
             chunks = process_zip_to_chunks(
                 zip_path, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE,
                 max_archive_bytes, max_file_bytes, max_files_per_zip, max_extracted_per_zip,
+                db_path=db_path,
             )
         except Exception as e:
             _log_event(
@@ -1835,6 +2173,13 @@ def run_add(
             no_color=no_color,
 
             embedding_workers=embedding_workers,
+        )
+    if all_image_vectors:
+        _batch_add_image_vectors(
+            image_collection,
+            all_image_vectors,
+            batch_size=max(1, min(64, ADD_BATCH_SIZE)),
+            no_color=no_color,
         )
 
     if (not incremental) or ledger_sources_to_replace or tax_rows:
@@ -2002,14 +2347,13 @@ def remove_single_file(
     ef = get_embedding_function()
     client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-    try:
-        collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
-    except Exception:
-        pass
-    try:
-        collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": path_str}]})
-    except Exception:
-        pass
+    image_collection = _get_image_collection(client)
+    _delete_source_from_collections(
+        collection=collection,
+        image_collection=image_collection,
+        silo_slug=silo_slug,
+        source_path=path_str,
+    )
     if prev:
         _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
@@ -2068,6 +2412,9 @@ def update_single_file(
             return ("skipped", path_str)
     if not should_index(path_str, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE):
         return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
+    if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}:
+        ensure_vision_model_ready()
+        ensure_image_embedding_adapter_ready()
 
     max_file_bytes, _max_depth, max_archive_bytes, max_files_per_zip, max_extracted_per_zip = _load_limits_config()
     try:
@@ -2110,19 +2457,18 @@ def update_single_file(
     ef = get_embedding_function()
     client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-
-    try:
-        collection.delete(where={"$and": [{"silo": silo_slug}, {"source": path_str}]})
-    except Exception:
-        pass
-    try:
-        collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": path_str}]})
-    except Exception:
-        pass
+    image_collection = _get_image_collection(client)
+    _delete_source_from_collections(
+        collection=collection,
+        image_collection=image_collection,
+        silo_slug=silo_slug,
+        source_path=path_str,
+    )
     if prev:
         _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
     chunks: list[ChunkTuple] = []
+    image_vectors: list[ImageVectorTuple] = []
     if kind == "zip":
         try:
             chunks = process_zip_to_chunks(
@@ -2133,6 +2479,7 @@ def update_single_file(
                 max_file_bytes,
                 max_files_per_zip,
                 max_extracted_per_zip,
+                db_path=db_path,
             )
         except Exception:
             chunks = []
@@ -2148,9 +2495,15 @@ def update_single_file(
                 source_path=path_str,
                 target_silo=silo_slug,
             )
+            image_vectors = _clone_image_vectors_from_existing_silo(
+                collection=image_collection,
+                from_silo=clone_from,
+                source_path=path_str,
+                target_silo=silo_slug,
+            )
         if not chunks:
             try:
-                chunks = process_one_file(p, kind, file_hash or None, follow_symlinks, p)
+                chunks = process_one_file(p, kind, file_hash or None, follow_symlinks, p, db_path=db_path)
             except Exception:
                 chunks = []
 
@@ -2179,6 +2532,18 @@ def update_single_file(
             embedding_fn=ef,
             embedding_workers=embedding_workers,
         )
+        if not image_vectors:
+            vector_row = _image_vector_from_chunks(source_path=path_str, chunks=chunks)
+            if vector_row is not None:
+                vid, vpath, vdoc, vmeta = vector_row
+                image_vectors = [(vid, vpath, vdoc, {**vmeta, "silo": silo_slug})]
+        if image_vectors:
+            _batch_add_image_vectors(
+                image_collection,
+                image_vectors,
+                batch_size=1,
+                no_color=no_color,
+            )
         if file_hash:
             _file_registry_add(db_path, file_hash, silo_slug, path_str)
     tax_rows = extract_tax_rows_from_chunks(chunks) if chunks else []

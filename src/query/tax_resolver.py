@@ -19,6 +19,7 @@ from tax.query_contract import (
     METRIC_1099_MIN_REPORTING_THRESHOLD,
     METRIC_PAYROLL_TAXES,
     METRIC_STATE_TAX,
+    METRIC_STOCK_PROCEEDS,
     METRIC_TOTAL_INCOME,
     METRIC_TOTAL_TAX_LIABILITY,
     METRIC_W2_BOX,
@@ -164,6 +165,8 @@ def run_tax_resolver(
             form_type="1099-INT",
             explain=explain,
         )
+    if request.metric == METRIC_STOCK_PROCEEDS:
+        return _resolve_1099b_proceeds(request, rows, source_label, no_color, explain=explain)
     if request.metric == METRIC_DIVIDENDS:
         return _resolve_sum_metric(
             request,
@@ -300,6 +303,31 @@ def _resolve_1099_min_reporting_threshold(
         guardrail_reason="tax_reference_threshold",
         explain=explain,
     )
+
+
+def _resolve_1099b_proceeds(
+    request: TaxQuery,
+    rows: list[dict[str, Any]],
+    source_label: str,
+    no_color: bool,
+    *,
+    explain: bool = False,
+) -> dict[str, Any]:
+    year_str = str(request.tax_year) if request.tax_year else "requested year"
+    result = _resolve_single_field_metric(
+        request,
+        rows,
+        field_codes=["f1099_b_totals"],
+        label="Stock proceeds (1099-B)",
+        source_label=source_label,
+        no_color=no_color,
+        form_type="1099-B",
+        explain=explain,
+    )
+    # If abstain due to no match, give a clean, specific message
+    if result.get("guardrail") == "abstain" and result.get("category") in ("no_match", "no_year"):
+        result["message"] = f"No 1099-B proceeds data found for {year_str}. The document may not have been extracted."
+    return result
 
 
 def _resolve_single_field_metric(

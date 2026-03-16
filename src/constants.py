@@ -5,6 +5,7 @@ Centralized constants for llmLibrarian. Shared across ingest, query, and CLI mod
 # Storage
 DB_PATH = "./my_brain_db"
 LLMLI_COLLECTION = "llmli"
+LLMLI_IMAGE_COLLECTION = "llmli_image"
 
 # Chunking
 CHUNK_SIZE = 1000

@@ -79,7 +79,13 @@ Trace includes `answer_kind` (`catalog_artifact`, `guardrail`, or `rag`).
 ## OCR Observability
 
 - PDF extraction uses PyMuPDF text first.
-- Standalone image files (`.png`, `.jpg`, `.jpeg`, `.heic`, `.heif`, `.tif`, `.tiff`) are first-class indexed inputs and use the shared OCR path.
+- Standalone image files (`.png`, `.jpg`, `.jpeg`, `.heic`, `.heif`, `.tif`, `.tiff`) are first-class indexed inputs and now index as:
+  1) one `image_summary` chunk, plus
+  2) one or more `image_region` chunks when OCR finds meaningful text zones.
+- Standalone image files also write one image-vector row into a sibling collection (`llmli_image` for unified ask, `<collection>_image` for archetype collections). The join key is `parent_image_id`.
+- Image chunks use scalar-only Chroma metadata such as `record_type`, `source_modality=image`, `parent_image_id`, `region_index`, `region_role`, bbox fields, and `image_artifact_relpath`.
+- Image-vector rows keep retrieval-friendly scalar metadata (`record_type=image_vector`, `parent_image_id`, `source`, `silo`, `image_embedding_backend`) and store the visual embedding separately from the text collection.
+- Raw Vision observations and image-analysis artifacts are written under `<db>/image_artifacts/<file_hash>.json`.
 - In auto mode on macOS, OCR is attempted in deterministic order:
   1) Vision (via a cached Swift helper), then
   2) PaddleOCR (if installed), then
@@ -88,6 +94,10 @@ Trace includes `answer_kind` (`catalog_artifact`, `guardrail`, or `rag`).
   1) PaddleOCR (if installed), then
   2) `tesseract` CLI (if available).
 - `LLMLIBRARIAN_OCR_BACKEND` can pin OCR to `vision`, `paddleocr`, or `tesseract`; pinned mode disables fallback.
+- OCR fallback text is quality-gated; low-signal gibberish from fallback OCR is dropped instead of indexed.
+- Standalone image enrichment requires `LLMLIBRARIAN_VISION_MODEL` to point at a vision-capable Ollama model. If standalone images are present and the model is missing or text-only, `pal pull` / `llmli add` now fail fast.
+- Standalone image embeddings use the local OpenCLIP backend. If the OpenCLIP dependencies are missing, standalone image ingest now fails fast instead of silently skipping the image-vector collection.
+- Query retrieves from both the text collection and the image-vector collection, then materializes the winning image hits back into `image_summary` / `image_region` text evidence before synthesis.
 - OCR availability/fallback outcomes are logged as structured processor events.
 - Missing OCR backends do not fail ingestion; indexing continues with warnings.
 
@@ -96,6 +106,7 @@ Trace includes `answer_kind` (`catalog_artifact`, `guardrail`, or `rag`).
 - `LLMLIBRARIAN_DB`
 - `LLMLIBRARIAN_CONFIG`
 - `LLMLIBRARIAN_MODEL`
+- `LLMLIBRARIAN_VISION_MODEL`
 - `LLMLIBRARIAN_TRACE`
 - `LLMLIBRARIAN_RERANK`
 - `LLMLIBRARIAN_OCR_BACKEND`

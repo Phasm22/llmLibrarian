@@ -163,6 +163,16 @@ def route_intent(query: str) -> str:
     lacks_form = not has_form
     if has_year_only and (has_income or has_make_earn) and lacks_line and lacks_form and not has_tax_specific:
         return INTENT_MONEY_YEAR_TOTAL
+    # Document-counting is inventory, not field lookup → LOOKUP
+    if re.search(r"\bhow\s+many\b", q) and re.search(r"\b(1099|w-?2|1040|1098|forms?)\b", q):
+        return INTENT_LOOKUP
+    # Qualitative/ranking stock questions can't be answered by field resolver → LOOKUP
+    if (
+        re.search(r"\b(what|which)\b", q)
+        and re.search(r"\bstocks?\b", q)
+        and not re.search(r"\bhow\s+much\b", q)
+    ):
+        return INTENT_LOOKUP
     if (
         re.search(r"\b(min(?:imum)?|threshold|required|at\s+least)\b", q)
         and re.search(r"\b(file|issue|send|report)\b", q)
@@ -171,10 +181,16 @@ def route_intent(query: str) -> str:
         return INTENT_TAX_QUERY
     # TAX_QUERY: deterministic tax-domain resolver (box lookups, withholding/tax phrasing).
     if has_year_only and re.search(
-        r"\b(tax|taxes|withheld|witheld|withholding|federal\s+income\s+tax|federal|w-?2|1099|1040|box\s*\d{1,2}|payroll|state\s+tax)\b",
+        r"\b(tax|taxes|withheld|witheld|withholding|federal\s+income\s+tax|federal|w-?2|1099|1040|box\s*\d{1,2}|payroll|state\s+tax"
+        r"|stock|stocks|sell|sold|proceeds|brokerage|capital\s*gain)\b",
         q,
     ):
         return INTENT_TAX_QUERY
+    # Secondary: if tax_contract parser recognizes it as tax domain with a year, trust it
+    if has_year_only:
+        from tax.query_contract import _is_tax_domain as _tax_dom
+        if _tax_dom(q):
+            return INTENT_TAX_QUERY
     # PROJECT_COUNT: how many coding projects in this folder/silo
     if re.search(r"\bhow\s+(many|much)\b", q) and re.search(r"\bprojects?\b", q):
         return INTENT_PROJECT_COUNT

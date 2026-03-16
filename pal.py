@@ -1423,7 +1423,12 @@ def _pull_path_mode(
     if follow_symlinks:
         llmli_args.append("--follow-symlinks")
     llmli_args.append(str(path))
-    code = _run_llmli(llmli_args, extra_env=extra_env)
+    suppress_env = {
+        "LLMLIBRARIAN_INGEST_LOG_LEVEL": "FATAL",
+        "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
+    }
+    merged_env = {**(extra_env or {}), **suppress_env}
+    code = _run_llmli(llmli_args, extra_env=merged_env)
     if code == 0:
         _record_source_path(path)
         if prompt is not None or clear_prompt:

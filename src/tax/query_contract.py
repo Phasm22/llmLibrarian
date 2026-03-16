@@ -15,6 +15,7 @@ METRIC_WAGES = "wages"
 METRIC_W2_BOX = "w2_box"
 METRIC_INTEREST_INCOME = "interest_income"
 METRIC_DIVIDENDS = "dividends"
+METRIC_STOCK_PROCEEDS = "stock_proceeds"
 METRIC_1099_MIN_REPORTING_THRESHOLD = "1099_min_reporting_threshold"
 
 _EMPLOYER_STOPWORDS = {
@@ -98,10 +99,10 @@ def _is_tax_domain(query: str) -> bool:
     q = query.lower()
     return bool(
         re.search(
-            r"\b(tax|w-?2|1099|1040|box\s*\d{1,2}|withheld|witheld|withholding|income|agi|wages|payroll|federal|interest|dividends?)\b",
+            r"\b(tax|w-?2|1099|1040|box\s*\d{1,2}|withheld|witheld|withholding|income|agi|wages|payroll|federal|interest|dividends?|stock|stocks|proceeds|brokerage|capital\s*gain)\b",
             q,
         )
-        or re.search(r"\bhow\s+much\b[\s\S]{0,80}\b(make|made|earn|earned|pay|paid)\b", q)
+        or re.search(r"\bhow\s+much\b[\s\S]{0,80}\b(make|made|earn|earned|pay|paid|sell|sold)\b", q)
     )
 
 
@@ -226,5 +227,8 @@ def parse_tax_query(query: str) -> TaxQuery | None:
 
     if re.search(r"\btotal\s+income\b|\bincome\b|\bline\s*9\b", q):
         return TaxQuery(raw, year, METRIC_TOTAL_INCOME, "1040", "f1040_line_9_total_income", employer, employer_tokens, None, None)
+
+    if re.search(r"\b(stock|stocks|sell|sold|proceeds|capital\s*gain|1099[-\s]*b|brokerage)\b", q):
+        return TaxQuery(raw, year, METRIC_STOCK_PROCEEDS, "1099-B", "f1099_b_totals", employer, employer_tokens, None, None)
 
     return TaxQuery(raw, year, METRIC_TOTAL_INCOME, None, None, employer, employer_tokens, None, None)

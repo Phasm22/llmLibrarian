@@ -207,7 +207,10 @@ Watcher locks live at `~/.pal/watch_locks`.
 4. `no extractable text` for PDFs
 - Meaning: scanned/image PDF or unreadable structure.
 - Current behavior: on macOS, llmLibrarian attempts OCR in this order: Vision (via the system Swift toolchain), then PaddleOCR (if installed), then `tesseract` (if available on PATH). On non-macOS, it uses PaddleOCR, then `tesseract`.
+- Standalone images also require `LLMLIBRARIAN_VISION_MODEL` to point at a vision-capable Ollama model so llmLibrarian can create `image_summary` chunks for non-text images.
+- Standalone images also index into a separate image-vector collection (`llmli_image`) using the local OpenCLIP backend so visual-only queries can retrieve non-text photos.
 - Fix when still failing: on macOS, ensure `swiftc` is available. Otherwise install `paddleocr` or `tesseract`, then re-run `pal pull <path>`.
+- If you are indexing standalone images and see a hard failure, set `LLMLIBRARIAN_VISION_MODEL`, run `uv sync` so the image-embedding backend is installed, then re-run `pal pull <path>`.
 - Note: OpenCV is not required for the baseline OCR fallback.
 
 5. stale catalog + `--force`

@@ -35,12 +35,34 @@ class ExtractedPage:
     meta: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class ImageRegion:
+    text: str
+    role: str
+    x: float
+    y: float
+    w: float
+    h: float
+    needs_vision_enrichment: bool = False
+    meta: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ExtractedImage:
+    summary: str
+    visible_text: str
+    regions: tuple[ImageRegion, ...]
+    meta: dict[str, Any] | None = None
+    artifact: dict[str, Any] | None = None
+
+
 class DocumentProcessor(Protocol):
     """Protocol for document processors. Each handles one file type."""
 
-    def extract(self, data: bytes, source_path: str) -> str | ExtractedText | list[ExtractedPage] | None:
+    def extract(self, data: bytes, source_path: str) -> str | ExtractedText | ExtractedImage | list[ExtractedPage] | None:
         """Extract text from file bytes. Returns:
         - str/ExtractedText for plain text content
+        - ExtractedImage for image files with OCR/vision enrichment
         - list[ExtractedPage] for paged documents (PDF)
         - None if extraction failed or library unavailable
         """
@@ -98,7 +120,17 @@ _PROCESSOR_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
 _VALID_OCR_BACKENDS = frozenset({"auto", "vision", "paddleocr", "tesseract"})
 _VISION_HELPER_BINARY: Path | None = None
 _VISION_HELPER_READY: bool | None = None
+_VISION_MODEL_READY: dict[str, bool] = {}
 _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff")
+
+
+@dataclass(frozen=True)
+class _OCRResult:
+    text: str
+    backend: str
+    observations: tuple[dict[str, Any], ...] = ()
+    raw_payload: dict[str, Any] | None = None
+    quality_reasons: tuple[str, ...] = ()
 
 
 def _processor_min_log_level() -> str:
@@ -146,6 +178,10 @@ def _ocr_preprocess_enabled() -> bool:
 def _configured_ocr_backend() -> str:
     raw = (os.environ.get("LLMLIBRARIAN_OCR_BACKEND") or "auto").strip().lower()
     return raw if raw in _VALID_OCR_BACKENDS else "auto"
+
+
+def _configured_vision_model() -> str:
+    return (os.environ.get("LLMLIBRARIAN_VISION_MODEL") or "").strip()
 
 
 def _vision_helper_source_path() -> Path:
@@ -218,6 +254,77 @@ def _alnum_ratio(s: str) -> float:
         return 0.0
     alnum = sum(1 for c in s if c.isalnum() or c in " $.,")
     return alnum / len(s)
+
+
+def _ocr_quality_assessment(text: str) -> tuple[bool, tuple[str, ...], dict[str, Any]]:
+    """Conservative OCR quality gate tuned to reject symbol-heavy gibberish."""
+    raw = (text or "").strip()
+    if not raw:
+        return False, ("empty_text",), {"length": 0}
+
+    alnum_ratio = _alnum_ratio(raw)
+    tokens = re.findall(r"[A-Za-z0-9$][A-Za-z0-9$'.,:-]*", raw)
+    alpha_tokens = [tok for tok in tokens if re.search(r"[A-Za-z]", tok)]
+    multi_char_alpha = [tok for tok in alpha_tokens if len(re.sub(r"[^A-Za-z]", "", tok)) >= 3]
+    single_char_tokens = sum(1 for tok in tokens if len(re.sub(r"[^A-Za-z0-9]", "", tok)) == 1)
+    symbol_chars = sum(1 for ch in raw if not (ch.isalnum() or ch.isspace() or ch in "$.,:;!?'-/()&"))
+    punct_ratio = symbol_chars / len(raw) if raw else 1.0
+    digit_chars = sum(1 for ch in raw if ch.isdigit())
+    stats = {
+        "length": len(raw),
+        "token_count": len(tokens),
+        "alpha_token_count": len(alpha_tokens),
+        "multi_char_alpha_count": len(multi_char_alpha),
+        "single_char_tokens": single_char_tokens,
+        "alnum_ratio": round(alnum_ratio, 4),
+        "punct_ratio": round(punct_ratio, 4),
+        "digit_ratio": round((digit_chars / len(raw)) if raw else 0.0, 4),
+    }
+
+    reasons: list[str] = []
+    if len(raw) >= 18 and alnum_ratio < 0.55:
+        reasons.append("low_alnum_ratio")
+    if len(raw) >= 25 and punct_ratio > 0.18:
+        reasons.append("high_symbol_ratio")
+    if len(tokens) >= 5 and len(multi_char_alpha) < 2 and digit_chars < 4:
+        reasons.append("missing_multi_char_words")
+    if len(tokens) >= 6 and single_char_tokens > max(3, len(tokens) // 2):
+        reasons.append("too_many_single_char_tokens")
+    if len(raw) >= 40 and len(alpha_tokens) >= 4 and len(multi_char_alpha) == 0:
+        reasons.append("alpha_tokens_too_short")
+    if len(raw) < 12 and alnum_ratio >= 0.7:
+        reasons = []
+
+    return (not reasons, tuple(reasons), stats)
+
+
+def ensure_vision_model_ready() -> str:
+    """
+    Ensure the configured Ollama vision model exists and advertises image capability.
+    Raises ImageExtractionError when image enrichment is required but unavailable.
+    """
+    model = _configured_vision_model()
+    if not model:
+        raise ImageExtractionError(
+            "LLMLIBRARIAN_VISION_MODEL is required for standalone image enrichment."
+        )
+    if _VISION_MODEL_READY.get(model):
+        return model
+    try:
+        import ollama
+
+        info = ollama.show(model)
+        capabilities = [str(v).lower() for v in (getattr(info, "capabilities", None) or [])]
+    except Exception as e:
+        raise ImageExtractionError(
+            f"LLMLIBRARIAN_VISION_MODEL={model!r} is unavailable: {e}"
+        ) from e
+    if "vision" not in capabilities:
+        raise ImageExtractionError(
+            f"LLMLIBRARIAN_VISION_MODEL={model!r} is not vision-capable."
+        )
+    _VISION_MODEL_READY[model] = True
+    return model
 
 
 def _preprocess_image_for_ocr(image_bytes: bytes) -> bytes:
@@ -419,8 +526,33 @@ def _ensure_vision_helper_binary() -> str | None:
         return None
 
 
-def _ocr_with_vision_path(image_path: str) -> str | None:
-    """Run OCR with Apple's Vision framework when available."""
+def _reconstruct_column_aware_text(observations: list[dict]) -> str:
+    """
+    Group observations by approximate row (Y-band), detect columns by X,
+    then output left-to-right within each row. Preserves spatial structure of
+    multi-column tax forms (W-2, 1099) better than naive top-to-bottom sort.
+    """
+    if not observations:
+        return ""
+    # Sort by Y descending (top of page first — Vision uses bottom-left origin)
+    obs = sorted(observations, key=lambda o: -o["y"])
+    # Group into rows: observations within 0.012 Y of each other are the same row
+    rows: list[list[dict]] = []
+    for o in obs:
+        if rows and abs(o["y"] - rows[-1][0]["y"]) < 0.012:
+            rows[-1].append(o)
+        else:
+            rows.append([o])
+    # Within each row, sort left-to-right by X
+    lines: list[str] = []
+    for row in rows:
+        row.sort(key=lambda o: o["x"])
+        lines.append("  ".join(o["text"] for o in row))
+    return "\n".join(lines)
+
+
+def _ocr_with_vision_payload_path(image_path: str) -> dict[str, Any] | None:
+    """Run OCR with Apple's Vision framework when available and return raw payload."""
     helper = _ensure_vision_helper_binary()
     if helper is None:
         return None
@@ -441,8 +573,9 @@ def _ocr_with_vision_path(image_path: str) -> str | None:
             )
             return None
         payload = json.loads((proc.stdout or "{}").strip() or "{}")
-        text = str(payload.get("text") or "").strip()
-        return text or None
+        if not isinstance(payload, dict):
+            return None
+        return payload
     except Exception as e:
         _log_processor_event(
             "WARN",
@@ -452,6 +585,138 @@ def _ocr_with_vision_path(image_path: str) -> str | None:
             image_path=image_path,
         )
         return None
+
+
+def _ocr_with_vision_path(image_path: str) -> str | None:
+    payload = _ocr_with_vision_payload_path(image_path)
+    if not payload:
+        return None
+    observations = payload.get("observations")
+    if isinstance(observations, list) and observations:
+        text = _reconstruct_column_aware_text(observations)
+    else:
+        text = str(payload.get("text") or "").strip()
+    return text or None
+
+
+def _summarize_image_with_vision_model(image_bytes: bytes, source_path: str, visible_text: str) -> tuple[str, str]:
+    """Generate a compact ingest-time summary for image retrieval."""
+    model = ensure_vision_model_ready()
+    try:
+        import ollama
+
+        visible_section = ""
+        cleaned_visible = (visible_text or "").strip()
+        if cleaned_visible:
+            preview = cleaned_visible[:1200]
+            visible_section = f"\nVisible text extracted from OCR:\n{preview}\n"
+        resp = ollama.chat(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarize this image for local retrieval in 1-2 concise sentences. "
+                        "Mention the main subject, scene, and any obvious UI/app context. "
+                        "Do not invent unreadable text or identities."
+                        f"{visible_section}"
+                    ),
+                    "images": [image_bytes],
+                }
+            ],
+            keep_alive=0,
+            options={"temperature": 0, "seed": 42},
+        )
+        text = ((resp.get("message") or {}).get("content") or "").strip()
+    except Exception as e:
+        raise ImageExtractionError(f"Vision image summary failed for {source_path}: {e}") from e
+    if not text:
+        raise ImageExtractionError(f"Vision image summary returned no content for {source_path}.")
+    return text, model
+
+
+def _merge_observation_rows(observations: list[dict[str, Any]]) -> list[ImageRegion]:
+    """Merge Vision OCR observations into small semantic text regions."""
+    if not observations:
+        return []
+    obs = [
+        {
+            "text": str(o.get("text") or "").strip(),
+            "x": float(o.get("x") or 0.0),
+            "y": float(o.get("y") or 0.0),
+            "w": float(o.get("w") or 0.0),
+            "h": float(o.get("h") or 0.0),
+        }
+        for o in observations
+        if str(o.get("text") or "").strip()
+    ]
+    if not obs:
+        return []
+    obs.sort(key=lambda o: (-o["y"], o["x"]))
+    median_h = sorted(o["h"] for o in obs)[len(obs) // 2] if obs else 0.03
+    row_threshold = max(0.012, median_h * 0.7)
+    rows: list[list[dict[str, Any]]] = []
+    for item in obs:
+        if rows and abs(item["y"] - rows[-1][0]["y"]) <= row_threshold:
+            rows[-1].append(item)
+        else:
+            rows.append([item])
+
+    row_entries: list[dict[str, Any]] = []
+    for row in rows:
+        row.sort(key=lambda o: o["x"])
+        x0 = min(o["x"] for o in row)
+        y0 = min(o["y"] for o in row)
+        x1 = max(o["x"] + o["w"] for o in row)
+        y1 = max(o["y"] + o["h"] for o in row)
+        row_entries.append(
+            {
+                "text": " ".join(o["text"] for o in row).strip(),
+                "x0": x0,
+                "y0": y0,
+                "x1": x1,
+                "y1": y1,
+                "h": y1 - y0,
+            }
+        )
+
+    blocks: list[list[dict[str, Any]]] = []
+    for row in row_entries:
+        if not blocks:
+            blocks.append([row])
+            continue
+        prev = blocks[-1][-1]
+        vertical_gap = prev["y0"] - row["y1"]
+        overlap = min(prev["x1"], row["x1"]) - max(prev["x0"], row["x0"])
+        min_width = max(0.0001, min(prev["x1"] - prev["x0"], row["x1"] - row["x0"]))
+        overlap_ratio = overlap / min_width if overlap > 0 else 0.0
+        left_shift = abs(prev["x0"] - row["x0"])
+        if vertical_gap <= max(0.03, max(prev["h"], row["h"]) * 1.6) and (overlap_ratio >= 0.18 or left_shift <= 0.08):
+            blocks[-1].append(row)
+        else:
+            blocks.append([row])
+
+    regions: list[ImageRegion] = []
+    for block in blocks:
+        text = "\n".join(r["text"] for r in block if r["text"]).strip()
+        if not text:
+            continue
+        x0 = min(r["x0"] for r in block)
+        y0 = min(r["y0"] for r in block)
+        x1 = max(r["x1"] for r in block)
+        y1 = max(r["y1"] for r in block)
+        regions.append(
+            ImageRegion(
+                text=text,
+                role="ocr_block",
+                x=round(x0, 6),
+                y=round(y0, 6),
+                w=round(max(0.0, x1 - x0), 6),
+                h=round(max(0.0, y1 - y0), 6),
+                needs_vision_enrichment=False,
+            )
+        )
+    return regions
 
 
 def _ocr_with_paddle_path(image_path: str) -> str | None:
@@ -472,6 +737,13 @@ def _ocr_with_paddle_path(image_path: str) -> str | None:
             extractor="paddleocr",
         )
         return None
+
+
+def _ocr_with_paddle_detail_path(image_path: str) -> _OCRResult | None:
+    text = _ocr_with_paddle_path(image_path)
+    if not text:
+        return None
+    return _OCRResult(text=text, backend="paddleocr")
 
 
 def _ocr_with_paddle(image_png: bytes) -> str | None:
@@ -556,6 +828,13 @@ def _ocr_with_tesseract_path(image_path: str) -> str | None:
         return None
 
 
+def _ocr_with_tesseract_detail_path(image_path: str) -> _OCRResult | None:
+    text = _ocr_with_tesseract_path(image_path)
+    if not text:
+        return None
+    return _OCRResult(text=text, backend="tesseract")
+
+
 def _ocr_with_tesseract(image_png: bytes) -> str | None:
     """Backwards-compatible byte wrapper around tesseract."""
     try:
@@ -573,7 +852,23 @@ def _ocr_with_tesseract(image_png: bytes) -> str | None:
         return None
 
 
-def _ocr_image_path(image_path: str, source_path: str, ocr_mode: str) -> tuple[str | None, str | None]:
+def _ocr_with_vision_detail_path(image_path: str) -> _OCRResult | None:
+    payload = _ocr_with_vision_payload_path(image_path)
+    if not payload:
+        return None
+    observations = payload.get("observations") if isinstance(payload.get("observations"), list) else []
+    text = _reconstruct_column_aware_text(observations) if observations else str(payload.get("text") or "").strip()
+    if not text:
+        return None
+    return _OCRResult(
+        text=text,
+        backend="vision",
+        observations=tuple(observations),
+        raw_payload=payload,
+    )
+
+
+def _ocr_image_path_detailed(image_path: str, source_path: str, ocr_mode: str) -> _OCRResult | None:
     configured = _configured_ocr_backend()
     preferred = _preferred_ocr_backends()
     for idx, backend in enumerate(preferred):
@@ -587,18 +882,39 @@ def _ocr_image_path(image_path: str, source_path: str, ocr_mode: str) -> tuple[s
                 ocr_mode=ocr_mode,
             )
             if configured != "auto":
-                return None, None
+                return None
             continue
 
-        text: str | None = None
+        candidate: _OCRResult | None = None
         if backend == "vision":
-            text = _ocr_with_vision_path(image_path)
+            candidate = _ocr_with_vision_detail_path(image_path)
         elif backend == "paddleocr":
-            text = _ocr_with_paddle_path(image_path)
+            candidate = _ocr_with_paddle_detail_path(image_path)
         elif backend == "tesseract":
-            text = _ocr_with_tesseract_path(image_path)
+            candidate = _ocr_with_tesseract_detail_path(image_path)
 
-        if text:
+        if candidate and candidate.text:
+            quality_ok, reasons, quality_stats = _ocr_quality_assessment(candidate.text)
+            if not quality_ok:
+                _log_processor_event(
+                    "INFO",
+                    "OCR text dropped by quality gate",
+                    path=source_path,
+                    backend=backend,
+                    ocr_mode=ocr_mode,
+                    reasons=list(reasons),
+                    **quality_stats,
+                )
+                candidate = None
+            else:
+                candidate = _OCRResult(
+                    text=candidate.text,
+                    backend=candidate.backend,
+                    observations=candidate.observations,
+                    raw_payload=candidate.raw_payload,
+                    quality_reasons=reasons,
+                )
+        if candidate and candidate.text:
             _log_processor_event(
                 "INFO",
                 "OCR backend selected",
@@ -606,7 +922,7 @@ def _ocr_image_path(image_path: str, source_path: str, ocr_mode: str) -> tuple[s
                 backend=backend,
                 ocr_mode=ocr_mode,
             )
-            return text, backend
+            return candidate
 
         level = "WARN" if configured != "auto" else "INFO"
         _log_processor_event(
@@ -629,8 +945,15 @@ def _ocr_image_path(image_path: str, source_path: str, ocr_mode: str) -> tuple[s
                     )
                     break
             continue
+        return None
+    return None
+
+
+def _ocr_image_path(image_path: str, source_path: str, ocr_mode: str) -> tuple[str | None, str | None]:
+    result = _ocr_image_path_detailed(image_path, source_path, ocr_mode)
+    if result is None:
         return None, None
-    return None, None
+    return result.text, result.backend
 
 
 def _ocr_image_bytes(
@@ -639,13 +962,30 @@ def _ocr_image_bytes(
     ocr_mode: str,
     preferred_suffix: str = ".png",
 ) -> tuple[str | None, str | None]:
+    result = _ocr_image_bytes_detailed(
+        image_bytes,
+        source_path,
+        ocr_mode=ocr_mode,
+        preferred_suffix=preferred_suffix,
+    )
+    if result is None:
+        return None, None
+    return result.text, result.backend
+
+
+def _ocr_image_bytes_detailed(
+    image_bytes: bytes,
+    source_path: str,
+    ocr_mode: str,
+    preferred_suffix: str = ".png",
+) -> _OCRResult | None:
     payload = _preprocess_image_for_ocr(image_bytes) if _ocr_preprocess_enabled() else image_bytes
     suffix = preferred_suffix if preferred_suffix.startswith(".") else f".{preferred_suffix}"
     try:
         with tempfile.TemporaryDirectory() as td:
             image_path = Path(td) / f"ocr-input{suffix}"
             image_path.write_bytes(payload)
-            return _ocr_image_path(str(image_path), source_path, ocr_mode)
+            return _ocr_image_path_detailed(str(image_path), source_path, ocr_mode)
     except Exception as e:
         _log_processor_event(
             "WARN",
@@ -654,20 +994,35 @@ def _ocr_image_bytes(
             error=str(e),
             ocr_mode=ocr_mode,
         )
-        return None, None
+        return None
 
 
 def _ocr_image_file(data: bytes, source_path: str, ocr_mode: str = "image_file") -> tuple[str | None, str | None]:
+    result = _ocr_image_file_detailed(data, source_path, ocr_mode=ocr_mode)
+    if result is None:
+        return None, None
+    return result.text, result.backend
+
+
+def _ocr_image_file_detailed(data: bytes, source_path: str, ocr_mode: str = "image_file") -> _OCRResult | None:
     suffix = Path(source_path).suffix.lower() or ".png"
     if _ocr_preprocess_enabled():
-        return _ocr_image_bytes(data, source_path, ocr_mode=ocr_mode, preferred_suffix=".png")
+        return _ocr_image_bytes_detailed(data, source_path, ocr_mode=ocr_mode, preferred_suffix=".png")
     if Path(source_path).exists():
-        return _ocr_image_path(source_path, source_path, ocr_mode)
-    return _ocr_image_bytes(data, source_path, ocr_mode=ocr_mode, preferred_suffix=suffix)
+        return _ocr_image_path_detailed(source_path, source_path, ocr_mode)
+    return _ocr_image_bytes_detailed(data, source_path, ocr_mode=ocr_mode, preferred_suffix=suffix)
 
 
 def _ocr_pdf_page_text(page: Any, source_path: str) -> tuple[str | None, str | None]:
     """OCR fallback for image-only PDF pages. Returns (text, backend) or (None, None)."""
+    result = _ocr_pdf_page_result(page, source_path)
+    if result is None:
+        return None, None
+    return result.text, result.backend
+
+
+def _ocr_pdf_page_result(page: Any, source_path: str) -> _OCRResult | None:
+    """OCR fallback for image-only PDF pages with quality gate metadata."""
     use_preprocess = _ocr_preprocess_enabled()
     try:
         dpi = 400 if use_preprocess else 300
@@ -680,9 +1035,9 @@ def _ocr_pdf_page_text(page: Any, source_path: str) -> tuple[str | None, str | N
             page=(getattr(page, "number", 0) + 1),
             error=str(e),
         )
-        return None, None
+        return None
 
-    return _ocr_image_bytes(image_png, source_path, ocr_mode="pdf_scan_fallback", preferred_suffix=".png")
+    return _ocr_image_bytes_detailed(image_png, source_path, ocr_mode="pdf_scan_fallback", preferred_suffix=".png")
 
 
 def _normalize_table_rows(rows: list[list[str | None]]) -> list[list[str]]:
@@ -941,16 +1296,111 @@ class PPTXProcessor:
             raise PPTXExtractionError("Failed to extract PPTX content.")
 
 
+def _build_image_summary_text(summary: str, visible_text: str) -> str:
+    lines = [f"Image summary: {(summary or '').strip()}"]
+    cleaned_visible = (visible_text or "").strip()
+    if cleaned_visible:
+        preview_lines = [line.strip() for line in cleaned_visible.splitlines() if line.strip()]
+        preview = "\n".join(preview_lines[:12]).strip()
+        if preview:
+            lines.append("Visible text:")
+            lines.append(preview[:1600])
+    return "\n".join(lines).strip()
+
+
 class ImageProcessor:
     format_label = "Image"
-    install_hint = "macOS Vision or paddleocr/tesseract"
+    install_hint = "macOS Vision or paddleocr/tesseract with LLMLIBRARIAN_VISION_MODEL"
 
-    def extract(self, data: bytes, source_path: str) -> ExtractedText | None:
+    def extract(
+        self,
+        data: bytes,
+        source_path: str,
+        *,
+        enable_multimodal: bool = True,
+    ) -> ExtractedImage | None:
         try:
-            text, backend = _ocr_image_file(data, source_path, ocr_mode="image_file")
-            if not text or not backend:
+            ocr_result = _ocr_image_file_detailed(data, source_path, ocr_mode="image_file")
+            visible_text = (ocr_result.text if ocr_result else "").strip()
+            backend = ocr_result.backend if ocr_result else None
+
+            regions: list[ImageRegion] = []
+            raw_payload: dict[str, Any] | None = None
+            if ocr_result and ocr_result.backend == "vision" and ocr_result.observations:
+                regions = _merge_observation_rows(list(ocr_result.observations))
+                raw_payload = dict(ocr_result.raw_payload or {})
+            elif visible_text:
+                regions = [
+                    ImageRegion(
+                        text=visible_text,
+                        role="ocr_block",
+                        x=0.0,
+                        y=0.0,
+                        w=1.0,
+                        h=1.0,
+                        needs_vision_enrichment=False,
+                    )
+                ]
+
+            summary_text = ""
+            vision_model = ""
+            if enable_multimodal:
+                summary_text, vision_model = _summarize_image_with_vision_model(data, source_path, visible_text)
+            elif not visible_text:
                 return None
-            return ExtractedText(text=text, meta={"ocr_backend": backend, "ocr_mode": "image_file"})
+
+            if not summary_text:
+                summary_text = visible_text or Path(source_path).name
+
+            if not regions:
+                regions = [
+                    ImageRegion(
+                        text=summary_text,
+                        role="full_frame_summary",
+                        x=0.0,
+                        y=0.0,
+                        w=1.0,
+                        h=1.0,
+                        needs_vision_enrichment=True,
+                    )
+                ]
+
+            artifact = {
+                "source_path": source_path,
+                "ocr_backend": backend,
+                "ocr_mode": "image_file",
+                "visible_text": visible_text,
+                "summary": summary_text,
+                "vision_model": vision_model or None,
+                "regions": [
+                    {
+                        "text": region.text,
+                        "role": region.role,
+                        "x": region.x,
+                        "y": region.y,
+                        "w": region.w,
+                        "h": region.h,
+                        "needs_vision_enrichment": region.needs_vision_enrichment,
+                        "meta": dict(region.meta or {}),
+                    }
+                    for region in regions
+                ],
+                "raw_vision_payload": raw_payload,
+            }
+            meta = {
+                "ocr_backend": backend,
+                "ocr_mode": "image_file",
+                "source_modality": "image",
+            }
+            if vision_model:
+                meta["vision_model"] = vision_model
+            return ExtractedImage(
+                summary=_build_image_summary_text(summary_text, visible_text),
+                visible_text=visible_text,
+                regions=tuple(regions),
+                meta=meta,
+                artifact=artifact,
+            )
         except Exception as e:
             raise ImageExtractionError(str(e)) from e
 

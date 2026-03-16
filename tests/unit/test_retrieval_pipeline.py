@@ -14,6 +14,7 @@ from query.retrieval import (
     resolve_subscope,
     rrf_merge,
     sort_by_academic_priority,
+    sort_by_image_chunk_priority,
     extract_direct_lexical_terms,
     sort_by_source_priority,
     source_extension_rank_map,
@@ -56,6 +57,20 @@ def test_diversify_by_source_handles_empty_docs():
     assert docs == []
     assert metas == []
     assert dists == []
+
+
+def test_sort_by_image_chunk_priority_prefers_summary_then_best_region():
+    docs, metas, dists = sort_by_image_chunk_priority(
+        docs=["region-2", "summary", "region-1", "other"],
+        metas=[
+            {"source": "/tmp/a.jpg", "source_modality": "image", "record_type": "image_region", "region_index": 2},
+            {"source": "/tmp/a.jpg", "source_modality": "image", "record_type": "image_summary", "region_index": 0},
+            {"source": "/tmp/a.jpg", "source_modality": "image", "record_type": "image_region", "region_index": 1},
+            {"source": "/tmp/b.txt"},
+        ],
+        dists=[0.25, 0.30, 0.10, 0.05],
+    )
+    assert docs[:3] == ["summary", "region-1", "region-2"]
 
 
 def test_diversify_by_silo_caps_per_silo_deterministically():

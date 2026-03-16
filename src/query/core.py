@@ -21,6 +21,7 @@ from constants import (
     MAX_CHUNKS_PER_FILE,
 )
 from embeddings import get_embedding_function
+from image_embeddings import get_image_embedding_adapter, image_collection_name
 from load_config import load_config, get_archetype, get_archetype_optional, get_query_options
 from state import get_silo_prompt_override, get_silo_display_name
 from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chunks
@@ -54,6 +55,7 @@ from query.retrieval import (
     rrf_merge,
     extract_direct_lexical_terms,
     sort_by_source_priority,
+    sort_by_image_chunk_priority,
     sort_by_academic_priority,
     source_extension_rank_map,
     source_priority_score,
@@ -232,6 +234,15 @@ _OWNERSHIP_PATTERN = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_IMAGE_QUERY_PATTERN = re.compile(
+    r"\b("
+    r"image|images|photo|photos|picture|pictures|"
+    r"screenshot|screenshots|screen|ui|visual|logo|icon|"
+    r"dog|cat|person|face|scene|object|objects|"
+    r"shown|showing|looks\s+like|appears\s+in"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def _is_unified_analytical_query(query: str, intent: str) -> bool:
@@ -254,6 +265,72 @@ def _combine_where_and(base_where: dict[str, Any] | None, extra: dict[str, Any])
     if "$and" in base_where and isinstance(base_where.get("$and"), list):
         return {"$and": [*list(base_where["$and"]), extra]}
     return {"$and": [base_where, extra]}
+
+
+def _query_is_image_relevant(query: str, docs: list[str], metas: list[dict | None]) -> bool:
+    if _IMAGE_QUERY_PATTERN.search(query or ""):
+        return True
+    return any(str((meta or {}).get("source_modality") or "") == "image" for meta in metas[:4]) or not docs
+
+
+def _query_image_collection(
+    *,
+    collection: Any,
+    image_collection: Any,
+    image_adapter: Any,
+    query_text: str,
+    n_results: int,
+    base_where: dict[str, Any] | None,
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    query_kw: dict[str, Any] = {
+        "query_embeddings": image_adapter.embed_texts([query_text]),
+        "n_results": n_results,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if base_where:
+        query_kw["where"] = base_where
+    try:
+        image_results = image_collection.query(**query_kw)
+    except Exception:
+        return [], [], []
+    image_metas = (image_results.get("metadatas") or [[]])[0] or []
+    image_dists = (image_results.get("distances") or [[]])[0] or []
+    out_docs: list[str] = []
+    out_metas: list[dict | None] = []
+    out_dists: list[float | None] = []
+    seen_parents: set[str] = set()
+    for idx, meta in enumerate(image_metas):
+        meta = meta if isinstance(meta, dict) else {}
+        parent_image_id = str(meta.get("parent_image_id") or "")
+        if not parent_image_id or parent_image_id in seen_parents:
+            continue
+        seen_parents.add(parent_image_id)
+        where = _combine_where_and(base_where, {"parent_image_id": parent_image_id}) if base_where else {"parent_image_id": parent_image_id}
+        try:
+            text_results = collection.query(
+                query_texts=[query_text],
+                n_results=4,
+                include=["documents", "metadatas", "distances"],
+                where=where,
+            )
+        except Exception:
+            continue
+        docs = (text_results.get("documents") or [[]])[0] or []
+        metas = (text_results.get("metadatas") or [[]])[0] or []
+        dists = (text_results.get("distances") or [[]])[0] or []
+        if not docs:
+            continue
+        docs, metas, dists = sort_by_image_chunk_priority(docs, metas, dists)
+        for j, doc in enumerate(docs[:2]):
+            out_docs.append(doc)
+            out_metas.append(metas[j] if j < len(metas) else None)
+            image_dist = image_dists[idx] if idx < len(image_dists) else None
+            text_dist = dists[j] if j < len(dists) else None
+            if image_dist is not None and text_dist is not None:
+                out_dists.append((float(image_dist) + float(text_dist)) / 2.0)
+            else:
+                out_dists.append(image_dist if image_dist is not None else text_dist)
+    return out_docs, out_metas, out_dists
 
 
 def _rank_candidate_silos(
@@ -531,6 +608,9 @@ def _confidence_assessment(
         ):
             warning = None
             reason = "relaxed_overlap"
+        elif intent == INTENT_TAX_QUERY and structured_support:
+            warning = None
+            reason = "relaxed_tax_query_structured"
         elif structured_support and (query_overlap or direct_canonical_available):
             warning = None
             reason = "relaxed_structured"
@@ -1264,12 +1344,19 @@ def run_ask(
     if intent == INTENT_EVIDENCE_PROFILE:
         system_prompt = (
             system_prompt.rstrip()
-            + "\n\nBase your answer only on direct quotes from the context. Cite each quote; do not paraphrase preferences or opinions."
+            + "\n\nGive 3–5 direct quotes with file citations. No summary paragraph."
+            + " Base your answer only on direct quotes from the context. Cite each quote; do not paraphrase preferences or opinions."
         )
     elif intent == INTENT_AGGREGATE:
         system_prompt = (
             system_prompt.rstrip()
-            + "\n\nIf the question asks for a list or total across documents, list each item and cite its source."
+            + "\n\nList items one per line with source. No prose preamble."
+            + " If the question asks for a list or total across documents, list each item and cite its source."
+        )
+    elif intent in (INTENT_TAX_QUERY,):
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nState the figure, form type, and source file. One paragraph max."
         )
     elif intent == INTENT_ACADEMIC_HISTORY:
         system_prompt = (
@@ -1293,6 +1380,16 @@ def run_ask(
             + "\n\nDirect query conflict policy: if sources conflict, prioritize canonical/official sources over draft/archive/stale notes."
             + " If canonical evidence is present, answer decisively from it."
         )
+    elif intent == INTENT_LOOKUP:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\nAnswer in 3 sentences or fewer. Cite your source file."
+        )
+    # Universal honesty footer
+    system_prompt = (
+        system_prompt.rstrip()
+        + "\n\nIf the context does not clearly support an answer, say what is and is not present — do not invent details."
+    )
     if code_activity_year_lookup and code_activity_requested_year is not None:
         system_prompt = (
             system_prompt.rstrip()
@@ -1308,6 +1405,8 @@ def run_ask(
         name=collection_name,
         embedding_function=ef,
     )
+    image_adapter = get_image_embedding_adapter()
+    image_collection = client.get_or_create_collection(name=image_collection_name(collection_name)) if image_adapter is not None else None
 
     # CODE_LANGUAGE: deterministic count by extension (code files only). No retrieval, no LLM.
     if intent == INTENT_CODE_LANGUAGE and use_unified:
@@ -1717,6 +1816,20 @@ def run_ask(
                     file=sys.stderr,
                 )
 
+    if image_collection is not None and image_adapter is not None and _query_is_image_relevant(query, docs, metas):
+        image_docs, image_metas, image_dists = _query_image_collection(
+            collection=collection,
+            image_collection=image_collection,
+            image_adapter=image_adapter,
+            query_text=query_for_retrieval,
+            n_results=max(2, min(4, n_results)),
+            base_where=query_kw.get("where") if isinstance(query_kw.get("where"), dict) else None,
+        )
+        if image_docs:
+            docs = image_docs + docs
+            metas = image_metas + metas
+            dists = image_dists + dists
+
     # EVIDENCE_PROFILE + unified + silo/subscope: hybrid search (vector + Chroma where_document, RRF merge)
     if include_ids and ids_v and len(ids_v) == len(docs):
         where_doc = None
@@ -1803,12 +1916,13 @@ def run_ask(
                 merged_docs: list[str] = []
                 merged_metas: list[dict | None] = []
                 merged_dists: list[float | None] = []
-                seen_keys: set[tuple[str, str, str, str]] = set()
+                seen_keys: set[tuple[str, str, str, str, str]] = set()
                 for doc_row, meta_row, dist_row in combined_rows:
                     source = str((meta_row or {}).get("source") or "")
                     line = str((meta_row or {}).get("line_start") or "")
                     page = str((meta_row or {}).get("page") or "")
-                    key = (doc_row or "", source, line, page)
+                    region = str((meta_row or {}).get("region_index") or "")
+                    key = (doc_row or "", source, line, page, region)
                     if key in seen_keys:
                         continue
                     seen_keys.add(key)
@@ -1898,6 +2012,9 @@ def run_ask(
             docs = [c[0] for c in combined]
             metas = [c[1] for c in combined]
             dists = [c[2] for c in combined]
+
+    if docs:
+        docs, metas, dists = sort_by_image_chunk_priority(docs, metas, dists)
 
     # Diversify by source: cap chunks per file so one huge file (e.g. Closed Traffic.txt) doesn't crowd out others
     source_cache = [((m or {}).get("source") or "") for m in metas]
@@ -2311,9 +2428,35 @@ def run_ask(
             "\n\n[RECENCY HINTS - WEAK EVIDENCE]\n"
             + "\n".join(recency_hints)
         )
+    # Inject file roster when querying a specific silo so the LLM can count/enumerate files
+    roster_block = ""
+    if silo:
+        from query.context import build_file_roster
+        manifest_path = Path(db) / "llmli_file_manifest.json"
+        roster_block = build_file_roster(silo, manifest_path)
+
+    # --- Deterministic form-count: bypass LLM for "how many [form_type]" queries ---
+    import re as _re
+    _is_form_count = (
+        silo
+        and _re.search(r"\bhow\s+many\b", query, _re.IGNORECASE)
+        and _re.search(r"\b(1099|w-?2|w2|1040|1098|form)", query, _re.IGNORECASE)
+    )
+    if _is_form_count:
+        from query.context import count_forms_from_manifest, format_form_count_answer
+        _year_m = _re.search(r"\b(20\d{2})\b", query)
+        _year = _year_m.group(1) if _year_m else None
+        _manifest_path = Path(db) / "llmli_file_manifest.json"
+        _form_result = count_forms_from_manifest(silo, _manifest_path, year=_year)
+        if _form_result:
+            _answer = format_form_count_answer(_form_result, query, source_label)
+            lines = [_answer, "", dim(no_color, "---"), label_style(no_color, f"Answered by: {source_label} (file roster)")]
+            return "\n".join(lines)
+
     user_prompt = (
         f"Using ONLY the following context, answer: {query}\n\n"
-        "[START CONTEXT]\n"
+        + (f"{roster_block}\n" if roster_block else "")
+        + "[START CONTEXT]\n"
         f"{context}{recency_section}\n"
         "[END CONTEXT]"
     )

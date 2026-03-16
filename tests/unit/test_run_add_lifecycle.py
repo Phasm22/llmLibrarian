@@ -5,6 +5,8 @@ import pytest
 
 from ingest import CloudSyncPathError, _file_manifest_path, run_add
 from file_registry import _file_registry_path
+from processors import ImageExtractionError
+from image_embeddings import ImageEmbeddingError
 
 
 class _FakeCollection:
@@ -60,6 +62,32 @@ def test_run_add_blocks_cloud_path_without_override(monkeypatch, tmp_path):
     monkeypatch.setattr("ingest.is_cloud_sync_path", lambda _path: "OneDrive")
     with pytest.raises(CloudSyncPathError):
         run_add(root, db_path=tmp_path / "db", allow_cloud=False)
+
+
+def test_run_add_hard_fails_when_vision_model_missing_for_images(monkeypatch, tmp_path):
+    root = tmp_path / "photos"
+    root.mkdir()
+    image_path = root / "dog.jpg"
+    image_path.write_bytes(b"fake-image")
+    monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [(image_path, "code")])
+    monkeypatch.setattr("ingest.ensure_vision_model_ready", lambda: (_ for _ in ()).throw(ImageExtractionError("missing model")))
+    with pytest.raises(ImageExtractionError):
+        run_add(root, db_path=tmp_path / "db", allow_cloud=True)
+
+
+def test_run_add_hard_fails_when_image_embedding_backend_missing(monkeypatch, tmp_path):
+    root = tmp_path / "photos"
+    root.mkdir()
+    image_path = root / "dog.jpg"
+    image_path.write_bytes(b"fake-image")
+    monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [(image_path, "code")])
+    monkeypatch.setattr("ingest.ensure_vision_model_ready", lambda: "llava:test")
+    monkeypatch.setattr(
+        "ingest.ensure_image_embedding_adapter_ready",
+        lambda: (_ for _ in ()).throw(ImageEmbeddingError("missing image backend")),
+    )
+    with pytest.raises(ImageEmbeddingError):
+        run_add(root, db_path=tmp_path / "db", allow_cloud=True)
 
 
 def test_run_add_writes_status_file(monkeypatch, tmp_path):
