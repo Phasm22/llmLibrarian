@@ -281,6 +281,7 @@ def _hydrate_single_image_summary_doc(
     doc: str,
     meta: dict[str, Any] | None,
     db_path: str,
+    allow_lazy: bool = True,
 ) -> tuple[str, dict[str, Any] | None]:
     meta_dict = dict(meta or {})
     if str(meta_dict.get("record_type") or "") != "image_summary":
@@ -302,7 +303,7 @@ def _hydrate_single_image_summary_doc(
             meta_dict["vision_model"] = artifact.get("vision_model")
         return _build_image_summary_text(summary_text, visible_text), meta_dict
 
-    if summary_status != "deferred":
+    if summary_status != "deferred" or not allow_lazy:
         return doc, meta
 
     source_path = str(meta_dict.get("source") or artifact.get("source_path") or "").strip()
@@ -336,18 +337,28 @@ def _hydrate_image_summary_docs(
     docs: list[str],
     metas: list[dict | None],
     db_path: str,
-) -> tuple[list[str], list[dict | None]]:
+    max_lazy: int = 1,
+) -> tuple[list[str], list[dict | None], int]:
     out_docs: list[str] = []
     out_metas: list[dict | None] = []
+    lazy_used = 0
     for idx, doc in enumerate(docs):
         hydrated_doc, hydrated_meta = _hydrate_single_image_summary_doc(
             doc=doc,
             meta=metas[idx] if idx < len(metas) else None,
             db_path=db_path,
+            allow_lazy=lazy_used < max_lazy,
         )
+        if (
+            hydrated_meta
+            and str((hydrated_meta or {}).get("record_type") or "") == "image_summary"
+            and str((hydrated_meta or {}).get("summary_status") or "") == "cached_query_time"
+            and str(((metas[idx] if idx < len(metas) else None) or {}).get("summary_status") or "") == "deferred"
+        ):
+            lazy_used += 1
         out_docs.append(hydrated_doc)
         out_metas.append(hydrated_meta)
-    return out_docs, out_metas
+    return out_docs, out_metas, lazy_used
 
 
 def _query_image_collection(
@@ -377,6 +388,7 @@ def _query_image_collection(
     out_metas: list[dict | None] = []
     out_dists: list[float | None] = []
     seen_parents: set[str] = set()
+    lazy_budget = 1
     for idx, meta in enumerate(image_metas):
         meta = meta if isinstance(meta, dict) else {}
         parent_image_id = str(meta.get("parent_image_id") or "")
@@ -398,11 +410,13 @@ def _query_image_collection(
         dists = (text_results.get("distances") or [[]])[0] or []
         if not docs:
             continue
-        docs, metas = _hydrate_image_summary_docs(
+        docs, metas, hydrated = _hydrate_image_summary_docs(
             docs=list(docs),
             metas=list(metas),
             db_path=db_path,
+            max_lazy=lazy_budget,
         )
+        lazy_budget = max(0, lazy_budget - hydrated)
         docs, metas, dists = sort_by_image_chunk_priority(docs, metas, dists)
         for j, doc in enumerate(docs[:2]):
             out_docs.append(doc)

@@ -467,6 +467,7 @@ def test_image_ocr_signal_assessment_prefers_text_heavy_images():
     assert signal["eager_summary"] is True
     assert signal["keep_visible_text"] is True
     assert signal["ocr_signal_score"] >= 0.55
+    assert signal["text_structured"] is True
 
 
 def test_image_processor_defers_natural_photo_and_suppresses_low_signal_ocr(monkeypatch):
@@ -498,6 +499,45 @@ def test_image_processor_defers_natural_photo_and_suppresses_low_signal_ocr(monk
     assert out.artifact is not None
     assert out.artifact["ocr_signal_score"] < 0.55
     assert out.artifact["visible_text"] == ""
+
+
+def test_image_ocr_signal_assessment_defers_low_coverage_vision_gibberish():
+    signal = processors._image_ocr_signal_assessment(
+        processors._OCRResult(
+            text="ros\nnOM noltsiasyagA telriasi)",
+            backend="vision",
+            observations=(
+                {"text": "ros", "x": 0.1, "y": 0.4, "w": 0.08, "h": 0.03},
+                {"text": "nOM noltsiasyagA telriasi)", "x": 0.1, "y": 0.34, "w": 0.18, "h": 0.035},
+            ),
+        )
+    )
+    assert signal["text_structured"] is False
+    assert signal["eager_summary"] is False
+    assert signal["keep_visible_text"] is True
+
+
+def test_image_processor_allows_truly_strong_ocr_only_text_to_go_eager(monkeypatch):
+    monkeypatch.setattr(
+        processors,
+        "_ocr_image_file_detailed",
+        lambda _data, _source, ocr_mode="image_file": processors._OCRResult(
+            text=(
+                "Network latency report for branch office users with packet loss summary and "
+                "application connectivity timeline from monitoring console dashboard today"
+            ),
+            backend="tesseract",
+            observations=(),
+            raw_payload=None,
+        ),
+    )
+    monkeypatch.setattr(processors, "_summarize_image_with_vision_model", lambda *_args, **_kwargs: ("A dashboard screenshot.", "llava:test"))
+
+    out = ImageProcessor().extract(b"image-bytes", "dashboard.jpg")
+    assert out is not None
+    assert out.meta is not None
+    assert out.meta["summary_status"] == "eager"
+    assert out.meta["needs_vision_enrichment"] is False
 
 
 def test_get_paddle_ocr_engine_falls_back_when_show_log_is_unsupported(monkeypatch):

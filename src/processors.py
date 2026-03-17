@@ -310,9 +310,13 @@ def _image_summary_placeholder(visible_text: str) -> str:
 def _image_ocr_signal_assessment(ocr_result: _OCRResult | None) -> dict[str, Any]:
     visible_text = (ocr_result.text if ocr_result else "").strip()
     observations = list(ocr_result.observations) if ocr_result else []
+    backend = str(ocr_result.backend or "") if ocr_result else ""
     quality_ok, reasons, stats = _ocr_quality_assessment(visible_text)
     multi_char_alpha = int(stats.get("multi_char_alpha_count") or 0)
     token_count = int(stats.get("token_count") or 0)
+    alpha_token_count = int(stats.get("alpha_token_count") or 0)
+    single_char_tokens = int(stats.get("single_char_tokens") or 0)
+    alnum_ratio = float(stats.get("alnum_ratio") or 0.0)
     text_len = len(visible_text)
     observation_count = len(observations)
     coverage = 0.0
@@ -323,6 +327,8 @@ def _image_ocr_signal_assessment(ocr_result: _OCRResult | None) -> dict[str, Any
             if isinstance(o, dict)
         )
         coverage = min(1.0, coverage)
+    single_char_ratio = (single_char_tokens / token_count) if token_count else 1.0
+    meaningful_word_ratio = (multi_char_alpha / alpha_token_count) if alpha_token_count else 0.0
 
     score = 0.0
     if quality_ok:
@@ -333,15 +339,26 @@ def _image_ocr_signal_assessment(ocr_result: _OCRResult | None) -> dict[str, Any
     score += min(0.16, coverage * 1.6)
     score = round(min(1.0, score), 4)
 
-    eager_summary = bool(
+    text_structured = bool(
         quality_ok
+        and backend == "vision"
         and (
-            score >= 0.55
-            or (multi_char_alpha >= 4 and text_len >= 40)
-            or (multi_char_alpha >= 2 and text_len >= 24)
-            or (observation_count >= 4 and coverage >= 0.03)
+            observation_count >= 3
+            or (observation_count >= 2 and coverage >= 0.018 and multi_char_alpha >= 4 and text_len >= 30)
+            or (observation_count >= 1 and coverage >= 0.06 and multi_char_alpha >= 4 and text_len >= 20)
         )
     )
+    ocr_strong = bool(
+        quality_ok
+        and observation_count == 0
+        and backend in {"tesseract", "paddleocr"}
+        and multi_char_alpha >= 8
+        and text_len >= 80
+        and single_char_ratio <= 0.15
+        and meaningful_word_ratio >= 0.7
+        and alnum_ratio >= 0.85
+    )
+    eager_summary = bool(text_structured or ocr_strong)
     keep_visible_text = bool(
         visible_text
         and quality_ok
@@ -357,8 +374,13 @@ def _image_ocr_signal_assessment(ocr_result: _OCRResult | None) -> dict[str, Any
         "quality_ok": quality_ok,
         "quality_reasons": reasons,
         "quality_stats": stats,
+        "backend": backend,
         "observation_count": observation_count,
         "coverage": round(coverage, 4),
+        "single_char_ratio": round(single_char_ratio, 4),
+        "meaningful_word_ratio": round(meaningful_word_ratio, 4),
+        "text_structured": text_structured,
+        "ocr_strong": ocr_strong,
         "eager_summary": eager_summary,
         "keep_visible_text": keep_visible_text,
     }

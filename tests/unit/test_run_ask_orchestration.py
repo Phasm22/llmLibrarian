@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from query.intent import (
     INTENT_ACADEMIC_HISTORY,
@@ -248,6 +249,103 @@ def test_query_image_collection_reuses_cached_summary_without_resummarizing(monk
 
     assert "gray cat" in docs[0].lower()
     assert metas[0]["summary_status"] == "cached_query_time"
+
+
+def test_query_image_collection_only_hydrates_top_deferred_image(monkeypatch, tmp_path):
+    image_one = tmp_path / "cat.jpg"
+    image_two = tmp_path / "dog.jpg"
+    image_one.write_bytes(b"cat")
+    image_two.write_bytes(b"dog")
+    writes = []
+
+    class _TextCollection:
+        def query(self, **kwargs):
+            parent = (kwargs.get("where") or {}).get("parent_image_id")
+            if parent == "img-1":
+                return {
+                    "documents": [["Image summary: Photo image with deferred visual summary; no reliable OCR text."]],
+                    "metadatas": [[{
+                        "source": str(image_one),
+                        "record_type": "image_summary",
+                        "source_modality": "image",
+                        "parent_image_id": "img-1",
+                        "region_index": 0,
+                        "summary_status": "deferred",
+                        "needs_vision_enrichment": True,
+                        "image_artifact_relpath": "image_artifacts/img-1.json",
+                    }]],
+                    "distances": [[0.18]],
+                    "ids": [["s1"]],
+                }
+            return {
+                "documents": [["Image summary: Photo image with deferred visual summary; no reliable OCR text."]],
+                "metadatas": [[{
+                    "source": str(image_two),
+                    "record_type": "image_summary",
+                    "source_modality": "image",
+                    "parent_image_id": "img-2",
+                    "region_index": 0,
+                    "summary_status": "deferred",
+                    "needs_vision_enrichment": True,
+                    "image_artifact_relpath": "image_artifacts/img-2.json",
+                }]],
+                "distances": [[0.22]],
+                "ids": [["s2"]],
+            }
+
+    class _ImageCollection:
+        def query(self, **_kwargs):
+            return {
+                "documents": [["Image vector 1", "Image vector 2"]],
+                "metadatas": [[
+                    {"source": str(image_one), "record_type": "image_vector", "source_modality": "image", "parent_image_id": "img-1"},
+                    {"source": str(image_two), "record_type": "image_vector", "source_modality": "image", "parent_image_id": "img-2"},
+                ]],
+                "distances": [[0.08, 0.11]],
+                "ids": [["iv1", "iv2"]],
+            }
+
+    class _Adapter:
+        def embed_texts(self, _texts):
+            return [[0.1, 0.2, 0.3]]
+
+    def _read_artifact(_db, relpath):
+        if relpath.endswith("img-1.json"):
+            return {
+                "source_path": str(image_one),
+                "visible_text": "",
+                "summary": "Photo image with deferred visual summary; no reliable OCR text.",
+                "summary_status": "deferred",
+            }
+        return {
+            "source_path": str(image_two),
+            "visible_text": "",
+            "summary": "Photo image with deferred visual summary; no reliable OCR text.",
+            "summary_status": "deferred",
+        }
+
+    monkeypatch.setattr(query_core, "_read_image_artifact", _read_artifact)
+    monkeypatch.setattr(query_core, "_update_image_artifact", lambda _db, _rel, payload: writes.append(payload) or _rel)
+    monkeypatch.setattr(
+        query_core,
+        "_summarize_image_with_vision_model",
+        lambda _bytes, source_path, _visible: (f"Summary for {Path(source_path).stem}", "llava:test"),
+    )
+
+    docs, metas, _dists = query_core._query_image_collection(
+        collection=_TextCollection(),
+        image_collection=_ImageCollection(),
+        image_adapter=_Adapter(),
+        query_text="pets",
+        n_results=2,
+        base_where=None,
+        db_path=str(tmp_path / "db"),
+    )
+
+    assert "summary for cat" in docs[0].lower()
+    assert metas[0]["summary_status"] == "cached_query_time"
+    assert any((m or {}).get("parent_image_id") == "img-2" and (m or {}).get("summary_status") == "deferred" for m in metas)
+    assert len(writes) == 1
 
 
 def test_run_ask_file_list_short_circuits_without_retrieval_or_llm(monkeypatch, mock_ollama):
