@@ -307,6 +307,13 @@ def _image_summary_placeholder(visible_text: str) -> str:
     return "Photo image with deferred visual summary; no reliable OCR text."
 
 
+def _image_summary_disabled_placeholder(visible_text: str) -> str:
+    cleaned = (visible_text or "").strip()
+    if cleaned:
+        return "Text-forward image indexed with OCR only; multimodal vision disabled."
+    return "Photo image indexed with OCR only; multimodal vision disabled."
+
+
 def _image_ocr_signal_assessment(ocr_result: _OCRResult | None) -> dict[str, Any]:
     visible_text = (ocr_result.text if ocr_result else "").strip()
     observations = list(ocr_result.observations) if ocr_result else []
@@ -1442,8 +1449,9 @@ class ImageProcessor:
                     summary_status = "eager"
                 else:
                     summary_text = _image_summary_placeholder(visible_text)
-            elif not visible_text:
-                return None
+            else:
+                summary_text = _image_summary_disabled_placeholder(visible_text)
+                summary_status = "disabled"
 
             if not summary_text:
                 summary_text = visible_text or Path(source_path).name
@@ -1457,7 +1465,7 @@ class ImageProcessor:
                         y=0.0,
                         w=1.0,
                         h=1.0,
-                        needs_vision_enrichment=(summary_status != "eager"),
+                        needs_vision_enrichment=(summary_status == "deferred"),
                     )
                 ]
 
@@ -1499,7 +1507,7 @@ class ImageProcessor:
                 "ocr_mode": "image_file",
                 "source_modality": "image",
                 "summary_status": summary_status,
-                "needs_vision_enrichment": summary_status != "eager",
+                "needs_vision_enrichment": summary_status == "deferred",
             }
             if vision_model:
                 meta["vision_model"] = vision_model

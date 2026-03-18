@@ -8,6 +8,7 @@ from chromadb.config import Settings
 import ingest
 import processors
 import query.core as query_core
+from state import update_silo
 
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "sample_images"
@@ -71,7 +72,14 @@ def _patch_multimodal(monkeypatch):
 def test_overlay_fixture_indexes_visible_text_regions(tmp_path):
     db = tmp_path / "db"
     path = FIXTURES / "2022-08-26_DD04BC2B-93B8-45CA-B106-8F57F19A2D70-overlay.png"
-    status, _ = ingest.update_single_file(path, db_path=db, silo_slug="photos", allow_cloud=True, update_counts=False)
+    status, _ = ingest.update_single_file(
+        path,
+        db_path=db,
+        silo_slug="photos",
+        allow_cloud=True,
+        update_counts=False,
+        image_vision_enabled=True,
+    )
     assert status == "updated"
 
     coll = _collection(db)
@@ -89,7 +97,14 @@ def test_overlay_fixture_indexes_visible_text_regions(tmp_path):
 def test_laptop_fixture_indexes_multiple_regions(tmp_path):
     db = tmp_path / "db"
     path = FIXTURES / "2022-10-07_D39EDAD5-DE75-4B31-8D46-20741ABB6257-main.jpg"
-    status, _ = ingest.update_single_file(path, db_path=db, silo_slug="photos", allow_cloud=True, update_counts=False)
+    status, _ = ingest.update_single_file(
+        path,
+        db_path=db,
+        silo_slug="photos",
+        allow_cloud=True,
+        update_counts=False,
+        image_vision_enabled=True,
+    )
     assert status == "updated"
 
     coll = _collection(db)
@@ -104,7 +119,14 @@ def test_laptop_fixture_indexes_multiple_regions(tmp_path):
 def test_dog_fixture_drops_gibberish_and_defers_summary(tmp_path):
     db = tmp_path / "db"
     path = FIXTURES / "2022-08-23_8C991D97-B8DD-4960-8850-BDF55B99DE2D-main.jpg"
-    status, _ = ingest.update_single_file(path, db_path=db, silo_slug="photos", allow_cloud=True, update_counts=False)
+    status, _ = ingest.update_single_file(
+        path,
+        db_path=db,
+        silo_slug="photos",
+        allow_cloud=True,
+        update_counts=False,
+        image_vision_enabled=True,
+    )
     assert status == "updated"
 
     coll = _collection(db)
@@ -120,7 +142,14 @@ def test_dog_fixture_drops_gibberish_and_defers_summary(tmp_path):
 def test_dog_fixture_populates_image_vector_collection(tmp_path):
     db = tmp_path / "db"
     path = FIXTURES / "2022-08-23_8C991D97-B8DD-4960-8850-BDF55B99DE2D-main.jpg"
-    status, _ = ingest.update_single_file(path, db_path=db, silo_slug="photos", allow_cloud=True, update_counts=False)
+    status, _ = ingest.update_single_file(
+        path,
+        db_path=db,
+        silo_slug="photos",
+        allow_cloud=True,
+        update_counts=False,
+        image_vision_enabled=True,
+    )
     assert status == "updated"
 
     coll = _image_collection(db)
@@ -136,8 +165,25 @@ def test_dog_fixture_populates_image_vector_collection(tmp_path):
 def test_dog_fixture_lazy_query_summary_is_cached(tmp_path):
     db = tmp_path / "db"
     path = FIXTURES / "2022-08-23_8C991D97-B8DD-4960-8850-BDF55B99DE2D-main.jpg"
-    status, _ = ingest.update_single_file(path, db_path=db, silo_slug="photos", allow_cloud=True, update_counts=False)
+    status, _ = ingest.update_single_file(
+        path,
+        db_path=db,
+        silo_slug="photos",
+        allow_cloud=True,
+        update_counts=False,
+        image_vision_enabled=True,
+    )
     assert status == "updated"
+    update_silo(
+        db,
+        "photos",
+        str(path.parent.resolve()),
+        1,
+        1,
+        "2026-03-17T00:00:00+00:00",
+        display_name="Photos",
+        image_vision_enabled=True,
+    )
 
     class _Adapter:
         def embed_texts(self, texts):

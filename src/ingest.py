@@ -115,7 +115,7 @@ def get_capabilities_text() -> str:
         chain = " -> ".join(ocr_backends)
         lines.append(f"  PDF OCR fallback: yes ({chain})")
         lines.append(f"  Image OCR: yes ({chain})")
-        lines.append("  Image summaries: requires LLMLIBRARIAN_VISION_MODEL (vision-capable Ollama model)")
+        lines.append("  Image summaries: opt-in via --image-vision; requires LLMLIBRARIAN_VISION_MODEL when enabled")
         backend = image_embedding_backend_name()
         if backend:
             lines.append(f"  Image embeddings: yes ({backend} -> {LLMLI_IMAGE_COLLECTION})")
@@ -442,6 +442,38 @@ def get_text_from_image_bytes(
         _log_event("ERROR", "Image extraction failed", error=str(e), path=source_path)
         return None
     return result if isinstance(result, ExtractedImage) else None
+
+
+def _resolve_image_vision_enabled(
+    *,
+    db_path: str | Path,
+    silo_slug: str | None,
+    requested: bool | None,
+) -> bool:
+    if requested is not None:
+        return bool(requested)
+    if silo_slug:
+        try:
+            from state import get_silo_image_vision_enabled
+
+            persisted = get_silo_image_vision_enabled(db_path, silo_slug)
+            if persisted is not None:
+                return persisted
+        except Exception:
+            pass
+    return False
+
+
+def _resolve_worker_override(value: int | None, env_name: str, fallback: int, *, cap: int = 32) -> int:
+    resolved = fallback
+    if value is not None:
+        resolved = value
+    else:
+        try:
+            resolved = int(os.environ.get(env_name, resolved))
+        except (TypeError, ValueError):
+            resolved = fallback
+    return max(1, min(int(resolved), cap))
 
 
 def _chunk_metadata_only(
@@ -1244,6 +1276,7 @@ def process_one_file(
     follow_symlinks: bool = False,
     path_resolved: Path | None = None,
     db_path: str | Path | None = None,
+    image_vision_enabled: bool = True,
 ) -> list[ChunkTuple]:
     """
     Read file and return list of (id, doc, meta). Runs in worker thread.
@@ -1268,7 +1301,7 @@ def process_one_file(
     processor = PROCESSORS.get(suffix, DEFAULT_PROCESSOR)
     try:
         if isinstance(processor, ImageProcessor):
-            result = processor.extract(data, path_str, enable_multimodal=True)
+            result = processor.extract(data, path_str, enable_multimodal=image_vision_enabled)
         else:
             result = processor.extract(data, path_str)
     except DocumentExtractionError as e:
@@ -1940,6 +1973,9 @@ def run_add(
     incremental: bool = True,
     forced_silo_slug: str | None = None,
     display_name_override: str | None = None,
+    image_vision_enabled: bool | None = None,
+    workers: int | None = None,
+    embedding_workers: int | None = None,
 ) -> tuple[int, int]:
     """
     Index a single folder into the unified collection (llmli). Silo name = basename(path) unless forced.
@@ -1949,7 +1985,7 @@ def run_add(
     If interrupted (e.g. Ctrl+C): Chroma may have 0 or partial chunks for this silo;
     the registry is only updated on success. Re-run add for the same path to get a consistent state.
     """
-    from state import update_silo, set_last_failures, slugify, resolve_silo_by_path
+    from state import update_silo, set_last_failures, slugify, resolve_silo_by_path, get_silo_image_vision_enabled
 
     db_path = db_path or DB_PATH
     path = Path(path)
@@ -1968,6 +2004,11 @@ def run_add(
     else:
         existing_slug = resolve_silo_by_path(db_path, path)
         silo_slug = existing_slug if existing_slug else slugify(display_name, str(path))
+    effective_image_vision_enabled = _resolve_image_vision_enabled(
+        db_path=db_path,
+        silo_slug=silo_slug,
+        requested=image_vision_enabled,
+    )
     limits_cfg = {}
     try:
         config = load_config()
@@ -1992,22 +2033,22 @@ def run_add(
         stats=collect_stats,
     )
     if _requires_standalone_image_enrichment(file_list):
-        ensure_vision_model_ready()
+        if effective_image_vision_enabled:
+            ensure_vision_model_ready()
         ensure_image_embedding_adapter_ready()
     regular = [(p, k) for p, k in file_list if k != "zip"]
     zips = [p for p, k in file_list if k == "zip"]
 
-    workers = max(1, min(MAX_WORKERS, (os.cpu_count() or 8)))
-    try:
-        workers = int(os.environ.get("LLMLIBRARIAN_MAX_WORKERS", workers))
-    except (TypeError, ValueError):
-        pass
-    workers = max(1, min(workers, 32))
-    try:
-        embedding_workers = int(os.environ.get("LLMLIBRARIAN_EMBEDDING_WORKERS", "8"))
-    except (TypeError, ValueError):
-        embedding_workers = 1
-    embedding_workers = max(1, min(embedding_workers, 32))
+    workers = _resolve_worker_override(
+        workers,
+        "LLMLIBRARIAN_MAX_WORKERS",
+        max(1, min(MAX_WORKERS, (os.cpu_count() or 8))),
+    )
+    embedding_workers = _resolve_worker_override(
+        embedding_workers,
+        "LLMLIBRARIAN_EMBEDDING_WORKERS",
+        8,
+    )
     if not quiet:
         print(dim(no_color, _format_preflight_summary(file_list, collect_stats)))
         print(dim(no_color, f"  Workers: file={workers}, embedding={embedding_workers}"))
@@ -2071,7 +2112,12 @@ def run_add(
                     (str(e.get("silo") or "") for e in existing_entries if str(e.get("silo") or "") != silo_slug),
                     "",
                 )
-                if clone_from:
+                can_clone = bool(clone_from)
+                if can_clone and k == "image":
+                    source_mode = get_silo_image_vision_enabled(db_path, clone_from) if clone_from else None
+                    target_mode = effective_image_vision_enabled
+                    can_clone = source_mode is not None and target_mode is not None and source_mode == target_mode
+                if can_clone and clone_from:
                     cloned = _clone_chunks_from_existing_silo(
                         collection=collection,
                         from_silo=clone_from,
@@ -2168,7 +2214,16 @@ def run_add(
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_item = {
-            executor.submit(process_one_file, p, k, h, follow_symlinks, p_res, db_path): (p, k, h)
+            executor.submit(
+                process_one_file,
+                p,
+                k,
+                h,
+                follow_symlinks,
+                p_res,
+                db_path,
+                effective_image_vision_enabled,
+            ): (p, k, h)
             for p, k, h, p_res in regular_with_hash
         }
         for future in as_completed(future_to_item):
@@ -2331,7 +2386,7 @@ def run_add(
             all_chunks,
             batch_size=batch_size,
             no_color=no_color,
-
+            embedding_fn=ef,
             embedding_workers=embedding_workers,
         )
     if all_image_vectors:
@@ -2395,7 +2450,17 @@ def run_add(
                 total_files = len(manifest_files)
         except Exception:
             pass
-    update_silo(db_path, silo_slug, str(path), total_files, chunks_count, now_iso, display_name=display_name, language_stats=language_stats)
+    update_silo(
+        db_path,
+        silo_slug,
+        str(path),
+        total_files,
+        chunks_count,
+        now_iso,
+        display_name=display_name,
+        language_stats=language_stats,
+        image_vision_enabled=effective_image_vision_enabled,
+    )
     set_last_failures(db_path, failures)
 
     # Summary: trust + usability (per-file FAIL still printed above)
@@ -2419,6 +2484,7 @@ def run_add(
                 "failures": len(failures),
                 "chunks_count": chunks_count,
                 "updated": now_iso,
+                "image_vision_enabled": effective_image_vision_enabled,
             }
             with open(status_path, "w", encoding="utf-8") as f:
                 json.dump(status, f)
@@ -2559,6 +2625,8 @@ def update_single_file(
     follow_symlinks: bool = False,
     no_color: bool = False,
     update_counts: bool = True,
+    image_vision_enabled: bool | None = None,
+    embedding_workers: int | None = None,
 ) -> tuple[str, str]:
     """
     Index or update a single file within a silo. Returns (status, path).
@@ -2583,10 +2651,16 @@ def update_single_file(
         cloud_kind = is_cloud_sync_path(p)
         if cloud_kind:
             return ("skipped", path_str)
+    effective_image_vision_enabled = _resolve_image_vision_enabled(
+        db_path=db_path,
+        silo_slug=silo_slug,
+        requested=image_vision_enabled,
+    )
     if not should_index(path_str, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE):
         return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
     if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}:
-        ensure_vision_model_ready()
+        if effective_image_vision_enabled:
+            ensure_vision_model_ready()
         ensure_image_embedding_adapter_ready()
 
     max_file_bytes, _max_depth, max_archive_bytes, max_files_per_zip, max_extracted_per_zip = _load_limits_config()
@@ -2661,7 +2735,13 @@ def update_single_file(
             (str(e.get("silo") or "") for e in existing if str(e.get("silo") or "") != silo_slug),
             "",
         )
-        if clone_from and file_hash:
+        can_clone = bool(clone_from and file_hash)
+        if can_clone and kind == "image":
+            from state import get_silo_image_vision_enabled
+
+            source_mode = get_silo_image_vision_enabled(db_path, clone_from) if clone_from else None
+            can_clone = source_mode is not None and source_mode == effective_image_vision_enabled
+        if can_clone and clone_from and file_hash:
             chunks = _clone_chunks_from_existing_silo(
                 collection=collection,
                 from_silo=clone_from,
@@ -2676,7 +2756,15 @@ def update_single_file(
             )
         if not chunks:
             try:
-                chunks = process_one_file(p, kind, file_hash or None, follow_symlinks, p, db_path=db_path)
+                chunks = process_one_file(
+                    p,
+                    kind,
+                    file_hash or None,
+                    follow_symlinks,
+                    p,
+                    db_path=db_path,
+                    image_vision_enabled=effective_image_vision_enabled,
+                )
             except Exception:
                 chunks = []
 
@@ -2691,12 +2779,11 @@ def update_single_file(
         except (TypeError, ValueError):
             pass
         batch_size = max(1, min(batch_size, 2000))
-        embedding_workers = 1
-        try:
-            embedding_workers = int(os.environ.get("LLMLIBRARIAN_EMBEDDING_WORKERS", "1"))
-        except (TypeError, ValueError):
-            embedding_workers = 1
-        embedding_workers = max(1, min(embedding_workers, 32))
+        embedding_workers = _resolve_worker_override(
+            embedding_workers,
+            "LLMLIBRARIAN_EMBEDDING_WORKERS",
+            1,
+        )
         _batch_add(
             collection,
             chunks,

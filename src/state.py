@@ -62,6 +62,7 @@ def update_silo(
     updated_iso: str,
     display_name: str | None = None,
     language_stats: dict | None = None,
+    image_vision_enabled: bool | None = None,
 ) -> None:
     """Record silo after add. Preserves unknown keys (e.g. prompt overrides)."""
     reg = _read_registry(db_path)
@@ -79,6 +80,8 @@ def update_silo(
     )
     if language_stats is not None:
         entry["language_stats"] = language_stats
+    if image_vision_enabled is not None:
+        entry["image_vision_enabled"] = bool(image_vision_enabled)
     reg[slug] = entry
     _write_registry(db_path, reg)
 
@@ -116,6 +119,18 @@ def get_silo_display_name(db_path: str | Path, slug: str) -> str | None:
         return None
     value = entry.get("display_name")
     return value if isinstance(value, str) else None
+
+
+def get_silo_image_vision_enabled(db_path: str | Path, slug: str) -> bool | None:
+    """Get persisted image-vision setting for a silo, if present."""
+    reg = _read_registry(db_path)
+    entry = reg.get(slug)
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("image_vision_enabled")
+    if isinstance(value, bool):
+        return value
+    return None
 
 def list_silos(db_path: str | Path) -> list[dict[str, Any]]:
     """Return list of silo dicts (slug, display_name, path, files_indexed, chunks_count, updated)."""

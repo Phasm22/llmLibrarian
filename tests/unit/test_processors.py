@@ -540,6 +540,33 @@ def test_image_processor_allows_truly_strong_ocr_only_text_to_go_eager(monkeypat
     assert out.meta["needs_vision_enrichment"] is False
 
 
+def test_image_processor_disabled_mode_emits_ocr_only_summary(monkeypatch):
+    monkeypatch.setattr(
+        processors,
+        "_ocr_image_file_detailed",
+        lambda _data, _source, ocr_mode="image_file": processors._OCRResult(
+            text="Gross Pay $4,626.76",
+            backend="vision",
+            observations=(
+                {"text": "Gross Pay $4,626.76", "x": 0.1, "y": 0.2, "w": 0.4, "h": 0.08},
+            ),
+            raw_payload={"text": "Gross Pay $4,626.76", "observations": [{"text": "Gross Pay $4,626.76", "x": 0.1, "y": 0.2, "w": 0.4, "h": 0.08}]},
+        ),
+    )
+    monkeypatch.setattr(
+        processors,
+        "_summarize_image_with_vision_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("disabled mode should never call multimodal vision")),
+    )
+
+    out = ImageProcessor().extract(b"image-bytes", "receipt.jpg", enable_multimodal=False)
+    assert out is not None
+    assert "ocr only" in out.summary.lower()
+    assert out.meta["summary_status"] == "disabled"
+    assert out.meta["needs_vision_enrichment"] is False
+    assert out.regions[0].needs_vision_enrichment is False
+
+
 def test_get_paddle_ocr_engine_falls_back_when_show_log_is_unsupported(monkeypatch):
     calls: list[dict] = []
 

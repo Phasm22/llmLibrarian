@@ -112,6 +112,9 @@ def cmd_add(args: argparse.Namespace) -> int:
             incremental=not getattr(args, "full", False),
             forced_silo_slug=getattr(args, "silo", None),
             display_name_override=getattr(args, "display_name", None),
+            image_vision_enabled=getattr(args, "image_vision", None),
+            workers=getattr(args, "workers", None),
+            embedding_workers=getattr(args, "embedding_workers", None),
         )
         return 0
     except CloudSyncPathError as e:
@@ -395,6 +398,9 @@ def main() -> int:
     p_add.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive (ingestion may be unreliable)")
     p_add.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks inside the target folder")
     p_add.add_argument("--full", action="store_true", help="Full reindex (delete + add) instead of incremental")
+    p_add.add_argument("--image-vision", action="store_true", default=None, help="Enable multimodal image summaries for this silo (default: off unless previously enabled)")
+    p_add.add_argument("--workers", type=int, help="Override file/extraction worker count for this run")
+    p_add.add_argument("--embedding-workers", type=int, help="Override embedding worker count for this run")
     p_add.add_argument("--silo", dest="silo", help=argparse.SUPPRESS)
     p_add.add_argument("--display-name", dest="display_name", help=argparse.SUPPRESS)
     p_add.set_defaults(db=None)

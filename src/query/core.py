@@ -141,6 +141,11 @@ except ImportError:
     _read_image_artifact = None  # type: ignore[misc, assignment]
     _update_image_artifact = None  # type: ignore[misc, assignment]
 
+try:
+    from state import get_silo_image_vision_enabled
+except ImportError:
+    get_silo_image_vision_enabled = None  # type: ignore[misc, assignment]
+
 
 class QueryPolicyError(Exception):
     """User-facing deterministic query policy error with exit code."""
@@ -276,6 +281,18 @@ def _query_is_image_relevant(query: str, docs: list[str], metas: list[dict | Non
     return any(str((meta or {}).get("source_modality") or "") == "image" for meta in metas[:4]) or not docs
 
 
+def _meta_allows_image_vision(db_path: str, meta: dict[str, Any] | None) -> bool:
+    if get_silo_image_vision_enabled is None:
+        return False
+    slug = str((meta or {}).get("silo") or "").strip()
+    if not slug:
+        return False
+    try:
+        return bool(get_silo_image_vision_enabled(db_path, slug))
+    except Exception:
+        return False
+
+
 def _hydrate_single_image_summary_doc(
     *,
     doc: str,
@@ -292,6 +309,11 @@ def _hydrate_single_image_summary_doc(
     artifact = _read_image_artifact(db_path, relpath)
     if not artifact:
         return doc, meta
+
+    if not _meta_allows_image_vision(db_path, meta_dict):
+        meta_dict["summary_status"] = "disabled"
+        meta_dict["needs_vision_enrichment"] = False
+        return doc, meta_dict
 
     summary_status = str(artifact.get("summary_status") or meta_dict.get("summary_status") or "").strip().lower()
     visible_text = str(artifact.get("visible_text") or "")

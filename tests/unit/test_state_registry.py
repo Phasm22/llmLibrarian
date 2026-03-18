@@ -3,6 +3,7 @@ import json
 from ingest import _file_manifest_path
 from state import (
     get_silo_display_name,
+    get_silo_image_vision_enabled,
     get_last_failures,
     get_silo_prompt_override,
     list_silos,
@@ -176,3 +177,26 @@ def test_get_silo_display_name(tmp_path):
     db.mkdir()
     update_silo(db, "health-aaaaaaaa", "/tmp/health", 1, 1, "2026-02-09T00:00:00+00:00", display_name="Health")
     assert get_silo_display_name(db, "health-aaaaaaaa") == "Health"
+
+
+def test_update_silo_persists_image_vision_enabled(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    update_silo(
+        db,
+        "photos-aaaaaaaa",
+        "/tmp/photos",
+        2,
+        8,
+        "2026-02-09T00:00:00+00:00",
+        display_name="Photos",
+        image_vision_enabled=True,
+    )
+    assert get_silo_image_vision_enabled(db, "photos-aaaaaaaa") is True
+
+
+def test_get_silo_image_vision_enabled_missing_returns_none(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    update_silo(db, "docs-aaaaaaaa", "/tmp/docs", 1, 1, "2026-02-09T00:00:00+00:00", display_name="Docs")
+    assert get_silo_image_vision_enabled(db, "docs-aaaaaaaa") is None

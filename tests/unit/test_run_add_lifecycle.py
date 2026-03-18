@@ -64,7 +64,34 @@ def test_run_add_blocks_cloud_path_without_override(monkeypatch, tmp_path):
         run_add(root, db_path=tmp_path / "db", allow_cloud=False)
 
 
-def test_run_add_hard_fails_when_vision_model_missing_for_images(monkeypatch, tmp_path):
+def test_run_add_images_default_to_ocr_only_without_vision_model(monkeypatch, tmp_path):
+    root = tmp_path / "photos"
+    root.mkdir()
+    image_path = root / "dog.jpg"
+    image_path.write_bytes(b"fake-image")
+    monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [(image_path, "code")])
+    called = {"image_embeddings": 0, "vision_model": 0}
+
+    def _fake_embeddings():
+        called["image_embeddings"] += 1
+        return object()
+
+    def _fake_vision_model():
+        called["vision_model"] += 1
+        raise AssertionError("vision model should stay off by default")
+
+    monkeypatch.setattr("ingest.ensure_vision_model_ready", _fake_vision_model)
+    monkeypatch.setattr("ingest.ensure_image_embedding_adapter_ready", _fake_embeddings)
+    monkeypatch.setattr("ingest.process_one_file", lambda *a, **k: [])
+
+    files_indexed, failures = run_add(root, db_path=tmp_path / "db", allow_cloud=True)
+    assert files_indexed == 0
+    assert failures == 0
+    assert called["image_embeddings"] == 1
+    assert called["vision_model"] == 0
+
+
+def test_run_add_hard_fails_when_vision_model_missing_for_images_if_enabled(monkeypatch, tmp_path):
     root = tmp_path / "photos"
     root.mkdir()
     image_path = root / "dog.jpg"
@@ -72,7 +99,7 @@ def test_run_add_hard_fails_when_vision_model_missing_for_images(monkeypatch, tm
     monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [(image_path, "code")])
     monkeypatch.setattr("ingest.ensure_vision_model_ready", lambda: (_ for _ in ()).throw(ImageExtractionError("missing model")))
     with pytest.raises(ImageExtractionError):
-        run_add(root, db_path=tmp_path / "db", allow_cloud=True)
+        run_add(root, db_path=tmp_path / "db", allow_cloud=True, image_vision_enabled=True)
 
 
 def test_run_add_hard_fails_when_image_embedding_backend_missing(monkeypatch, tmp_path):
@@ -88,6 +115,22 @@ def test_run_add_hard_fails_when_image_embedding_backend_missing(monkeypatch, tm
     )
     with pytest.raises(ImageEmbeddingError):
         run_add(root, db_path=tmp_path / "db", allow_cloud=True)
+
+
+def test_run_add_persists_image_vision_enabled(monkeypatch, tmp_path):
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "a.txt").write_text("hello world", encoding="utf-8")
+    coll = _FakeCollection()
+    _patch_runtime(monkeypatch, coll)
+
+    run_add(root, db_path=tmp_path / "db", allow_cloud=True, image_vision_enabled=True)
+
+    from state import get_silo_image_vision_enabled, resolve_silo_by_path
+
+    slug = resolve_silo_by_path(tmp_path / "db", root)
+    assert slug is not None
+    assert get_silo_image_vision_enabled(tmp_path / "db", slug) is True
 
 
 def test_run_add_writes_status_file(monkeypatch, tmp_path):
@@ -245,6 +288,31 @@ def test_run_add_prints_effective_worker_settings(monkeypatch, tmp_path, capsys)
     assert files_indexed >= 1
     assert failures == 0
     assert "Workers: file=3, embedding=5" in captured.out
+
+
+def test_run_add_cli_worker_overrides_beat_env(monkeypatch, tmp_path, capsys):
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "a.txt").write_text("hello world", encoding="utf-8")
+    coll = _FakeCollection()
+    _patch_runtime(monkeypatch, coll)
+    monkeypatch.setenv("LLMLIBRARIAN_MAX_WORKERS", "3")
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_WORKERS", "5")
+    monkeypatch.delenv("LLMLIBRARIAN_QUIET", raising=False)
+
+    files_indexed, failures = run_add(
+        root,
+        db_path=tmp_path / "db",
+        allow_cloud=True,
+        no_color=True,
+        workers=7,
+        embedding_workers=2,
+    )
+    captured = capsys.readouterr()
+
+    assert files_indexed >= 1
+    assert failures == 0
+    assert "Workers: file=7, embedding=2" in captured.out
 
 
 def test_run_add_prints_image_preflight_and_progress(monkeypatch, tmp_path, capsys):

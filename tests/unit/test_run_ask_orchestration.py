@@ -123,6 +123,7 @@ def test_query_image_collection_lazy_caches_deferred_summary(monkeypatch, tmp_pa
                     "record_type": "image_summary",
                     "source_modality": "image",
                     "parent_image_id": "img-1",
+                    "silo": "photos",
                     "region_index": 0,
                     "summary_status": "deferred",
                     "needs_vision_enrichment": True,
@@ -166,6 +167,7 @@ def test_query_image_collection_lazy_caches_deferred_summary(monkeypatch, tmp_pa
         "_summarize_image_with_vision_model",
         lambda _bytes, _source, _visible: ("An orange tabby cat lying on a bed.", "llava:test"),
     )
+    monkeypatch.setattr(query_core, "get_silo_image_vision_enabled", lambda _db, _slug: True)
 
     docs, metas, dists = query_core._query_image_collection(
         collection=_TextCollection(),
@@ -198,6 +200,7 @@ def test_query_image_collection_reuses_cached_summary_without_resummarizing(monk
                     "record_type": "image_summary",
                     "source_modality": "image",
                     "parent_image_id": "img-1",
+                    "silo": "photos",
                     "region_index": 0,
                     "summary_status": "deferred",
                     "needs_vision_enrichment": True,
@@ -236,6 +239,7 @@ def test_query_image_collection_reuses_cached_summary_without_resummarizing(monk
         "_summarize_image_with_vision_model",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cached summaries should not re-run vision")),
     )
+    monkeypatch.setattr(query_core, "get_silo_image_vision_enabled", lambda _db, _slug: True)
 
     docs, metas, _dists = query_core._query_image_collection(
         collection=_TextCollection(),
@@ -269,6 +273,7 @@ def test_query_image_collection_only_hydrates_top_deferred_image(monkeypatch, tm
                         "record_type": "image_summary",
                         "source_modality": "image",
                         "parent_image_id": "img-1",
+                        "silo": "photos",
                         "region_index": 0,
                         "summary_status": "deferred",
                         "needs_vision_enrichment": True,
@@ -284,6 +289,7 @@ def test_query_image_collection_only_hydrates_top_deferred_image(monkeypatch, tm
                     "record_type": "image_summary",
                     "source_modality": "image",
                     "parent_image_id": "img-2",
+                    "silo": "photos",
                     "region_index": 0,
                     "summary_status": "deferred",
                     "needs_vision_enrichment": True,
@@ -331,6 +337,7 @@ def test_query_image_collection_only_hydrates_top_deferred_image(monkeypatch, tm
         "_summarize_image_with_vision_model",
         lambda _bytes, source_path, _visible: (f"Summary for {Path(source_path).stem}", "llava:test"),
     )
+    monkeypatch.setattr(query_core, "get_silo_image_vision_enabled", lambda _db, _slug: True)
 
     docs, metas, _dists = query_core._query_image_collection(
         collection=_TextCollection(),
@@ -346,6 +353,73 @@ def test_query_image_collection_only_hydrates_top_deferred_image(monkeypatch, tm
     assert metas[0]["summary_status"] == "cached_query_time"
     assert any((m or {}).get("parent_image_id") == "img-2" and (m or {}).get("summary_status") == "deferred" for m in metas)
     assert len(writes) == 1
+
+
+def test_query_image_collection_skips_lazy_hydration_when_silo_vision_disabled(monkeypatch, tmp_path):
+    image_path = tmp_path / "cat.jpg"
+    image_path.write_bytes(b"fake-image")
+
+    class _TextCollection:
+        def query(self, **kwargs):
+            return {
+                "documents": [["Image summary: Photo image with deferred visual summary; no reliable OCR text."]],
+                "metadatas": [[{
+                    "source": str(image_path),
+                    "record_type": "image_summary",
+                    "source_modality": "image",
+                    "parent_image_id": "img-1",
+                    "silo": "photos",
+                    "summary_status": "deferred",
+                    "needs_vision_enrichment": True,
+                    "image_artifact_relpath": "image_artifacts/img-1.json",
+                }]],
+                "distances": [[0.18]],
+                "ids": [["s1"]],
+            }
+
+    class _ImageCollection:
+        def query(self, **_kwargs):
+            return {
+                "documents": [["Image vector"]],
+                "metadatas": [[{"source": str(image_path), "record_type": "image_vector", "source_modality": "image", "parent_image_id": "img-1"}]],
+                "distances": [[0.08]],
+                "ids": [["iv1"]],
+            }
+
+    class _Adapter:
+        def embed_texts(self, _texts):
+            return [[0.1, 0.2, 0.3]]
+
+    monkeypatch.setattr(
+        query_core,
+        "_read_image_artifact",
+        lambda _db, _rel: {
+            "source_path": str(image_path),
+            "visible_text": "",
+            "summary": "Photo image with deferred visual summary; no reliable OCR text.",
+            "summary_status": "deferred",
+        },
+    )
+    monkeypatch.setattr(query_core, "get_silo_image_vision_enabled", lambda _db, _slug: False)
+    monkeypatch.setattr(
+        query_core,
+        "_summarize_image_with_vision_model",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("disabled silos should not hydrate with multimodal vision")),
+    )
+
+    docs, metas, _dists = query_core._query_image_collection(
+        collection=_TextCollection(),
+        image_collection=_ImageCollection(),
+        image_adapter=_Adapter(),
+        query_text="what color is my cat",
+        n_results=2,
+        base_where=None,
+        db_path=str(tmp_path / "db"),
+    )
+
+    assert "deferred visual summary" in docs[0].lower()
+    assert metas[0]["summary_status"] == "disabled"
+    assert metas[0]["needs_vision_enrichment"] is False
 
 
 def test_run_ask_file_list_short_circuits_without_retrieval_or_llm(monkeypatch, mock_ollama):

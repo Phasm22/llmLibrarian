@@ -1409,6 +1409,9 @@ def _pull_path_mode(
     full: bool = False,
     prompt: str | None = None,
     clear_prompt: bool = False,
+    image_vision: bool | None = None,
+    workers: int | None = None,
+    embedding_workers: int | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> int:
     path = Path(path_input).resolve()
@@ -1422,6 +1425,12 @@ def _pull_path_mode(
         llmli_args.append("--allow-cloud")
     if follow_symlinks:
         llmli_args.append("--follow-symlinks")
+    if image_vision:
+        llmli_args.append("--image-vision")
+    if workers is not None:
+        llmli_args.extend(["--workers", str(workers)])
+    if embedding_workers is not None:
+        llmli_args.extend(["--embedding-workers", str(embedding_workers)])
     llmli_args.append(str(path))
     suppress_env = {
         "LLMLIBRARIAN_INGEST_LOG_LEVEL": "FATAL",
@@ -1446,6 +1455,9 @@ def _pull_watch_path_mode(
     follow_symlinks: bool,
     prompt: str | None = None,
     clear_prompt: bool = False,
+    image_vision: bool | None = None,
+    workers: int | None = None,
+    embedding_workers: int | None = None,
 ) -> int:
     if Observer is None:
         print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
@@ -1466,6 +1478,9 @@ def _pull_watch_path_mode(
             full=False,
             prompt=prompt,
             clear_prompt=clear_prompt,
+            image_vision=image_vision,
+            workers=workers,
+            embedding_workers=embedding_workers,
             extra_env=watch_env,
         )
         if rc != 0:
@@ -1593,6 +1608,9 @@ def pull_all_sources(
     full: bool = False,
     allow_cloud: bool = False,
     follow_symlinks: bool = False,
+    image_vision: bool | None = None,
+    workers: int | None = None,
+    embedding_workers: int | None = None,
 ) -> int:
     """Pull all registered sources. Returns exit code."""
     reg = _read_registry()
@@ -1620,6 +1638,12 @@ def pull_all_sources(
             llmli_args.append("--allow-cloud")
         if follow_symlinks:
             llmli_args.append("--follow-symlinks")
+        if image_vision:
+            llmli_args.append("--image-vision")
+        if workers is not None:
+            llmli_args.extend(["--workers", str(workers)])
+        if embedding_workers is not None:
+            llmli_args.extend(["--embedding-workers", str(embedding_workers)])
         llmli_args.append(path)
 
         status_file = tempfile.NamedTemporaryFile(prefix="llmli_status_", delete=False)
@@ -1692,18 +1716,22 @@ def pull_command(
     prompt: str | None = typer.Option(None, "--prompt", help="Custom system prompt override for this silo."),
     clear_prompt: bool = typer.Option(False, "--clear-prompt", help="Clear custom prompt override for this silo."),
     allow_cloud: bool = typer.Option(False, "--allow-cloud", help="Allow cloud-synced folders."),
+    image_vision: bool = typer.Option(False, "--image-vision", help="Enable multimodal image summaries for this silo (default: off unless previously enabled)."),
+    workers: int | None = typer.Option(None, "--workers", help="Override file/extraction worker count for this run."),
+    embedding_workers: int | None = typer.Option(None, "--embedding-workers", help="Override embedding worker count for this run."),
     interval: float = typer.Option(10.0, "--interval", help="Reconcile interval (watch mode).", hidden=True),
     debounce: float = typer.Option(1.0, "--debounce", help="Debounce delay (watch mode).", hidden=True),
     follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks.", hidden=True),
 ) -> None:
+    image_vision_requested: bool | None = True if image_vision else None
     mode_count = int(bool(watch)) + int(bool(status)) + int(bool(stop))
     if mode_count > 1:
         print("Use only one operation mode: --watch, --status, or --stop.", file=sys.stderr)
         raise typer.Exit(code=2)
 
     if status:
-        if prompt is not None or clear_prompt or full or watch or stop is not None:
-            print("--status cannot be combined with --watch/--stop/--full/--prompt/--clear-prompt.", file=sys.stderr)
+        if prompt is not None or clear_prompt or full or watch or stop is not None or image_vision_requested is not None or workers is not None or embedding_workers is not None:
+            print("--status cannot be combined with --watch/--stop/--full/--prompt/--clear-prompt/--image-vision/--workers.", file=sys.stderr)
             raise typer.Exit(code=2)
         _exit(_pull_watch_status_mode(path, json_output=json_output, prune_stale=prune_stale))
         return
@@ -1712,8 +1740,8 @@ def pull_command(
         if path:
             print("--stop does not accept PATH. Use: pal pull --stop <target>", file=sys.stderr)
             raise typer.Exit(code=2)
-        if watch or prompt is not None or clear_prompt or full or prune_stale:
-            print("--stop cannot be combined with --watch/--full/--prompt/--clear-prompt/--prune-stale.", file=sys.stderr)
+        if watch or prompt is not None or clear_prompt or full or prune_stale or image_vision_requested is not None or workers is not None or embedding_workers is not None:
+            print("--stop cannot be combined with --watch/--full/--prompt/--clear-prompt/--prune-stale/--image-vision/--workers.", file=sys.stderr)
             raise typer.Exit(code=2)
         _exit(_pull_watch_stop_mode(stop, json_output=json_output))
         return
@@ -1747,6 +1775,9 @@ def pull_command(
                 follow_symlinks,
                 prompt=prompt,
                 clear_prompt=clear_prompt,
+                image_vision=image_vision_requested,
+                workers=workers,
+                embedding_workers=embedding_workers,
             )
         )
         return
@@ -1759,10 +1790,22 @@ def pull_command(
                 full=full,
                 prompt=prompt,
                 clear_prompt=clear_prompt,
+                image_vision=image_vision_requested,
+                workers=workers,
+                embedding_workers=embedding_workers,
             )
         )
         return
-    _exit(pull_all_sources(full=full, allow_cloud=allow_cloud, follow_symlinks=follow_symlinks))
+    _exit(
+        pull_all_sources(
+            full=full,
+            allow_cloud=allow_cloud,
+            follow_symlinks=follow_symlinks,
+            image_vision=image_vision_requested,
+            workers=workers,
+            embedding_workers=embedding_workers,
+        )
+    )
 
 
 @app.command("ask", help="Ask a question across your indexed data.")

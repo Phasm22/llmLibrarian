@@ -25,7 +25,7 @@ def test_llmli_root_help_lists_all_subcommands(monkeypatch, capsys):
 @pytest.mark.parametrize(
     ("subcmd", "tokens"),
     [
-        ("add", ["--allow-cloud", "--follow-symlinks", "--full"]),
+        ("add", ["--allow-cloud", "--follow-symlinks", "--full", "--image-vision", "--workers", "--embedding-workers"]),
         ("ask", ["--in", "--unified", "--strict", "--quiet", "--explain", "--force", "--model", "--n-results"]),
         ("inspect", ["--top", "--filter"]),
         ("index", ["--archetype", "--mode", "--follow-symlinks"]),
@@ -63,6 +63,11 @@ def test_llmli_add_parses_all_modifiers(monkeypatch):
             "--allow-cloud",
             "--follow-symlinks",
             "--full",
+            "--image-vision",
+            "--workers",
+            "6",
+            "--embedding-workers",
+            "4",
             "--silo",
             "src-silo",
             "--display-name",
@@ -79,6 +84,9 @@ def test_llmli_add_parses_all_modifiers(monkeypatch):
     assert args.allow_cloud is True
     assert args.follow_symlinks is True
     assert args.full is True
+    assert args.image_vision is True
+    assert args.workers == 6
+    assert args.embedding_workers == 4
     assert args.silo == "src-silo"
     assert args.display_name == "Source Silo"
 
@@ -222,6 +230,9 @@ def test_cmd_add_honors_env_db_path(monkeypatch, tmp_path: Path):
         allow_cloud=False,
         follow_symlinks=False,
         full=False,
+        image_vision=False,
+        workers=5,
+        embedding_workers=3,
         silo=None,
         display_name=None,
     )
@@ -230,3 +241,6 @@ def test_cmd_add_honors_env_db_path(monkeypatch, tmp_path: Path):
     assert rc == 0
     assert str(seen["path"]) == str(target_dir.resolve())
     assert seen["kwargs"]["db_path"] == env_db
+    assert seen["kwargs"]["image_vision_enabled"] is False
+    assert seen["kwargs"]["workers"] == 5
+    assert seen["kwargs"]["embedding_workers"] == 3

@@ -81,6 +81,18 @@ def test_pull_all_passes_full_and_follow_flags(monkeypatch):
     assert "--follow-symlinks" in cmd
 
 
+def test_pull_all_passes_image_vision_and_worker_flags(monkeypatch):
+    monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
+    seen_cmds = _mock_subprocess(monkeypatch, files_indexed_by_path={"/tmp/stuff": 1}, seen_cmds=[])
+    pal.pull_all_sources(image_vision=True, workers=6, embedding_workers=4)
+    cmd = seen_cmds[0]
+    assert "--image-vision" in cmd
+    assert "--workers" in cmd
+    assert "6" in cmd
+    assert "--embedding-workers" in cmd
+    assert "4" in cmd
+
+
 def test_pull_command_requires_path_for_watch(capsys):
     from typer.testing import CliRunner
     runner = CliRunner()
@@ -179,13 +191,16 @@ def test_temporary_env_restores_previous_values(monkeypatch):
 def test_pull_with_path_calls_path_mode(monkeypatch):
     called = {}
 
-    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False):
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None):
         called["path"] = str(path_input)
         called["allow_cloud"] = allow_cloud
         called["follow_symlinks"] = follow_symlinks
         called["full"] = full
         called["prompt"] = prompt
         called["clear_prompt"] = clear_prompt
+        called["image_vision"] = image_vision
+        called["workers"] = workers
+        called["embedding_workers"] = embedding_workers
         return 0
 
     monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path)
@@ -199,6 +214,28 @@ def test_pull_with_path_calls_path_mode(monkeypatch):
     assert called["full"] is True
     assert called["prompt"] is None
     assert called["clear_prompt"] is False
+    assert called["image_vision"] is None
+
+
+def test_pull_with_path_passes_image_vision_and_worker_flags(monkeypatch):
+    called = {}
+
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None):
+        called["path"] = str(path_input)
+        called["image_vision"] = image_vision
+        called["workers"] = workers
+        called["embedding_workers"] = embedding_workers
+        return 0
+
+    monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path)
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", "/tmp/one", "--image-vision", "--workers", "7", "--embedding-workers", "3"])
+    assert res.exit_code == 0
+    assert called["path"] == "/tmp/one"
+    assert called["image_vision"] is True
+    assert called["workers"] == 7
+    assert called["embedding_workers"] == 3
 
 
 def test_pull_status_mode_dispatches(monkeypatch):
@@ -239,7 +276,7 @@ def test_pull_stop_mode_dispatches(monkeypatch):
 def test_pull_with_path_passes_prompt_option(monkeypatch):
     called = {}
 
-    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False):
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None):
         called["path"] = str(path_input)
         called["prompt"] = prompt
         called["clear_prompt"] = clear_prompt
@@ -259,7 +296,7 @@ def test_pull_with_path_passes_prompt_option(monkeypatch):
 def test_pull_with_path_passes_clear_prompt_option(monkeypatch):
     called = {}
 
-    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False):
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None):
         called["path"] = str(path_input)
         called["prompt"] = prompt
         called["clear_prompt"] = clear_prompt

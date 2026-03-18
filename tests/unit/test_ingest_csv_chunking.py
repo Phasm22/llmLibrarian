@@ -256,7 +256,7 @@ def test_capabilities_reports_image_ocr_and_extensions(monkeypatch):
     assert ".png" in out
     assert ".heic" in out
     assert "Image OCR: yes (vision -> paddleocr -> tesseract)" in out
-    assert "Image summaries: requires LLMLIBRARIAN_VISION_MODEL" in out
+    assert "Image summaries: opt-in via --image-vision" in out
     assert "Image embeddings: yes (open_clip -> llmli_image)" in out
 
 
