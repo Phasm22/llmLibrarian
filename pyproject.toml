@@ -43,7 +43,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
-dev-mode-dirs = ["src"]
+dev-mode-dirs = [".", "src"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]

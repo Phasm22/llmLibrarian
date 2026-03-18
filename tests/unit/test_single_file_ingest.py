@@ -54,6 +54,27 @@ def test_update_single_file_skips_when_unchanged(monkeypatch, mock_collection, d
     assert len(add_calls) == 1
 
 
+def test_update_single_file_returns_error_without_deleting_existing_state(monkeypatch, mock_collection, db_path: Path, tmp_path: Path):
+    _patch_ingest_runtime(monkeypatch, mock_collection)
+    target = tmp_path / "note.txt"
+    target.write_text("hello world", encoding="utf-8")
+
+    status, _ = update_single_file(target, db_path=db_path, silo_slug="__self__", allow_cloud=True)
+    assert status == "updated"
+    manifest_before = _file_manifest_path(db_path).read_text(encoding="utf-8")
+    delete_count_before = len([c for c in mock_collection.calls if c[0] == "delete"])
+
+    target.write_text("changed content", encoding="utf-8")
+    monkeypatch.setattr("ingest.process_one_file", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ollama down")))
+
+    status, path_str = update_single_file(target, db_path=db_path, silo_slug="__self__", allow_cloud=True)
+    assert status == "error"
+    assert path_str == str(target.resolve())
+    assert _file_manifest_path(db_path).read_text(encoding="utf-8") == manifest_before
+    delete_count_after = len([c for c in mock_collection.calls if c[0] == "delete"])
+    assert delete_count_after == delete_count_before
+
+
 def test_remove_single_file_deletes(monkeypatch, mock_collection, db_path: Path, tmp_path: Path):
     _patch_ingest_runtime(monkeypatch, mock_collection)
     target = tmp_path / "note.txt"
@@ -156,3 +177,20 @@ def test_update_single_file_image_adds_image_vector(monkeypatch, mock_collection
     image_add_calls = [kwargs for name, kwargs in image_collection.calls if name == "add"]
     assert image_add_calls
     assert image_add_calls[0]["metadatas"][0]["record_type"] == "image_vector"
+
+
+def test_update_single_file_returns_error_when_image_model_unavailable(monkeypatch, mock_collection, db_path: Path, tmp_path: Path):
+    _patch_ingest_runtime(monkeypatch, mock_collection)
+    target = tmp_path / "dog.jpg"
+    target.write_bytes(b"fake-image")
+    monkeypatch.setattr("ingest.ensure_vision_model_ready", lambda: (_ for _ in ()).throw(RuntimeError("missing model")))
+
+    status, path_str = update_single_file(
+        target,
+        db_path=db_path,
+        silo_slug="photos",
+        allow_cloud=True,
+        image_vision_enabled=True,
+    )
+    assert status == "error"
+    assert path_str == str(target.resolve())

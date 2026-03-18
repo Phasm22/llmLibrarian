@@ -5,6 +5,7 @@ Not a replacement for llmli; pal add/ask/ls/log delegate to llmli. Use pal tool 
 """
 import hashlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -14,6 +15,7 @@ import threading
 import getpass
 import re
 from contextlib import contextmanager
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import typer
@@ -72,6 +74,8 @@ def _bootstrap_src_path() -> None:
 
 
 _bootstrap_src_path()
+
+import jobs_runtime as jobsrt
 
 
 def _ensure_pal_home() -> None:
@@ -573,6 +577,58 @@ def _write_registry(data: dict) -> None:
     _ensure_pal_home()
     with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def _remove_source_path(path: str | Path) -> bool:
+    try:
+        target = str(Path(path).expanduser().resolve())
+    except Exception:
+        target = str(path)
+    reg = _read_registry()
+    sources = reg.get("sources", []) or []
+    kept = []
+    removed = False
+    for source in sources:
+        raw = str((source or {}).get("path") or "")
+        if not raw:
+            continue
+        try:
+            candidate = str(Path(raw).expanduser().resolve())
+        except Exception:
+            candidate = raw
+        if candidate == target:
+            removed = True
+            continue
+        kept.append(source)
+    if removed:
+        reg["sources"] = kept
+        _write_registry(reg)
+    return removed
+
+
+def _resolve_registry_source_for_remove(target: str, db_path: str | Path) -> str | None:
+    raw = (target or "").strip()
+    if not raw:
+        return None
+    registry = _read_llmli_registry(db_path)
+    if raw in registry:
+        entry = registry.get(raw) if isinstance(registry, dict) else None
+        if isinstance(entry, dict) and entry.get("path"):
+            return str(entry.get("path"))
+    lowered = raw.lower()
+    for slug, entry in registry.items():
+        if not isinstance(entry, dict):
+            continue
+        display_name = str(entry.get("display_name") or slug)
+        if display_name.lower() == lowered and entry.get("path"):
+            return str(entry.get("path"))
+    try:
+        candidate = Path(raw).expanduser().resolve()
+    except Exception:
+        candidate = None
+    if candidate is not None:
+        return str(candidate)
+    return None
 
 
 def _resolve_llmli_paths() -> tuple[Path, Path]:
@@ -1144,16 +1200,50 @@ class SiloWatcher:
 
         self._observer = Observer()
         self._handler = _SiloEventHandler(self)
-        self._queue: dict[str, dict[str, float | str]] = {}
+        self._queue: dict[str, dict[str, object]] = {}
         self._queue_lock = threading.Lock()
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._logger = self._build_logger()
+
+    def _build_logger(self) -> logging.Logger:
+        logger = logging.getLogger(f"pal.watch.{self.silo_slug}.{os.getpid()}")
+        if logger.handlers:
+            return logger
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        log_dir = jobsrt.watch_log_dir(PAL_HOME)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            jobsrt.watch_log_path(PAL_HOME, self.silo_slug),
+            maxBytes=1_000_000,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        logger.addHandler(handler)
+        return logger
 
     def _log(self, message: str) -> None:
+        self._logger.info(message)
         print(message)
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _retry_delay(self, attempts: int) -> float:
+        schedule = [30.0, 60.0, 120.0, 300.0]
+        idx = min(max(attempts - 1, 0), len(schedule) - 1)
+        return schedule[idx]
+
+    def _queue_action(self, path_str: str, action: str, delay: float | None = None, attempts: int = 0) -> None:
+        due_at = time.time() + (self.debounce if delay is None else max(delay, 0.0))
+        with self._queue_lock:
+            self._queue[path_str] = {
+                "due_at": due_at,
+                "action": action,
+                "attempts": attempts,
+            }
 
     def enqueue_update(self, path: str) -> None:
         try:
@@ -1167,9 +1257,7 @@ class SiloWatcher:
             return
         if not self._should_index(str(p), self._include, self._exclude):
             return
-        now = time.time()
-        with self._queue_lock:
-            self._queue[str(p)] = {"ts": now, "action": "update"}
+        self._queue_action(str(p), "update")
 
     def enqueue_delete(self, path: str) -> None:
         try:
@@ -1181,59 +1269,60 @@ class SiloWatcher:
                 return
         except Exception:
             return
-        now = time.time()
-        with self._queue_lock:
-            existing = self._queue.get(str(p))
-            if existing and existing.get("action") == "update":
-                self._queue[str(p)] = {"ts": now, "action": "delete"}
-            else:
-                self._queue[str(p)] = {"ts": now, "action": "delete"}
+        self._queue_action(str(p), "delete")
 
     def _drain_due(self, now: float | None = None) -> int:
         if now is None:
             now = time.time()
-        due: list[tuple[str, str]] = []
+        due: list[tuple[str, str, int]] = []
         with self._queue_lock:
             for path, meta in list(self._queue.items()):
-                ts = float(meta.get("ts") or 0.0)
+                due_at = float(meta.get("due_at") or 0.0)
                 action = str(meta.get("action") or "update")
-                if now - ts >= self.debounce:
-                    due.append((path, action))
+                attempts = int(meta.get("attempts") or 0)
+                if now >= due_at:
+                    due.append((path, action, attempts))
                     del self._queue[path]
         if not due:
             return 0
         updated = 0
         removed = 0
         skipped = 0
-        for path, action in due:
-            with self._lock:
-                if action == "delete":
-                    status, _ = self._remove_single_file(
-                        path,
-                        db_path=self.db_path,
-                        silo_slug=self.silo_slug,
-                        update_counts=True,
-                    )
-                    if status == "removed":
-                        removed += 1
+        for path, action, attempts in due:
+            try:
+                with self._lock:
+                    if action == "delete":
+                        status, _ = self._remove_single_file(
+                            path,
+                            db_path=self.db_path,
+                            silo_slug=self.silo_slug,
+                            update_counts=True,
+                        )
                     else:
-                        skipped += 1
-                else:
-                    status, _ = self._update_single_file(
-                        path,
-                        db_path=self.db_path,
-                        silo_slug=self.silo_slug,
-                        allow_cloud=self.allow_cloud,
-                        follow_symlinks=False,
-                        no_color=True,
-                        update_counts=True,
-                    )
-                    if status == "updated":
-                        updated += 1
-                    elif status == "removed":
-                        removed += 1
-                    else:
-                        skipped += 1
+                        status, _ = self._update_single_file(
+                            path,
+                            db_path=self.db_path,
+                            silo_slug=self.silo_slug,
+                            allow_cloud=self.allow_cloud,
+                            follow_symlinks=False,
+                            no_color=True,
+                            update_counts=True,
+                        )
+            except Exception as exc:
+                status = "error"
+                self._log(f"{self.label}: error processing {path}: {exc}")
+            if status == "error":
+                next_attempt = attempts + 1
+                delay = self._retry_delay(next_attempt)
+                self._queue_action(path, action, delay=delay, attempts=next_attempt)
+                self._log(f"{self.label}: retrying {Path(path).name} in {int(delay)}s")
+                continue
+            if status == "updated":
+                updated += 1
+            elif status == "removed":
+                removed += 1
+            else:
+                skipped += 1
         processed = updated + removed
         if processed or skipped:
             self._log(f"{self.label}: +{updated} updated, -{removed} removed, {skipped} skipped")
@@ -1241,7 +1330,10 @@ class SiloWatcher:
 
     def _process_loop(self) -> None:
         while not self._stop.is_set():
-            self._drain_due()
+            try:
+                self._drain_due()
+            except Exception as exc:
+                self._log(f"{self.label}: queue loop error: {exc}")
             time.sleep(0.2)
 
     def _reconcile_once(self) -> tuple[int, int, int]:
@@ -1267,52 +1359,32 @@ class SiloWatcher:
         silo_manifest = (manifest.get("silos") or {}).get(self.silo_slug, {})
         manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
 
-        updated = 0
-        removed = 0
+        queued_updates = 0
+        queued_removes = 0
         skipped = 0
-        with self._lock:
-            if isinstance(manifest_files, dict):
-                for path_str in list(manifest_files.keys()):
-                    if path_str not in current:
-                        status, _ = self._remove_single_file(
-                            path_str,
-                            db_path=self.db_path,
-                            silo_slug=self.silo_slug,
-                            update_counts=False,
-                        )
-                        if status == "removed":
-                            removed += 1
-            for path_str, (mtime, size) in current.items():
-                prev = manifest_files.get(path_str) if isinstance(manifest_files, dict) else None
-                if prev and prev.get("mtime") == mtime and prev.get("size") == size:
-                    continue
-                status, _ = self._update_single_file(
-                    path_str,
-                    db_path=self.db_path,
-                    silo_slug=self.silo_slug,
-                    allow_cloud=self.allow_cloud,
-                    follow_symlinks=False,
-                    no_color=True,
-                    update_counts=False,
-                )
-                if status == "updated":
-                    updated += 1
-                elif status == "removed":
-                    removed += 1
-                else:
-                    skipped += 1
-        if updated or removed:
-            self._update_silo_counts(self.db_path, self.silo_slug)
-        return (updated, removed, skipped)
+        if isinstance(manifest_files, dict):
+            for path_str in list(manifest_files.keys()):
+                if path_str not in current:
+                    self._queue_action(path_str, "delete")
+                    queued_removes += 1
+        for path_str, (mtime, size) in current.items():
+            prev = manifest_files.get(path_str) if isinstance(manifest_files, dict) else None
+            if prev and prev.get("mtime") == mtime and prev.get("size") == size:
+                continue
+            self._queue_action(path_str, "update")
+            queued_updates += 1
+        return (queued_updates, queued_removes, skipped)
 
     def _reconcile_loop(self) -> None:
         while not self._stop.is_set():
             time.sleep(self.interval)
             if self._stop.is_set():
                 break
-            updated, removed, skipped = self._reconcile_once()
-            if updated or removed or skipped:
-                self._log(f"Check for missed changes: +{updated} updated, -{removed} removed, {skipped} skipped")
+            queued_updates, queued_removes, skipped = self._reconcile_once()
+            if queued_updates or queued_removes or skipped:
+                self._log(
+                    f"Check for missed changes: +{queued_updates} queued, -{queued_removes} queued, {skipped} skipped"
+                )
 
     def run(self) -> None:
         if self.startup_message:
@@ -1327,9 +1399,11 @@ class SiloWatcher:
         recon = threading.Thread(target=self._reconcile_loop, daemon=True)
         worker.start()
         recon.start()
-        updated, removed, skipped = self._reconcile_once()
-        if updated or removed or skipped:
-            self._log(f"Check for missed changes: +{updated} updated, -{removed} removed, {skipped} skipped")
+        queued_updates, queued_removes, skipped = self._reconcile_once()
+        if queued_updates or queued_removes or skipped:
+            self._log(
+                f"Check for missed changes: +{queued_updates} queued, -{queued_removes} queued, {skipped} skipped"
+            )
         try:
             while not self._stop.is_set():
                 time.sleep(1.0)
@@ -1444,6 +1518,7 @@ def _pull_path_mode(
             if not _set_silo_prompt_for_path(path, prompt, clear_prompt=clear_prompt):
                 print("Error: unable to resolve silo for prompt override.", file=sys.stderr)
                 return 1
+        _sync_daemon_if_installed()
     return code
 
 
@@ -1688,6 +1763,141 @@ def pull_all_sources(
     return 0 if fail_count == 0 else 1
 
 
+def _daemon_workdir() -> str:
+    cwd = Path.cwd().resolve()
+    if (cwd / "pal.py").exists() and (cwd / "cli.py").exists():
+        return str(cwd)
+    return str(Path(__file__).resolve().parent)
+
+
+def _daemon_runtime_metadata(manager: str | None = None) -> dict[str, object]:
+    detected_manager = manager or jobsrt.supported_service_manager()
+    if not detected_manager:
+        raise RuntimeError(f"Unsupported platform for daemon services: {sys.platform}")
+    db_path = Path(os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")).resolve()
+    return {
+        "version": 1,
+        "manager": detected_manager,
+        "python_executable": str(Path(sys.executable).resolve()),
+        "pal_path": str(Path(__file__).resolve()),
+        "workdir": _daemon_workdir(),
+        "db_path": str(db_path),
+        "pal_home": str(PAL_HOME.resolve()),
+        "installed_at": int(time.time()),
+    }
+
+
+def _daemon_metadata() -> dict[str, object] | None:
+    return jobsrt.read_daemon_metadata(PAL_HOME)
+
+
+def _daemon_is_installed() -> bool:
+    return _daemon_metadata() is not None
+
+
+def _daemon_env(db_path: str | Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["LLMLIBRARIAN_DB"] = str(Path(db_path).resolve())
+    env["PAL_HOME"] = str(PAL_HOME.resolve())
+    return env
+
+
+def _derive_watch_jobs_for_daemon(manager: str, db_path: str | Path | None = None) -> tuple[list[jobsrt.JobSpec], list[str]]:
+    target_db = db_path or os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    return jobsrt.derive_watch_jobs(
+        _read_registry(),
+        _read_llmli_registry(target_db),
+        pal_home=PAL_HOME,
+        db_path=target_db,
+        manager=manager,
+    )
+
+
+def _sync_daemon_services(emit_output: bool = True) -> int:
+    existing = _daemon_metadata()
+    if not existing:
+        if emit_output:
+            print("Daemon is not installed. Use: pal daemon install", file=sys.stderr)
+        return 1
+    manager_name = str(existing.get("manager") or "")
+    refreshed = _daemon_runtime_metadata(manager_name)
+    jobsrt.write_daemon_metadata(PAL_HOME, refreshed)
+    db_path = str(refreshed["db_path"])
+    jobs, warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=db_path)
+    manager = jobsrt.PlatformManager(manager_name)
+    result = manager.sync(
+        jobs,
+        python_executable=str(refreshed["python_executable"]),
+        pal_path=str(refreshed["pal_path"]),
+        workdir=str(refreshed["workdir"]),
+        env=_daemon_env(db_path),
+    )
+    if emit_output:
+        print(f"Daemon manager: {manager_name}")
+        print(f"Jobs: {len(jobs)}")
+        if warnings:
+            print("Warnings:")
+            for warning in warnings:
+                print(f"  - {warning}")
+        print(f"Services written: {len(result.get('written') or [])}")
+        print(f"Services removed: {len(result.get('removed') or [])}")
+        errors = result.get("errors") or []
+        if errors:
+            print("Errors:", file=sys.stderr)
+            for err in errors:
+                print(f"  - {err}", file=sys.stderr)
+    return 0 if not (result.get("errors") or []) else 1
+
+
+def _sync_daemon_if_installed() -> None:
+    if not _daemon_is_installed():
+        return
+    rc = _sync_daemon_services(emit_output=False)
+    if rc != 0:
+        print("Warning: daemon sync failed. Run `pal daemon sync`.", file=sys.stderr)
+
+
+def _resolve_job_target(target: str, jobs: list[jobsrt.JobSpec]) -> tuple[jobsrt.JobSpec | None, str | None]:
+    raw = (target or "").strip()
+    if not raw:
+        return None, "Error: missing daemon target."
+    lowered = raw.lower()
+    for job in jobs:
+        if job.slug.lower() == lowered or job.service_name.lower() == lowered:
+            return job, None
+        if Path(job.source_path).name.lower() == lowered:
+            return job, None
+    try:
+        normalized = str(Path(raw).expanduser().resolve())
+    except Exception:
+        normalized = raw
+    matches = [job for job in jobs if str(Path(job.source_path).resolve()) == normalized]
+    if not matches:
+        return None, f"Error: no daemon job found for '{target}'."
+    if len(matches) > 1:
+        return None, f"Error: ambiguous daemon target '{target}'."
+    return matches[0], None
+
+
+def _tail_file(path: Path, lines: int = 100) -> list[str]:
+    if not path.exists():
+        return []
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+    except Exception:
+        return []
+
+
+def _daemon_status_rows() -> tuple[dict[str, object] | None, list[jobsrt.JobSpec], list[str], list[dict]]:
+    metadata = _daemon_metadata()
+    if not metadata:
+        return None, [], [], []
+    manager_name = str(metadata.get("manager") or "")
+    jobs, warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or "./my_brain_db"))
+    records, _ = _status_records(str(metadata.get("db_path") or "./my_brain_db"), None)
+    return metadata, jobs, warnings, records
+
+
 # --- Typer CLI ---
 
 app = typer.Typer(
@@ -1697,6 +1907,10 @@ app = typer.Typer(
     add_completion=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+daemon_app = typer.Typer(help="Install and manage background silo watchers.", add_completion=False)
+jobs_app = typer.Typer(help="Inspect derived background jobs.", add_completion=False)
+app.add_typer(daemon_app, name="daemon")
+app.add_typer(jobs_app, name="jobs")
 
 
 def _exit(rc: int) -> None:
@@ -1893,12 +2107,131 @@ def remove_command(
     silo: list[str] = typer.Argument(..., help="Silo slug, display name, or path."),
 ) -> None:
     name = " ".join(silo) if isinstance(silo, list) else str(silo)
-    _exit(_run_llmli(["rm", name]))
+    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    source_path = _resolve_registry_source_for_remove(name, db_path)
+    rc = _run_llmli(["rm", name])
+    if rc != 0:
+        _exit(rc)
+        return
+    if source_path:
+        _remove_source_path(source_path)
+    else:
+        _remove_source_path(name)
+    _sync_daemon_if_installed()
 
 
 @app.command("sync", help="Re-index the project's own source (dev mode).")
 def sync_command() -> None:
     _exit(ensure_self_silo(force=True))
+
+
+@daemon_app.command("install", help="Install user-space watch services for registered silos.")
+def daemon_install_command() -> None:
+    metadata = _daemon_runtime_metadata()
+    PAL_HOME.mkdir(parents=True, exist_ok=True)
+    jobsrt.watch_log_dir(PAL_HOME).mkdir(parents=True, exist_ok=True)
+    jobsrt.write_daemon_metadata(PAL_HOME, metadata)
+    _exit(_sync_daemon_services(emit_output=True))
+
+
+@daemon_app.command("sync", help="Reconcile daemon services against registered silos.")
+def daemon_sync_command() -> None:
+    _exit(_sync_daemon_services(emit_output=True))
+
+
+@daemon_app.command("status", help="Show daemon install state and job health.")
+def daemon_status_command() -> None:
+    metadata, jobs, warnings, records = _daemon_status_rows()
+    if not metadata:
+        print("Daemon: not installed")
+        return
+    print("Daemon")
+    print(f"  Installed: yes")
+    print(f"  Manager: {metadata.get('manager')}")
+    print(f"  Python: {metadata.get('python_executable')}")
+    print(f"  Jobs: {len(jobs)}")
+    if warnings:
+        print("  Warnings:")
+        for warning in warnings:
+            print(f"    - {warning}")
+    record_by_slug = {str((record or {}).get("silo") or ""): record for record in records if isinstance(record, dict)}
+    print("\nSilo                      State      Service")
+    print("---------------------------------------------------------------")
+    manager_name = str(metadata.get("manager") or "")
+    manager = jobsrt.PlatformManager(manager_name)
+    for job in jobs:
+        record = record_by_slug.get(job.slug)
+        state = str((record or {}).get("state") or "installed")
+        if not manager.desired_path(job.slug).exists():
+            state = "missing"
+        print(f"{job.slug:24} {state:10} {job.service_name}")
+
+
+@daemon_app.command("logs", help="Show recent daemon logs for one silo.")
+def daemon_logs_command(
+    target: str = typer.Argument(..., help="Silo slug, source path, or service name."),
+    lines: int = typer.Option(100, "--lines", min=1, help="Number of log lines to show."),
+) -> None:
+    metadata = _daemon_metadata()
+    if not metadata:
+        print("Daemon is not installed. Use: pal daemon install", file=sys.stderr)
+        raise typer.Exit(code=1)
+    manager_name = str(metadata.get("manager") or "")
+    jobs, _warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or "./my_brain_db"))
+    job, err = _resolve_job_target(target, jobs)
+    if err:
+        print(err, file=sys.stderr)
+        raise typer.Exit(code=1)
+    out_lines = _tail_file(Path(job.log_path), lines=lines)
+    err_lines = _tail_file(jobsrt.watch_stderr_log_path(PAL_HOME, job.slug), lines=lines)
+    print(f"# {job.slug} stdout")
+    for line in out_lines:
+        print(line)
+    if err_lines:
+        print(f"\n# {job.slug} stderr")
+        for line in err_lines:
+            print(line)
+
+
+@daemon_app.command("uninstall", help="Remove all daemon-managed services.")
+def daemon_uninstall_command() -> None:
+    metadata = _daemon_metadata()
+    if not metadata:
+        print("Daemon: not installed")
+        return
+    manager = jobsrt.PlatformManager(str(metadata.get("manager") or ""))
+    result = manager.uninstall_all()
+    jobsrt.remove_daemon_metadata(PAL_HOME)
+    print(f"Removed services: {len(result.get('removed') or [])}")
+    errors = result.get("errors") or []
+    if errors:
+        for err in errors:
+            print(err, file=sys.stderr)
+        raise typer.Exit(code=1)
+
+
+@jobs_app.command("ls", help="List derived daemon jobs.")
+def jobs_ls_command() -> None:
+    metadata = _daemon_metadata()
+    manager_name = str((metadata or {}).get("manager") or jobsrt.supported_service_manager() or "")
+    if not manager_name:
+        print(f"Unsupported platform for daemon jobs: {sys.platform}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    db_path = str((metadata or {}).get("db_path") or os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"))
+    jobs, warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=db_path)
+    records, _ = _status_records(db_path, None)
+    state_by_slug = {str((record or {}).get("silo") or ""): str((record or {}).get("state") or "installed") for record in records}
+    if warnings:
+        for warning in warnings:
+            print(f"Warning: {warning}", file=sys.stderr)
+    if not jobs:
+        print("No daemon jobs.")
+        return
+    print("Kind        Silo                      State      Service                      Log")
+    print("-----------------------------------------------------------------------------------------------")
+    for job in jobs:
+        state = state_by_slug.get(job.slug, "installed")
+        print(f"{job.kind:10} {job.slug:24} {state:10} {job.service_name:28} {job.log_path}")
 
 
 @app.command("diff", help="Show files changed since last pull.")

@@ -2659,9 +2659,12 @@ def update_single_file(
     if not should_index(path_str, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE):
         return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
     if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}:
-        if effective_image_vision_enabled:
-            ensure_vision_model_ready()
-        ensure_image_embedding_adapter_ready()
+        try:
+            if effective_image_vision_enabled:
+                ensure_vision_model_ready()
+            ensure_image_embedding_adapter_ready()
+        except Exception:
+            return ("error", path_str)
 
     max_file_bytes, _max_depth, max_archive_bytes, max_files_per_zip, max_extracted_per_zip = _load_limits_config()
     try:
@@ -2705,14 +2708,6 @@ def update_single_file(
     client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
     image_collection = _get_image_collection(client)
-    _delete_source_from_collections(
-        collection=collection,
-        image_collection=image_collection,
-        silo_slug=silo_slug,
-        source_path=path_str,
-    )
-    if prev:
-        _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
     chunks: list[ChunkTuple] = []
     image_vectors: list[ImageVectorTuple] = []
@@ -2729,7 +2724,7 @@ def update_single_file(
                 db_path=db_path,
             )
         except Exception:
-            chunks = []
+            return ("error", path_str)
     else:
         clone_from = next(
             (str(e.get("silo") or "") for e in existing if str(e.get("silo") or "") != silo_slug),
@@ -2752,8 +2747,8 @@ def update_single_file(
                 collection=image_collection,
                 from_silo=clone_from,
                 source_path=path_str,
-                target_silo=silo_slug,
-            )
+                        target_silo=silo_slug,
+                    )
         if not chunks:
             try:
                 chunks = process_one_file(
@@ -2766,7 +2761,16 @@ def update_single_file(
                     image_vision_enabled=effective_image_vision_enabled,
                 )
             except Exception:
-                chunks = []
+                return ("error", path_str)
+
+    _delete_source_from_collections(
+        collection=collection,
+        image_collection=image_collection,
+        silo_slug=silo_slug,
+        source_path=path_str,
+    )
+    if prev:
+        _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
     if chunks:
         chunks = [
