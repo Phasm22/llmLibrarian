@@ -65,7 +65,7 @@ from file_registry import (
     get_paths_by_silo,
 )
 from load_config import load_config, get_archetype
-from style import bold, dim, label_style, success_style, warn_style
+from style import bold, dim, label_style, success_style, warn_style, status_line, clear_status_line
 
 # --- Default limits (overridden by config) ---
 DEFAULT_MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
@@ -1834,6 +1834,7 @@ def run_index(
     # 2. Split: regular files (parallel) vs zips (main thread, limits)
     regular = [(path, kind) for path, kind in file_list if kind != "zip"]
     zips = [path for path, kind in file_list if kind == "zip"]
+    total_to_process = len(regular) + len(zips)
 
     all_chunks: list[ChunkTuple] = []
     all_image_vectors: list[ImageVectorTuple] = []
@@ -1872,7 +1873,10 @@ def run_index(
                     if vector_row is not None:
                         all_image_vectors.append(vector_row)
                 files_indexed += 1
-                print(success_style(no_color, f"  ✅ {path.name} ({len(chunks)} chunks)"))
+                if sys.stdout.isatty():
+                    status_line(f"↻ {files_indexed}/{total_to_process}: {path.name}")
+                else:
+                    print(success_style(no_color, f"  ✅ {path.name} ({len(chunks)} chunks)"))
             elif kind == "pdf" and not _suppress_recoverable_warnings():
                 print(
                     warn_style(
@@ -1922,7 +1926,10 @@ def run_index(
         if chunks:
             all_chunks.extend(chunks)
             files_indexed += 1
-            print(success_style(no_color, f"  ✅ {zip_path.name} ({len(chunks)} chunks)"))
+            if sys.stdout.isatty():
+                status_line(f"↻ {files_indexed}/{total_to_process}: {zip_path.name}")
+            else:
+                print(success_style(no_color, f"  ✅ {zip_path.name} ({len(chunks)} chunks)"))
 
     # 5. Batch add to ChromaDB (embedding runs here; progress so you can see where it hangs)
     if all_chunks:
@@ -1957,6 +1964,7 @@ def run_index(
             log_line=log_line,
         )
 
+    clear_status_line()
     elapsed = time.perf_counter() - t0
     done_msg = f"Done: {files_indexed} files, {len(all_chunks)} chunks in {elapsed:.1f}s"
     print(bold(no_color, done_msg))
@@ -2212,6 +2220,7 @@ def run_add(
             if fhash:
                 to_register.append((fhash, path_str))
 
+    total_to_process = len(regular_with_hash) + len(zips)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_item = {
             executor.submit(
@@ -2277,6 +2286,8 @@ def run_add(
                     image_done += 1
                 tax_rows.extend(extract_tax_rows_from_chunks(chunks))
                 files_indexed += 1
+                if not quiet and sys.stdout.isatty():
+                    status_line(f"↻ {files_indexed}/{total_to_process}: {p.name}")
                 if fhash:
                     to_register.append((fhash, str(p)))
             elif kind == "pdf" and not _suppress_recoverable_warnings():
@@ -2465,6 +2476,7 @@ def run_add(
 
     # Summary: trust + usability (per-file FAIL still printed above)
     if not quiet:
+        clear_status_line()
         if failures:
             print(warn_style(no_color, f"Indexed {files_indexed} files ({len(failures)} failed). pal log or llmli log --last to see failures."), file=sys.stderr)
         else:

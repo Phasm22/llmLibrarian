@@ -5,6 +5,7 @@ from query.formatting import (
     source_url,
     sanitize_answer_metadata_artifacts,
     normalize_answer_direct_address,
+    find_direct_address_contract_violations,
     normalize_uncertainty_tone,
     normalize_ownership_claims,
     normalize_sentence_start,
@@ -69,6 +70,23 @@ def test_normalize_answer_direct_address_rewrites_common_third_person_terms():
     assert "Your visit was brief." in out
     assert "You should retest." in out
     assert "You requested follow-up." in out
+
+
+def test_find_direct_address_contract_violations_flags_narrator_and_grammar_artifacts():
+    raw = (
+        "Jill appears to be the narrator's girlfriend. "
+        "The writer acknowledges that. "
+        "You says this because you's certain."
+    )
+    out = find_direct_address_contract_violations(raw)
+    assert "third-person narrator/writer reference" in out
+    assert "subject-verb agreement artifact" in out
+    assert "possessive you artifact" in out
+
+
+def test_find_direct_address_contract_violations_is_empty_for_clean_second_person_answer():
+    raw = "Jill appears to be your girlfriend's sister. You mentioned this on March 5, 2026."
+    assert find_direct_address_contract_violations(raw) == []
 
 
 def test_normalize_uncertainty_tone_reduces_hedge_loops_when_banner_present():

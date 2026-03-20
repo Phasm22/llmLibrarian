@@ -81,7 +81,12 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     def _chat(**kwargs: Any) -> dict[str, Any]:
         state["calls"].append(kwargs)
-        return state["response"]
+        response = state["response"]
+        if isinstance(response, list):
+            if not response:
+                raise AssertionError("mock_ollama response queue is empty")
+            return response.pop(0)
+        return response
 
     monkeypatch.setitem(sys.modules, "ollama", SimpleNamespace(chat=_chat))
     return state

@@ -1836,9 +1836,7 @@ def _sync_daemon_services(emit_output: bool = True) -> int:
         print(f"Daemon manager: {manager_name}")
         print(f"Jobs: {len(jobs)}")
         if warnings:
-            print("Warnings:")
-            for warning in warnings:
-                print(f"  - {warning}")
+            print(f"  ({len(warnings)} sources skipped — not indexed or missing)")
         print(f"Services written: {len(result.get('written') or [])}")
         print(f"Services removed: {len(result.get('removed') or [])}")
         errors = result.get("errors") or []
@@ -1862,21 +1860,30 @@ def _resolve_job_target(target: str, jobs: list[jobsrt.JobSpec]) -> tuple[jobsrt
     if not raw:
         return None, "Error: missing daemon target."
     lowered = raw.lower()
+    # Exact match pass
     for job in jobs:
         if job.slug.lower() == lowered or job.service_name.lower() == lowered:
             return job, None
         if Path(job.source_path).name.lower() == lowered:
             return job, None
+    # Full path match
     try:
         normalized = str(Path(raw).expanduser().resolve())
     except Exception:
         normalized = raw
     matches = [job for job in jobs if str(Path(job.source_path).resolve()) == normalized]
-    if not matches:
-        return None, f"Error: no daemon job found for '{target}'."
+    if len(matches) == 1:
+        return matches[0], None
     if len(matches) > 1:
         return None, f"Error: ambiguous daemon target '{target}'."
-    return matches[0], None
+    # Prefix match pass (e.g. "much-thinks" matches "much-thinks-d3e14819")
+    slug_try = lowered.replace(" ", "-")
+    prefix_matches = [j for j in jobs if j.slug.lower().startswith(slug_try)]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0], None
+    if len(prefix_matches) > 1:
+        return None, f"Error: ambiguous daemon target '{target}' (matches: {', '.join(j.slug for j in prefix_matches)})."
+    return None, f"Error: no daemon job found for '{target}'."
 
 
 def _tail_file(path: Path, lines: int = 100) -> list[str]:
@@ -1898,19 +1905,65 @@ def _daemon_status_rows() -> tuple[dict[str, object] | None, list[jobsrt.JobSpec
     return metadata, jobs, warnings, records
 
 
+# --- Shell completion helpers ---
+
+def _complete_silo(incomplete: str) -> list[str]:
+    """Return silo slugs/display-names that match the incomplete prefix."""
+    try:
+        _ensure_src_on_path()
+        from state import list_silos
+        db = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+        silos = list_silos(db)
+        results = []
+        for s in silos:
+            slug = s.get("slug", "")
+            display = s.get("display_name", "")
+            if slug and slug.startswith(incomplete):
+                results.append(slug)
+            if display and display != slug and display.startswith(incomplete):
+                results.append(display)
+        return results
+    except Exception:
+        return []
+
+
+def _complete_job_target(incomplete: str) -> list[str]:
+    """Return daemon job slugs that match the incomplete prefix."""
+    try:
+        metadata = _daemon_metadata()
+        if not metadata:
+            return []
+        manager_name = str(metadata.get("manager") or "")
+        jobs, _ = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or "./my_brain_db"))
+        return [j.slug for j in jobs if j.slug.startswith(incomplete)]
+    except Exception:
+        return []
+
+
 # --- Typer CLI ---
 
 app = typer.Typer(
     name="pal",
     help="Index folders, ask questions, stay in sync.",
     no_args_is_help=True,
-    add_completion=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
-daemon_app = typer.Typer(help="Install and manage background silo watchers.", add_completion=False)
-jobs_app = typer.Typer(help="Inspect derived background jobs.", add_completion=False)
+daemon_app = typer.Typer(help="Install and manage background silo watchers.", add_completion=False, invoke_without_command=True)
+jobs_app = typer.Typer(help="Inspect derived background jobs.", add_completion=False, invoke_without_command=True)
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(jobs_app, name="jobs")
+
+
+@daemon_app.callback()
+def daemon_callback(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        _daemon_status_impl()
+
+
+@jobs_app.callback()
+def jobs_callback(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        _jobs_ls_impl()
 
 
 def _exit(rc: int) -> None:
@@ -1923,7 +1976,7 @@ def pull_command(
     path: str | None = typer.Argument(None, metavar="PATH", help="Folder to index. Omit to refresh all."),
     watch: bool = typer.Option(False, "--watch", help="Stay running and sync changes live."),
     status: bool = typer.Option(False, "--status", help="Show watcher status (all, or only PATH when provided)."),
-    stop: str | None = typer.Option(None, "--stop", metavar="TARGET", help="Stop watcher by pid, silo slug/display name, or watched path."),
+    stop: str | None = typer.Option(None, "--stop", metavar="TARGET", help="Stop watcher by pid, silo slug/display name, or watched path.", autocompletion=_complete_silo),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON for --status/--stop."),
     prune_stale: bool = typer.Option(False, "--prune-stale", help="Remove stale watcher locks (status mode only)."),
     full: bool = typer.Option(False, "--full", help="Full rebuild (delete + re-add)."),
@@ -2025,7 +2078,7 @@ def pull_command(
 @app.command("ask", help="Ask a question across your indexed data.")
 def ask_command(
     query: list[str] = typer.Argument(..., metavar="QUESTION"),
-    in_silo: str | None = typer.Option(None, "--in", help="Query only this silo."),
+    in_silo: str | None = typer.Option(None, "--in", help="Query only this silo.", autocompletion=_complete_silo),
     unified: bool = typer.Option(False, "--unified", help="Combine results from all silos."),
     strict: bool = typer.Option(False, "--strict", help="Only answer when evidence is strong; say unknown otherwise."),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Answer only (quiet output for scripts)."),
@@ -2079,7 +2132,7 @@ def ls_command() -> None:
 
 @app.command("inspect", help="Show details for a silo.")
 def inspect_command(
-    silo: str = typer.Argument(..., help="Silo slug or display name."),
+    silo: str = typer.Argument(..., help="Silo slug or display name.", autocompletion=_complete_silo),
     top: int | None = typer.Option(None, "--top", help="Show top N files by chunks."),
     filter: str | None = typer.Option(None, "--filter", help="Show only pdf, docx, or code."),
 ) -> None:
@@ -2104,7 +2157,7 @@ def log_command() -> None:
 
 @app.command("remove", help="Remove a silo.")
 def remove_command(
-    silo: list[str] = typer.Argument(..., help="Silo slug, display name, or path."),
+    silo: list[str] = typer.Argument(..., help="Silo slug, display name, or path.", autocompletion=_complete_silo),
 ) -> None:
     name = " ".join(silo) if isinstance(silo, list) else str(silo)
     db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
@@ -2139,8 +2192,7 @@ def daemon_sync_command() -> None:
     _exit(_sync_daemon_services(emit_output=True))
 
 
-@daemon_app.command("status", help="Show daemon install state and job health.")
-def daemon_status_command() -> None:
+def _daemon_status_impl() -> None:
     metadata, jobs, warnings, records = _daemon_status_rows()
     if not metadata:
         print("Daemon: not installed")
@@ -2151,9 +2203,7 @@ def daemon_status_command() -> None:
     print(f"  Python: {metadata.get('python_executable')}")
     print(f"  Jobs: {len(jobs)}")
     if warnings:
-        print("  Warnings:")
-        for warning in warnings:
-            print(f"    - {warning}")
+        print(f"  ({len(warnings)} sources skipped — not indexed or missing)")
     record_by_slug = {str((record or {}).get("silo") or ""): record for record in records if isinstance(record, dict)}
     print("\nSilo                      State      Service")
     print("---------------------------------------------------------------")
@@ -2167,9 +2217,14 @@ def daemon_status_command() -> None:
         print(f"{job.slug:24} {state:10} {job.service_name}")
 
 
+@daemon_app.command("status", help="Show daemon install state and job health.")
+def daemon_status_command() -> None:
+    _daemon_status_impl()
+
+
 @daemon_app.command("logs", help="Show recent daemon logs for one silo.")
 def daemon_logs_command(
-    target: str = typer.Argument(..., help="Silo slug, source path, or service name."),
+    target: str | None = typer.Argument(None, help="Silo slug, source path, or service name.", autocompletion=_complete_job_target),
     lines: int = typer.Option(100, "--lines", min=1, help="Number of log lines to show."),
 ) -> None:
     metadata = _daemon_metadata()
@@ -2178,6 +2233,21 @@ def daemon_logs_command(
         raise typer.Exit(code=1)
     manager_name = str(metadata.get("manager") or "")
     jobs, _warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or "./my_brain_db"))
+    if not target:
+        if not jobs:
+            print("No daemon jobs.")
+            return
+        print("Available silos (pass one as TARGET):")
+        for job in jobs:
+            last_line = ""
+            try:
+                lines_tail = _tail_file(Path(job.log_path), lines=1)
+                last_line = lines_tail[-1] if lines_tail else ""
+            except Exception:
+                pass
+            suffix = f"  {last_line}" if last_line else ""
+            print(f"  {job.slug}{suffix}")
+        return
     job, err = _resolve_job_target(target, jobs)
     if err:
         print(err, file=sys.stderr)
@@ -2210,8 +2280,7 @@ def daemon_uninstall_command() -> None:
         raise typer.Exit(code=1)
 
 
-@jobs_app.command("ls", help="List derived daemon jobs.")
-def jobs_ls_command() -> None:
+def _jobs_ls_impl() -> None:
     metadata = _daemon_metadata()
     manager_name = str((metadata or {}).get("manager") or jobsrt.supported_service_manager() or "")
     if not manager_name:
@@ -2222,21 +2291,30 @@ def jobs_ls_command() -> None:
     records, _ = _status_records(db_path, None)
     state_by_slug = {str((record or {}).get("silo") or ""): str((record or {}).get("state") or "installed") for record in records}
     if warnings:
-        for warning in warnings:
-            print(f"Warning: {warning}", file=sys.stderr)
+        print(f"  ({len(warnings)} sources skipped — not indexed or missing)", file=sys.stderr)
     if not jobs:
         print("No daemon jobs.")
         return
+    _ensure_src_on_path()
+    from style import link_style
+    no_color = not sys.stdout.isatty()
     print("Kind        Silo                      State      Service                      Log")
     print("-----------------------------------------------------------------------------------------------")
     for job in jobs:
         state = state_by_slug.get(job.slug, "installed")
-        print(f"{job.kind:10} {job.slug:24} {state:10} {job.service_name:28} {job.log_path}")
+        log_name = Path(job.log_path).name
+        log_cell = link_style(no_color, f"file://{job.log_path}", log_name)
+        print(f"{job.kind:10} {job.slug:24} {state:10} {job.service_name:28} {log_cell}")
+
+
+@jobs_app.command("ls", help="List derived daemon jobs.")
+def jobs_ls_command() -> None:
+    _jobs_ls_impl()
 
 
 @app.command("diff", help="Show files changed since last pull.")
 def diff_command(
-    silo: str = typer.Argument(..., help="Silo slug or display name."),
+    silo: str = typer.Argument(..., help="Silo slug or display name.", autocompletion=_complete_silo),
 ) -> None:
     _ensure_src_on_path()
     from state import resolve_silo_to_slug, resolve_silo_prefix, list_silos
@@ -2461,7 +2539,7 @@ def main() -> int:
         env["LLMLIBRARIAN_INGEST_LOG_LEVEL"] = "FATAL"
         env["LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS"] = "1"
         env["LLMLIBRARIAN_WATCH_ENV_APPLIED"] = "1"
-        os.execvpe(sys.argv[0], sys.argv, env)
+        os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
     if _argv_requests_watch_pull(sys.argv[1:]):
         _apply_watch_process_env()
     app()

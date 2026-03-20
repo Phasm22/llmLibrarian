@@ -39,6 +39,9 @@ def write_trace(
     confidence_overlap_support: float | None = None,
     confidence_reason: str | None = None,
     confidence_banner_emitted: bool | None = None,
+    answer_repair_triggered: bool | None = None,
+    answer_repair_reason: str | None = None,
+    answer_repair_resolved: bool | None = None,
     academic_mode: bool | None = None,
     academic_rerank_applied: bool | None = None,
     academic_transcript_hits: int | None = None,
@@ -114,6 +117,12 @@ def write_trace(
         payload["confidence_reason"] = str(confidence_reason)
     if confidence_banner_emitted is not None:
         payload["confidence_banner_emitted"] = bool(confidence_banner_emitted)
+    if answer_repair_triggered is not None:
+        payload["answer_repair_triggered"] = bool(answer_repair_triggered)
+    if answer_repair_reason:
+        payload["answer_repair_reason"] = str(answer_repair_reason)
+    if answer_repair_resolved is not None:
+        payload["answer_repair_resolved"] = bool(answer_repair_resolved)
     if academic_mode is not None:
         payload["academic_mode"] = bool(academic_mode)
     if academic_rerank_applied is not None:

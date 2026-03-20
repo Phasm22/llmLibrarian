@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """
 llmLibrarian (llmli) CLI: add, ask, ls, index, rm, log.
 Deterministic, locally-hosted context engine for high-stakes personal data.
@@ -11,6 +12,28 @@ import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
+
+
+def _silo_completer(prefix, **kwargs):
+    """Return silo slugs and display names for shell completion."""
+    try:
+        src = _ROOT / "src"
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
+        from state import list_silos
+        db = os.environ.get("LLMLIBRARIAN_DB", str(_ROOT / "my_brain_db"))
+        silos = list_silos(db)
+        results = []
+        for s in silos:
+            slug = s.get("slug", "")
+            display = s.get("display_name", "")
+            if slug and slug.startswith(prefix):
+                results.append(slug)
+            if display and display != slug and display.startswith(prefix):
+                results.append(display)
+        return results
+    except Exception:
+        return []
 
 
 def _iter_editable_roots(site_root: Path) -> list[Path]:
@@ -172,7 +195,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
 def cmd_ls(args: argparse.Namespace) -> int:
     """List silos in the llmli registry."""
     from state import list_silos
-    from style import dim
+    from style import dim, link_style
     db = _db_path(args)
     silos = list_silos(db)
     if not silos:
@@ -197,8 +220,10 @@ def cmd_ls(args: argparse.Namespace) -> int:
     for display, slug, files, chunks, updated, path in rows:
         display = _truncate_mid(display, name_w)
         slug = _truncate_mid(slug, slug_w)
-        path = _truncate_tail(path, path_w)
-        print(f"{display:<{name_w}}  {slug:<{slug_w}}  {files:>5}  {chunks:>7}  {updated:<19}  {path}")
+        short_path = _truncate_tail(path, path_w)
+        url = f"file://{path}" if path and path != "?" else ""
+        path_cell = link_style(args.no_color, url, short_path)
+        print(f"{display:<{name_w}}  {slug:<{slug_w}}  {files:>5}  {chunks:>7}  {updated:<19}  {path_cell}")
     return 0
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -409,7 +434,8 @@ def main() -> int:
     # ask [--archetype X | --in <silo>] [--strict] <query...>  (default: unified llmli collection)
     p_ask = sub.add_parser("ask", help="Ask (unified llmli by default; or archetype / --in silo)")
     p_ask.add_argument("--archetype", "-a", help="Archetype id (e.g. tax, infra)")
-    p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to one silo (slug or display name)")
+    in_silo_arg = p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to one silo (slug or display name)")
+    in_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
     p_ask.add_argument("--unified", action="store_true", help="Search across all silos (compare/analyze across indexed content)")
     p_ask.add_argument("--strict", action="store_true", help="Never conclude absence from partial evidence; say unknown + sources when unsure")
     p_ask.add_argument("--quiet", "-q", action="store_true", help="Answer only (no source footer); useful for scripting")
@@ -426,7 +452,8 @@ def main() -> int:
 
     # inspect <silo> [--top N] [--filter pdf|docx|code]
     p_inspect = sub.add_parser("inspect", help="Show silo details and top files by chunk count (default: top 20)")
-    p_inspect.add_argument("silo", help="Silo slug or display name")
+    inspect_silo_arg = p_inspect.add_argument("silo", help="Silo slug or display name")
+    inspect_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
     p_inspect.add_argument("--top", type=int, default=20, help="Show top N chunkiest files (default: 20)")
     p_inspect.add_argument("--filter", choices=["pdf", "docx", "code"], help="Show only this type (pdf, docx, or code)")
     p_inspect.set_defaults(_run=cmd_inspect)
@@ -441,7 +468,8 @@ def main() -> int:
 
     # remove <silo>
     p_rm = sub.add_parser("rm", help="Remove silo (registry + chunks)")
-    p_rm.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
+    rm_silo_arg = p_rm.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
+    rm_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
     p_rm.set_defaults(_run=cmd_rm)
 
     # capabilities
@@ -464,6 +492,11 @@ def main() -> int:
     p_eval.add_argument("--no-direct-decisive-mode", dest="direct_decisive_mode", action="store_false", help="Override config to disable direct decisive mode for this eval run")
     p_eval.set_defaults(_run=cmd_eval_adversarial)
 
+    try:
+        import argcomplete
+        argcomplete.autocomplete(parser)
+    except ImportError:
+        pass
     args = parser.parse_args()
     return args._run(args)
 

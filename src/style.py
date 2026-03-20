@@ -67,3 +67,15 @@ def code_block_style(no_color: bool, text: str) -> str:
     if no_color:
         return text
     return f"\033[2;37m{text}\033[0m"  # dim white
+
+
+def status_line(text: str) -> None:
+    """Overwrite current line in TTY. No-op when not a TTY."""
+    if sys.stdout.isatty():
+        print(f"\r\033[2K  {text}", end="", flush=True)
+
+
+def clear_status_line() -> None:
+    """Clear the status line if on a TTY."""
+    if sys.stdout.isatty():
+        print("\r\033[2K", end="", flush=True)

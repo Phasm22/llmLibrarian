@@ -164,20 +164,23 @@ def sanitize_answer_metadata_artifacts(answer: str) -> str:
     return out
 
 
+_APOSTROPHE_CLASS = r"[\x27\u2018\u2019]"
+
+
 _THIRD_PERSON_USER_PATTERNS = (
-    (re.compile(r"\b(?:the|this|a|an)\s+patient['’]s\b", re.IGNORECASE), "your"),
-    (re.compile(r"\b(?:the|this|a|an)\s+user['’]s\b", re.IGNORECASE), "your"),
+    (re.compile(rf"\b(?:the|this|a|an)\s+patient{_APOSTROPHE_CLASS}s\b", re.IGNORECASE), "your"),
+    (re.compile(rf"\b(?:the|this|a|an)\s+user{_APOSTROPHE_CLASS}s\b", re.IGNORECASE), "your"),
     (
         re.compile(
             r"\b(?:[Tt]he|[Tt]his|[Aa]|[Aa]n)\s+patient\s+named\s+"
-            r"[A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*){0,3}\b",
+            r"[A-Z][A-Za-z.'’-]*(?:\s+[A-Z][A-Za-z.'’-]*){0,3}\b",
         ),
         "you",
     ),
     (
         re.compile(
             r"\b(?:[Tt]he|[Tt]his|[Aa]|[Aa]n)\s+user\s+named\s+"
-            r"[A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*){0,3}\b",
+            r"[A-Z][A-Za-z.'’-]*(?:\s+[A-Z][A-Za-z.'’-]*){0,3}\b",
         ),
         "you",
     ),
@@ -205,6 +208,64 @@ def normalize_answer_direct_address(answer: str) -> str:
     for pattern, replacement in _THIRD_PERSON_USER_PATTERNS:
         out = pattern.sub(lambda m: _repl(m, replacement), out)
     return out
+
+
+_DIRECT_ADDRESS_CONTRACT_PATTERNS = (
+    (
+        "third-person named user reference",
+        re.compile(
+            r"\b(?:the|this|a|an)\s+(?:patient|user)\s+named\s+"
+            r"[A-Z][A-Za-z.'’-]*(?:\s+[A-Z][A-Za-z.'’-]*){0,3}\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "third-person user reference",
+        re.compile(
+            rf"\b(?:the|this|a|an)\s+(?:patient|user)(?:{_APOSTROPHE_CLASS}s)?\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "third-person narrator/writer reference",
+        re.compile(
+            rf"\b(?:the|this)\s+(?:narrator|writer|author){_APOSTROPHE_CLASS}s\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "third-person narrator/writer reference",
+        re.compile(
+            r"\b(?:the|this)\s+(?:narrator|writer|author)\s+"
+            r"(?:acknowledge(?:s|d)?|describe(?:s|d)?|discuss(?:es|ed)?|feel(?:s|ing|t)?|"
+            r"felt|think(?:s|ing|thought)?|say(?:s|ing|said)?|note(?:s|d)?|write(?:s|ing|wrote|written)?|"
+            r"tell(?:s|ing|told)?|mention(?:s|ed)?|want(?:s|ed)?|plan(?:s|ned)?|prefer(?:s|red)?|"
+            r"keep(?:s|ing|kept)?|worr(?:y|ies|ied)|likes?|loves?|has|have|had|is|was|were)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    ("possessive you artifact", re.compile(rf"\byou{_APOSTROPHE_CLASS}s\b", re.IGNORECASE)),
+    ("subject-verb agreement artifact", re.compile(r"\byou\s+acknowledges\b", re.IGNORECASE)),
+    ("subject-verb agreement artifact", re.compile(r"\byou\s+says\b", re.IGNORECASE)),
+    ("subject-verb agreement artifact", re.compile(r"\byou\s+was\b", re.IGNORECASE)),
+    ("subject-verb agreement artifact", re.compile(r"\byou\s+has\b", re.IGNORECASE)),
+)
+
+
+def find_direct_address_contract_violations(answer: str) -> list[str]:
+    """
+    Report direct-address contract violations that need a repair rewrite.
+    """
+    if not answer:
+        return []
+
+    seen: set[str] = set()
+    violations: list[str] = []
+    for label, pattern in _DIRECT_ADDRESS_CONTRACT_PATTERNS:
+        if pattern.search(answer) and label not in seen:
+            seen.add(label)
+            violations.append(label)
+    return violations
 
 
 _UNCERTAINTY_LEAD_PATTERNS = (

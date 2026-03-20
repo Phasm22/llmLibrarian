@@ -1345,9 +1345,10 @@ def test_run_ask_uses_direct_address_tone_policy(monkeypatch, mock_collection, m
     }
     run_ask(archetype_id=None, query="what is this", no_color=True, use_reranker=False, silo="stuff")
     system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
-    assert "Use a neutral, direct tone." in system_prompt
-    assert "Address the user directly as 'you'/'your'." in system_prompt
-    assert "Do not refer to the user in third person" in system_prompt
+    assert system_prompt.startswith("Use a neutral, direct tone.")
+    assert "Always address the user directly as 'you'/'your'/'you've'." in system_prompt
+    assert "NEVER refer to the user in third person" in system_prompt
+    assert system_prompt.index("Use a neutral, direct tone.") < system_prompt.index("Answer only from the provided context.")
     assert "Do not start responses with 'You'." not in system_prompt
 
 
@@ -1440,6 +1441,78 @@ def test_run_ask_normalizes_third_person_user_phrasing(monkeypatch, mock_collect
     assert "The user" not in out
     assert "You should retest in 3 months." in out
     assert "You requested follow-up." in out
+    assert len(mock_ollama["calls"]) == 1
+
+
+def test_run_ask_repairs_direct_address_contract_with_second_llm_pass(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["journal context"]],
+        "metadatas": [[{"source": "/tmp/journal.md", "line_start": 8, "is_local": 1, "silo": "much-thinks"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = [
+        {
+            "message": {
+                "content": "Jill appears to be the narrator's girlfriend. The narrator acknowledges this."
+            }
+        },
+        {
+            "message": {
+                "content": "Jill appears to be your girlfriend. You acknowledge this."
+            }
+        },
+    ]
+
+    out = run_ask(archetype_id=None, query="who is Jill to me?", no_color=True, use_reranker=False, silo="much-thinks")
+    assert len(mock_ollama["calls"]) == 2
+    assert "the narrator" not in out.lower()
+    assert "Jill appears to be your girlfriend." in out
+    assert "You acknowledge this." in out
+    repair_system_prompt = mock_ollama["calls"][1]["messages"][0]["content"]
+    assert "Allowed edits only:" in repair_system_prompt
+    assert "Return only the repaired answer text." in repair_system_prompt
+
+
+def test_run_ask_repairs_narrator_possessive_without_yous_artifact(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["journal context"]],
+        "metadatas": [[{"source": "/tmp/journal.md", "line_start": 8, "is_local": 1, "silo": "much-thinks"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = [
+        {"message": {"content": "Jill appears to be the narrator's girlfriend."}},
+        {"message": {"content": "Jill appears to be your girlfriend."}},
+    ]
+
+    out = run_ask(archetype_id=None, query="who is Jill to me?", no_color=True, use_reranker=False, silo="much-thinks")
+    assert "your girlfriend" in out
+    assert "you's" not in out.lower()
+
+
+def test_run_ask_compliant_direct_address_answer_does_not_trigger_repair(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["journal context"]],
+        "metadatas": [[{"source": "/tmp/journal.md", "line_start": 8, "is_local": 1, "silo": "much-thinks"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = {
+        "message": {
+            "content": "Jill is your girlfriend's sister. You mentioned this on March 5, 2026."
+        }
+    }
+
+    out = run_ask(archetype_id=None, query="who is Jill to me?", no_color=True, use_reranker=False, silo="much-thinks")
+    assert "Jill is your girlfriend's sister." in out
+    assert len(mock_ollama["calls"]) == 1
 
 
 def test_run_ask_direct_decisive_mode_adds_conflict_policy(monkeypatch, mock_collection, mock_ollama):
@@ -1736,6 +1809,35 @@ def test_run_ask_trace_includes_confidence_diagnostics(monkeypatch, tmp_path, mo
     assert "confidence_banner_emitted" in payload
 
 
+def test_run_ask_trace_records_direct_address_repair(monkeypatch, tmp_path, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    trace_path = tmp_path / "trace.jsonl"
+    monkeypatch.setenv("LLMLIBRARIAN_TRACE", str(trace_path))
+    mock_collection.query_result = {
+        "documents": [["journal context"]],
+        "metadatas": [[{"source": "/tmp/journal.md", "is_local": 1, "silo": "much-thinks"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = [
+        {"message": {"content": "Jill appears to be the narrator's girlfriend. The narrator acknowledges this."}},
+        {"message": {"content": "Jill appears to be your girlfriend. You acknowledge this."}},
+    ]
+
+    run_ask(
+        archetype_id=None,
+        query="who is Jill to me?",
+        no_color=True,
+        use_reranker=False,
+        silo="much-thinks",
+    )
+    payload = json.loads(trace_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert payload["answer_repair_triggered"] is True
+    assert "third-person narrator/writer reference" in payload["answer_repair_reason"]
+    assert payload["answer_repair_resolved"] is True
+
+
 def test_run_ask_silo_prompt_override_precedence(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
@@ -1754,7 +1856,9 @@ def test_run_ask_silo_prompt_override_precedence(monkeypatch, mock_collection, m
 
     run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, silo="stuff-deadbeef")
     system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
-    assert system_prompt.startswith("Override prompt.")
+    assert system_prompt.startswith("Use a neutral, direct tone.")
+    assert "Override prompt." in system_prompt
+    assert system_prompt.index("Use a neutral, direct tone.") < system_prompt.index("Override prompt.")
 
 
 def test_run_ask_silo_prompt_falls_back_to_slug_base(monkeypatch, mock_collection, mock_ollama):
@@ -1775,7 +1879,9 @@ def test_run_ask_silo_prompt_falls_back_to_slug_base(monkeypatch, mock_collectio
 
     run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, silo="stuff-deadbeef")
     system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
-    assert system_prompt.startswith("Hash base prompt.")
+    assert system_prompt.startswith("Use a neutral, direct tone.")
+    assert "Hash base prompt." in system_prompt
+    assert system_prompt.index("Use a neutral, direct tone.") < system_prompt.index("Hash base prompt.")
 
 
 def test_run_ask_silo_prompt_falls_back_to_normalized_display_name(monkeypatch, mock_collection, mock_ollama):
@@ -1796,7 +1902,9 @@ def test_run_ask_silo_prompt_falls_back_to_normalized_display_name(monkeypatch, 
 
     run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, silo="x-12345678")
     system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
-    assert system_prompt.startswith("Display prompt.")
+    assert system_prompt.startswith("Use a neutral, direct tone.")
+    assert "Display prompt." in system_prompt
+    assert system_prompt.index("Use a neutral, direct tone.") < system_prompt.index("Display prompt.")
 
 
 def test_run_ask_silo_prompt_uses_default_when_no_override_or_archetype(monkeypatch, mock_collection, mock_ollama):
@@ -1814,7 +1922,9 @@ def test_run_ask_silo_prompt_uses_default_when_no_override_or_archetype(monkeypa
 
     run_ask(archetype_id=None, query="what is alpha", no_color=True, use_reranker=False, silo="x-12345678")
     system_prompt = mock_ollama["calls"][0]["messages"][0]["content"]
-    assert system_prompt.startswith("Answer only from the provided context. Be concise.")
+    assert system_prompt.startswith("Use a neutral, direct tone.")
+    assert "Answer only from the provided context. Be concise." in system_prompt
+    assert system_prompt.index("Use a neutral, direct tone.") < system_prompt.index("Answer only from the provided context. Be concise.")
 
 
 def test_run_ask_evidence_profile_uses_hybrid_get(monkeypatch, mock_collection, mock_ollama):
