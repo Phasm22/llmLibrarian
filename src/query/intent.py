@@ -197,6 +197,13 @@ def route_intent(query: str) -> str:
     # REFLECT: analyze / reflect on (often short or pasted)
     if re.search(r"\breflect\b|\bsummarize\s+this\b|\banalyze\s+this\b", q) and len(q) < 120:
         return INTENT_REFLECT
+    # REFLECT: self-reflective identity/style questions that need synthesis across personal writing.
+    if (
+        re.search(r"\bwhat\s+kind\s+of\b", q)
+        and re.search(r"\bam\s+i\b", q)
+        and re.search(r"\b(writer|writing|person|thinker|learner|student|author)\b", q)
+    ):
+        return INTENT_REFLECT
     # EVIDENCE_PROFILE: preferences, "what do I like", "what did I say about", "do I mention"
     if re.search(
         r"\bwhat (?:do i|did i) (?:like|love|enjoy|say|think|decide)\b|\bdo i (?:mention|say|like)\b|"

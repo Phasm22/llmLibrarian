@@ -1456,20 +1456,20 @@ def test_run_ask_repairs_direct_address_contract_with_second_llm_pass(monkeypatc
     mock_ollama["response"] = [
         {
             "message": {
-                "content": "Jill appears to be the narrator's girlfriend. The narrator acknowledges this."
+                "content": "Jules appears to be the narrator's girlfriend. The narrator acknowledges this."
             }
         },
         {
             "message": {
-                "content": "Jill appears to be your girlfriend. You acknowledge this."
+                "content": "Jules appears to be your girlfriend. You acknowledge this."
             }
         },
     ]
 
-    out = run_ask(archetype_id=None, query="who is Jill to me?", no_color=True, use_reranker=False, silo="much-thinks")
+    out = run_ask(archetype_id=None, query="who is Jules to me?", no_color=True, use_reranker=False, silo="much-thinks")
     assert len(mock_ollama["calls"]) == 2
     assert "the narrator" not in out.lower()
-    assert "Jill appears to be your girlfriend." in out
+    assert "Jules appears to be your girlfriend." in out
     assert "You acknowledge this." in out
     repair_system_prompt = mock_ollama["calls"][1]["messages"][0]["content"]
     assert "Allowed edits only:" in repair_system_prompt
@@ -1486,11 +1486,11 @@ def test_run_ask_repairs_narrator_possessive_without_yous_artifact(monkeypatch, 
         "ids": [["id-1"]],
     }
     mock_ollama["response"] = [
-        {"message": {"content": "Jill appears to be the narrator's girlfriend."}},
-        {"message": {"content": "Jill appears to be your girlfriend."}},
+        {"message": {"content": "Jules appears to be the narrator's girlfriend."}},
+        {"message": {"content": "Jules appears to be your girlfriend."}},
     ]
 
-    out = run_ask(archetype_id=None, query="who is Jill to me?", no_color=True, use_reranker=False, silo="much-thinks")
+    out = run_ask(archetype_id=None, query="who is Jules to me?", no_color=True, use_reranker=False, silo="much-thinks")
     assert "your girlfriend" in out
     assert "you's" not in out.lower()
 
@@ -1506,13 +1506,50 @@ def test_run_ask_compliant_direct_address_answer_does_not_trigger_repair(monkeyp
     }
     mock_ollama["response"] = {
         "message": {
-            "content": "Jill is your girlfriend's sister. You mentioned this on March 5, 2026."
+            "content": "Jules is your girlfriend's sister. You mentioned this on March 5, 2026."
         }
     }
 
-    out = run_ask(archetype_id=None, query="who is Jill to me?", no_color=True, use_reranker=False, silo="much-thinks")
-    assert "Jill is your girlfriend's sister." in out
+    out = run_ask(archetype_id=None, query="who is Jules to me?", no_color=True, use_reranker=False, silo="much-thinks")
+    assert "Jules is your girlfriend's sister." in out
     assert len(mock_ollama["calls"]) == 1
+
+
+def test_run_ask_repairs_journal_self_reference_phrasing(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [["journal context"]],
+        "metadatas": [[{"source": "/tmp/journal.md", "line_start": 8, "is_local": 1, "silo": "much-thinks"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = [
+        {
+            "message": {
+                "content": (
+                    "Sid appears to be a friend from college who has maintained a significant friendship over the years. "
+                    "The person reflecting in the journal entries values this relationship highly. "
+                    "Additionally, Sid is noted to live in Boulder, where the person often hangs out with him."
+                )
+            }
+        },
+        {
+            "message": {
+                "content": (
+                    "Sid appears to be a friend from college who has maintained a significant friendship over the years. "
+                    "You value this relationship highly. "
+                    "Additionally, Sid is noted to live in Boulder, where you often hang out with him."
+                )
+            }
+        },
+    ]
+
+    out = run_ask(archetype_id=None, query="who is sid?", no_color=True, use_reranker=False, silo="much-thinks")
+    assert len(mock_ollama["calls"]) == 2
+    assert "the person" not in out.lower()
+    assert "You value this relationship highly." in out
+    assert "where you often hang out with him." in out
 
 
 def test_run_ask_direct_decisive_mode_adds_conflict_policy(monkeypatch, mock_collection, mock_ollama):
@@ -1821,13 +1858,13 @@ def test_run_ask_trace_records_direct_address_repair(monkeypatch, tmp_path, mock
         "ids": [["id-1"]],
     }
     mock_ollama["response"] = [
-        {"message": {"content": "Jill appears to be the narrator's girlfriend. The narrator acknowledges this."}},
-        {"message": {"content": "Jill appears to be your girlfriend. You acknowledge this."}},
+        {"message": {"content": "Jules appears to be the narrator's girlfriend. The narrator acknowledges this."}},
+        {"message": {"content": "Jules appears to be your girlfriend. You acknowledge this."}},
     ]
 
     run_ask(
         archetype_id=None,
-        query="who is Jill to me?",
+        query="who is Jules to me?",
         no_color=True,
         use_reranker=False,
         silo="much-thinks",
@@ -1836,6 +1873,69 @@ def test_run_ask_trace_records_direct_address_repair(monkeypatch, tmp_path, mock
     assert payload["answer_repair_triggered"] is True
     assert "third-person narrator/writer reference" in payload["answer_repair_reason"]
     assert payload["answer_repair_resolved"] is True
+
+
+def test_run_ask_self_reflective_writer_query_avoids_structure_fallback(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.get_silo_display_name", lambda _db, _silo: "Journal / Reflection")
+    monkeypatch.setattr("query.core.get_silo_prompt_override", lambda _db, _silo: None)
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {}})
+    mock_collection.query_result = {
+        "documents": [[
+            "I keep returning to introspection, patterns, and emotional clarity in these entries.",
+            "My writing often circles around meaning-making, self-observation, and revising what I feel.",
+        ]],
+        "metadatas": [[
+            {"source": "/tmp/2026-03-17.md", "line_start": 1, "is_local": 1, "silo": "much-thinks"},
+            {"source": "/tmp/2026-03-20.md", "line_start": 1, "is_local": 1, "silo": "much-thinks"},
+        ]],
+        "distances": [[9.9, 9.8]],
+        "ids": [["id-1", "id-2"]],
+    }
+    mock_ollama["response"] = {
+        "message": {"content": "You come across as a recursive, self-observing reflective writer who uses journaling to test and refine meaning."}
+    }
+
+    out = run_ask(
+        archetype_id=None,
+        query="what kind of reflective writer am i",
+        no_color=True,
+        use_reranker=False,
+        silo="much-thinks",
+    )
+
+    assert "I don't have content closely matching that query." not in out
+    assert "You come across as a recursive, self-observing reflective writer" in out
+    assert len(mock_ollama["calls"]) == 1
+
+
+def test_run_ask_trace_includes_stage_timings(monkeypatch, tmp_path, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    trace_path = tmp_path / "trace.jsonl"
+    monkeypatch.setenv("LLMLIBRARIAN_TRACE", str(trace_path))
+    mock_collection.query_result = {
+        "documents": [["Reflective writing context with recurring patterns and strong self-observation."]],
+        "metadatas": [[{"source": "/tmp/journal.md", "is_local": 1, "silo": "much-thinks"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = {
+        "message": {"content": "You write in a reflective and pattern-seeking way."}
+    }
+
+    run_ask(
+        archetype_id=None,
+        query="what kind of reflective writer am i",
+        no_color=True,
+        use_reranker=False,
+        silo="much-thinks",
+    )
+
+    payload = json.loads(trace_path.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert "stage_timings_ms" in payload
+    assert "llm_call" in payload["stage_timings_ms"]
+    assert payload["slowest_stage"] in payload["stage_timings_ms"]
+    assert payload["slowest_stage_ms"] == payload["stage_timings_ms"][payload["slowest_stage"]]
 
 
 def test_run_ask_silo_prompt_override_precedence(monkeypatch, mock_collection, mock_ollama):
@@ -2108,7 +2208,7 @@ def test_run_ask_tax_resolver_short_circuits_llm(monkeypatch, mock_ollama):
 def test_run_ask_academic_resolver_short_circuits_llm(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_ACADEMIC_HISTORY)
-    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"user_name": "Tandon Kelvon Jenkins"}})
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"user_name": "Landon Kelvin Jennings"}})
     monkeypatch.setattr(
         "query.core.parse_academic_query",
         lambda _q: {
@@ -2134,7 +2234,7 @@ def test_run_ask_academic_resolver_short_circuits_llm(monkeypatch, mock_collecti
             "receipt_metas": [{"source": "/tmp/Uccs_Transcript.pdf", "record_type": "transcript_row"}],
             "academic_transcript_hits": 1,
             "academic_evidence_rows": 1,
-            "academic_identity_name": "Tandon Kelvon Jenkins",
+            "academic_identity_name": "Landon Kelvin Jennings",
             "academic_identity_rows": 1,
             "academic_school_rows": 1,
             "academic_rows_pre_filter": 1,
@@ -2149,7 +2249,7 @@ def test_run_ask_academic_resolver_short_circuits_llm(monkeypatch, mock_collecti
         silo="old-school",
     )
     assert "1. [High] CS 2060 C Programming" in out
-    assert seen.get("user_name") == "Tandon Kelvon Jenkins"
+    assert seen.get("user_name") == "Landon Kelvin Jennings"
     assert mock_ollama["calls"] == []
     assert not any(name == "query" for name, _kwargs in mock_collection.calls)
 
@@ -2222,7 +2322,7 @@ def test_run_ask_academic_trace_fields_present(monkeypatch, tmp_path, mock_colle
     trace_path = tmp_path / "trace.jsonl"
     monkeypatch.setenv("LLMLIBRARIAN_TRACE", str(trace_path))
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_ACADEMIC_HISTORY)
-    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"user_name": "Tandon Kelvon Jenkins"}})
+    monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"user_name": "Landon Kelvin Jennings"}})
     monkeypatch.setattr(
         "query.core.parse_academic_query",
         lambda _q: {
@@ -2246,7 +2346,7 @@ def test_run_ask_academic_trace_fields_present(monkeypatch, tmp_path, mock_colle
             "receipt_metas": [{"source": "/tmp/Uccs_Transcript.pdf", "record_type": "transcript_row"}],
             "academic_transcript_hits": 1,
             "academic_evidence_rows": 1,
-            "academic_identity_name": "Tandon Kelvon Jenkins",
+            "academic_identity_name": "Landon Kelvin Jennings",
             "academic_identity_rows": 1,
             "academic_school_rows": 1,
             "academic_rows_pre_filter": 1,
@@ -2264,7 +2364,7 @@ def test_run_ask_academic_trace_fields_present(monkeypatch, tmp_path, mock_colle
     assert payload.get("academic_rerank_applied") is False
     assert payload.get("academic_transcript_hits") == 1
     assert payload.get("academic_evidence_rows") == 1
-    assert payload.get("academic_identity_name") == "Tandon Kelvon Jenkins"
+    assert payload.get("academic_identity_name") == "Landon Kelvin Jennings"
     assert payload.get("academic_identity_rows") == 1
     assert payload.get("academic_school_rows") == 1
     assert payload.get("academic_rows_pre_filter") == 1

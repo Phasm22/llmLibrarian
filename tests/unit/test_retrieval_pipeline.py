@@ -345,11 +345,11 @@ def test_academic_source_priority_boosts_identity_and_school_matches():
             "record_type": "transcript_row",
             "doc_type": "transcript",
             "source": "/tmp/Uccs_Transcript.pdf",
-            "student_name": "Tandon Kelvon Jenkins",
+            "student_name": "Landon Kelvin Jennings",
             "course_school": "University of Colorado Colorado Springs",
         },
         "Course row: CS 2060 | C Programming",
-        {"mode": "classes_taken", "user_name": "Tandon Kelvon Jenkins", "requested_school": "UCCS"},
+        {"mode": "classes_taken", "user_name": "Landon Kelvin Jennings", "requested_school": "UCCS"},
     )
     mismatched = academic_source_priority_score(
         {
@@ -360,7 +360,7 @@ def test_academic_source_priority_boosts_identity_and_school_matches():
             "course_school": "Other School",
         },
         "Course row: CS 2060 | C Programming",
-        {"mode": "classes_taken", "user_name": "Tandon Kelvon Jenkins", "requested_school": "UCCS"},
+        {"mode": "classes_taken", "user_name": "Landon Kelvin Jennings", "requested_school": "UCCS"},
     )
     assert matched > mismatched
 

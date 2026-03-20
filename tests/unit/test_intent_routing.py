@@ -70,6 +70,10 @@ def test_route_intent_reflect_query():
     assert route_intent("reflect on this") == INTENT_REFLECT
 
 
+def test_route_intent_self_reflective_writer_query():
+    assert route_intent("what kind of reflective writer am i") == INTENT_REFLECT
+
+
 def test_route_intent_evidence_profile_query():
     assert route_intent("what do i like about this project?") == INTENT_EVIDENCE_PROFILE
 

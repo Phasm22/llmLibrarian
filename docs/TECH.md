@@ -2,6 +2,13 @@
 
 Current runtime contracts only.
 
+## Product Shape
+
+The system is organized around a few stable ideas:
+- `pal` is the operator-facing wrapper for ingest, ask, and health checks.
+- `llmli` is the direct engine CLI for lower-level actions and automation.
+- most behavior is deterministic and driven by the index, not by ad hoc prompts.
+
 ## Query Contract
 
 `run_ask` follows this order:
@@ -42,6 +49,8 @@ Watch lifecycle:
 - stop: `pal pull --stop <target>`
 
 Watcher locks live in `~/.pal/watch_locks/*.pid`.
+
+The broader maintenance and inspection surfaces are intentionally thin wrappers around the same index state: use them when you need to confirm freshness, support, or cleanup, not as separate product modes.
 
 ## OCR and Images
 

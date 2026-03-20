@@ -959,6 +959,8 @@ def _repair_direct_address_answer(
         "Keep every other word, date, number, relationship term, quote, bullet, heading, and source reference unchanged. "
         "Examples: \"the narrator's girlfriend\" -> \"your girlfriend\". "
         "\"The narrator acknowledges this.\" -> \"You acknowledge this.\" "
+        "\"The person reflecting in the journal entries values this relationship.\" -> \"You value this relationship.\" "
+        "\"The person often hangs out with him.\" -> \"You often hang out with him.\" "
         "Return only the repaired answer text."
     )
     repair_user_prompt = (
@@ -1071,6 +1073,15 @@ def run_ask(
 
     # Silent intent routing: choose retrieval K and evidence handling (no new CLI flags)
     t0 = time.perf_counter()
+    stage_timings_ms: dict[str, float] = {}
+    _stage_started = t0
+
+    def _mark_stage(name: str) -> None:
+        nonlocal _stage_started
+        now = time.perf_counter()
+        stage_timings_ms[name] = round((now - _stage_started) * 1000, 2)
+        _stage_started = now
+
     intent = route_intent(query)
     query_opts = get_query_options(load_config(config_path))
     auto_scope_binding = bool(query_opts.get("auto_scope_binding", True))
@@ -1138,6 +1149,7 @@ def run_ask(
             + " Treat custom scripts/tests/docs in personal repos as likely authored unless contradictory evidence appears."
             + " Label uncertain ownership explicitly."
         )
+    _mark_stage("setup")
     # CAPABILITIES: return deterministic report inline (source of truth; no retrieval, no LLM)
     if intent == INTENT_CAPABILITIES and use_unified:
         try:
@@ -1584,6 +1596,7 @@ def run_ask(
     )
     image_adapter = get_image_embedding_adapter()
     image_collection = client.get_or_create_collection(name=image_collection_name(collection_name)) if image_adapter is not None else None
+    _mark_stage("collection_init")
 
     # CODE_LANGUAGE: deterministic count by extension (code files only). No retrieval, no LLM.
     if intent == INTENT_CODE_LANGUAGE and use_unified:
@@ -2246,6 +2259,7 @@ def run_ask(
                 max_per_silo=per_silo_cap,
                 silos=silo_cache,
             )
+    _mark_stage("retrieval_pipeline")
 
     # Filetype-hinted summary floor: keep sources that contribute at least one chunk under relevance threshold.
     # This trims unrelated same-extension files (e.g., other PPTX decks) without introducing non-determinism.
@@ -2411,7 +2425,8 @@ def run_ask(
         and top_d < 2.0
     )
     has_evidence_overlap = _has_query_evidence_overlap(query, docs, metas)
-    if all_dists_above_threshold(dists, threshold) and not unscoped_soft_low_conf and not has_evidence_overlap:
+    allow_low_confidence_synthesis = bool(silo and intent in (INTENT_REFLECT, INTENT_EVIDENCE_PROFILE))
+    if all_dists_above_threshold(dists, threshold) and not unscoped_soft_low_conf and not has_evidence_overlap and not allow_low_confidence_synthesis:
         if academic_mode:
             warning_text = "Low confidence: class-history query is not grounded in transcript/audit course rows in this scope."
             time_ms = (time.perf_counter() - t0) * 1000
@@ -2660,6 +2675,8 @@ def run_ask(
         options={"temperature": 0, "seed": 42},
     )
     _elapsed = _time.perf_counter() - _t0
+    stage_timings_ms["llm_call"] = round(_elapsed * 1000, 2)
+    _stage_started = _time.perf_counter()
     try:
         _parts = [f"[llm {model}] {_elapsed:.1f}s"]
         if _proc is not None:
@@ -2712,6 +2729,7 @@ def run_ask(
             )
     answer = style_answer(raw_answer, no_color)
     answer = linkify_sources_in_answer(answer, metas, no_color)
+    _mark_stage("answer_postprocess")
 
     if quiet:
         return answer
@@ -2729,6 +2747,10 @@ def run_ask(
     out.extend([""] + render_sources_footer(docs, metas, dists, no_color=no_color, detailed=explain))
 
     time_ms = (time.perf_counter() - t0) * 1000
+    slowest_stage = None
+    slowest_stage_ms = None
+    if stage_timings_ms:
+        slowest_stage, slowest_stage_ms = max(stage_timings_ms.items(), key=lambda item: item[1])
     write_trace(
         intent=intent,
         n_stage1=n_stage1,
@@ -2766,6 +2788,9 @@ def run_ask(
         academic_identity_rows=academic_identity_rows if academic_mode else None,
         academic_school_rows=academic_school_rows if academic_mode else None,
         academic_rows_pre_filter=academic_rows_pre_filter if academic_mode else None,
+        stage_timings_ms=stage_timings_ms,
+        slowest_stage=slowest_stage,
+        slowest_stage_ms=slowest_stage_ms,
     )
     return "\n".join(out)
 

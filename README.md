@@ -2,7 +2,8 @@
 
 Local-first search + reasoning over files you choose to index.
 
-`pal` is the operator-facing CLI. `llmli` is the direct engine CLI.
+`pal` is the operator-facing CLI for indexing, asking, and keeping the index healthy.
+`llmli` is the direct engine CLI for scripting and lower-level automation.
 
 ## Quick Start
 
@@ -19,16 +20,13 @@ If you want multimodal image summaries, also set a vision-capable Ollama model:
 export LLMLIBRARIAN_VISION_MODEL=qwen2.5vl:7b
 ```
 
-## Core Flow
+## Typical Flow
 
 ```bash
 pal pull /path/to/folder
-pal pull /path/to/photos --image-vision
-pal pull /path/to/folder --workers 12 --embedding-workers 4
-pal ls
 pal ask --in <silo> "what is this folder mostly about?"
 pal ask --unified "what themes repeat across my indexed folders?"
-pal inspect <silo> --top 5
+pal inspect <silo>
 ```
 
 Natural shorthand is supported:
@@ -37,24 +35,15 @@ Natural shorthand is supported:
 pal ask in <silo> "what files are from 2022"
 ```
 
-## What `pal pull` Does
+## What It Is For
 
-- Indexes supported files in the folder.
-- Registers the folder as a silo.
-- Re-pulls changed files on later runs.
-- Prints preflight counts and image progress for image-heavy folders.
-- Accepts `--image-vision` per silo.
-- Accepts `--workers` and `--embedding-workers` per run.
+Use it to turn a folder into a searchable silo, then ask grounded questions about that silo or across all silos.
 
-Cloud-sync folders are blocked by default. Use `--allow-cloud` only if the files are fully local and pinned.
+`pal pull` handles ingest and refresh. Cloud-sync folders are blocked by default; use `--allow-cloud` only if the files are fully local and pinned.
 
-## What `pal ask` Does
+`pal capabilities`, `pal log`, `pal status`, and `pal diff` are the main maintenance views when you need to check what changed, what is supported, or whether an index is drifting.
 
-- Default ask searches indexed silos.
-- `--in <silo>` scopes to one silo.
-- `--unified` searches across silos.
-- Deterministic structure asks use manifest/registry data, not embedding retrieval.
-- Answers cite sources so you can verify them.
+`pal ask` searches indexed data and cites sources so you can verify the answer.
 
 ## Images and OCR
 
@@ -72,21 +61,6 @@ Cloud-sync folders are blocked by default. Use `--allow-cloud` only if the files
 If standalone images are present:
 - `LLMLIBRARIAN_VISION_MODEL` is required only when `--image-vision` is enabled.
 - OpenCLIP image embedding dependencies must be installed (`uv sync`).
-
-## Common Commands
-
-| Command | Purpose |
-|---|---|
-| `pal pull <path>` | Index one folder and register/update its silo. |
-| `pal pull --status` | Show watcher state. |
-| `pal pull --stop <target>` | Stop a watcher. |
-| `pal ask --in <silo> "..."` | Ask inside one silo. |
-| `pal ask --unified "..."` | Ask across silos. |
-| `pal ls` | List silos. |
-| `pal inspect <silo>` | Show silo details and top files. |
-| `pal capabilities` | Show supported file types/extractors. |
-| `pal log` | Show recent indexing failures. |
-| `pal sync` | Refresh the repo self-silo in dev mode. |
 
 ## Troubleshooting
 

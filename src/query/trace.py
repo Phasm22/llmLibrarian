@@ -50,6 +50,9 @@ def write_trace(
     academic_identity_rows: int | None = None,
     academic_school_rows: int | None = None,
     academic_rows_pre_filter: int | None = None,
+    stage_timings_ms: dict[str, float] | None = None,
+    slowest_stage: str | None = None,
+    slowest_stage_ms: float | None = None,
 ) -> None:
     """Append one JSON-line to LLMLIBRARIAN_TRACE file (if set). Optional receipt: source paths and chunk hashes for chunks sent to the LLM. No-op if env unset. Does not raise."""
     path = os.environ.get("LLMLIBRARIAN_TRACE")
@@ -139,6 +142,15 @@ def write_trace(
         payload["academic_school_rows"] = int(academic_school_rows)
     if academic_rows_pre_filter is not None:
         payload["academic_rows_pre_filter"] = int(academic_rows_pre_filter)
+    if stage_timings_ms:
+        payload["stage_timings_ms"] = {
+            str(k): round(float(v), 2)
+            for k, v in stage_timings_ms.items()
+        }
+    if slowest_stage:
+        payload["slowest_stage"] = str(slowest_stage)
+    if slowest_stage_ms is not None:
+        payload["slowest_stage_ms"] = round(float(slowest_stage_ms), 2)
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")

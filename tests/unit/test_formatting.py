@@ -55,7 +55,7 @@ def test_sanitize_answer_metadata_artifacts_rewrites_file_only_token():
 
 def test_normalize_answer_direct_address_rewrites_common_third_person_terms():
     raw = (
-        "A patient named Tandon Jenkins had normal levels. "
+        "A patient named Landon Jennings had normal levels. "
         "The patient's visit was brief. The patient had normal levels. "
         "This patient should retest. The user requested follow-up."
     )
@@ -74,7 +74,7 @@ def test_normalize_answer_direct_address_rewrites_common_third_person_terms():
 
 def test_find_direct_address_contract_violations_flags_narrator_and_grammar_artifacts():
     raw = (
-        "Jill appears to be the narrator's girlfriend. "
+        "Jules appears to be the narrator's girlfriend. "
         "The writer acknowledges that. "
         "You says this because you's certain."
     )
@@ -85,8 +85,18 @@ def test_find_direct_address_contract_violations_flags_narrator_and_grammar_arti
 
 
 def test_find_direct_address_contract_violations_is_empty_for_clean_second_person_answer():
-    raw = "Jill appears to be your girlfriend's sister. You mentioned this on March 5, 2026."
+    raw = "Jules appears to be your girlfriend's sister. You mentioned this on March 5, 2026."
     assert find_direct_address_contract_violations(raw) == []
+
+
+def test_find_direct_address_contract_violations_flags_journal_self_reference():
+    raw = (
+        "Sid appears to be a longtime friend. "
+        "The person reflecting in the journal entries values this relationship highly. "
+        "Additionally, Sid is noted to live in Boulder, where the person often hangs out with him."
+    )
+    out = find_direct_address_contract_violations(raw)
+    assert "third-person journal self-reference" in out
 
 
 def test_normalize_uncertainty_tone_reduces_hedge_loops_when_banner_present():

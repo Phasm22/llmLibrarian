@@ -265,6 +265,15 @@ def find_direct_address_contract_violations(answer: str) -> list[str]:
         if pattern.search(answer) and label not in seen:
             seen.add(label)
             violations.append(label)
+    lower = answer.lower()
+    journalish = bool(
+        re.search(
+            r"\b(?:journal entries|retrieved entries|provided entries|these entries|the entries|these notes|the notes)\b",
+            lower,
+        )
+    )
+    if journalish and re.search(r"\bthe person\b", answer, re.IGNORECASE) and "third-person journal self-reference" not in seen:
+        violations.append("third-person journal self-reference")
     return violations
 
 

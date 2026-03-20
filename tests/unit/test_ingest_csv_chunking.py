@@ -117,7 +117,7 @@ def test_process_one_file_transcript_pdf_parses_title_first_rows(monkeypatch, tm
         assert source_path == str(p.resolve())
         return [
             (
-                "NAME: Jenkins, Tandon Kelvon\n"
+                "NAME: Jennings, Landon Kelvin\n"
                 "Fall 2023 CU Colo Springs\n"
                 "Programming with C\n"
                 "CS 2060\n"
@@ -140,7 +140,7 @@ def test_process_one_file_transcript_pdf_parses_title_first_rows(monkeypatch, tm
     assert metas[0]["course_title"] == "Programming with C"
     assert metas[0]["course_grade"] == "B"
     assert metas[0]["course_credits"] == "3.0"
-    assert metas[0]["student_name"] == "Tandon Kelvon Jenkins"
+    assert metas[0]["student_name"] == "Landon Kelvin Jennings"
     assert metas[0]["course_school"] == "University of Colorado Colorado Springs"
     assert metas[0]["course_status"] == "attempted"
     assert metas[1]["course_code"] == "CS 4500"

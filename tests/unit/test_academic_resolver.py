@@ -28,7 +28,7 @@ def test_run_academic_resolver_returns_deduped_rows_with_confidence_labels():
                     "course_term": "Fall 2023",
                     "course_grade": "A",
                     "course_credits": "4.000",
-                    "student_name": "Tandon Kelvon Jenkins",
+                    "student_name": "Landon Kelvin Jennings",
                     "course_school": "University of Colorado Colorado Springs",
                     "page": 1,
                 },
@@ -40,7 +40,7 @@ def test_run_academic_resolver_returns_deduped_rows_with_confidence_labels():
                     "course_term": "Fall 2023",
                     "course_grade": "A",
                     "course_credits": "4.000",
-                    "student_name": "Tandon Kelvon Jenkins",
+                    "student_name": "Landon Kelvin Jennings",
                     "course_school": "University of Colorado Colorado Springs",
                     "page": 1,
                 },
@@ -147,7 +147,7 @@ def test_run_academic_resolver_filters_transcript_rows_by_configured_identity():
                     "record_type": "transcript_row",
                     "course_code": "CS 2060",
                     "course_title": "C Programming",
-                    "student_name": "Tandon Kelvon Jenkins",
+                    "student_name": "Landon Kelvin Jennings",
                     "course_school": "University of Colorado Colorado Springs",
                 },
                 {
@@ -174,7 +174,7 @@ def test_run_academic_resolver_filters_transcript_rows_by_configured_identity():
         silo="old-school",
         source_label="old-school",
         no_color=True,
-        user_name="Tandon Kelvon Jenkins",
+        user_name="Landon Kelvin Jennings",
     )
     assert out is not None
     response = str(out["response"])
@@ -213,7 +213,7 @@ def test_run_academic_resolver_returns_constraint_no_match_response():
         silo="old-school",
         source_label="old-school",
         no_color=True,
-        user_name="Tandon Kelvon Jenkins",
+        user_name="Landon Kelvin Jennings",
     )
     assert out is not None
     assert out["guardrail_no_match"] is True
@@ -234,7 +234,7 @@ def test_run_academic_resolver_applies_school_filter_with_aliases():
                     "record_type": "transcript_row",
                     "course_code": "CS 2060",
                     "course_title": "C Programming",
-                    "student_name": "Tandon Kelvon Jenkins",
+                    "student_name": "Landon Kelvin Jennings",
                     "course_school": "CU Colo Springs",
                 },
                 {
@@ -242,7 +242,7 @@ def test_run_academic_resolver_applies_school_filter_with_aliases():
                     "record_type": "transcript_row",
                     "course_code": "MAT 201",
                     "course_title": "Calculus I",
-                    "student_name": "Tandon Kelvon Jenkins",
+                    "student_name": "Landon Kelvin Jennings",
                     "course_school": "Pikes Peak State College",
                 },
             ],
@@ -261,7 +261,7 @@ def test_run_academic_resolver_applies_school_filter_with_aliases():
         silo="old-school",
         source_label="old-school",
         no_color=True,
-        user_name="Tandon Kelvon Jenkins",
+        user_name="Landon Kelvin Jennings",
     )
     assert out is not None
     response = str(out["response"])
@@ -282,7 +282,7 @@ def test_run_academic_resolver_keeps_attempted_not_completed_rows():
                     "course_title": "Operating Systems I",
                     "course_grade": "W",
                     "course_status": "attempted_not_completed",
-                    "student_name": "Tandon Kelvon Jenkins",
+                    "student_name": "Landon Kelvin Jennings",
                     "course_school": "University of Colorado Colorado Springs",
                 }
             ],
@@ -301,7 +301,7 @@ def test_run_academic_resolver_keeps_attempted_not_completed_rows():
         silo="old-school",
         source_label="old-school",
         no_color=True,
-        user_name="Tandon Kelvon Jenkins",
+        user_name="Landon Kelvin Jennings",
     )
     assert out is not None
     response = str(out["response"])
