@@ -107,6 +107,7 @@ from query.formatting import (
     normalize_ownership_claims,
     normalize_sentence_start,
     normalize_inline_numbered_lists,
+    wrap_reflection_answer,
     linkify_sources_in_answer,
     format_source,
     render_sources_footer,
@@ -2720,6 +2721,8 @@ def run_ask(
     raw_answer = normalize_ownership_claims(raw_answer)
     raw_answer = normalize_inline_numbered_lists(raw_answer)
     raw_answer = normalize_sentence_start(raw_answer)
+    if archetype_id == "much-thinks" or silo == "much-thinks" or source_label == "Journal / Reflection":
+        raw_answer = wrap_reflection_answer(raw_answer)
     if unified_analytical_query and _distinct_silo_count(metas) <= 1:
         lone = str((metas[0] or {}).get("silo") or "one silo") if metas else "one silo"
         if "evidence concentration note" not in raw_answer.lower():

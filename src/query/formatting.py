@@ -4,6 +4,8 @@ source URL generation, and snippet previews.
 """
 import os
 import re
+import shutil
+import textwrap
 from statistics import median
 from urllib.parse import quote
 from pathlib import Path
@@ -422,6 +424,106 @@ def normalize_inline_numbered_lists(answer: str) -> str:
                     out_lines.append("")
                 out_lines.append(item)
     return "\n".join(out_lines)
+
+
+def _wrap_terminal_text(text: str, width: int) -> str:
+    wrapper = textwrap.TextWrapper(
+        width=width,
+        break_long_words=False,
+        break_on_hyphens=False,
+        replace_whitespace=False,
+        drop_whitespace=True,
+    )
+    return wrapper.fill(text.strip())
+
+
+def _answer_wrap_width(default: int = 88) -> int:
+    try:
+        cols = shutil.get_terminal_size(fallback=(default, 24)).columns
+    except Exception:
+        cols = default
+    try:
+        cols = int(cols)
+    except Exception:
+        cols = default
+    return max(72, min(96, cols - 2 if cols > 2 else default))
+
+
+def wrap_reflection_answer(answer: str, width: int | None = None) -> str:
+    """
+    Reflow reflection-style prose into readable terminal-width paragraphs.
+
+    Keeps code fences intact, preserves numbered/bulleted lists, and strips
+    markdown heading markers so reflection answers read like prose instead of raw markdown.
+    """
+    if not answer:
+        return ""
+
+    target_width = width or _answer_wrap_width()
+    lines = answer.splitlines()
+    out: list[str] = []
+    plain_block: list[str] = []
+    in_code_block = False
+
+    def flush_plain_block() -> None:
+        if not plain_block:
+            return
+        paragraph = " ".join(part.strip() for part in plain_block if part.strip())
+        if paragraph:
+            out.append(_wrap_terminal_text(paragraph, target_width))
+        plain_block.clear()
+
+    for raw in lines:
+        line = raw.rstrip()
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            flush_plain_block()
+            out.append(line)
+            in_code_block = not in_code_block
+            continue
+
+        if in_code_block:
+            out.append(line)
+            continue
+
+        if not stripped:
+            flush_plain_block()
+            if out and out[-1] != "":
+                out.append("")
+            continue
+
+        heading = re.match(r"^\s{0,3}#{1,6}\s*(.+?)\s*$", line)
+        if heading:
+            flush_plain_block()
+            out.append(_wrap_terminal_text(heading.group(1), target_width))
+            continue
+
+        list_match = re.match(r"^(\s*)(?:([-*•])|(\d+\.))\s+(.+)$", line)
+        if list_match:
+            flush_plain_block()
+            indent = list_match.group(1) or ""
+            marker = list_match.group(2) or list_match.group(3) or ""
+            content = list_match.group(4).strip()
+            prefix = f"{indent}{marker} "
+            wrapper = textwrap.TextWrapper(
+                width=target_width,
+                initial_indent=prefix,
+                subsequent_indent=" " * len(prefix),
+                break_long_words=False,
+                break_on_hyphens=False,
+                replace_whitespace=False,
+                drop_whitespace=True,
+            )
+            out.append(wrapper.fill(content))
+            continue
+
+        plain_block.append(line)
+
+    flush_plain_block()
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
 
 
 def linkify_sources_in_answer(answer: str, metas: list[dict | None], no_color: bool) -> str:

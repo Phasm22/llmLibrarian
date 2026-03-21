@@ -1552,6 +1552,36 @@ def test_run_ask_repairs_journal_self_reference_phrasing(monkeypatch, mock_colle
     assert "where you often hang out with him." in out
 
 
+def test_run_ask_wraps_much_thinks_reflection_answers(monkeypatch, mock_collection, mock_ollama):
+    _patch_query_runtime(monkeypatch, mock_collection)
+    monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
+    mock_collection.query_result = {
+        "documents": [[
+            "I keep returning to the same ideas about work, energy, and whether I am making progress in the right places."
+        ]],
+        "metadatas": [[{"source": "/tmp/journal.md", "line_start": 8, "is_local": 1, "silo": "much-thinks"}]],
+        "distances": [[0.2]],
+        "ids": [["id-1"]],
+    }
+    mock_ollama["response"] = {
+        "message": {
+            "content": (
+                "### Difficult Days:\n"
+                "1. Emotional Tone: The language often reflects negative emotions such as tiredness, pressure, or struggle. "
+                "For example, phrases like \"I'm tired today was a long day\" and \"I should've gone for a run, to get energy\" "
+                "indicate fatigue and missed opportunities for stress relief.\n\n"
+                "2. Focus on Challenges: There's an emphasis on the difficulties faced during the day."
+            )
+        }
+    }
+
+    out = run_ask(archetype_id=None, query="what patterns show up in how I write about difficult days vs good days", no_color=True, use_reranker=False, silo="much-thinks")
+    assert "###" not in out
+    assert "Difficult Days:" in out
+    assert "1. Emotional Tone:" in out
+    assert max(len(line) for line in out.splitlines() if line.strip()) <= 96
+
+
 def test_run_ask_direct_decisive_mode_adds_conflict_policy(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)

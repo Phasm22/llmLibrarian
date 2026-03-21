@@ -10,6 +10,7 @@ from query.formatting import (
     normalize_ownership_claims,
     normalize_sentence_start,
     normalize_inline_numbered_lists,
+    wrap_reflection_answer,
 )
 
 
@@ -135,3 +136,19 @@ def test_normalize_inline_numbered_lists_reflows_single_line_lists():
     assert "1. alpha" in out
     assert "\n2. beta" in out
     assert "\n3. gamma" in out
+
+
+def test_wrap_reflection_answer_removes_markdown_headings_and_wraps_prose():
+    raw = (
+        "### Difficult Days:\n"
+        "1. Emotional Tone: The language often reflects negative emotions such as tiredness, pressure, or struggle. "
+        "For example, phrases like \"I'm tired today was a long day\" and \"I should've gone for a run, to get energy\" "
+        "indicate fatigue and missed opportunities for stress relief.\n\n"
+        "2. Focus on Challenges: There's an emphasis on the difficulties faced during the day."
+    )
+    out = wrap_reflection_answer(raw, width=60)
+    assert "###" not in out
+    assert "Difficult Days:" in out
+    assert "1. Emotional Tone:" in out
+    assert "2. Focus on Challenges:" in out
+    assert max(len(line) for line in out.splitlines()) <= 60
