@@ -1,9 +1,10 @@
 """
 Centralized constants for llmLibrarian. Shared across ingest, query, and CLI modules.
 """
+from pathlib import Path
 
 # Storage
-DB_PATH = "./my_brain_db"
+DB_PATH = str(Path(__file__).parent.parent / "my_brain_db")
 LLMLI_COLLECTION = "llmli"
 LLMLI_IMAGE_COLLECTION = "llmli_image"
 

@@ -24,6 +24,9 @@ PAL_HOME = Path(os.environ.get("PAL_HOME", os.path.expanduser("~/.pal")))
 REGISTRY_PATH = PAL_HOME / "registry.json"
 WATCH_LOCKS_DIR = PAL_HOME / "watch_locks"
 
+_PAL_ROOT = Path(__file__).resolve().parent
+_DEFAULT_DB = str(_PAL_ROOT / "my_brain_db")
+
 
 def _iter_editable_roots(site_root: Path) -> list[Path]:
     roots: list[Path] = []
@@ -938,7 +941,7 @@ def ensure_self_silo(force: bool = False, emit_warning: bool = True) -> int:
         return 0
 
     is_dev = _is_dev_repo_at_root(repo_root)
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     llmli_registry = _read_llmli_registry(db_path)
     repo_str = str(repo_root.resolve())
     existing_slug = _resolve_llmli_silo_by_path(llmli_registry, repo_root)
@@ -1467,7 +1470,7 @@ def _set_silo_prompt_for_path(path: Path, prompt: str | None, clear_prompt: bool
     _ensure_src_on_path()
     from state import set_silo_prompt_override
 
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     llmli_registry = _read_llmli_registry(db_path)
     slug = _resolve_llmli_silo_by_path(llmli_registry, path)
     if slug is None:
@@ -1560,7 +1563,7 @@ def _pull_watch_path_mode(
         )
         if rc != 0:
             return rc
-        db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+        db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
         llmli_registry = _read_llmli_registry(db_path)
         slug = _resolve_llmli_silo_by_path(llmli_registry, path)
         if slug is None:
@@ -1598,7 +1601,7 @@ def _apply_watch_process_env() -> None:
 
 
 def _pull_watch_status_mode(path_input: str | None, json_output: bool, prune_stale: bool) -> int:
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     opt_path = Path(path_input).resolve() if path_input else None
     records, err = _status_records(db_path, opt_path)
     if err:
@@ -1624,7 +1627,7 @@ def _pull_watch_status_mode(path_input: str | None, json_output: bool, prune_sta
 
 
 def _pull_watch_stop_mode(target: str, json_output: bool, timeout: float = 3.0) -> int:
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     records, _ = _status_records(db_path, None)
     record, err = _resolve_stop_target(target, records)
     if err:
@@ -1774,7 +1777,7 @@ def _daemon_runtime_metadata(manager: str | None = None) -> dict[str, object]:
     detected_manager = manager or jobsrt.supported_service_manager()
     if not detected_manager:
         raise RuntimeError(f"Unsupported platform for daemon services: {sys.platform}")
-    db_path = Path(os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")).resolve()
+    db_path = Path(os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)).resolve()
     return {
         "version": 1,
         "manager": detected_manager,
@@ -1803,7 +1806,7 @@ def _daemon_env(db_path: str | Path) -> dict[str, str]:
 
 
 def _derive_watch_jobs_for_daemon(manager: str, db_path: str | Path | None = None) -> tuple[list[jobsrt.JobSpec], list[str]]:
-    target_db = db_path or os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    target_db = db_path or os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     return jobsrt.derive_watch_jobs(
         _read_registry(),
         _read_llmli_registry(target_db),
@@ -1900,8 +1903,8 @@ def _daemon_status_rows() -> tuple[dict[str, object] | None, list[jobsrt.JobSpec
     if not metadata:
         return None, [], [], []
     manager_name = str(metadata.get("manager") or "")
-    jobs, warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or "./my_brain_db"))
-    records, _ = _status_records(str(metadata.get("db_path") or "./my_brain_db"), None)
+    jobs, warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or _DEFAULT_DB))
+    records, _ = _status_records(str(metadata.get("db_path") or _DEFAULT_DB), None)
     return metadata, jobs, warnings, records
 
 
@@ -1912,7 +1915,7 @@ def _complete_silo(incomplete: str) -> list[str]:
     try:
         _ensure_src_on_path()
         from state import list_silos
-        db = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+        db = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
         silos = list_silos(db)
         results = []
         for s in silos:
@@ -1934,7 +1937,7 @@ def _complete_job_target(incomplete: str) -> list[str]:
         if not metadata:
             return []
         manager_name = str(metadata.get("manager") or "")
-        jobs, _ = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or "./my_brain_db"))
+        jobs, _ = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or _DEFAULT_DB))
         return [j.slug for j in jobs if j.slug.startswith(incomplete)]
     except Exception:
         return []
@@ -2085,7 +2088,7 @@ def ask_command(
     explain: bool = typer.Option(False, "--explain", help="Print deterministic catalog diagnostics to stderr when applicable."),
     force: bool = typer.Option(False, "--force", help="Allow deterministic catalog queries on stale scope."),
 ) -> None:
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     in_silo_norm, query_norm, scope_err = _normalize_natural_ask_scope(query, in_silo, db_path)
     if scope_err:
         print(scope_err, file=sys.stderr)
@@ -2160,7 +2163,7 @@ def remove_command(
     silo: list[str] = typer.Argument(..., help="Silo slug, display name, or path.", autocompletion=_complete_silo),
 ) -> None:
     name = " ".join(silo) if isinstance(silo, list) else str(silo)
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     source_path = _resolve_registry_source_for_remove(name, db_path)
     rc = _run_llmli(["rm", name])
     if rc != 0:
@@ -2232,7 +2235,7 @@ def daemon_logs_command(
         print("Daemon is not installed. Use: pal daemon install", file=sys.stderr)
         raise typer.Exit(code=1)
     manager_name = str(metadata.get("manager") or "")
-    jobs, _warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or "./my_brain_db"))
+    jobs, _warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or _DEFAULT_DB))
     if not target:
         if not jobs:
             print("No daemon jobs.")
@@ -2286,7 +2289,7 @@ def _jobs_ls_impl() -> None:
     if not manager_name:
         print(f"Unsupported platform for daemon jobs: {sys.platform}", file=sys.stderr)
         raise typer.Exit(code=1)
-    db_path = str((metadata or {}).get("db_path") or os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"))
+    db_path = str((metadata or {}).get("db_path") or os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB))
     jobs, warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=db_path)
     records, _ = _status_records(db_path, None)
     state_by_slug = {str((record or {}).get("silo") or ""): str((record or {}).get("state") or "installed") for record in records}
@@ -2321,7 +2324,7 @@ def diff_command(
     from file_registry import _read_file_manifest
     from ingest import _load_limits_config, collect_files, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE
 
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     slug = resolve_silo_to_slug(db_path, silo) or resolve_silo_prefix(db_path, silo)
     if not slug:
         print(f"Error: silo not found: {silo}", file=sys.stderr)
@@ -2398,7 +2401,7 @@ def status_command() -> None:
         find_path_overlaps,
     )
 
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     registry = load_registry(db_path)
     file_registry = load_file_registry(db_path)
     manifest = load_manifest(db_path)
@@ -2459,7 +2462,7 @@ def silos_command() -> None:
         find_path_overlaps,
         find_count_mismatches,
     )
-    db_path = os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db")
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     registry = load_registry(db_path)
     file_registry = load_file_registry(db_path)
     manifest = load_manifest(db_path)
