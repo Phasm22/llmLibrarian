@@ -85,7 +85,7 @@ def _bootstrap_src_path() -> None:
 _bootstrap_src_path()
 
 def _db_path(args: argparse.Namespace) -> Path:
-    return Path(getattr(args, "db", None) or os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"))
+    return Path(getattr(args, "db", None) or os.environ.get("LLMLIBRARIAN_DB", str(_ROOT / "my_brain_db"))).resolve()
 
 def _config_path(args: argparse.Namespace) -> Path | None:
     return getattr(args, "config", None) or os.environ.get("LLMLIBRARIAN_CONFIG")
@@ -412,7 +412,7 @@ def cmd_eval_adversarial(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="llmli", description="llmLibrarian CLI: add, ask, ls, inspect, index, rm, capabilities, log")
-    parser.add_argument("--db", default=os.environ.get("LLMLIBRARIAN_DB", "./my_brain_db"), help="DB path")
+    parser.add_argument("--db", default=os.environ.get("LLMLIBRARIAN_DB", str(_ROOT / "my_brain_db")), help="DB path")
     parser.add_argument("--config", help="Path to archetypes.yaml")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color")
     sub = parser.add_subparsers(dest="command", required=True)
