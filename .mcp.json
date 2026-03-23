@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "llmLibrarian": {
+      "command": "/Users/tjm4/llmLibrarian/.venv/bin/python",
+      "args": ["/Users/tjm4/llmLibrarian/mcp_server.py"],
+      "env": {
+        "LLMLIBRARIAN_DB": "/Users/tjm4/llmLibrarian/my_brain_db"
+      }
+    }
+  }
+}

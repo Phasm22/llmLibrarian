@@ -1,0 +1,33 @@
+# Databases and indexed data
+my_brain_db/
+*.db
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.spec
+
+# Dev and docs
+.git/
+.claude/
+.codex/
+.coverage
+tests/
+docs/
+jobs/
+gemini_summary.md
+adversarial_eval_smoke.json
+SETUP_REMOTE.md
+SECURITY_AND_TESTING.md
+AGENTS.md
+
+# Previous pack output
+*.mcpb

@@ -1,0 +1,41 @@
+{
+  "manifest_version": "0.4",
+  "name": "llmlibrarian",
+  "display_name": "llmLibrarian",
+  "version": "0.1.0",
+  "description": "Query your indexed personal documents using natural language. Retrieves raw chunks or Ollama-synthesized answers from your locally-indexed silos.",
+  "long_description": "llmLibrarian is a deterministic, locally-hosted RAG engine for personal data. It indexes folders into silos (ChromaDB collections) and answers questions using retrieved chunks. Use `retrieve` to get raw evidence for Claude to reason over, or `ask` to get an Ollama-synthesized answer. Supports PDF, DOCX, XLSX, PPTX, and text/code files.",
+  "author": {
+    "name": "tjm4"
+  },
+  "server": {
+    "type": "uv",
+    "entry_point": "mcp_server.py",
+    "mcp_config": {
+      "command": "uv",
+      "args": ["run", "mcp_server.py"],
+      "env": {
+        "LLMLIBRARIAN_DB": "${user.db_path}",
+        "LLMLIBRARIAN_MODEL": "${user.model}"
+      }
+    }
+  },
+  "user_config": {
+    "db_path": {
+      "type": "string",
+      "title": "Database path",
+      "description": "Absolute path to your my_brain_db directory (e.g. /Users/you/llmLibrarian/my_brain_db)",
+      "required": true
+    },
+    "model": {
+      "type": "string",
+      "title": "Ollama model",
+      "description": "Ollama model used by the `ask` tool (e.g. llama3.1:8b, phi4:14b)",
+      "default": "llama3.1:8b",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0"
+  }
+}

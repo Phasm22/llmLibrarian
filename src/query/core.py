@@ -24,7 +24,7 @@ from embeddings import get_embedding_function
 from image_embeddings import get_image_embedding_adapter, image_collection_name
 from processors import _build_image_summary_text, _summarize_image_with_vision_model
 from load_config import load_config, get_archetype, get_archetype_optional, get_query_options
-from state import get_silo_prompt_override, get_silo_display_name
+from state import get_silo_prompt_override, get_silo_display_name, resolve_silo_to_slug
 from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chunks
 from style import bold, dim, label_style
 
@@ -2722,6 +2722,9 @@ def run_ask(
     raw_answer = normalize_inline_numbered_lists(raw_answer)
     raw_answer = normalize_sentence_start(raw_answer)
     if archetype_id == "much-thinks" or silo == "much-thinks" or source_label == "Journal / Reflection":
+        # Strip numbered/bulleted list markers before wrapping — reflection answers should be prose only.
+        import re as _re
+        raw_answer = _re.sub(r"(?m)^[ \t]*(?:\d+\.|[-*•])[ \t]+", "", raw_answer)
         raw_answer = wrap_reflection_answer(raw_answer)
     if unified_analytical_query and _distinct_silo_count(metas) <= 1:
         lone = str((metas[0] or {}).get("silo") or "one silo") if metas else "one silo"
@@ -2796,6 +2799,135 @@ def run_ask(
         slowest_stage_ms=slowest_stage_ms,
     )
     return "\n".join(out)
+
+
+_DETERMINISTIC_INTENTS = frozenset({
+    INTENT_CAPABILITIES,
+    INTENT_CODE_LANGUAGE,
+    INTENT_STRUCTURE,
+    INTENT_FILE_LIST,
+    INTENT_TIMELINE,
+    INTENT_METADATA_ONLY,
+})
+
+
+def run_retrieve(
+    query: str,
+    silo: str | None = None,
+    n_results: int = DEFAULT_N_RESULTS,
+    db_path: str | Path | None = None,
+    config_path: str | Path | None = None,
+) -> dict:
+    """
+    Return raw retrieved chunks with metadata — no LLM synthesis.
+
+    Runs intent routing, query expansion, vector retrieval, diversification,
+    and deduplication, then returns the chunk list for the caller to reason over.
+    Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) do not
+    use vector retrieval; for those, use `ask` instead.
+    """
+    db = str(db_path or DB_PATH)
+    intent = route_intent(query)
+
+    if intent in _DETERMINISTIC_INTENTS:
+        return {
+            "query": query,
+            "intent": intent,
+            "silo_filter": silo,
+            "note": (
+                f"Intent '{intent}' is deterministic and does not use vector retrieval. "
+                "Use the `ask` tool for this query type."
+            ),
+            "chunks": [],
+        }
+
+    # Resolve silo display name → slug for ChromaDB where filter
+    silo_slug: str | None = None
+    if silo:
+        silo_slug = resolve_silo_to_slug(db, silo) or silo
+
+    use_reranker = is_reranker_enabled()
+    n_effective = effective_k(intent, n_results)
+    if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE, INTENT_ACADEMIC_HISTORY):
+        n_stage1 = max(n_effective, RERANK_STAGE1_N if use_reranker else 60)
+    elif intent == INTENT_REFLECT:
+        n_stage1 = n_effective
+    else:
+        n_stage1 = RERANK_STAGE1_N if use_reranker else min(100, max(n_results * 5, 60))
+
+    # Query expansion (same gating as run_ask)
+    query_for_retrieval = query.strip()
+    if intent not in (INTENT_FIELD_LOOKUP, INTENT_CAPABILITIES, INTENT_CODE_LANGUAGE):
+        query_for_retrieval = expand_query(query_for_retrieval)
+
+    ef = get_embedding_function()
+    client = chromadb.PersistentClient(path=db, settings=Settings(anonymized_telemetry=False))
+    collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+
+    query_kw: dict = {
+        "query_texts": [query_for_retrieval],
+        "n_results": n_stage1,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if silo_slug:
+        query_kw["where"] = {"silo": silo_slug}
+
+    results = collection.query(**query_kw)
+    docs = (results.get("documents") or [[]])[0] or []
+    metas = (results.get("metadatas") or [[]])[0] or []
+    dists = (results.get("distances") or [[]])[0] or []
+
+    # Diversify by source and dedup
+    per_intent_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
+    docs, metas, dists = diversify_by_source(docs, metas, dists, n_results, max_per_source=per_intent_cap)
+    docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+
+    # Cross-silo diversity for unscoped unified queries
+    if silo_slug is None:
+        per_silo_cap = max_silo_chunks_for_intent(intent, 3)
+        silo_cache = [str(((m or {}).get("silo") or "")) for m in metas]
+        docs, metas, dists = diversify_by_silo(
+            docs, metas, dists, n_results, max_per_silo=per_silo_cap, silos=silo_cache
+        )
+
+    # Build structured output
+    chunks = []
+    for rank, (doc, meta, dist) in enumerate(zip(docs, metas, dists), start=1):
+        m = meta or {}
+        mtime_raw = m.get("mtime")
+        mtime_iso = None
+        if mtime_raw is not None:
+            try:
+                from datetime import datetime, timezone
+                mtime_iso = datetime.fromtimestamp(float(mtime_raw), tz=timezone.utc).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        score = None
+        if dist is not None:
+            try:
+                score = round(1.0 - float(dist), 4)
+            except Exception:
+                pass
+        chunks.append({
+            "rank": rank,
+            "text": doc or "",
+            "score": score,
+            "source": str(m.get("source") or ""),
+            "silo": str(m.get("silo") or ""),
+            "doc_type": str(m.get("doc_type") or "other"),
+            "mtime_iso": mtime_iso,
+            "page": m.get("page"),
+            "line_start": m.get("line_start"),
+            "chunk_index": m.get("chunk_index"),
+            "record_type": m.get("record_type"),
+        })
+
+    return {
+        "query": query,
+        "intent": intent,
+        "silo_filter": silo_slug,
+        "chunks": chunks,
+    }
 
 
 def main() -> None:

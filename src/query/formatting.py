@@ -449,12 +449,313 @@ def _answer_wrap_width(default: int = 88) -> int:
     return max(72, min(96, cols - 2 if cols > 2 else default))
 
 
+
+def linkify_sources_in_answer(answer: str, metas: list[dict | None], no_color: bool) -> str:
+    """Replace file paths in the answer body with OSC 8 hyperlinks (same as Sources section). Longer path first so 'src/foo.py' is linked before 'foo.py'."""
+    seen_sources: set[str] = set()
+    variants: list[tuple[str, str]] = []  # (path_variant, url)
+    for meta in metas or []:
+        source_val = (meta or {}).get("source") or ""
+        if not source_val or source_val in seen_sources:
+            continue
+        seen_sources.add(source_val)
+        line = (meta or {}).get("line_start")
+        page = (meta or {}).get("page")
+        url = source_url(source_val, line=line, page=page)
+        if not url:
+            continue
+        short = shorten_path(source_val)
+        name = Path(source_val).name
+        added = {p for p, _ in variants}
+        for v in (source_val, short, name):
+            if v and v not in added:
+                variants.append((v, url))
+                added.add(v)
+    # Sort by length descending so "src/query_engine.py" is replaced before "query_engine.py"
+    variants.sort(key=lambda p: -len(p[0]))
+    out = answer
+    for path_var, url in variants:
+        # Replace path occurrences (allow at word/path boundaries). Use lambda so replacement isn't parsed as re template (ANSI has \033).
+        pattern = r"(?<![/\w])" + re.escape(path_var) + r"(?![/\w])"
+        repl = link_style(no_color, url, path_var)
+        out = re.sub(pattern, lambda _: repl, out)
+    return out
+
+
+def format_source(
+    doc: str,
+    meta: dict | None,
+    distance: float | None,
+    include_snippet: bool = True,
+    no_color: bool = True,
+) -> str:
+    """Format one source: short path (with file:// hyperlink when TTY), line/page, score, and a one-line snippet."""
+    source_val = (meta or {}).get("source") or "?"
+    display_path = shorten_path(source_val)
+    line = (meta or {}).get("line_start")
+    page = (meta or {}).get("page")
+    snippet = snippet_preview(doc or "") if include_snippet else ""
+    loc = _format_meta_location(meta)
+    score_str = ""
+    if distance is not None:
+        try:
+            score = 1.0 / (1.0 + float(distance))
+            score_str = f" \u00b7 {score:.2f}"
+        except (TypeError, ValueError):
+            pass
+    file_url = source_url(source_val, line=line, page=page)
+    path_part = link_style(no_color, file_url, display_path)
+    meta_part = dim(no_color, f"{loc}{score_str}")
+    if snippet:
+        snippet_part = dim(no_color, snippet)
+        return f"  \u2022 {path_part}{meta_part}\n    {snippet_part}"
+    return f"  \u2022 {path_part}{meta_part}"
+
+
+def _aggregate_footer_sources(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+) -> list[tuple[str, dict[str, Any], float | None]]:
+    """De-duplicate footer sources by source path and aggregate line/page markers."""
+    by_source: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else None
+        dist = dists[i] if i < len(dists) else None
+        source = ((meta or {}).get("source") or "").strip() or f"__unknown_{i}"
+        if source not in by_source:
+            by_source[source] = {
+                "doc": doc,
+                "meta": dict(meta) if isinstance(meta, dict) else (meta or {}),
+                "dist": dist,
+                "lines": set(),
+                "pages": set(),
+                "regions": set(),
+            }
+            order.append(source)
+        entry = by_source[source]
+        if dist is not None and (entry["dist"] is None or float(dist) < float(entry["dist"])):
+            entry["dist"] = dist
+        m = meta or {}
+        line = m.get("line_start")
+        page = m.get("page")
+        region = m.get("region_index")
+        if line is not None:
+            entry["lines"].add(str(line))
+        if page is not None:
+            entry["pages"].add(str(page))
+        if region is not None:
+            entry["regions"].add(str(region))
+
+    out: list[tuple[str, dict[str, Any], float | None]] = []
+    for source in order:
+        entry = by_source[source]
+        meta = dict(entry["meta"] or {})
+        lines = sorted(entry["lines"], key=lambda x: (len(x), x))
+        pages = sorted(entry["pages"], key=lambda x: (len(x), x))
+        regions = sorted(entry["regions"], key=lambda x: (len(x), x))
+        if lines:
+            meta["line_start"] = ", ".join(lines)
+        if pages:
+            meta["page"] = ", ".join(pages)
+        if regions:
+            meta["region_index"] = ", ".join(regions)
+        out.append((entry["doc"], meta, entry["dist"]))
+    return out
+
+
+def render_sources_footer(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    *,
+    no_color: bool,
+    detailed: bool = False,
+    max_items: int = 8,
+) -> list[str]:
+    """Render a compact sources footer, optionally with per-file detail for explain/debug flows."""
+    rows = _aggregate_footer_sources(docs, metas, dists)
+    if not rows:
+        return []
+
+    summary = f"Sources: {len(rows)} source{'s' if len(rows) != 1 else ''}"
+    scores = []
+    for _doc, _meta, dist in rows:
+        if dist is None:
+            continue
+        try:
+            scores.append(1.0 / (1.0 + float(dist)))
+        except (TypeError, ValueError):
+            continue
+    if scores:
+        summary += f" | median match {median(scores):.2f}"
+
+    out = [bold(no_color, summary)]
+    if detailed:
+        for doc, meta, dist in rows[:max_items]:
+            out.append(format_source(doc, meta, dist, include_snippet=False, no_color=no_color))
+        if len(rows) > max_items:
+            out.append(dim(no_color, f"... ({len(rows) - max_items} more sources omitted)"))
+    return out
+
+
+def linkify_sources_in_answer(answer: str, metas: list[dict | None], no_color: bool) -> str:
+    """Replace file paths in the answer body with OSC 8 hyperlinks (same as Sources section). Longer path first so 'src/foo.py' is linked before 'foo.py'."""
+    seen_sources: set[str] = set()
+    variants: list[tuple[str, str]] = []  # (path_variant, url)
+    for meta in metas or []:
+        source_val = (meta or {}).get("source") or ""
+        if not source_val or source_val in seen_sources:
+            continue
+        seen_sources.add(source_val)
+        line = (meta or {}).get("line_start")
+        page = (meta or {}).get("page")
+        url = source_url(source_val, line=line, page=page)
+        if not url:
+            continue
+        short = shorten_path(source_val)
+        name = Path(source_val).name
+        added = {p for p, _ in variants}
+        for v in (source_val, short, name):
+            if v and v not in added:
+                variants.append((v, url))
+                added.add(v)
+    # Sort by length descending so "src/query_engine.py" is replaced before "query_engine.py"
+    variants.sort(key=lambda p: -len(p[0]))
+    out = answer
+    for path_var, url in variants:
+        # Replace path occurrences (allow at word/path boundaries). Use lambda so replacement isn't parsed as re template (ANSI has \033).
+        pattern = r"(?<![/\w])" + re.escape(path_var) + r"(?![/\w])"
+        repl = link_style(no_color, url, path_var)
+        out = re.sub(pattern, lambda _: repl, out)
+    return out
+
+
+def format_source(
+    doc: str,
+    meta: dict | None,
+    distance: float | None,
+    include_snippet: bool = True,
+    no_color: bool = True,
+) -> str:
+    """Format one source: short path (with file:// hyperlink when TTY), line/page, score, and a one-line snippet."""
+    source_val = (meta or {}).get("source") or "?"
+    display_path = shorten_path(source_val)
+    line = (meta or {}).get("line_start")
+    page = (meta or {}).get("page")
+    snippet = snippet_preview(doc or "") if include_snippet else ""
+    loc = _format_meta_location(meta)
+    score_str = ""
+    if distance is not None:
+        try:
+            score = 1.0 / (1.0 + float(distance))
+            score_str = f" \u00b7 {score:.2f}"
+        except (TypeError, ValueError):
+            pass
+    file_url = source_url(source_val, line=line, page=page)
+    path_part = link_style(no_color, file_url, display_path)
+    meta_part = dim(no_color, f"{loc}{score_str}")
+    if snippet:
+        snippet_part = dim(no_color, snippet)
+        return f"  \u2022 {path_part}{meta_part}\n    {snippet_part}"
+    return f"  \u2022 {path_part}{meta_part}"
+
+
+def _aggregate_footer_sources(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+) -> list[tuple[str, dict[str, Any], float | None]]:
+    """De-duplicate footer sources by source path and aggregate line/page markers."""
+    by_source: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else None
+        dist = dists[i] if i < len(dists) else None
+        source = ((meta or {}).get("source") or "").strip() or f"__unknown_{i}"
+        if source not in by_source:
+            by_source[source] = {
+                "doc": doc,
+                "meta": dict(meta) if isinstance(meta, dict) else (meta or {}),
+                "dist": dist,
+                "lines": set(),
+                "pages": set(),
+                "regions": set(),
+            }
+            order.append(source)
+        entry = by_source[source]
+        if dist is not None and (entry["dist"] is None or float(dist) < float(entry["dist"])):
+            entry["dist"] = dist
+        m = meta or {}
+        line = m.get("line_start")
+        page = m.get("page")
+        region = m.get("region_index")
+        if line is not None:
+            entry["lines"].add(str(line))
+        if page is not None:
+            entry["pages"].add(str(page))
+        if region is not None:
+            entry["regions"].add(str(region))
+
+    out: list[tuple[str, dict[str, Any], float | None]] = []
+    for source in order:
+        entry = by_source[source]
+        meta = dict(entry["meta"] or {})
+        lines = sorted(entry["lines"], key=lambda x: (len(x), x))
+        pages = sorted(entry["pages"], key=lambda x: (len(x), x))
+        regions = sorted(entry["regions"], key=lambda x: (len(x), x))
+        if lines:
+            meta["line_start"] = ", ".join(lines)
+        if pages:
+            meta["page"] = ", ".join(pages)
+        if regions:
+            meta["region_index"] = ", ".join(regions)
+        out.append((entry["doc"], meta, entry["dist"]))
+    return out
+
+
+def render_sources_footer(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    *,
+    no_color: bool,
+    detailed: bool = False,
+    max_items: int = 8,
+) -> list[str]:
+    """Render a compact sources footer, optionally with per-file detail for explain/debug flows."""
+    rows = _aggregate_footer_sources(docs, metas, dists)
+    if not rows:
+        return []
+
+    summary = f"Sources: {len(rows)} source{'s' if len(rows) != 1 else ''}"
+    scores = []
+    for _doc, _meta, dist in rows:
+        if dist is None:
+            continue
+        try:
+            scores.append(1.0 / (1.0 + float(dist)))
+        except (TypeError, ValueError):
+            continue
+    if scores:
+        summary += f" | median match {median(scores):.2f}"
+
+    out = [bold(no_color, summary)]
+    if detailed:
+        for doc, meta, dist in rows[:max_items]:
+            out.append(format_source(doc, meta, dist, include_snippet=False, no_color=no_color))
+        if len(rows) > max_items:
+            out.append(dim(no_color, f"... ({len(rows) - max_items} more sources omitted)"))
+    return out
+
+
 def wrap_reflection_answer(answer: str, width: int | None = None) -> str:
     """
     Reflow reflection-style prose into readable terminal-width paragraphs.
 
-    Keeps code fences intact, preserves numbered/bulleted lists, and strips
-    markdown heading markers so reflection answers read like prose instead of raw markdown.
+    Strips numbered/bulleted lists into prose, removes markdown heading markers,
+    and wraps to terminal width.
     """
     if not answer:
         return ""

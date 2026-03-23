@@ -194,20 +194,21 @@ def route_intent(query: str) -> str:
     # PROJECT_COUNT: how many coding projects in this folder/silo
     if re.search(r"\bhow\s+(many|much)\b", q) and re.search(r"\bprojects?\b", q):
         return INTENT_PROJECT_COUNT
-    # REFLECT: analyze / reflect on (often short or pasted)
+    # REFLECT: analyze / reflect on a pasted entry (often short or pasted)
     if re.search(r"\breflect\b|\bsummarize\s+this\b|\banalyze\s+this\b", q) and len(q) < 120:
         return INTENT_REFLECT
-    # REFLECT: self-reflective identity/style questions that need synthesis across personal writing.
-    if (
-        re.search(r"\bwhat\s+kind\s+of\b", q)
-        and re.search(r"\bam\s+i\b", q)
-        and re.search(r"\b(writer|writing|person|thinker|learner|student|author)\b", q)
-    ):
-        return INTENT_REFLECT
-    # EVIDENCE_PROFILE: preferences, "what do I like", "what did I say about", "do I mention"
+    # EVIDENCE_PROFILE: abstract self-questions needing wide cross-entry synthesis.
+    # These are identity/pattern questions that require scanning many entries, not just keyword hits.
     if re.search(
-        r"\bwhat (?:do i|did i) (?:like|love|enjoy|say|think|decide)\b|\bdo i (?:mention|say|like)\b|"
-        r"\b(?:my )?(?:preferences?|favorites?|opinions?)\b|\bwhat (?:have i|did i) (?:written|said)\b",
+        r"\bhow\s+(?:is|do|does|am)\s+(?:my|i)\b|"
+        r"\bwhat\s+(?:is|are)\s+my\s+(?!income|wage|salary|tax|earning)"
+        r"(?:thought|mind|process|approach|style|pattern|habit|tendency|nature|way|default|sense)\b|"
+        r"\bhow\s+do\s+i\s+(?:think|process|approach|tend|handle|work|operate|decide|reason)\b|"
+        r"\bwhat\s+(?:kind|sort|type)\s+of\s+(?:person|thinker|learner|writer|mind)\s+am\s+i\b|"
+        r"\bwhat\s+(?:do i|did i) (?:like|love|enjoy|say|think|decide)\b|"
+        r"\bdo i (?:mention|say|like)\b|"
+        r"\b(?:my )?(?:preferences?|favorites?|opinions?)\b|"
+        r"\bwhat (?:have i|did i) (?:written|said)\b",
         q,
     ):
         return INTENT_EVIDENCE_PROFILE
