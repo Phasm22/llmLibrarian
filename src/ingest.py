@@ -337,6 +337,24 @@ def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -
     line_start = 1
     for i, line in enumerate(lines):
         line_num = i + 1
+        if len(line) > size:
+            if current:
+                result.append(("\n".join(current), line_start))
+                current = []
+                current_len = 0
+            n = len(line)
+            start = 0
+            while start < n:
+                end = min(start + size, n)
+                result.append((line[start:end], line_num))
+                if end >= n:
+                    break
+                next_start = end - overlap
+                if next_start <= start:
+                    next_start = start + 1
+                start = next_start
+            line_start = line_num + 1
+            continue
         current.append(line)
         current_len += len(line) + 1
         if current_len >= size:

@@ -19,6 +19,9 @@ llmlibrarian_index.log
 llmli_registry.json
 llmli_last_failures.json
 
+# Claude Code (local nested worktrees; not part of the product)
+.claude/worktrees/
+
 # IDE / OS
 .idea/
 .vscode/
