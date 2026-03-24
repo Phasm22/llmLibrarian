@@ -59,6 +59,11 @@ mcp = FastMCP(
         "ALWAYS use `retrieve` for document questions — returns raw chunks for you to reason over. "
         "Use `retrieve_bulk` when a topic needs multiple retrieval angles (e.g. all risk factor categories). "
         "Pass `section=` to scope retrieval to a document section (e.g. 'Item 1A', 'Risk Factors'). "
+        "Pass `doc_type=` to restrict retrieval to a specific document type — useful when you want only "
+        "resumes, transcripts, tax returns, or code files (e.g. doc_type='transcript', 'resume', 'tax_return', 'code', 'other'). "
+        "For tax questions (`TAX_QUERY` intent), `retrieve` also returns a `tax_ledger` field alongside chunks — "
+        "this contains structured, ingest-time extracted values (AGI, total tax, W-2 boxes, etc.) with exact amounts. "
+        "Prefer `tax_ledger` rows over raw chunk text for precise tax figures; fall back to chunks for context. "
         "Use `list_silos` to discover silo slugs before scoping a query. "
         "Call `health` first if tools are failing — it reports db and model status. "
         "Use `capabilities` to see supported file types."
@@ -72,6 +77,7 @@ def retrieve(
     silo: str | None = None,
     n_results: int = 40,
     section: str | None = None,
+    doc_type: str | None = None,
 ) -> dict:
     """
     Retrieve raw document chunks without LLM synthesis. Returns ranked chunks with
@@ -79,6 +85,8 @@ def retrieve(
     date, doc type, and position metadata.
     Pass section= to restrict results to a specific document section
     (e.g. section='Item 1A' or section='Risk Factors').
+    Pass doc_type= to restrict to a specific document type
+    (e.g. doc_type='transcript', 'resume', 'pdf', 'code', 'other').
     Intent routing is applied automatically to govern retrieval scope.
     """
     from query.core import run_retrieve
@@ -88,6 +96,7 @@ def retrieve(
             silo=silo,
             n_results=n_results,
             section=section,
+            doc_type=doc_type,
             db_path=_DB_PATH,
             config_path=_CONFIG_PATH,
         )
@@ -102,13 +111,15 @@ def retrieve_bulk(
     silo: str | None = None,
     n_results: int = 20,
     section: str | None = None,
+    doc_type: str | None = None,
 ) -> dict:
     """
     Fire multiple semantic queries and return merged, deduplicated chunks ranked
     by best score. Use when a topic requires several retrieval angles — for example,
     to cover all risk factor categories in a 10-K with one call instead of many.
     Each chunk is tagged with the query that retrieved it. Pass section= to restrict
-    all queries to a specific document section.
+    all queries to a specific document section. Pass doc_type= to restrict all queries
+    to a specific document type (e.g. 'transcript', 'resume', 'pdf', 'code', 'other').
     """
     from query.core import run_retrieve
     seen: set[str] = set()
@@ -121,6 +132,7 @@ def retrieve_bulk(
                 silo=silo,
                 n_results=n_results,
                 section=section,
+                doc_type=doc_type,
                 db_path=_DB_PATH,
                 config_path=_CONFIG_PATH,
             )

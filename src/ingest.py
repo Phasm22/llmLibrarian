@@ -2162,6 +2162,18 @@ def run_add(
                         continue
             if h:
                 existing_entries = _file_registry_get(db_path, h)
+                # Warn when identical content is already indexed in this silo under a different path.
+                same_silo_dupes = [
+                    str(e.get("path") or "")
+                    for e in existing_entries
+                    if str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") != str(p_res)
+                ]
+                if same_silo_dupes:
+                    print(
+                        f"[llmli][WARN] Duplicate content: {p_res} matches already-indexed"
+                        f" {same_silo_dupes[0]} — consider consolidating your folder structure.",
+                        file=sys.stderr,
+                    )
                 clone_from = next(
                     (str(e.get("silo") or "") for e in existing_entries if str(e.get("silo") or "") != silo_slug),
                     "",

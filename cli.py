@@ -286,6 +286,64 @@ def cmd_rm(args: argparse.Namespace) -> int:
         print(f"Removed chunks and file registry for silo: {slug_to_clean} (was not in silo list)")
     return 0
 
+def cmd_repair(args: argparse.Namespace) -> int:
+    """Wipe and re-index a silo to fix ChromaDB index inconsistencies ('Error finding id')."""
+    silo_arg = getattr(args, "silo", None)
+    if not silo_arg:
+        print("Error: repair requires a silo slug or display name.", file=sys.stderr)
+        return 1
+    from state import list_silos, resolve_silo_to_slug, resolve_silo_prefix, remove_manifest_silo
+    from constants import DB_PATH, LLMLI_COLLECTION
+    from ingest import _file_registry_remove_silo, run_add
+    import chromadb
+    from chromadb.config import Settings
+
+    db = _db_path(args)
+    raw = " ".join(silo_arg) if isinstance(silo_arg, list) else str(silo_arg)
+    slug = (
+        resolve_silo_to_slug(db, raw)
+        or resolve_silo_prefix(db, raw)
+    )
+    if slug is None:
+        print(f"Error: silo '{raw}' not found. Run `llmli ls` to see available silos.", file=sys.stderr)
+        return 1
+
+    silos = {s["slug"]: s for s in list_silos(db)}
+    silo_info = silos.get(slug, {})
+    silo_path = silo_info.get("path", "")
+
+    if not silo_path or not Path(silo_path).exists():
+        print(
+            f"Error: silo '{slug}' has no resolvable path ('{silo_path}'). "
+            "Cannot re-index automatically. Remove and re-add manually.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"[repair] Wiping ChromaDB chunks for silo '{slug}'...")
+    try:
+        client = chromadb.PersistentClient(path=str(db), settings=Settings(anonymized_telemetry=False))
+        coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
+        coll.delete(where={"silo": slug})
+    except Exception as e:
+        print(f"[repair] Warning: could not wipe Chroma chunks: {e}", file=sys.stderr)
+
+    print(f"[repair] Clearing file registry for silo '{slug}'...")
+    _file_registry_remove_silo(db, slug)
+    remove_manifest_silo(db, slug)
+
+    print(f"[repair] Re-indexing '{silo_path}' (full, non-incremental)...")
+    files_ok, n_failures = run_add(
+        path=silo_path,
+        db_path=str(db),
+        incremental=False,
+    )
+    print(f"[repair] Done: {files_ok} file(s) re-indexed, {n_failures} failure(s).")
+    if n_failures:
+        print("  Run `llmli log` for failure details.")
+    return 0
+
+
 def cmd_capabilities(args: argparse.Namespace) -> int:
     """Print supported file types and extractors (source of truth). No LLM, no retrieval."""
     from ingest import get_capabilities_text
@@ -471,6 +529,12 @@ def main() -> int:
     rm_silo_arg = p_rm.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
     rm_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
     p_rm.set_defaults(_run=cmd_rm)
+
+    # repair <silo>
+    p_repair = sub.add_parser("repair", help="Fix ChromaDB index errors by wiping and re-indexing a silo")
+    repair_silo_arg = p_repair.add_argument("silo", nargs="+", help="Silo slug or display name")
+    repair_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
+    p_repair.set_defaults(_run=cmd_repair)
 
     # capabilities
     p_capabilities = sub.add_parser("capabilities", help="Supported file types and document extractors (source of truth)")

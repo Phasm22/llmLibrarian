@@ -195,8 +195,8 @@ def test_max_silo_chunks_for_intent_uses_intent_specific_caps():
     assert max_silo_chunks_for_intent("unknown", 9) == 9
 
 
-def test_dedup_by_chunk_hash_noop_when_env_disabled(monkeypatch):
-    monkeypatch.delenv("LLMLIBRARIAN_DEDUP_CHUNK_HASH", raising=False)
+def test_dedup_by_chunk_hash_noop_when_env_explicitly_disabled(monkeypatch):
+    monkeypatch.setenv("LLMLIBRARIAN_DEDUP_CHUNK_HASH", "0")
     docs = ["x1", "x2"]
     metas = [{"chunk_hash": "h1"}, {"chunk_hash": "h1"}]
     dists = [0.1, 0.2]
@@ -206,8 +206,8 @@ def test_dedup_by_chunk_hash_noop_when_env_disabled(monkeypatch):
     assert out_dists == dists
 
 
-def test_dedup_by_chunk_hash_filters_duplicates_when_enabled(monkeypatch):
-    monkeypatch.setenv("LLMLIBRARIAN_DEDUP_CHUNK_HASH", "1")
+def test_dedup_by_chunk_hash_filters_duplicates_by_default(monkeypatch):
+    monkeypatch.delenv("LLMLIBRARIAN_DEDUP_CHUNK_HASH", raising=False)
     out_docs, out_metas, out_dists = dedup_by_chunk_hash(
         docs=["first", "dup", "nohash", "unique"],
         metas=[

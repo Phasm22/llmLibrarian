@@ -277,6 +277,59 @@ def _combine_where_and(base_where: dict[str, Any] | None, extra: dict[str, Any])
     return {"$and": [base_where, extra]}
 
 
+def _is_chroma_index_error(exc: Exception) -> bool:
+    """Detect ChromaDB HNSW index/metadata mismatch errors (e.g. 'Error finding id')."""
+    msg = str(exc).lower()
+    return "finding id" in msg or "internalerror" in type(exc).__name__.lower()
+
+
+def _safe_query(
+    collection: Any,
+    query_kw: dict[str, Any],
+    silo_slug: str | None = None,
+) -> tuple[list[str], list[dict | None], list[float | None], str | None]:
+    """
+    Run collection.query(**query_kw) with a graceful fallback when ChromaDB throws an
+    index-consistency error (e.g. 'InternalError: Error finding id').
+
+    When the scoped query fails and a silo_slug is set, retries without the where filter
+    and post-filters results to the target silo in Python.  Returns (docs, metas, dists,
+    warning) where warning is None on success or a human-readable string on fallback.
+    """
+    try:
+        results = collection.query(**query_kw)
+        docs = (results.get("documents") or [[]])[0] or []
+        metas = (results.get("metadatas") or [[]])[0] or []
+        dists = (results.get("distances") or [[]])[0] or []
+        return docs, metas, dists, None
+    except Exception as exc:
+        if not _is_chroma_index_error(exc):
+            raise
+        # Silo index is inconsistent — fall back to unscoped query + Python post-filter.
+        warning = (
+            f"Silo '{silo_slug}' has a ChromaDB index inconsistency ({type(exc).__name__}: {exc}). "
+            "Results were retrieved globally and filtered to this silo in Python. "
+            "Fix: run `llmli repair <silo>` or `llmli add --full <folder>` to re-index."
+        )
+        fallback_kw = {k: v for k, v in query_kw.items() if k != "where"}
+        results = collection.query(**fallback_kw)
+        docs = (results.get("documents") or [[]])[0] or []
+        metas = (results.get("metadatas") or [[]])[0] or []
+        dists = (results.get("distances") or [[]])[0] or []
+        if silo_slug:
+            filtered = [
+                (d, m, dist)
+                for d, m, dist in zip(docs, metas, dists)
+                if str((m or {}).get("silo") or "") == silo_slug
+            ]
+            if filtered:
+                docs, metas, dists = zip(*filtered)  # type: ignore[assignment]
+                docs, metas, dists = list(docs), list(metas), list(dists)
+            else:
+                docs, metas, dists = [], [], []
+        return docs, metas, dists, warning
+
+
 def _query_is_image_relevant(query: str, docs: list[str], metas: list[dict | None]) -> bool:
     if _IMAGE_QUERY_PATTERN.search(query or ""):
         return True
@@ -2816,6 +2869,7 @@ def run_retrieve(
     silo: str | None = None,
     n_results: int = DEFAULT_N_RESULTS,
     section: str | None = None,
+    doc_type: str | None = None,
     db_path: str | Path | None = None,
     config_path: str | Path | None = None,
 ) -> dict:
@@ -2825,6 +2879,8 @@ def run_retrieve(
     Runs intent routing, query expansion, vector retrieval, diversification,
     and deduplication, then returns the chunk list for the caller to reason over.
     Pass section= to post-filter chunks to a specific document section (e.g. 'Item 1A').
+    Pass doc_type= to restrict to a specific document type stored in chunk metadata
+    (e.g. 'transcript', 'resume', 'pdf', 'code', 'other').
     Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) bypass
     vector retrieval and return a note field with the answer.
     """
@@ -2871,13 +2927,17 @@ def run_retrieve(
         "n_results": n_stage1,
         "include": ["documents", "metadatas", "distances"],
     }
+    where_parts: list[dict] = []
     if silo_slug:
-        query_kw["where"] = {"silo": silo_slug}
+        where_parts.append({"silo": silo_slug})
+    if doc_type:
+        where_parts.append({"doc_type": doc_type})
+    if len(where_parts) == 1:
+        query_kw["where"] = where_parts[0]
+    elif len(where_parts) > 1:
+        query_kw["where"] = {"$and": where_parts}
 
-    results = collection.query(**query_kw)
-    docs = (results.get("documents") or [[]])[0] or []
-    metas = (results.get("metadatas") or [[]])[0] or []
-    dists = (results.get("distances") or [[]])[0] or []
+    docs, metas, dists, _silo_warning = _safe_query(collection, query_kw, silo_slug)
 
     # Diversify by source and dedup
     per_intent_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
@@ -2938,12 +2998,49 @@ def run_retrieve(
             "record_type": m.get("record_type"),
         })
 
-    return {
+    result: dict = {
         "query": query,
         "intent": intent,
         "silo_filter": silo_slug,
         "chunks": chunks,
     }
+    if _silo_warning:
+        result["silo_warning"] = _silo_warning
+
+    # For TAX_QUERY, also surface structured tax ledger rows so callers get actual values
+    # (e.g. AGI, total tax, withholding) without relying solely on PDF chunk text ranking.
+    if intent == INTENT_TAX_QUERY:
+        try:
+            from tax.ledger import load_tax_ledger_rows
+            from tax.query_contract import parse_tax_query
+
+            parsed = parse_tax_query(query)
+            requested_year: int | None = parsed.tax_year if parsed else None
+
+            ledger_rows = load_tax_ledger_rows(
+                db,
+                silo=silo_slug,
+                tax_year=requested_year,
+            )
+            if ledger_rows:
+                result["tax_ledger"] = [
+                    {
+                        "tax_year": r.get("tax_year"),
+                        "form_type": r.get("form_type"),
+                        "field_label": r.get("field_label"),
+                        "raw_value": r.get("raw_value"),
+                        "normalized_decimal": r.get("normalized_decimal"),
+                        "source": r.get("source"),
+                        "page": r.get("page"),
+                        "confidence": r.get("confidence"),
+                        "extractor_tier": r.get("extractor_tier"),
+                    }
+                    for r in ledger_rows
+                ]
+        except Exception:
+            pass
+
+    return result
 
 
 def main() -> None:

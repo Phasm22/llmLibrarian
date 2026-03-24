@@ -413,8 +413,8 @@ def dedup_by_chunk_hash(
     metas: list[dict | None],
     dists: list[float | None],
 ) -> tuple[list[str], list[dict | None], list[float | None]]:
-    """Keep first occurrence of each chunk_hash; drop later duplicates. Optional (env LLMLIBRARIAN_DEDUP_CHUNK_HASH=1)."""
-    if os.environ.get("LLMLIBRARIAN_DEDUP_CHUNK_HASH", "").strip().lower() not in ("1", "true", "yes"):
+    """Keep first occurrence of each chunk_hash; drop later duplicates. On by default; disable with LLMLIBRARIAN_DEDUP_CHUNK_HASH=0."""
+    if os.environ.get("LLMLIBRARIAN_DEDUP_CHUNK_HASH", "1").strip().lower() in ("0", "false", "no"):
         return docs, metas, dists
     seen: set[str] = set()
     out_docs: list[str] = []

@@ -165,8 +165,9 @@ def _log_warn_once(key: str, message: str, **fields: Any) -> None:
 
 
 def _pdf_tables_enabled() -> bool:
-    # Default OFF: table extraction via pdfplumber is expensive and noisy on malformed/scanned PDFs.
-    val = os.environ.get("LLMLIBRARIAN_PDF_TABLES", "0").strip().lower()
+    # Default ON: pdfplumber table extraction improves structured PDF data (e.g. tax forms).
+    # Disable with LLMLIBRARIAN_PDF_TABLES=0 for noisy/scanned PDFs.
+    val = os.environ.get("LLMLIBRARIAN_PDF_TABLES", "1").strip().lower()
     return val not in ("0", "false", "no")
 
 
