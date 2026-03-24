@@ -13,7 +13,7 @@
     "entry_point": "mcp_server.py",
     "mcp_config": {
       "command": "uv",
-      "args": ["run", "mcp_server.py"],
+      "args": ["run", "--python", ">=3.10,<3.14", "mcp_server.py"],
       "env": {
         "LLMLIBRARIAN_DB": "${user.db_path}",
         "LLMLIBRARIAN_MODEL": "${user.model}"

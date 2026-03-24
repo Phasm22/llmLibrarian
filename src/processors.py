@@ -16,6 +16,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from html.parser import HTMLParser
 from typing import Any, Protocol
 
 # ChunkTuple imported from ingest to avoid circular; use forward reference in type hints.
@@ -1522,6 +1523,71 @@ class ImageProcessor:
             raise ImageExtractionError(str(e)) from e
 
 
+class _TagStripper(HTMLParser):
+    SKIP_TAGS = {"script", "style", "head", "meta", "link", "noscript", "nav", "footer"}
+    HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip_depth = 0
+        self._heading_buf: list[str] = []
+        self._in_heading = False
+
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if t in self.SKIP_TAGS:
+            self._skip_depth += 1
+        elif not self._skip_depth:
+            if t in self.HEADING_TAGS:
+                self._in_heading = True
+                self._heading_buf = []
+            else:
+                self._parts.append(" ")
+
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t in self.SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        elif not self._skip_depth:
+            if t in self.HEADING_TAGS and self._in_heading:
+                heading = "".join(self._heading_buf).strip()
+                if heading:
+                    self._parts.append(f"\n§SECTION: {heading}§\n")
+                self._in_heading = False
+                self._heading_buf = []
+            else:
+                self._parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            if self._in_heading:
+                self._heading_buf.append(data)
+            else:
+                self._parts.append(data)
+
+    def get_text(self) -> str:
+        text = "".join(self._parts)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+
+class HTMLProcessor:
+    format_label = "HTML"
+    install_hint = ""
+
+    def extract(self, data: bytes, source_path: str) -> str:
+        import html as _html
+        try:
+            raw = data.decode("utf-8", errors="replace")
+            stripper = _TagStripper()
+            stripper.feed(raw)
+            return _html.unescape(stripper.get_text())
+        except Exception as e:
+            raise TextExtractionError(str(e)) from e
+
+
 class TextProcessor:
     format_label = "Text"
     install_hint = ""
@@ -1539,6 +1605,8 @@ PROCESSORS: dict[str, DocumentProcessor] = {
     ".docx": DOCXProcessor(),  # type: ignore[dict-item]
     ".xlsx": XLSXProcessor(),  # type: ignore[dict-item]
     ".pptx": PPTXProcessor(),  # type: ignore[dict-item]
+    ".html": HTMLProcessor(),
+    ".htm": HTMLProcessor(),
     ".png": ImageProcessor(),  # type: ignore[dict-item]
     ".jpg": ImageProcessor(),  # type: ignore[dict-item]
     ".jpeg": ImageProcessor(),  # type: ignore[dict-item]

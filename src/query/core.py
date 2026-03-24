@@ -2815,6 +2815,7 @@ def run_retrieve(
     query: str,
     silo: str | None = None,
     n_results: int = DEFAULT_N_RESULTS,
+    section: str | None = None,
     db_path: str | Path | None = None,
     config_path: str | Path | None = None,
 ) -> dict:
@@ -2823,8 +2824,9 @@ def run_retrieve(
 
     Runs intent routing, query expansion, vector retrieval, diversification,
     and deduplication, then returns the chunk list for the caller to reason over.
-    Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) do not
-    use vector retrieval; for those, use `ask` instead.
+    Pass section= to post-filter chunks to a specific document section (e.g. 'Item 1A').
+    Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) bypass
+    vector retrieval and return a note field with the answer.
     """
     db = str(db_path or DB_PATH)
     intent = route_intent(query)
@@ -2836,7 +2838,7 @@ def run_retrieve(
             "silo_filter": silo,
             "note": (
                 f"Intent '{intent}' is deterministic and does not use vector retrieval. "
-                "Use the `ask` tool for this query type."
+                "Try rephrasing as a descriptive question for semantic retrieval."
             ),
             "chunks": [],
         }
@@ -2890,6 +2892,16 @@ def run_retrieve(
             docs, metas, dists, n_results, max_per_silo=per_silo_cap, silos=silo_cache
         )
 
+    # Section post-filter: keep chunks whose section metadata contains the search term
+    if section:
+        section_lower = section.lower()
+        filtered = [
+            (d, m, dist) for d, m, dist in zip(docs, metas, dists)
+            if section_lower in (m or {}).get("section", "").lower()
+        ]
+        if filtered:
+            docs, metas, dists = zip(*filtered)
+
     # Build structured output
     chunks = []
     for rank, (doc, meta, dist) in enumerate(zip(docs, metas, dists), start=1):
@@ -2903,15 +2915,19 @@ def run_retrieve(
             except Exception:
                 pass
         score = None
+        confidence = "low"
         if dist is not None:
             try:
-                score = round(1.0 - float(dist), 4)
+                score = round(max(0.0, 1.0 - float(dist)), 4)
+                confidence = "high" if score >= 0.5 else "medium" if score >= 0.2 else "low"
             except Exception:
                 pass
         chunks.append({
             "rank": rank,
             "text": doc or "",
             "score": score,
+            "confidence": confidence,
+            "section": str(m.get("section") or ""),
             "source": str(m.get("source") or ""),
             "silo": str(m.get("silo") or ""),
             "doc_type": str(m.get("doc_type") or "other"),

@@ -598,6 +598,9 @@ def _is_local(source_path: str) -> int:
     return 1
 
 
+_SECTION_MARKER_RE = re.compile(r"^§SECTION: (.+?)§$", re.MULTILINE)
+
+
 def _chunks_from_content(
     file_id: str,
     text: str,
@@ -612,10 +615,24 @@ def _chunks_from_content(
     """Build chunk list (id, doc, meta). doc_type from content (first 500 chars) overrides path when not 'other'."""
     content_type = _doc_type_from_content(text[:CONTENT_SAMPLE_LEN])
     doc_type = content_type if content_type != "other" else _doc_type_from_path(source_path)
-    chunks_with_lines = chunk_text(text)
+
+    # Build line→section map from §SECTION: ...§ markers before chunking
+    section_by_line: dict[int, str] = {}
+    current_section = ""
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        m = _SECTION_MARKER_RE.match(line.strip())
+        if m:
+            current_section = m.group(1)
+        section_by_line[lineno] = current_section
+
+    # Strip markers from text so chunker sees clean content
+    clean_text = _SECTION_MARKER_RE.sub("", text)
+    chunks_with_lines = chunk_text(clean_text)
+
     out: list[ChunkTuple] = []
     for i, (chunk, line_s) in enumerate(chunks_with_lines):
         cid = _stable_chunk_id(source_path, mtime, i)
+        section = section_by_line.get(line_s, current_section if not section_by_line else "")
         meta: dict = {
             "source": source_path,
             "source_path": source_path,
@@ -626,6 +643,7 @@ def _chunks_from_content(
             "is_local": _is_local(source_path),
             "doc_type": doc_type,
             "content_extracted": 1 if content_extracted else 0,
+            "section": section,
         }
         if file_hash:
             meta["file_hash"] = file_hash
@@ -1846,9 +1864,14 @@ def run_index(
         file_list.extend(collect_files(p, include, exclude, max_depth, max_file_bytes, follow_symlinks=follow_symlinks))
 
     log(f"Collected {len(file_list)} files")
+    _image_embed_ok = True
     if _requires_standalone_image_enrichment(file_list):
-        ensure_vision_model_ready()
-        ensure_image_embedding_adapter_ready()
+        ensure_vision_model_ready()  # always required in run_index (archetype-driven indexing)
+        try:
+            ensure_image_embedding_adapter_ready()
+        except Exception as _img_err:
+            print(warn_style(no_color, f"  ⚠️ Image embedding unavailable ({_img_err}); image files will be skipped."))
+            _image_embed_ok = False
     # 2. Split: regular files (parallel) vs zips (main thread, limits)
     regular = [(path, kind) for path, kind in file_list if kind != "zip"]
     zips = [path for path, kind in file_list if kind == "zip"]
@@ -1973,7 +1996,7 @@ def run_index(
             embedding_fn=ef,
             embedding_workers=embedding_workers,
         )
-    if all_image_vectors:
+    if all_image_vectors and _image_embed_ok:
         _batch_add_image_vectors(
             image_collection,
             all_image_vectors,
@@ -2058,10 +2081,15 @@ def run_add(
         follow_symlinks=follow_symlinks,
         stats=collect_stats,
     )
+    _image_embed_ok = True
     if _requires_standalone_image_enrichment(file_list):
         if effective_image_vision_enabled:
-            ensure_vision_model_ready()
-        ensure_image_embedding_adapter_ready()
+            ensure_vision_model_ready()  # hard-fail: user explicitly requested vision
+        try:
+            ensure_image_embedding_adapter_ready()
+        except Exception as _img_err:
+            print(f"  ⚠️ Image embedding unavailable ({_img_err}); image files will be skipped.")
+            _image_embed_ok = False
     regular = [(p, k) for p, k in file_list if k != "zip"]
     zips = [p for p, k in file_list if k == "zip"]
 
@@ -2418,7 +2446,7 @@ def run_add(
             embedding_fn=ef,
             embedding_workers=embedding_workers,
         )
-    if all_image_vectors:
+    if all_image_vectors and _image_embed_ok:
         _batch_add_image_vectors(
             image_collection,
             all_image_vectors,

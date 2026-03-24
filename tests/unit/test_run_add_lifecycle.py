@@ -102,7 +102,8 @@ def test_run_add_hard_fails_when_vision_model_missing_for_images_if_enabled(monk
         run_add(root, db_path=tmp_path / "db", allow_cloud=True, image_vision_enabled=True)
 
 
-def test_run_add_hard_fails_when_image_embedding_backend_missing(monkeypatch, tmp_path):
+def test_run_add_warns_and_skips_when_image_embedding_backend_missing(monkeypatch, tmp_path, capsys):
+    """Image embedding backend missing is a soft warning; indexing completes for non-image content."""
     root = tmp_path / "photos"
     root.mkdir()
     image_path = root / "dog.jpg"
@@ -113,8 +114,10 @@ def test_run_add_hard_fails_when_image_embedding_backend_missing(monkeypatch, tm
         "ingest.ensure_image_embedding_adapter_ready",
         lambda: (_ for _ in ()).throw(ImageEmbeddingError("missing image backend")),
     )
-    with pytest.raises(ImageEmbeddingError):
-        run_add(root, db_path=tmp_path / "db", allow_cloud=True)
+    # Should NOT raise — image files are skipped gracefully
+    run_add(root, db_path=tmp_path / "db", allow_cloud=True)
+    captured = capsys.readouterr()
+    assert "Image embedding unavailable" in captured.out or "image files will be skipped" in captured.out
 
 
 def test_run_add_persists_image_vision_enabled(monkeypatch, tmp_path):
