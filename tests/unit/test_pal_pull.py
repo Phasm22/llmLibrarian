@@ -156,6 +156,7 @@ def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
 
     monkeypatch.setattr("pal.SiloWatcher", _DummyWatcher)
     monkeypatch.setattr("pal._run_watcher", _fake_run_watcher)
+    monkeypatch.setattr("pal.Observer", object())  # satisfy watchdog availability check
     from typer.testing import CliRunner
     runner = CliRunner()
     res = runner.invoke(pal.app, ["pull", "/tmp/folder", "--watch", "--interval", "12", "--debounce", "2"])

@@ -125,6 +125,12 @@ If standalone images are present:
 Retrieval was weak or mixed. Scope with `--in`, ask a narrower 
 question, or add better source files.
 
+`InternalError: Error finding id` (silo-scoped queries fail)
+ChromaDB index is inconsistent — usually from a partially-interrupted 
+ingest. The retrieve tool will fall back automatically, but to fully 
+fix it: `llmli repair <silo>`. This wipes and re-indexes from the 
+source folder.
+
 `no extractable text`
 The PDF is scanned/image-only or OCR is unavailable. On macOS, 
 confirm `swiftc` exists. Otherwise install `paddleocr` or `tesseract`.

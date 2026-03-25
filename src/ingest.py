@@ -76,7 +76,7 @@ DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP = 50 * 1024 * 1024  # 50 MB
 # Default include/exclude for llmli add. First-class: text + code + pdf/docx + xlsx/pptx (no silent ignore).
 ADD_DEFAULT_INCLUDE = [
     "*.py", "*.ts", "*.tsx", "*.js", "*.go", "*.rs", "*.sh", "*.md", "*.txt",
-    "*.yml", "*.yaml", "*.json", "*.csv", "*.xml", "*.html", "*.rst", "*.toml", "*.ini", "*.cfg", "*.sql",
+    "*.yml", "*.yaml", "*.json", "*.csv", "*.xml", "*.html", "*.htm", "*.rst", "*.toml", "*.ini", "*.cfg", "*.sql",
     "*.pdf", "*.docx", "*.xlsx", "*.pptx",
     "*.png", "*.jpg", "*.jpeg", "*.heic", "*.heif", "*.tif", "*.tiff",
 ]
@@ -2103,6 +2103,21 @@ def run_add(
         "LLMLIBRARIAN_EMBEDDING_WORKERS",
         8,
     )
+    # MPS (Apple Silicon) is not thread-safe for concurrent inference; cap to 1
+    # to prevent heap corruption when multiple threads call into PyTorch/MPS.
+    # CPU and CUDA handle concurrent calls safely.
+    try:
+        import torch as _torch
+        _device_override = os.environ.get("LLMLIBRARIAN_EMBEDDING_DEVICE", "").strip().lower()
+        _using_mps = (
+            not _device_override
+            and _torch.backends.mps.is_available()
+        ) or _device_override == "mps"
+        if _using_mps:
+            embedding_workers = 1
+    except ImportError:
+        pass
+
     if not quiet:
         print(dim(no_color, _format_preflight_summary(file_list, collect_stats)))
         print(dim(no_color, f"  Workers: file={workers}, embedding={embedding_workers}"))
@@ -2252,11 +2267,12 @@ def run_add(
 
     if precloned_by_path:
         for path_str, (fhash, cloned_chunks) in precloned_by_path.items():
+            _now_iso = datetime.now(timezone.utc).isoformat()
             cloned_norm = [
                 (
                     hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20],
                     doc,
-                    {**meta, "silo": silo_slug},
+                    {**meta, "silo": silo_slug, "indexed_at": _now_iso},
                 )
                 for cid, doc, meta in cloned_chunks
             ]
@@ -2310,8 +2326,9 @@ def run_add(
                 print(f"[llmli] FAIL {p}: {e}", file=sys.stderr)
                 continue
             if chunks:
+                _now_iso = datetime.now(timezone.utc).isoformat()
                 chunks = [
-                    (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug})
+                    (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug, "indexed_at": _now_iso})
                     for cid, doc, meta in chunks
                 ]
                 all_chunks.extend(chunks)
@@ -2396,8 +2413,9 @@ def run_add(
             print(f"[llmli] FAIL {zip_path}: {e}", file=sys.stderr)
             continue
         if chunks:
+            _now_iso = datetime.now(timezone.utc).isoformat()
             chunks = [
-                (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug})
+                (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug, "indexed_at": _now_iso})
                 for cid, doc, meta in chunks
             ]
             all_chunks.extend(chunks)
@@ -2843,8 +2861,9 @@ def update_single_file(
         _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
     if chunks:
+        _now_iso = datetime.now(timezone.utc).isoformat()
         chunks = [
-            (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug})
+            (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug, "indexed_at": _now_iso})
             for cid, doc, meta in chunks
         ]
         batch_size = ADD_BATCH_SIZE

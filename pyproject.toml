@@ -70,8 +70,6 @@ dev-mode-dirs = [".", "src"]
 packages = ["src"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"cli.py" = "cli.py"
-"pal.py" = "pal.py"
 "archetypes.yaml" = "archetypes.yaml"
 "src/vision_ocr.swift" = "src/vision_ocr.swift"
 

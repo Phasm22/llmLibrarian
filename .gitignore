@@ -35,3 +35,4 @@ tests/fixtures/sample_images/
 tests/unit/test_income_employer_guardrail.py
 tests/integration/test_income_year_query.py
 .env
+llmLibrarian.mcpb

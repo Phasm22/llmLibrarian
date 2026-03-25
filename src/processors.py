@@ -1525,7 +1525,10 @@ class ImageProcessor:
 
 
 class _TagStripper(HTMLParser):
-    SKIP_TAGS = {"script", "style", "head", "meta", "link", "noscript", "nav", "footer"}
+    # Void elements (meta, link) must not be here — they have no end tag, so incrementing
+    # skip_depth on open with no matching decrement would suppress all subsequent content.
+    # <head> already covers the head section; noscript/nav/footer are safe (they have end tags).
+    SKIP_TAGS = {"script", "style", "head", "noscript", "nav", "footer"}
     HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 
     def __init__(self):

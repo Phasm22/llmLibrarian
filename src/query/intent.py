@@ -195,7 +195,7 @@ def route_intent(query: str) -> str:
     if re.search(r"\bhow\s+(many|much)\b", q) and re.search(r"\bprojects?\b", q):
         return INTENT_PROJECT_COUNT
     # REFLECT: analyze / reflect on a pasted entry (often short or pasted)
-    if re.search(r"\breflect\b|\bsummarize\s+this\b|\banalyze\s+this\b", q) and len(q) < 120:
+    if re.search(r"\breflect(?:ive)?\b|\bsummarize\s+this\b|\banalyze\s+this\b", q) and len(q) < 120:
         return INTENT_REFLECT
     # EVIDENCE_PROFILE: abstract self-questions needing wide cross-entry synthesis.
     # These are identity/pattern questions that require scanning many entries, not just keyword hits.

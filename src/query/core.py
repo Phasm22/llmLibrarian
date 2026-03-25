@@ -2996,6 +2996,7 @@ def run_retrieve(
             "line_start": m.get("line_start"),
             "chunk_index": m.get("chunk_index"),
             "record_type": m.get("record_type"),
+            "indexed_at": m.get("indexed_at"),
         })
 
     result: dict = {

@@ -21,6 +21,7 @@ llmli ask --in <silo> "query"   # Query specific silo
 llmli ls                        # List silos
 llmli inspect <silo>            # Silo details + per-file chunk counts
 llmli rm <silo>                 # Remove silo
+llmli repair <silo>             # Fix ChromaDB index errors (wipe + re-index)
 llmli capabilities              # Supported file types
 
 # pal is the agent layer (delegates to llmli; state in ~/.pal/registry.json)
@@ -32,7 +33,7 @@ pal ask --in <silo> "query"
 ## Architecture
 
 **Two CLIs:**
-- `cli.py` → `llmli` — Full control CLI (add, ask, ls, inspect, index, rm, capabilities, log)
+- `cli.py` → `llmli` — Full control CLI (add, ask, ls, inspect, index, rm, repair, capabilities, log)
 - `pal.py` → `pal` — Agent CLI that orchestrates llmli; maintains state in `~/.pal/registry.json`
 
 **Core pipeline (src/):**

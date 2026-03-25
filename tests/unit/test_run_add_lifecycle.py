@@ -283,6 +283,7 @@ def test_run_add_prints_effective_worker_settings(monkeypatch, tmp_path, capsys)
     _patch_runtime(monkeypatch, coll)
     monkeypatch.setenv("LLMLIBRARIAN_MAX_WORKERS", "3")
     monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_WORKERS", "5")
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_DEVICE", "cpu")  # avoid MPS cap
     monkeypatch.delenv("LLMLIBRARIAN_QUIET", raising=False)
 
     files_indexed, failures = run_add(root, db_path=tmp_path / "db", allow_cloud=True, no_color=True)
@@ -301,6 +302,7 @@ def test_run_add_cli_worker_overrides_beat_env(monkeypatch, tmp_path, capsys):
     _patch_runtime(monkeypatch, coll)
     monkeypatch.setenv("LLMLIBRARIAN_MAX_WORKERS", "3")
     monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_WORKERS", "5")
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_DEVICE", "cpu")  # avoid MPS cap
     monkeypatch.delenv("LLMLIBRARIAN_QUIET", raising=False)
 
     files_indexed, failures = run_add(

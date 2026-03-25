@@ -1578,7 +1578,9 @@ def test_run_ask_wraps_much_thinks_reflection_answers(monkeypatch, mock_collecti
     out = run_ask(archetype_id=None, query="what patterns show up in how I write about difficult days vs good days", no_color=True, use_reranker=False, silo="much-thinks")
     assert "###" not in out
     assert "Difficult Days:" in out
-    assert "1. Emotional Tone:" in out
+    # much-thinks strips numbered list markers ("1. ") to produce prose — check content survives
+    assert "Emotional Tone:" in out
+    assert "1. Emotional Tone:" not in out  # marker was stripped
     assert max(len(line) for line in out.splitlines() if line.strip()) <= 96
 
 
