@@ -1603,6 +1603,101 @@ class TextProcessor:
             raise TextExtractionError(str(e)) from e
 
 
+class SQLiteProcessor:
+    format_label = "SQLite"
+    install_hint = ""
+
+    def extract(self, data: bytes, source_path: str) -> str:
+        import sqlite3
+        import tempfile
+        import os
+
+        try:
+            # Write bytes to a temp file so sqlite3 can open it
+            with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
+                tmp.write(data)
+                tmp_path = tmp.name
+
+            try:
+                # Open read-only to avoid touching WAL files
+                con = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
+                con.row_factory = sqlite3.Row
+                cur = con.cursor()
+
+                # Discover tables
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = {row[0] for row in cur.fetchall()}
+
+                # Firefox bookmarks schema
+                if "moz_bookmarks" in tables and "moz_places" in tables:
+                    return self._extract_firefox_bookmarks(cur)
+
+                # Generic fallback: dump all table rows as structured text
+                return self._extract_generic(cur, tables)
+
+            finally:
+                con.close()
+                os.unlink(tmp_path)
+
+        except Exception as e:
+            raise TextExtractionError(str(e)) from e
+
+    def _extract_firefox_bookmarks(self, cur: "sqlite3.Cursor") -> str:
+        from datetime import datetime, timezone
+
+        cur.execute("""
+            SELECT b.title, p.url,
+                   b.dateAdded / 1000000 AS added_epoch,
+                   parent.title AS folder
+            FROM moz_bookmarks b
+            JOIN moz_places p ON b.fk = p.id
+            LEFT JOIN moz_bookmarks parent ON b.parent = parent.id
+            WHERE b.type = 1
+            ORDER BY folder, b.dateAdded
+        """)
+        rows = cur.fetchall()
+
+        if not rows:
+            return "Firefox bookmarks database (no bookmarks found)"
+
+        lines = ["Firefox Bookmarks", "=" * 40]
+        current_folder = None
+        for row in rows:
+            folder = row["folder"] or "Unsorted"
+            if folder != current_folder:
+                lines.append(f"\n[{folder}]")
+                current_folder = folder
+            title = row["title"] or row["url"]
+            url = row["url"] or ""
+            try:
+                added = datetime.fromtimestamp(row["added_epoch"], tz=timezone.utc).strftime("%Y-%m-%d")
+            except Exception:
+                added = ""
+            lines.append(f"  {title}")
+            if url:
+                lines.append(f"    URL: {url}")
+            if added:
+                lines.append(f"    Added: {added}")
+        return "\n".join(lines)
+
+    def _extract_generic(self, cur: "sqlite3.Cursor", tables: set) -> str:
+        lines = []
+        for table in sorted(tables):
+            try:
+                cur.execute(f'SELECT * FROM "{table}" LIMIT 500')  # noqa: S608
+                rows = cur.fetchall()
+                if not rows:
+                    continue
+                cols = [desc[0] for desc in cur.description]
+                lines.append(f"\n[Table: {table}]")
+                lines.append("  Columns: " + ", ".join(cols))
+                for row in rows:
+                    lines.append("  " + " | ".join(str(v) for v in row))
+            except Exception:
+                continue
+        return "\n".join(lines) if lines else "SQLite database (no readable tables)"
+
+
 # Registry: suffix -> processor instance
 PROCESSORS: dict[str, DocumentProcessor] = {
     ".pdf": PDFProcessor(),  # type: ignore[dict-item]
@@ -1618,6 +1713,9 @@ PROCESSORS: dict[str, DocumentProcessor] = {
     ".heif": ImageProcessor(),  # type: ignore[dict-item]
     ".tif": ImageProcessor(),  # type: ignore[dict-item]
     ".tiff": ImageProcessor(),  # type: ignore[dict-item]
+    ".sqlite": SQLiteProcessor(),
+    ".sqlite3": SQLiteProcessor(),
+    ".db": SQLiteProcessor(),
 }
 
 # Default processor for code/text files

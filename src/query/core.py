@@ -54,6 +54,7 @@ from query.retrieval import (
     max_chunks_for_intent,
     all_dists_above_threshold,
     rrf_merge,
+    run_hybrid_retrieve,
     extract_direct_lexical_terms,
     sort_by_source_priority,
     sort_by_image_chunk_priority,
@@ -287,21 +288,23 @@ def _safe_query(
     collection: Any,
     query_kw: dict[str, Any],
     silo_slug: str | None = None,
-) -> tuple[list[str], list[dict | None], list[float | None], str | None]:
+) -> tuple[list[str], list[dict | None], list[float | None], list[str], str | None]:
     """
     Run collection.query(**query_kw) with a graceful fallback when ChromaDB throws an
     index-consistency error (e.g. 'InternalError: Error finding id').
 
     When the scoped query fails and a silo_slug is set, retries without the where filter
     and post-filters results to the target silo in Python.  Returns (docs, metas, dists,
-    warning) where warning is None on success or a human-readable string on fallback.
+    ids, warning) where warning is None on success or a human-readable string on fallback.
+    ChromaDB always returns ids from .query() regardless of the include list.
     """
     try:
         results = collection.query(**query_kw)
         docs = (results.get("documents") or [[]])[0] or []
         metas = (results.get("metadatas") or [[]])[0] or []
         dists = (results.get("distances") or [[]])[0] or []
-        return docs, metas, dists, None
+        ids = (results.get("ids") or [[]])[0] or []
+        return docs, metas, dists, ids, None
     except Exception as exc:
         if not _is_chroma_index_error(exc):
             raise
@@ -316,18 +319,19 @@ def _safe_query(
         docs = (results.get("documents") or [[]])[0] or []
         metas = (results.get("metadatas") or [[]])[0] or []
         dists = (results.get("distances") or [[]])[0] or []
+        ids = (results.get("ids") or [[]])[0] or []
         if silo_slug:
             filtered = [
-                (d, m, dist)
-                for d, m, dist in zip(docs, metas, dists)
+                (d, m, dist, cid)
+                for d, m, dist, cid in zip(docs, metas, dists, ids or [""] * len(docs))
                 if str((m or {}).get("silo") or "") == silo_slug
             ]
             if filtered:
-                docs, metas, dists = zip(*filtered)  # type: ignore[assignment]
-                docs, metas, dists = list(docs), list(metas), list(dists)
+                docs, metas, dists, ids = zip(*filtered)  # type: ignore[assignment]
+                docs, metas, dists, ids = list(docs), list(metas), list(dists), list(ids)
             else:
-                docs, metas, dists = [], [], []
-        return docs, metas, dists, warning
+                docs, metas, dists, ids = [], [], [], []
+        return docs, metas, dists, ids, warning
 
 
 def _query_is_image_relevant(query: str, docs: list[str], metas: list[dict | None]) -> bool:
@@ -1942,15 +1946,10 @@ def run_ask(
         )
         return response
 
-    direct_hybrid_enabled = direct_decisive_mode and intent in (INTENT_LOOKUP, INTENT_FIELD_LOOKUP)
-    include_ids = (
-        (intent == INTENT_EVIDENCE_PROFILE and use_unified and (silo or subscope_where))
-        or direct_hybrid_enabled
-    )
     query_kw: dict = {
         "query_texts": [query_for_retrieval],
         "n_results": n_stage1,
-        "include": ["documents", "metadatas", "distances"],
+        "include": ["documents", "metadatas", "distances"],  # ids are always returned by Chroma, not in include
     }
     where_parts: list[dict[str, Any]] = []
     if use_unified and silo:
@@ -1990,7 +1989,7 @@ def run_ask(
         docs = aggregated_docs
         metas = aggregated_metas
         dists = aggregated_dists
-        ids_v = [] if include_ids else []
+        ids_v: list[str] = []  # ids not tracked across temporal sub-queries; hybrid skipped for this path
 
         # Enhance system prompt for temporal comparison
         system_prompt = (
@@ -2003,7 +2002,7 @@ def run_ask(
         docs = (results.get("documents") or [[]])[0] or []
         metas = (results.get("metadatas") or [[]])[0] or []
         dists = (results.get("distances") or [[]])[0] or []
-        ids_v = (results.get("ids") or [[]])[0] or [] if include_ids else []
+        ids_v = (results.get("ids") or [[]])[0] or []
     # MONEY_YEAR_TOTAL fallthrough: replace vector results with deterministic year-filtered docs
     # so wrong-year chunks don't crowd out 2025 W-2s/1099s when the collection has many years.
     if _money_year_docs_override:
@@ -2042,7 +2041,7 @@ def run_ask(
                 docs_r = (retry_results.get("documents") or [[]])[0] or []
                 metas_r = (retry_results.get("metadatas") or [[]])[0] or []
                 dists_r = (retry_results.get("distances") or [[]])[0] or []
-                ids_r = (retry_results.get("ids") or [[]])[0] or [] if include_ids else []
+                ids_r = (retry_results.get("ids") or [[]])[0] or []
                 top_r = _top_distance(dists_r)
                 if docs_r and (top_d is None or (top_r is not None and top_r < top_d)):
                     docs, metas, dists, ids_v = docs_r, metas_r, dists_r, ids_r
@@ -2075,44 +2074,28 @@ def run_ask(
             metas = image_metas + metas
             dists = image_dists + dists
 
-    # EVIDENCE_PROFILE + unified + silo/subscope: hybrid search (vector + Chroma where_document, RRF merge)
-    if include_ids and ids_v and len(ids_v) == len(docs):
-        where_doc = None
-        if intent == INTENT_EVIDENCE_PROFILE:
-            where_doc = {"$or": [{"$contains": p} for p in PROFILE_LEXICAL_PHRASES]}
-        elif direct_hybrid_enabled:
-            lexical_terms = extract_direct_lexical_terms(query_for_retrieval)
-            if lexical_terms:
-                where_doc = {"$or": [{"$contains": p} for p in lexical_terms]}
-
-        if where_doc:
-            get_kw: dict = {"where_document": where_doc, "include": ["documents", "metadatas"]}
-            if use_unified and silo:
-                get_kw["where"] = {"silo": silo}
-            elif subscope_where:
-                get_kw["where"] = subscope_where
-            try:
-                lex = collection.get(**get_kw)
-                ids_l = (lex.get("ids") or [])[:MAX_LEXICAL_FOR_RRF]
-                docs_l = (lex.get("documents") or [])[:MAX_LEXICAL_FOR_RRF]
-                metas_l = (lex.get("metadatas") or [])[:MAX_LEXICAL_FOR_RRF]
-                if ids_l:
-                    docs, metas, dists = rrf_merge(
-                        ids_v, docs, metas, dists,
-                        ids_l, docs_l, metas_l,
-                        top_k=n_stage1,
-                    )
-                    hybrid_used = True
-                else:
-                    if not quiet and intent == INTENT_EVIDENCE_PROFILE:
-                        print("[llmli] hybrid skipped: lexical get returned no chunks (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
-            except Exception as e:
-                if not quiet and intent == INTENT_EVIDENCE_PROFILE:
-                    print(f"[llmli] hybrid skipped: lexical get failed: {e} (EVIDENCE_PROFILE fallback to trigger reorder).", file=sys.stderr)
-    # EVIDENCE_PROFILE fallback: in-app reorder by trigger regex (no hybrid)
+    # Universal hybrid retrieval: vector + lexical (RRF merge) for all intents.
+    # EVIDENCE_PROFILE uses predefined profile phrases; all other intents use terms extracted from the query.
+    # Temporal decomposition path skips hybrid (ids_v is empty in that case).
+    _hybrid_where = query_kw.get("where") if isinstance(query_kw.get("where"), dict) else None
+    _lexical_phrases = PROFILE_LEXICAL_PHRASES if intent == INTENT_EVIDENCE_PROFILE else None
+    docs, metas, dists, hybrid_method = run_hybrid_retrieve(
+        ids_v=ids_v,
+        docs_v=docs,
+        metas_v=metas,
+        dists_v=dists,
+        query_text=query_for_retrieval,
+        collection=collection,
+        where_filter=_hybrid_where,
+        top_k=n_stage1,
+        lexical_phrases=_lexical_phrases,
+    )
+    hybrid_used = (hybrid_method == "hybrid")
+    # EVIDENCE_PROFILE fallback: if hybrid didn't fire, reorder by trigger regex
     if intent == INTENT_EVIDENCE_PROFILE and docs and not hybrid_used:
         docs, metas, dists = filter_by_triggers(docs, metas, dists)
-    if direct_hybrid_enabled and docs:
+    # Direct decisive mode: apply source-priority sort (archetype-config-driven, independent of hybrid)
+    if direct_decisive_mode and docs:
         docs, metas, dists = sort_by_source_priority(
             docs,
             metas,
@@ -2213,7 +2196,7 @@ def run_ask(
             is_local = (meta or {}).get("is_local", 1)
             direct_priority = (
                 -source_priority_score(meta, canonical_tokens, deprioritized_tokens)
-                if direct_hybrid_enabled
+                if direct_decisive_mode
                 else 0
             )
             return (
@@ -2925,7 +2908,7 @@ def run_retrieve(
     query_kw: dict = {
         "query_texts": [query_for_retrieval],
         "n_results": n_stage1,
-        "include": ["documents", "metadatas", "distances"],
+        "include": ["documents", "metadatas", "distances"],  # ids always returned by Chroma, not in include
     }
     where_parts: list[dict] = []
     if silo_slug:
@@ -2937,7 +2920,22 @@ def run_retrieve(
     elif len(where_parts) > 1:
         query_kw["where"] = {"$and": where_parts}
 
-    docs, metas, dists, _silo_warning = _safe_query(collection, query_kw, silo_slug)
+    docs, metas, dists, ids_v, _silo_warning = _safe_query(collection, query_kw, silo_slug)
+
+    # Universal hybrid: vector + lexical (RRF) for all intents
+    _hybrid_where = query_kw.get("where") if isinstance(query_kw.get("where"), dict) else None
+    _lexical_phrases = PROFILE_LEXICAL_PHRASES if intent == INTENT_EVIDENCE_PROFILE else None
+    docs, metas, dists, retrieval_method = run_hybrid_retrieve(
+        ids_v=ids_v,
+        docs_v=docs,
+        metas_v=metas,
+        dists_v=dists,
+        query_text=query_for_retrieval,
+        collection=collection,
+        where_filter=_hybrid_where,
+        top_k=n_stage1,
+        lexical_phrases=_lexical_phrases,
+    )
 
     # Diversify by source and dedup
     per_intent_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
@@ -2966,6 +2964,7 @@ def run_retrieve(
     chunks = []
     for rank, (doc, meta, dist) in enumerate(zip(docs, metas, dists), start=1):
         m = meta or {}
+        signals = m.pop("_signals", None)  # injected by run_hybrid_retrieve; remove from meta before output
         mtime_raw = m.get("mtime")
         mtime_iso = None
         if mtime_raw is not None:
@@ -2997,12 +2996,14 @@ def run_retrieve(
             "chunk_index": m.get("chunk_index"),
             "record_type": m.get("record_type"),
             "indexed_at": m.get("indexed_at"),
+            "_signals": signals,
         })
 
     result: dict = {
         "query": query,
         "intent": intent,
         "silo_filter": silo_slug,
+        "retrieval_method": retrieval_method,
         "chunks": chunks,
     }
     if _silo_warning:

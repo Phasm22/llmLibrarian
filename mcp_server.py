@@ -58,6 +58,7 @@ mcp = FastMCP(
     instructions=(
         "ALWAYS use `retrieve` for document questions — returns raw chunks for you to reason over. "
         "Use `retrieve_bulk` when a topic needs multiple retrieval angles (e.g. all risk factor categories). "
+        "`retrieve_bulk` caps merged output at `max_total_chunks` (default 50) to prevent context overflow — if `truncated=True` is returned, lower `n_results` or reduce the number of queries. "
         "Pass `section=` to scope retrieval to a document section (e.g. 'Item 1A', 'Risk Factors'). "
         "Pass `doc_type=` to restrict retrieval to a specific document type — useful when you want only "
         "resumes, transcripts, tax returns, or code files (e.g. doc_type='transcript', 'resume', 'tax_return', 'code', 'other'). "
@@ -69,9 +70,22 @@ mcp = FastMCP(
         "Use `inspect_silo` to see per-file chunk counts — useful to diagnose coverage gaps or zero-chunk files. "
         "Use `trigger_reindex(silo=..., confirm=True)` to re-index a registered silo in the background when "
         "source files have changed. Only works on already-registered paths. "
+        "WARNING: both `trigger_reindex` and `llmli repair` re-crawl the source folder — files no longer present at their original path will be silently dropped from the silo. "
+        "Use `llmli repair <silo>` (CLI only, not an MCP tool) for ChromaDB index corruption/inconsistency errors — it does a hard wipe + full non-incremental re-index. "
+        "Use `trigger_reindex` when source files have changed and you want to update the index incrementally. "
         "`retrieve` responses include `answer_confidence` (high/medium/low), `answer_confidence_score`, and "
         "`coverage_note` — use these to calibrate how much to hedge your answer. When no silo filter is passed, "
         "`retrieve` also returns `chunks_by_silo` grouping results by silo for provenance reasoning. "
+        "Each chunk includes `_signals` with retrieval attribution: `vector_rank` (position in semantic results), "
+        "`lexical_rank` (position in exact-text results, null if not matched), and `rrf_score` (combined score). "
+        "When `lexical_rank` is non-null, the chunk matched the query text exactly — weight it highly for precise "
+        "factual lookups (IDs, error codes, config keys, exact names). When only `vector_rank` is set, the chunk "
+        "matched semantically. The top-level `retrieval_method` field ('hybrid' or 'vector_only') tells you which "
+        "path fired overall; `lexical_hit_count` and `vector_hit_count` give the breakdown. "
+        "Use `explain_retrieval` to get a structured breakdown of why results ranked as they did — useful for "
+        "diagnosing missed results or unexpected rankings before re-querying. "
+        "Use `add_silo(path=...)` to index a new folder as a silo (equivalent to `llmli add`). "
+        "Prefer this over the CLI — no PYTHONPATH setup required. path must be a directory; for a single file, put it in its own folder first. "
         "Call `health` first if tools are failing — it reports db and model status. "
         "Use `capabilities` to see supported file types."
     ),
@@ -168,13 +182,19 @@ def retrieve(
         )
         chunks = result.get("chunks", [])
 
-        # Feature 6: answer-level confidence signal
+        # Answer-level confidence signal
         conf_level, conf_score, coverage_note = _compute_answer_confidence(chunks)
         result["answer_confidence"] = conf_level
         result["answer_confidence_score"] = conf_score
         result["coverage_note"] = coverage_note
 
-        # Feature 7: cross-silo grouping (only when unscoped)
+        # Retrieval signal summary — helps LLM calibrate how to weight chunks
+        lexical_hits = sum(1 for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is not None)
+        vector_hits = sum(1 for c in chunks if (c.get("_signals") or {}).get("vector_rank") is not None)
+        result["lexical_hit_count"] = lexical_hits
+        result["vector_hit_count"] = vector_hits
+
+        # Cross-silo grouping (only when unscoped)
         if not silo and chunks:
             by_silo: dict[str, list] = {}
             for c in chunks:
@@ -193,6 +213,7 @@ def retrieve_bulk(
     n_results: int = 20,
     section: str | None = None,
     doc_type: str | None = None,
+    max_total_chunks: int = 50,
 ) -> dict:
     """
     Fire multiple semantic queries and return merged, deduplicated chunks ranked
@@ -201,6 +222,8 @@ def retrieve_bulk(
     Each chunk is tagged with the query that retrieved it. Pass section= to restrict
     all queries to a specific document section. Pass doc_type= to restrict all queries
     to a specific document type (e.g. 'transcript', 'resume', 'pdf', 'code', 'other').
+    max_total_chunks caps the merged output (default 50) to avoid context window overflow.
+    If the cap is hit, response includes truncated=True — lower n_results or reduce queries.
     Response includes answer_confidence, answer_confidence_score, and coverage_note.
     """
     from query.core import run_retrieve
@@ -227,6 +250,9 @@ def retrieve_bulk(
         except Exception as e:
             errors.append(f"{q!r}: {type(e).__name__}: {e}")
     all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
+    truncated = len(all_chunks) > max_total_chunks
+    if truncated:
+        all_chunks = all_chunks[:max_total_chunks]
 
     # Feature 6: answer-level confidence on merged results
     conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
@@ -235,12 +261,92 @@ def retrieve_bulk(
         "db_path": _DB_PATH,
         "queries": queries,
         "total_chunks": len(all_chunks),
+        "truncated": truncated,
         "answer_confidence": conf_level,
         "answer_confidence_score": conf_score,
         "coverage_note": coverage_note,
         "chunks": all_chunks,
         **({"errors": errors} if errors else {}),
     }
+
+
+@mcp.tool()
+def explain_retrieval(
+    query: str,
+    silo: str | None = None,
+    n_results: int = 20,
+) -> dict:
+    """
+    Return a structured breakdown of how retrieval results were ranked for a query.
+    Useful for diagnosing missed results, unexpected rankings, or low confidence answers
+    before deciding to re-query with different parameters.
+
+    Returns:
+    - retrieval_method: 'hybrid' (vector + lexical RRF) or 'vector_only'
+    - lexical_hit_count / vector_hit_count: how many chunks came from each signal
+    - ranked_chunks: each chunk with its _signals (vector_rank, lexical_rank, rrf_score),
+      score, source, and a short text preview
+    - signal_summary: plain-text explanation of what signals fired and why
+    """
+    from query.core import run_retrieve
+    try:
+        result = run_retrieve(
+            query=query,
+            silo=silo,
+            n_results=n_results,
+            db_path=_DB_PATH,
+            config_path=_CONFIG_PATH,
+        )
+        chunks = result.get("chunks", [])
+        method = result.get("retrieval_method", "unknown")
+
+        lexical_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is not None]
+        vector_only_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is None]
+
+        ranked_chunks = []
+        for c in chunks:
+            sig = c.get("_signals") or {}
+            ranked_chunks.append({
+                "rank": c.get("rank"),
+                "score": c.get("score"),
+                "source": c.get("source", ""),
+                "silo": c.get("silo", ""),
+                "text_preview": (c.get("text") or "")[:200],
+                "vector_rank": sig.get("vector_rank"),
+                "lexical_rank": sig.get("lexical_rank"),
+                "rrf_score": sig.get("rrf_score"),
+            })
+
+        # Build human-readable signal summary
+        if method == "hybrid":
+            summary_parts = [
+                f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had exact-text matches (lexical_rank set), "
+                f"{len(vector_only_hits)} chunk(s) matched semantically only.",
+            ]
+            if lexical_hits:
+                top_lex = lexical_hits[0]
+                summary_parts.append(
+                    f"Top lexical hit (rank {top_lex['rank']}): {top_lex.get('source','?')} "
+                    f"— score {top_lex.get('score')}"
+                )
+        else:
+            summary_parts = [
+                f"Vector-only retrieval: no exact-text terms were extracted from the query or lexical search returned no results. "
+                f"All {len(chunks)} chunk(s) matched semantically."
+            ]
+
+        return {
+            "db_path": _DB_PATH,
+            "query": query,
+            "intent": result.get("intent"),
+            "retrieval_method": method,
+            "lexical_hit_count": len(lexical_hits),
+            "vector_hit_count": len(vector_only_hits),
+            "signal_summary": " ".join(summary_parts),
+            "ranked_chunks": ranked_chunks,
+        }
+    except Exception as e:
+        return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "ranked_chunks": []}
 
 
 @mcp.tool()
@@ -456,6 +562,61 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
         }
     except Exception as e:
         return {"status": "error", "error": f"failed to launch process: {e}"}
+
+
+@mcp.tool()
+def add_silo(
+    path: str,
+    silo: str | None = None,
+    display_name: str | None = None,
+    allow_cloud: bool = False,
+    full: bool = False,
+) -> dict:
+    """
+    Index a folder as a new silo (or update an existing one). Equivalent to `llmli add <path>`.
+    path must be a directory — individual files are not supported (put the file in its own folder first).
+    silo: optional slug override (default: folder basename, slugified).
+    display_name: optional human-readable name override.
+    allow_cloud: set True to allow OneDrive/iCloud/Dropbox paths (blocked by default).
+    full: set True to force a full non-incremental reindex (default: incremental).
+    Runs synchronously — large folders may take a while. Returns files_indexed and failure count.
+    """
+    from pathlib import Path as _Path
+
+    p = _Path(path)
+    if not p.exists():
+        return {"status": "error", "error": f"path does not exist: {path}"}
+    if not p.is_dir():
+        return {
+            "status": "error",
+            "error": f"path must be a directory, not a file: {path}. Put the file in its own folder first.",
+        }
+
+    try:
+        from ingest import run_add
+        files_ok, n_failures = run_add(
+            path=path,
+            db_path=_DB_PATH,
+            forced_silo_slug=silo,
+            display_name_override=display_name,
+            allow_cloud=allow_cloud,
+            incremental=not full,
+        )
+        from state import resolve_silo_by_path, resolve_silo_to_slug
+        slug = (
+            resolve_silo_to_slug(_DB_PATH, silo) if silo
+            else resolve_silo_by_path(_DB_PATH, _Path(path).resolve())
+        )
+        return {
+            "status": "ok",
+            "silo": slug,
+            "path": str(_Path(path).resolve()),
+            "files_indexed": files_ok,
+            "failures": n_failures,
+            "message": f"Indexed {files_ok} file(s) into silo '{slug}'" + (f" with {n_failures} failure(s). Run `llmli log` for details." if n_failures else "."),
+        }
+    except Exception as e:
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
 
 
 @mcp.tool()

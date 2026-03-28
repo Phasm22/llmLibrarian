@@ -2027,9 +2027,12 @@ def run_add(
     embedding_workers: int | None = None,
 ) -> tuple[int, int]:
     """
-    Index a single folder into the unified collection (llmli). Silo name = basename(path) unless forced.
+    Index a folder or a single file into the unified collection (llmli). Silo name = basename(path) unless forced.
     Returns (files_indexed, failed_count). Failures saved for llmli log --last.
     Refuses cloud-sync roots (OneDrive, iCloud, Dropbox, etc.) unless allow_cloud=True.
+
+    When path is a single file (e.g. places.sqlite), include/exclude filters are bypassed — the file
+    is indexed directly. Use this to add explicitly-chosen files that are excluded by default (SQLite DBs, etc.).
 
     If interrupted (e.g. Ctrl+C): Chroma may have 0 or partial chunks for this silo;
     the registry is only updated on success. Re-run add for the same path to get a consistent state.
@@ -2041,8 +2044,9 @@ def run_add(
     if path.is_symlink() and not follow_symlinks:
         raise ValueError(f"Refusing to follow symlinked path: {path}. Use --follow-symlinks to allow.")
     path = path.resolve()
-    if not path.is_dir():
-        raise NotADirectoryError(f"Not a directory: {path}")
+    is_single_file = path.is_file()
+    if not is_single_file and not path.is_dir():
+        raise NotADirectoryError(f"Not a directory or file: {path}")
     if not allow_cloud:
         cloud_kind = is_cloud_sync_path(path)
         if cloud_kind:
@@ -2072,15 +2076,34 @@ def run_add(
     quiet = os.environ.get("LLMLIBRARIAN_QUIET", "").strip().lower() in ("1", "true", "yes")
 
     collect_stats: dict[str, Any] = {}
-    file_list = collect_files(
-        path,
-        ADD_DEFAULT_INCLUDE,
-        ADD_DEFAULT_EXCLUDE,
-        max_depth,
-        max_file_bytes,
-        follow_symlinks=follow_symlinks,
-        stats=collect_stats,
-    )
+    if is_single_file:
+        # User explicitly passed a single file — bypass include/exclude filters.
+        suf = path.suffix.lower()
+        if suf == ".zip":
+            kind = "zip"
+        elif suf == ".pdf":
+            kind = "pdf"
+        elif suf == ".docx":
+            kind = "docx"
+        elif suf == ".xlsx":
+            kind = "xlsx"
+        elif suf == ".pptx":
+            kind = "pptx"
+        elif suf in IMAGE_EXTENSIONS:
+            kind = "image"
+        else:
+            kind = "code"
+        file_list: list[tuple[Path, str]] = [(path, kind)]
+    else:
+        file_list = collect_files(
+            path,
+            ADD_DEFAULT_INCLUDE,
+            ADD_DEFAULT_EXCLUDE,
+            max_depth,
+            max_file_bytes,
+            follow_symlinks=follow_symlinks,
+            stats=collect_stats,
+        )
     _image_embed_ok = True
     if _requires_standalone_image_enrichment(file_list):
         if effective_image_vision_enabled:

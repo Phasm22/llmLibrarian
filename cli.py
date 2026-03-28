@@ -476,8 +476,8 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # add <path> [--allow-cloud]
-    p_add = sub.add_parser("add", help="Index folder into llmli (silo = basename); cloud-sync paths blocked unless --allow-cloud")
-    p_add.add_argument("path", help="Folder path to index")
+    p_add = sub.add_parser("add", help="Index folder (or single file) into llmli (silo = basename); cloud-sync paths blocked unless --allow-cloud")
+    p_add.add_argument("path", help="Folder or file path to index (single files bypass include/exclude filters)")
     p_add.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive (ingestion may be unreliable)")
     p_add.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks inside the target folder")
     p_add.add_argument("--full", action="store_true", help="Full reindex (delete + add) instead of incremental")

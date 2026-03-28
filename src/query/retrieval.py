@@ -118,16 +118,24 @@ def rrf_merge(
     metas_l: list[dict | None],
     top_k: int,
     k: int = RRF_K,
-) -> tuple[list[str], list[dict | None], list[float | None]]:
-    """Merge vector and lexical results by RRF score; return top_k (docs, metas, dists) in merged order."""
-    rank_v = {vid: 1.0 / (k + (i + 1)) for i, vid in enumerate(ids_v)}
-    rank_l = {lid: 1.0 / (k + (i + 1)) for i, lid in enumerate(ids_l)}
+) -> tuple[list[str], list[dict | None], list[float | None], list[dict]]:
+    """Merge vector and lexical results by RRF score; return top_k (docs, metas, dists, signals) in merged order.
+
+    signals is a list of dicts — one per output chunk — with keys:
+        vector_rank (int|None): 1-based rank in vector results, None if lexical-only
+        lexical_rank (int|None): 1-based rank in lexical results, None if vector-only
+        rrf_score (float): combined RRF score
+    """
+    pos_v = {vid: i + 1 for i, vid in enumerate(ids_v)}  # 1-based rank
+    pos_l = {lid: i + 1 for i, lid in enumerate(ids_l)}
+    score_v = {vid: 1.0 / (k + pos_v[vid]) for vid in ids_v}
+    score_l = {lid: 1.0 / (k + pos_l[lid]) for lid in ids_l}
     scores: dict[str, float] = {}
     for vid in ids_v:
-        scores[vid] = rank_v.get(vid, 0) + rank_l.get(vid, 0)
+        scores[vid] = score_v[vid] + score_l.get(vid, 0.0)
     for lid in ids_l:
         if lid not in scores:
-            scores[lid] = rank_l.get(lid, 0)
+            scores[lid] = score_l[lid]
     id_to_doc = dict(zip(ids_v, docs_v))
     id_to_meta = dict(zip(ids_v, metas_v))
     id_to_dist = dict(zip(ids_v, dists_v))
@@ -137,11 +145,78 @@ def rrf_merge(
             id_to_meta[lid] = metas_l[i] if i < len(metas_l) else None
             id_to_dist[lid] = None
     sorted_ids = sorted(scores.keys(), key=lambda x: -scores[x])[:top_k]
+    signals = [
+        {
+            "vector_rank": pos_v.get(cid),
+            "lexical_rank": pos_l.get(cid),
+            "rrf_score": round(scores[cid], 6),
+        }
+        for cid in sorted_ids
+    ]
     return (
         [id_to_doc[i] for i in sorted_ids],
         [id_to_meta[i] for i in sorted_ids],
         [id_to_dist[i] for i in sorted_ids],
+        signals,
     )
+
+
+def run_hybrid_retrieve(
+    ids_v: list[str],
+    docs_v: list[str],
+    metas_v: list[dict | None],
+    dists_v: list[float | None],
+    query_text: str,
+    collection: Any,
+    where_filter: dict | None,
+    top_k: int,
+    lexical_phrases: list[str] | None = None,
+) -> tuple[list[str], list[dict | None], list[float | None], str]:
+    """Run hybrid retrieval: combine pre-executed vector results with a lexical query and merge via RRF.
+
+    If ids_v is empty or no lexical terms can be extracted, falls back to vector-only results.
+
+    lexical_phrases — if provided, use these directly as $contains anchors (e.g. PROFILE_LEXICAL_PHRASES
+    for EVIDENCE_PROFILE intent). If None, terms are extracted from query_text automatically.
+
+    Injects ``_signals`` into each returned meta dict with keys:
+        vector_rank, lexical_rank, rrf_score  (all None for vector-only path)
+
+    Returns (docs, metas, dists, retrieval_method) where retrieval_method is ``"hybrid"`` or ``"vector_only"``.
+    """
+    if lexical_phrases is not None:
+        terms = list(lexical_phrases)
+    else:
+        terms = extract_direct_lexical_terms(query_text)
+
+    if ids_v and terms:
+        where_doc: dict = {"$or": [{"$contains": t} for t in terms[:MAX_LEXICAL_FOR_RRF]]}
+        get_kw: dict[str, Any] = {"where_document": where_doc, "include": ["documents", "metadatas"]}
+        if where_filter:
+            get_kw["where"] = where_filter
+        try:
+            lex = collection.get(**get_kw)
+            ids_l: list[str] = (lex.get("ids") or [])[:MAX_LEXICAL_FOR_RRF]
+            docs_l: list[str] = (lex.get("documents") or [])[:MAX_LEXICAL_FOR_RRF]
+            metas_l: list[dict | None] = (lex.get("metadatas") or [])[:MAX_LEXICAL_FOR_RRF]
+            if ids_l:
+                docs, metas, dists, signals = rrf_merge(
+                    ids_v, docs_v, metas_v, dists_v,
+                    ids_l, docs_l, metas_l,
+                    top_k=top_k,
+                )
+                for meta, sig in zip(metas, signals):
+                    if meta is not None:
+                        meta["_signals"] = sig
+                return docs, metas, dists, "hybrid"
+        except Exception:
+            pass
+
+    # Vector-only fallback: annotate with positional signals
+    for i, meta in enumerate(metas_v):
+        if meta is not None:
+            meta["_signals"] = {"vector_rank": i + 1, "lexical_rank": None, "rrf_score": None}
+    return docs_v, metas_v, dists_v, "vector_only"
 
 
 def filter_by_triggers(docs: list[str], metas: list[dict | None], dists: list[float | None]) -> tuple[list[str], list[dict | None], list[float | None]]:
