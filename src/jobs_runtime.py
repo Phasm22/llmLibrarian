@@ -263,7 +263,7 @@ def derive_watch_jobs(
     jobs: list[JobSpec] = []
     warnings: list[str] = []
     seen: set[str] = set()
-    sources = source_registry.get("sources", []) or []
+    sources = source_registry.get("bookmarks") or source_registry.get("sources") or []
     for raw in sources:
         if not isinstance(raw, dict):
             continue

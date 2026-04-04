@@ -13,7 +13,7 @@ runner = CliRunner()
 def test_pull_path_mode_syncs_daemon_when_installed(monkeypatch):
     seen = {"sync": 0}
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
-    monkeypatch.setattr("pal._run_llmli", lambda _args, extra_env=None: 0)
+    monkeypatch.setattr("ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
     monkeypatch.setattr("pal._daemon_is_installed", lambda: True)
     monkeypatch.setattr("pal._sync_daemon_services", lambda emit_output=False: seen.__setitem__("sync", seen["sync"] + 1) or 0)
@@ -25,7 +25,7 @@ def test_pull_path_mode_syncs_daemon_when_installed(monkeypatch):
 
 def test_remove_command_prunes_source_registry_and_syncs_daemon(monkeypatch):
     seen: dict[str, object] = {}
-    monkeypatch.setattr("pal._run_llmli", lambda _args: 0)
+    monkeypatch.setattr("operations.op_remove_silo", lambda _db, _name: {"removed_slug": "docs", "cleaned_slug": "docs", "not_found": False})
     monkeypatch.setattr("pal._resolve_registry_source_for_remove", lambda _name, _db: "/tmp/source")
     monkeypatch.setattr("pal._remove_source_path", lambda path: seen.setdefault("removed_path", path) or True)
     monkeypatch.setattr("pal._daemon_is_installed", lambda: True)

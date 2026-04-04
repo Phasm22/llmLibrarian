@@ -18,6 +18,7 @@ dependencies = [
     "typer>=0.21.0",
     "fastmcp>=2.0",
     "sentence-transformers>=2.0.0",
+    "watchdog>=6.0.0",
 ]
 
 [project.optional-dependencies]

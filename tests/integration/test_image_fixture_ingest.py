@@ -26,7 +26,7 @@ def _image_collection(db_path: Path):
 
 @pytest.fixture(autouse=True)
 def _patch_multimodal(monkeypatch):
-    monkeypatch.setattr("ingest.get_embedding_function", lambda: None)
+    monkeypatch.setattr("ingest.get_embedding_function", lambda **_kw: None)
     monkeypatch.setattr(ingest, "ensure_vision_model_ready", lambda: "llava:test")
     monkeypatch.setattr(processors, "ensure_vision_model_ready", lambda: "llava:test")
 

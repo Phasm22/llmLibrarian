@@ -33,8 +33,8 @@ def test_run_ask_wraps_context_and_injects_untrusted_rule(monkeypatch, tmp_path)
         return {"message": {"content": "ok"}}
 
     monkeypatch.setitem(sys.modules, "ollama", SimpleNamespace(chat=_chat))
-    monkeypatch.setattr("query.core.get_embedding_function", lambda: None)
-    monkeypatch.setattr("query.core.chromadb.PersistentClient", _DummyClient)
+    monkeypatch.setattr("query.core.get_embedding_function", lambda **_kw: None)
+    monkeypatch.setattr("query.core.get_client", lambda db_path: _DummyClient())
 
     _ = run_ask(
         archetype_id=None,

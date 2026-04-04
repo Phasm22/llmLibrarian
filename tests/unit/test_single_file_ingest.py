@@ -12,8 +12,8 @@ class _DummyClient:
 
 
 def _patch_ingest_runtime(monkeypatch, mock_collection):
-    monkeypatch.setattr("ingest.get_embedding_function", lambda: None)
-    monkeypatch.setattr("ingest.chromadb.PersistentClient", lambda *a, **k: _DummyClient(mock_collection))
+    monkeypatch.setattr("ingest.get_embedding_function", lambda **_kw: None)
+    monkeypatch.setattr("ingest.get_client", lambda db_path: _DummyClient(mock_collection))
 
 
 class _MultiClient:
@@ -132,10 +132,10 @@ def test_update_single_file_reuses_cross_silo_duplicate(monkeypatch, mock_collec
 def test_update_single_file_image_adds_image_vector(monkeypatch, mock_collection, db_path: Path, tmp_path: Path):
     image_collection = type(mock_collection)()
     monkeypatch.setattr(
-        "ingest.chromadb.PersistentClient",
-        lambda *a, **k: _MultiClient({"llmli": mock_collection, "llmli_image": image_collection}),
+        "ingest.get_client",
+        lambda db_path: _MultiClient({"llmli": mock_collection, "llmli_image": image_collection}),
     )
-    monkeypatch.setattr("ingest.get_embedding_function", lambda: None)
+    monkeypatch.setattr("ingest.get_embedding_function", lambda **_kw: None)
     monkeypatch.setattr("ingest.ensure_vision_model_ready", lambda: "llava:test")
 
     class _FakeAdapter:

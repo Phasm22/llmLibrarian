@@ -35,8 +35,8 @@ class _FakeClient:
 
 
 def _patch_runtime(monkeypatch, coll):
-    monkeypatch.setattr("ingest.get_embedding_function", lambda: None)
-    monkeypatch.setattr("ingest.chromadb.PersistentClient", lambda *a, **k: _FakeClient(coll))
+    monkeypatch.setattr("ingest.get_embedding_function", lambda **_kw: None)
+    monkeypatch.setattr("ingest.get_client", lambda db_path: _FakeClient(coll))
     monkeypatch.setattr("ingest.load_config", lambda *a, **k: {"limits": {}})
 
 

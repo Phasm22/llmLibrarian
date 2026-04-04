@@ -22,6 +22,10 @@ def test_pal_help_lists_all_commands():
 def test_pal_ls_inspect_log_remove_and_tool_delegate_to_llmli(monkeypatch):
     calls: list[list[str]] = []
     monkeypatch.setattr("pal._run_llmli", lambda args: calls.append(list(args)) or 0)
+    monkeypatch.setattr(
+        "operations.op_remove_silo",
+        lambda _db, name: {"removed_slug": name, "cleaned_slug": name, "not_found": False},
+    )
     monkeypatch.setenv("LLMLIBRARIAN_REQUIRE_SELF_SILO", "0")
 
     assert runner.invoke(pal.app, ["ls"]).exit_code == 0
@@ -33,8 +37,8 @@ def test_pal_ls_inspect_log_remove_and_tool_delegate_to_llmli(monkeypatch):
     assert calls[0] == ["ls"]
     assert calls[1] == ["inspect", "stuff", "--top", "7", "--filter", "pdf"]
     assert calls[2] == ["log", "--last"]
-    assert calls[3] == ["rm", "Stuff"]
-    assert calls[4] == ["ask", "hello"]
+    # remove now uses op_remove_silo directly — no llmli subprocess needed
+    assert calls[3] == ["ask", "hello"]
 
 
 def test_pal_sync_forces_self_index(monkeypatch):

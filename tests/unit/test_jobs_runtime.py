@@ -15,7 +15,7 @@ def test_derive_watch_jobs_uses_registered_indexed_sources(tmp_path: Path):
     unindexed.mkdir()
 
     source_registry = {
-        "sources": [
+        "bookmarks": [
             {"path": str(indexed)},
             {"path": str(missing)},
             {"path": str(unindexed)},

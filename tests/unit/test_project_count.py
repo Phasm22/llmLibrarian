@@ -13,8 +13,8 @@ class _DummyClient:
 
 
 def _patch_query_runtime(monkeypatch, mock_collection, tmp_path: Path):
-    monkeypatch.setattr("query.core.get_embedding_function", lambda: None)
-    monkeypatch.setattr("query.core.chromadb.PersistentClient", lambda *a, **k: _DummyClient(mock_collection))
+    monkeypatch.setattr("query.core.get_embedding_function", lambda **_kw: None)
+    monkeypatch.setattr("query.core.get_client", lambda db_path: _DummyClient(mock_collection))
     monkeypatch.setattr("query.project_count._get_silo_root", lambda _db, _silo: str(tmp_path / "root"))
     monkeypatch.setattr(
         "query.project_count.get_paths_by_silo",
@@ -38,8 +38,8 @@ def test_project_count_from_registry(monkeypatch, mock_collection, mock_ollama, 
 
 
 def test_project_count_falls_back_to_collection_when_no_registry(monkeypatch, mock_collection, mock_ollama, tmp_path):
-    monkeypatch.setattr("query.core.get_embedding_function", lambda: None)
-    monkeypatch.setattr("query.core.chromadb.PersistentClient", lambda *a, **k: _DummyClient(mock_collection))
+    monkeypatch.setattr("query.core.get_embedding_function", lambda **_kw: None)
+    monkeypatch.setattr("query.core.get_client", lambda db_path: _DummyClient(mock_collection))
     monkeypatch.setattr("query.project_count.get_paths_by_silo", None)
     monkeypatch.setattr("query.project_count._get_silo_root", lambda _db, _silo: str(tmp_path / "root"))
     mock_collection.get_result = {
@@ -56,8 +56,8 @@ def test_project_count_falls_back_to_collection_when_no_registry(monkeypatch, mo
 
 
 def test_project_count_no_code_files(monkeypatch, mock_collection, mock_ollama, tmp_path):
-    monkeypatch.setattr("query.core.get_embedding_function", lambda: None)
-    monkeypatch.setattr("query.core.chromadb.PersistentClient", lambda *a, **k: _DummyClient(mock_collection))
+    monkeypatch.setattr("query.core.get_embedding_function", lambda **_kw: None)
+    monkeypatch.setattr("query.core.get_client", lambda db_path: _DummyClient(mock_collection))
     monkeypatch.setattr(
         "query.project_count.get_paths_by_silo",
         lambda _db: {"silo-z": [str(tmp_path / "root" / "a" / "note.md")]},

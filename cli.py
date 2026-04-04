@@ -259,31 +259,16 @@ def cmd_rm(args: argparse.Namespace) -> int:
     if not silo:
         print("Error: remove requires silo name. Example: llmli remove \"Tax\"", file=sys.stderr)
         return 1
-    from state import remove_silo, slugify, resolve_silo_by_path, resolve_silo_prefix, remove_manifest_silo
-    from constants import DB_PATH, LLMLI_COLLECTION
-    from ingest import _file_registry_remove_silo
-    import chromadb
-    from chromadb.config import Settings
+    from operations import op_remove_silo
     db = _db_path(args)
-    # Allow path input to resolve to slug.
     raw = " ".join(silo) if isinstance(silo, list) else str(silo)
-    path_slug = resolve_silo_by_path(db, raw) if Path(raw).exists() else None
-    # Allow prefix match on hashed slugs.
-    prefix_slug = resolve_silo_prefix(db, raw)
-    removed_slug = remove_silo(db, path_slug or prefix_slug or raw)
-    slug_to_clean = removed_slug if removed_slug is not None else slugify(raw)
-    try:
-        client = chromadb.PersistentClient(path=str(db), settings=Settings(anonymized_telemetry=False))
-        coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
-        coll.delete(where={"silo": slug_to_clean})
-    except Exception as e:
-        print(f"Warning: could not delete chunks from DB: {e}", file=sys.stderr)
-    _file_registry_remove_silo(db, slug_to_clean)
-    remove_manifest_silo(db, slug_to_clean)
-    if removed_slug is not None:
-        print(f"Removed silo: {removed_slug}")
+    result = op_remove_silo(str(db), raw)
+    if result.get("chroma_warning"):
+        print(f"Warning: could not delete chunks from DB: {result['chroma_warning']}", file=sys.stderr)
+    if not result["not_found"]:
+        print(f"Removed silo: {result['removed_slug']}")
     else:
-        print(f"Removed chunks and file registry for silo: {slug_to_clean} (was not in silo list)")
+        print(f"Removed chunks and file registry for silo: {result['cleaned_slug']} (was not in silo list)")
     return 0
 
 def cmd_repair(args: argparse.Namespace) -> int:
@@ -292,55 +277,13 @@ def cmd_repair(args: argparse.Namespace) -> int:
     if not silo_arg:
         print("Error: repair requires a silo slug or display name.", file=sys.stderr)
         return 1
-    from state import list_silos, resolve_silo_to_slug, resolve_silo_prefix, remove_manifest_silo
-    from constants import DB_PATH, LLMLI_COLLECTION
-    from ingest import _file_registry_remove_silo, run_add
-    import chromadb
-    from chromadb.config import Settings
-
+    from operations import op_repair_silo
     db = _db_path(args)
     raw = " ".join(silo_arg) if isinstance(silo_arg, list) else str(silo_arg)
-    slug = (
-        resolve_silo_to_slug(db, raw)
-        or resolve_silo_prefix(db, raw)
-    )
-    if slug is None:
-        print(f"Error: silo '{raw}' not found. Run `llmli ls` to see available silos.", file=sys.stderr)
+    result = op_repair_silo(str(db), raw, verbose=True)
+    if result.get("status") == "error":
+        print(f"Error: {result['error']}", file=sys.stderr)
         return 1
-
-    silos = {s["slug"]: s for s in list_silos(db)}
-    silo_info = silos.get(slug, {})
-    silo_path = silo_info.get("path", "")
-
-    if not silo_path or not Path(silo_path).exists():
-        print(
-            f"Error: silo '{slug}' has no resolvable path ('{silo_path}'). "
-            "Cannot re-index automatically. Remove and re-add manually.",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(f"[repair] Wiping ChromaDB chunks for silo '{slug}'...")
-    try:
-        client = chromadb.PersistentClient(path=str(db), settings=Settings(anonymized_telemetry=False))
-        coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
-        coll.delete(where={"silo": slug})
-    except Exception as e:
-        print(f"[repair] Warning: could not wipe Chroma chunks: {e}", file=sys.stderr)
-
-    print(f"[repair] Clearing file registry for silo '{slug}'...")
-    _file_registry_remove_silo(db, slug)
-    remove_manifest_silo(db, slug)
-
-    print(f"[repair] Re-indexing '{silo_path}' (full, non-incremental)...")
-    files_ok, n_failures = run_add(
-        path=silo_path,
-        db_path=str(db),
-        incremental=False,
-    )
-    print(f"[repair] Done: {files_ok} file(s) re-indexed, {n_failures} failure(s).")
-    if n_failures:
-        print("  Run `llmli log` for failure details.")
     return 0
 
 
@@ -366,75 +309,56 @@ def cmd_log(args: argparse.Namespace) -> int:
 
 def cmd_inspect(args: argparse.Namespace) -> int:
     """Show silo details: path, total chunks, and per-file chunk counts (from indexed data)."""
-    from state import list_silos, resolve_silo_to_slug
-    from constants import LLMLI_COLLECTION
-    import chromadb
-    from chromadb.config import Settings
+    from operations import op_inspect_silo
     db = _db_path(args)
     silo_arg = getattr(args, "silo", None)
     if not silo_arg:
         print("Error: inspect requires silo name. Example: llmli inspect stuff", file=sys.stderr)
         return 1
-    slug = resolve_silo_to_slug(db, silo_arg)
-    if slug is None:
-        print(f"Error: silo not found: {silo_arg}", file=sys.stderr)
+    top_n = max(1, getattr(args, "top", 20))
+    result = op_inspect_silo(str(db), silo_arg, top=top_n)
+    if "error" in result:
+        print(f"Error: {result['error']}", file=sys.stderr)
         return 1
-    silos = list_silos(db)
-    info = next((s for s in silos if s.get("slug") == slug), None)
-    display = (info or {}).get("display_name", slug)
-    path = (info or {}).get("path", "?")
-    total_chunks = (info or {}).get("chunks_count", 0)
+
+    slug = result["slug"]
+    display = result["display_name"]
+    path = result.get("path", "?")
+    total_registry = result["total_chunks_registry"]
+    total_chroma = result["total_chunks_chroma"]
     print(f"Silo: {display} ({slug})")
     print(f"Path: {path}")
-    print(f"Total chunks (registry): {total_chunks}")
-    try:
-        client = chromadb.PersistentClient(path=str(db), settings=Settings(anonymized_telemetry=False))
-        coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
-        # Get all chunk metadatas for this silo to aggregate by source file
-        result = coll.get(where={"silo": slug}, include=["metadatas"])
-        metas = result.get("metadatas") or []
-        chroma_count = len(metas)
-        if chroma_count != total_chunks:
-            print(f"[llmli] registry mismatch: Chroma has {chroma_count} chunks for this silo, registry says {total_chunks}. Re-run add to fix.", file=sys.stderr)
-        by_source: dict[str, int] = {}
-        source_to_hash: dict[str, str] = {}
-        for m in metas:
-            meta = m or {}
-            src = meta.get("source") or "?"
-            by_source[src] = by_source.get(src, 0) + 1
-            if src not in source_to_hash and meta.get("file_hash"):
-                source_to_hash[src] = meta["file_hash"]
-        if not by_source:
-            print("No indexed files (chunks) found for this silo in the store.")
-            return 0
-        # Group by file_hash to mark duplicates (same content, different path)
-        hash_to_sources: dict[str, list[str]] = {}
-        for s, h in source_to_hash.items():
-            if h:
-                hash_to_sources.setdefault(h, []).append(s)
-        ext_filter = getattr(args, "filter", None)
-        if ext_filter == "pdf":
-            by_source = {s: c for s, c in by_source.items() if s.lower().endswith(".pdf")}
-        elif ext_filter == "docx":
-            by_source = {s: c for s, c in by_source.items() if s.lower().endswith(".docx")}
-        elif ext_filter == "code":
-            code_exts = (".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cpp", ".cs", ".rb", ".sh", ".md", ".txt", ".yml", ".yaml")
-            by_source = {s: c for s, c in by_source.items() if any(s.lower().endswith(e) for e in code_exts)}
-        top_n = max(1, getattr(args, "top", 20))
-        total_files = len(by_source)
-        print(f"Indexed files: {total_files}" + (f" (showing top {top_n})" if total_files > top_n else ""))
-        sorted_sources = sorted(by_source.items(), key=lambda x: -x[1])[:top_n]
-        for src, count in sorted_sources:
-            short = src if len(src) <= 72 else "..." + src[-69:]
-            dup_note = ""
-            h = source_to_hash.get(src)
-            if h and len(hash_to_sources.get(h, [])) > 1:
-                others = [s for s in hash_to_sources[h] if s != src]
-                dup_note = f"  [same content as {len(others)} other file(s)]"
-            print(f"  {count:6d} chunks  {short}{dup_note}")
-    except Exception as e:
-        print(f"Error reading store: {e}", file=sys.stderr)
-        return 1
+    print(f"Total chunks (registry): {total_registry}")
+    if not result["registry_match"]:
+        print(
+            f"[llmli] registry mismatch: Chroma has {total_chroma} chunks for this silo, "
+            f"registry says {total_registry}. Re-run add to fix.",
+            file=sys.stderr,
+        )
+
+    files = result.get("files", [])
+    if not files:
+        print("No indexed files (chunks) found for this silo in the store.")
+        return 0
+
+    # Apply CLI-only extension filter (not exposed in MCP)
+    ext_filter = getattr(args, "filter", None)
+    if ext_filter == "pdf":
+        files = [f for f in files if f["source"].lower().endswith(".pdf")]
+    elif ext_filter == "docx":
+        files = [f for f in files if f["source"].lower().endswith(".docx")]
+    elif ext_filter == "code":
+        code_exts = (".py", ".js", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cpp", ".cs", ".rb", ".sh", ".md", ".txt", ".yml", ".yaml")
+        files = [f for f in files if any(f["source"].lower().endswith(e) for e in code_exts)]
+
+    total_files = result["total_files"]
+    print(f"Indexed files: {total_files}" + (f" (showing top {top_n})" if total_files > top_n else ""))
+    for file_info in files:
+        src = file_info["source"]
+        count = file_info["chunk_count"]
+        short = src if len(src) <= 72 else "..." + src[-69:]
+        dup_note = "  [same content as duplicate file]" if file_info.get("has_duplicate_content") else ""
+        print(f"  {count:6d} chunks  {short}{dup_note}")
     return 0
 
 

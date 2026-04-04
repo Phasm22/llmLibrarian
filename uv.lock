@@ -2776,6 +2776,7 @@ dependencies = [
     { name = "sentence-transformers" },
     { name = "tqdm" },
     { name = "typer" },
+    { name = "watchdog" },
 ]
 
 [package.optional-dependencies]
@@ -2843,6 +2844,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'image'", specifier = ">=2.4.0" },
     { name = "tqdm", specifier = ">=4.66.0" },
     { name = "typer", specifier = ">=0.21.0" },
+    { name = "watchdog", specifier = ">=6.0.0" },
     { name = "watchdog", marker = "extra == 'watch'", specifier = ">=3.0.0" },
 ]
 provides-extras = ["image", "ocr", "rerank", "watch", "eval", "all", "dev", "build"]

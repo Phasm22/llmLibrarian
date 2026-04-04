@@ -24,7 +24,7 @@ def _mock_subprocess(monkeypatch, files_indexed_by_path=None, failures_by_path=N
 
 
 def test_pull_all_errors_when_no_sources(monkeypatch, capsys):
-    monkeypatch.setattr("pal._read_registry", lambda: {"sources": []})
+    monkeypatch.setattr("pal._read_registry", lambda: {"bookmarks": []})
     rc = pal.pull_all_sources()
     assert rc == 1
     assert "No registered folders" in capsys.readouterr().err
@@ -33,7 +33,7 @@ def test_pull_all_errors_when_no_sources(monkeypatch, capsys):
 def test_pull_all_reports_all_up_to_date(monkeypatch, capsys):
     monkeypatch.setattr(
         "pal._read_registry",
-        lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}, {"name": "Tax", "path": "/tmp/tax"}]},
+        lambda: {"bookmarks": [{"name": "Stuff", "path": "/tmp/stuff"}, {"name": "Tax", "path": "/tmp/tax"}]},
     )
     _mock_subprocess(monkeypatch)
     rc = pal.pull_all_sources()
@@ -43,7 +43,7 @@ def test_pull_all_reports_all_up_to_date(monkeypatch, capsys):
 
 
 def test_pull_all_reports_updated_silos(monkeypatch, capsys):
-    monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
+    monkeypatch.setattr("pal._read_registry", lambda: {"bookmarks": [{"name": "Stuff", "path": "/tmp/stuff"}]})
     _mock_subprocess(monkeypatch, files_indexed_by_path={"/tmp/stuff": 4})
     rc = pal.pull_all_sources()
     out = capsys.readouterr().out
@@ -52,7 +52,7 @@ def test_pull_all_reports_updated_silos(monkeypatch, capsys):
 
 
 def test_pull_all_reports_failures_and_nonzero_exit(monkeypatch, capsys):
-    monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
+    monkeypatch.setattr("pal._read_registry", lambda: {"bookmarks": [{"name": "Stuff", "path": "/tmp/stuff"}]})
     _mock_subprocess(monkeypatch, failures_by_path={"/tmp/stuff"})
     rc = pal.pull_all_sources()
     captured = capsys.readouterr()
@@ -61,7 +61,7 @@ def test_pull_all_reports_failures_and_nonzero_exit(monkeypatch, capsys):
 
 
 def test_pull_all_non_tty_emits_progress_lines(monkeypatch, capsys):
-    monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
+    monkeypatch.setattr("pal._read_registry", lambda: {"bookmarks": [{"name": "Stuff", "path": "/tmp/stuff"}]})
     monkeypatch.setattr("sys.stderr.isatty", lambda: False)
     _mock_subprocess(monkeypatch, files_indexed_by_path={"/tmp/stuff": 0})
     pal.pull_all_sources()
@@ -70,7 +70,7 @@ def test_pull_all_non_tty_emits_progress_lines(monkeypatch, capsys):
 
 
 def test_pull_all_passes_full_and_follow_flags(monkeypatch):
-    monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
+    monkeypatch.setattr("pal._read_registry", lambda: {"bookmarks": [{"name": "Stuff", "path": "/tmp/stuff"}]})
     seen_cmds = _mock_subprocess(monkeypatch, files_indexed_by_path={"/tmp/stuff": 1}, seen_cmds=[])
     pal.pull_all_sources(full=True, allow_cloud=True, follow_symlinks=True)
     assert seen_cmds
@@ -82,7 +82,7 @@ def test_pull_all_passes_full_and_follow_flags(monkeypatch):
 
 
 def test_pull_all_passes_image_vision_and_worker_flags(monkeypatch):
-    monkeypatch.setattr("pal._read_registry", lambda: {"sources": [{"name": "Stuff", "path": "/tmp/stuff"}]})
+    monkeypatch.setattr("pal._read_registry", lambda: {"bookmarks": [{"name": "Stuff", "path": "/tmp/stuff"}]})
     seen_cmds = _mock_subprocess(monkeypatch, files_indexed_by_path={"/tmp/stuff": 1}, seen_cmds=[])
     pal.pull_all_sources(image_vision=True, workers=6, embedding_workers=4)
     cmd = seen_cmds[0]
@@ -316,7 +316,7 @@ def test_pull_with_path_passes_clear_prompt_option(monkeypatch):
 
 def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
-    monkeypatch.setattr("pal._run_llmli", lambda _args, extra_env=None: 0)
+    monkeypatch.setattr("ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
     calls = {}
 
@@ -334,7 +334,7 @@ def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
 
 def test_pull_path_mode_errors_when_prompt_override_target_missing(monkeypatch):
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
-    monkeypatch.setattr("pal._run_llmli", lambda _args, extra_env=None: 0)
+    monkeypatch.setattr("ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
     monkeypatch.setattr("pal._set_silo_prompt_for_path", lambda *_a, **_k: False)
 
