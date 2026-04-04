@@ -567,13 +567,25 @@ def _render_health_summary(
 
 
 def _read_registry() -> dict:
+    """Read the pal registry. Migrates legacy 'sources' key to 'bookmarks' transparently."""
+    empty: dict = {"bookmarks": []}
     if not REGISTRY_PATH.exists():
-        return {"sources": [], "tools": {"llmli": {"last_ok": None, "last_failures": None}}}
+        return empty
     try:
         with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except Exception:
-        return {"sources": [], "tools": {"llmli": {"last_ok": None, "last_failures": None}}}
+        return empty
+    # Migrate legacy format: 'sources' → 'bookmarks', strip index-state fields.
+    if "sources" in data and "bookmarks" not in data:
+        raw = data.get("sources") or []
+        data["bookmarks"] = [
+            {k: v for k, v in entry.items() if k in ("path", "name", "silo")}
+            for entry in raw
+            if isinstance(entry, dict) and entry.get("path")
+        ]
+        del data["sources"]
+    return data
 
 
 def _write_registry(data: dict) -> None:
@@ -588,10 +600,10 @@ def _remove_source_path(path: str | Path) -> bool:
     except Exception:
         target = str(path)
     reg = _read_registry()
-    sources = reg.get("sources", []) or []
+    bookmarks = reg.get("bookmarks", []) or []
     kept = []
     removed = False
-    for source in sources:
+    for source in bookmarks:
         raw = str((source or {}).get("path") or "")
         if not raw:
             continue
@@ -604,7 +616,7 @@ def _remove_source_path(path: str | Path) -> bool:
             continue
         kept.append(source)
     if removed:
-        reg["sources"] = kept
+        reg["bookmarks"] = kept
         _write_registry(reg)
     return removed
 
@@ -871,11 +883,11 @@ def _git_is_dirty(root: Path) -> bool:
 
 
 def _upsert_self_source(reg: dict, repo_root: Path, last_index_mtime: int | None) -> dict:
-    sources = reg.get("sources", []) or []
+    bookmarks = reg.get("bookmarks", []) or []
     repo_str = str(repo_root.resolve())
     filtered = [
         s
-        for s in sources
+        for s in bookmarks
         if not (
             (s.get("silo") == "__self__")
             or (s.get("path") == repo_str and s.get("name") == "self")
@@ -883,19 +895,16 @@ def _upsert_self_source(reg: dict, repo_root: Path, last_index_mtime: int | None
     ]
     entry = {
         "path": repo_str,
-        "tool": "llmli",
         "name": "self",
         "silo": "__self__",
     }
-    if last_index_mtime is not None:
-        entry["self_silo_last_index_mtime"] = int(last_index_mtime)
     filtered.append(entry)
-    reg["sources"] = filtered
+    reg["bookmarks"] = filtered
     return reg
 
 
 def _get_self_index_mtime_from_registry(reg: dict) -> int | None:
-    for s in reg.get("sources", []) or []:
+    for s in reg.get("bookmarks", []) or []:
         if s.get("silo") == "__self__" and s.get("path"):
             v = s.get("self_silo_last_index_mtime")
             try:
@@ -962,15 +971,27 @@ def ensure_self_silo(force: bool = False, emit_warning: bool = True) -> int:
                 else:
                     _warn_self_silo_mismatch()
             return 0
+        _ensure_src_on_path()
+        db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
         if self_entry and self_path and self_path != repo_str:
-            _run_llmli(["rm", "__self__"])
+            from operations import op_remove_silo
+            op_remove_silo(db_path, "__self__")
         if existing_slug and existing_slug != "__self__":
-            _run_llmli(["rm", existing_slug])
-        llmli_args = ["add", "--silo", "__self__", "--display-name", "self"]
-        if is_dev:
-            llmli_args.append("--allow-cloud")
-        llmli_args.append(repo_str)
-        code = _run_llmli(llmli_args)
+            from operations import op_remove_silo
+            op_remove_silo(db_path, existing_slug)
+        try:
+            from ingest import run_add
+            files_ok, n_failures = run_add(
+                path=repo_str,
+                db_path=db_path,
+                forced_silo_slug="__self__",
+                display_name_override="self",
+                allow_cloud=is_dev,
+            )
+            code = 0 if files_ok >= 0 else 1
+        except Exception as e:
+            print(f"Warning: failed to index self-silo: {e}", file=sys.stderr)
+            code = 1
         if code != 0:
             print("Warning: failed to index self-silo.", file=sys.stderr)
             return code
@@ -1451,17 +1472,17 @@ def _run_watcher(watcher: SiloWatcher, db_path: str | Path, silo_slug: str) -> i
 
 def _record_source_path(path: Path) -> None:
     reg = _read_registry()
-    sources = reg.get("sources", [])
-    entry = {"path": str(path), "tool": "llmli", "name": path.name}
+    bookmarks = reg.get("bookmarks", [])
+    entry = {"path": str(path), "name": path.name}
     replaced = False
-    for idx, src in enumerate(sources):
+    for idx, src in enumerate(bookmarks):
         if src.get("path") == str(path):
-            sources[idx] = entry
+            bookmarks[idx] = entry
             replaced = True
             break
     if not replaced:
-        sources.append(entry)
-    reg["sources"] = sources
+        bookmarks.append(entry)
+    reg["bookmarks"] = bookmarks
     _write_registry(reg)
 
 
@@ -1495,26 +1516,43 @@ def _pull_path_mode(
     if not path.is_dir():
         print(f"Error: not a directory: {path}", file=sys.stderr)
         return 1
-    llmli_args = ["add"]
-    if full:
-        llmli_args.append("--full")
-    if allow_cloud:
-        llmli_args.append("--allow-cloud")
-    if follow_symlinks:
-        llmli_args.append("--follow-symlinks")
-    if image_vision:
-        llmli_args.append("--image-vision")
-    if workers is not None:
-        llmli_args.extend(["--workers", str(workers)])
-    if embedding_workers is not None:
-        llmli_args.extend(["--embedding-workers", str(embedding_workers)])
-    llmli_args.append(str(path))
+
+    _ensure_src_on_path()
+    # Apply suppression env vars before calling run_add directly so log noise is
+    # controlled the same way the subprocess approach did.
     suppress_env = {
         "LLMLIBRARIAN_INGEST_LOG_LEVEL": "FATAL",
         "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
     }
     merged_env = {**(extra_env or {}), **suppress_env}
-    code = _run_llmli(llmli_args, extra_env=merged_env)
+    _prev_env: dict[str, str | None] = {}
+    for k, v in merged_env.items():
+        _prev_env[k] = os.environ.get(k)
+        os.environ[k] = v
+    try:
+        from ingest import run_add
+        db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
+        files_ok, n_failures = run_add(
+            path=path,
+            db_path=db_path,
+            allow_cloud=allow_cloud,
+            follow_symlinks=follow_symlinks,
+            incremental=not full,
+            image_vision_enabled=image_vision,
+            workers=workers,
+            embedding_workers=embedding_workers,
+        )
+        code = 0 if n_failures == 0 or files_ok > 0 else 1
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        code = 1
+    finally:
+        for k, prev in _prev_env.items():
+            if prev is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev
+
     if code == 0:
         _record_source_path(path)
         if prompt is not None or clear_prompt:
@@ -1692,17 +1730,17 @@ def pull_all_sources(
 ) -> int:
     """Pull all registered sources. Returns exit code."""
     reg = _read_registry()
-    sources = reg.get("sources", [])
-    if not sources:
+    bookmarks = reg.get("bookmarks", [])
+    if not bookmarks:
         print("No registered folders. Use: pal pull <path>", file=sys.stderr)
         return 1
     import tempfile
     is_tty = sys.stderr.isatty()
-    total = len(sources)
+    total = len(bookmarks)
     fail_count = 0
     updated_silos: list[str] = []
     failed_silos: list[str] = []
-    for idx, src in enumerate(sources, 1):
+    for idx, src in enumerate(bookmarks, 1):
         path = src.get("path")
         if not path:
             continue
@@ -2165,10 +2203,15 @@ def remove_command(
     name = " ".join(silo) if isinstance(silo, list) else str(silo)
     db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
     source_path = _resolve_registry_source_for_remove(name, db_path)
-    rc = _run_llmli(["rm", name])
-    if rc != 0:
-        _exit(rc)
-        return
+    _ensure_src_on_path()
+    from operations import op_remove_silo
+    result = op_remove_silo(db_path, name)
+    if result.get("chroma_warning"):
+        print(f"Warning: {result['chroma_warning']}", file=sys.stderr)
+    if result["not_found"]:
+        print(f"Removed chunks and file registry for silo: {result['cleaned_slug']} (was not in silo list)")
+    else:
+        print(f"Removed silo: {result['removed_slug']}")
     if source_path:
         _remove_source_path(source_path)
     else:

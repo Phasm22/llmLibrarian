@@ -44,16 +44,10 @@ def _resolve_db_path() -> str:
 _DB_PATH = _resolve_db_path()
 _CONFIG_PATH = str(Path(os.environ.get("LLMLIBRARIAN_CONFIG", str(_ROOT / "archetypes.yaml"))).resolve())
 
-# Lock wrapper script used by trigger_reindex to serialize concurrent ChromaDB writes.
-# Arguments: <lock_file_path> <cmd> [args...]
-# Uses fcntl.LOCK_EX so concurrent reindex calls queue instead of racing.
-_LOCK_WRAPPER = """\
-import fcntl, subprocess, sys
-with open(sys.argv[1], 'w') as lf:
-    fcntl.flock(lf, fcntl.LOCK_EX)
-    r = subprocess.run(sys.argv[2:])
-    sys.exit(r.returncode)
-"""
+import threading
+
+# Serializes concurrent trigger_reindex calls in-process (no subprocess races).
+_reindex_lock = threading.Lock()
 
 if not Path(_DB_PATH).exists():
     print(
@@ -108,11 +102,8 @@ mcp = FastMCP(
 # Without this, the Rust bindings keep HNSW index files open in write mode,
 # which causes SIGSEGV when a concurrent process (repair, reindex) tries to write.
 def _release_chroma() -> None:
-    try:
-        import chromadb
-        chromadb.PersistentClient.clear_system_cache()
-    except Exception:
-        pass
+    from chroma_client import release
+    release()
 
 
 # Helper: answer-level confidence signal
@@ -139,31 +130,10 @@ def _compute_answer_confidence(chunks: list[dict]) -> tuple[str, float, str]:
 
 
 # ---------------------------------------------------------------------------
-# Helper: doc-type breakdown from language_stats.by_ext
+# Helper: doc-type breakdown (delegated to operations module)
 # ---------------------------------------------------------------------------
 
-_CODE_EXTS = {
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cpp",
-    ".cs", ".rb", ".sh", ".swift", ".kt", ".scala", ".r", ".lua", ".pl", ".php",
-}
-_DOC_TYPE_MAP = {
-    ".pdf": "pdf", ".docx": "docx", ".doc": "docx",
-    ".xlsx": "xlsx", ".xls": "xlsx", ".csv": "xlsx",
-    ".pptx": "pptx", ".ppt": "pptx",
-}
-
-def _doc_type_breakdown(by_ext: dict) -> dict:
-    breakdown: dict[str, int] = {}
-    for ext, count in (by_ext or {}).items():
-        ext_lower = ext.lower()
-        if ext_lower in _DOC_TYPE_MAP:
-            cat = _DOC_TYPE_MAP[ext_lower]
-        elif ext_lower in _CODE_EXTS:
-            cat = "code"
-        else:
-            cat = "other"
-        breakdown[cat] = breakdown.get(cat, 0) + count
-    return breakdown
+from operations import _doc_type_breakdown, _inject_staleness
 
 
 # ---------------------------------------------------------------------------
@@ -387,92 +357,8 @@ def list_silos(check_staleness: bool = False) -> dict:
     Pass check_staleness=True to also get is_stale, stale_file_count, and
     newest_source_mtime_iso per silo (walks source directory — may be slow for large silos).
     """
-    from state import list_silos as _list_silos, get_query_health
-    silos = _list_silos(_DB_PATH)
-
-    # Build per-silo error index from query health log (single read)
-    health_entries = get_query_health(_DB_PATH)
-    silo_errors: dict[str, str] = {}  # slug -> most recent error time
-    for entry in health_entries:
-        slug = entry.get("silo") or ""
-        t = entry.get("time") or ""
-        if slug and (slug not in silo_errors or t > silo_errors[slug]):
-            silo_errors[slug] = t
-
-    for s in silos:
-        # Feature 4: doc type breakdown
-        by_ext = (s.get("language_stats") or {}).get("by_ext") or {}
-        s["doc_type_breakdown"] = _doc_type_breakdown(by_ext)
-
-        # Health: surface recorded query-time index errors
-        slug = s.get("slug") or ""
-        if slug in silo_errors:
-            s["has_index_errors"] = True
-            s["last_index_error_time"] = silo_errors[slug]
-        else:
-            s["has_index_errors"] = False
-            s["last_index_error_time"] = None
-
-        # Feature 1: staleness detection (opt-in)
-        if check_staleness:
-            _inject_staleness(s)
-
-    return {
-        "db_path": _DB_PATH,
-        "db_exists": Path(_DB_PATH).exists(),
-        "silo_count": len(silos),
-        "silos": silos,
-    }
-
-
-def _inject_staleness(silo_entry: dict) -> None:
-    """Mutate silo_entry in-place with staleness fields."""
-    from datetime import datetime, timezone
-
-    source_path = silo_entry.get("path", "")
-    updated_iso = silo_entry.get("updated", "")
-
-    if not source_path or not Path(source_path).exists():
-        silo_entry["is_stale"] = None
-        silo_entry["staleness_note"] = "source path not accessible"
-        return
-
-    # Parse last-indexed timestamp
-    try:
-        last_indexed = datetime.fromisoformat(updated_iso).timestamp()
-    except Exception:
-        silo_entry["is_stale"] = None
-        silo_entry["staleness_note"] = "cannot parse updated timestamp"
-        return
-
-    stale_count = 0
-    newest_stale_mtime: float | None = None
-
-    try:
-        for dirpath, _dirs, filenames in os.walk(source_path):
-            for fname in filenames:
-                fpath = os.path.join(dirpath, fname)
-                try:
-                    mtime = os.path.getmtime(fpath)
-                except OSError:
-                    continue
-                if mtime > last_indexed:
-                    stale_count += 1
-                    if newest_stale_mtime is None or mtime > newest_stale_mtime:
-                        newest_stale_mtime = mtime
-    except Exception as e:
-        silo_entry["is_stale"] = None
-        silo_entry["staleness_note"] = f"walk error: {e}"
-        return
-
-    silo_entry["is_stale"] = stale_count > 0
-    silo_entry["stale_file_count"] = stale_count
-    if newest_stale_mtime is not None:
-        silo_entry["newest_source_mtime_iso"] = datetime.fromtimestamp(
-            newest_stale_mtime, tz=timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    else:
-        silo_entry["newest_source_mtime_iso"] = None
+    from operations import op_list_silos
+    return op_list_silos(_DB_PATH, check_staleness=check_staleness)
 
 
 @mcp.tool()
@@ -483,81 +369,20 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
     Useful to diagnose zero-chunk files (likely failed to parse), detect duplicate content,
     or verify coverage after indexing. top= limits how many files are returned (default 50).
     """
-    from state import list_silos as _list_silos, resolve_silo_to_slug
-    from constants import LLMLI_COLLECTION
-    import chromadb
-    from chromadb.config import Settings
-
-    slug = resolve_silo_to_slug(_DB_PATH, silo)
-    if slug is None:
-        return {"error": f"silo not found: {silo!r}"}
-
-    all_silos = _list_silos(_DB_PATH)
-    info = next((s for s in all_silos if s.get("slug") == slug), None)
-    display = (info or {}).get("display_name", slug)
-    path = (info or {}).get("path", "")
-    total_registry = (info or {}).get("chunks_count", 0)
-
-    try:
-        client = chromadb.PersistentClient(path=_DB_PATH, settings=Settings(anonymized_telemetry=False))
-        coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
-        result = coll.get(where={"silo": slug}, include=["metadatas"])
-        metas = result.get("metadatas") or []
-    except Exception as e:
-        return {"error": f"ChromaDB error: {e}"}
-
-    total_chroma = len(metas)
-
-    # Aggregate chunks by source file
-    by_source: dict[str, int] = {}
-    source_to_hash: dict[str, str] = {}
-    for m in metas:
-        meta = m or {}
-        src = meta.get("source") or "?"
-        by_source[src] = by_source.get(src, 0) + 1
-        if src not in source_to_hash and meta.get("file_hash"):
-            source_to_hash[src] = meta["file_hash"]
-
-    # Detect duplicate content (same file_hash, different paths)
-    hash_to_sources: dict[str, list[str]] = {}
-    for src, h in source_to_hash.items():
-        if h:
-            hash_to_sources.setdefault(h, []).append(src)
-
-    sorted_files = sorted(by_source.items(), key=lambda x: -x[1])[:max(1, top)]
-    files = [
-        {
-            "source": src,
-            "chunk_count": count,
-            "has_duplicate_content": bool(
-                source_to_hash.get(src)
-                and len(hash_to_sources.get(source_to_hash[src], [])) > 1
-            ),
-        }
-        for src, count in sorted_files
-    ]
-
+    from operations import op_inspect_silo
+    result = op_inspect_silo(_DB_PATH, silo, top=top)
     _release_chroma()
-    return {
-        "slug": slug,
-        "display_name": display,
-        "path": path,
-        "total_chunks_registry": total_registry,
-        "total_chunks_chroma": total_chroma,
-        "registry_match": total_registry == total_chroma,
-        "total_files": len(by_source),
-        "files_shown": len(files),
-        "files": files,
-    }
+    return result
 
 
 @mcp.tool()
 def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     """
-    Re-index a registered silo from its source path in the background.
+    Re-index a registered silo from its source path in a background thread.
     Only works on already-registered silos — cannot add new paths.
     Requires confirm=True to proceed (safety guard against accidental calls).
-    Returns immediately; the reindex runs as a background process.
+    Returns immediately; the reindex runs in-process (uses the shared ChromaDB client,
+    no concurrent-write crash risk). Concurrent calls are serialized via a lock.
     Check list_silos() for updated timestamp after completion.
     """
     if not confirm:
@@ -584,32 +409,23 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     if not Path(source_path).exists():
         return {"status": "error", "error": f"source path does not exist: {source_path}"}
 
-    llmli_bin = str(_ROOT / ".venv" / "bin" / "llmli")
-    if not Path(llmli_bin).exists():
-        return {"status": "error", "error": f"llmli binary not found at {llmli_bin}"}
+    def _run_reindex() -> None:
+        with _reindex_lock:
+            try:
+                from ingest import run_add
+                run_add(path=source_path, db_path=_DB_PATH, incremental=True)
+            except Exception:
+                pass
 
-    import subprocess
-    import sys
-    env = {**os.environ, "LLMLIBRARIAN_DB": _DB_PATH}
-    lock_path = str(Path(_DB_PATH) / ".reindex.lock")
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, "-c", _LOCK_WRAPPER, lock_path, llmli_bin, "add", source_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            env=env,
-        )
-        return {
-            "status": "started",
-            "pid": proc.pid,
-            "silo": slug,
-            "display_name": info.get("display_name", slug),
-            "path": source_path,
-            "message": "Reindex running in background (serialized via lock). Call list_silos() after a few minutes to see the updated timestamp.",
-        }
-    except Exception as e:
-        return {"status": "error", "error": f"failed to launch process: {e}"}
+    t = threading.Thread(target=_run_reindex, daemon=True)
+    t.start()
+    return {
+        "status": "started",
+        "silo": slug,
+        "display_name": info.get("display_name", slug),
+        "path": source_path,
+        "message": "Reindex running in background thread (in-process, serialized). Call list_silos() after a few minutes to see the updated timestamp.",
+    }
 
 
 @mcp.tool()
@@ -628,58 +444,15 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
             "message": "Pass confirm=True to start the repair. This wipes and fully re-indexes the silo.",
         }
 
-    from state import list_silos as _list_silos, resolve_silo_to_slug, remove_manifest_silo
-    from ingest import run_add, _file_registry_remove_silo
-    from constants import LLMLI_COLLECTION
-    import chromadb
-    from chromadb.config import Settings
-
-    slug = resolve_silo_to_slug(_DB_PATH, silo)
-    if slug is None:
-        return {"status": "error", "error": f"silo not found: {silo!r}"}
-
-    all_silos = _list_silos(_DB_PATH)
-    info = next((s for s in all_silos if s.get("slug") == slug), None)
-    if not info:
-        return {"status": "error", "error": f"silo registry entry missing for slug: {slug}"}
-
-    source_path = info.get("path", "")
-    if not source_path:
-        return {"status": "error", "error": "silo has no registered source path"}
-
-    if not Path(source_path).exists():
-        return {"status": "error", "error": f"source path does not exist: {source_path}"}
-
+    from operations import op_repair_silo
     try:
-        # Release any open ChromaDB handles before wiping
-        _release_chroma()
-
-        # Wipe existing chunks
-        client = chromadb.PersistentClient(path=_DB_PATH, settings=Settings(anonymized_telemetry=False))
-        coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
-        coll.delete(where={"silo": slug})
-        del coll, client
-        _release_chroma()
-
-        # Clear file registry and manifest
-        _file_registry_remove_silo(_DB_PATH, slug)
-        remove_manifest_silo(_DB_PATH, slug)
-
-        # Full non-incremental re-index
-        files_ok, n_failures = run_add(
-            path=source_path,
-            db_path=_DB_PATH,
-            incremental=False,
-        )
-        return {
-            "status": "completed",
-            "silo": slug,
-            "display_name": info.get("display_name", slug),
-            "path": source_path,
-            "files_indexed": files_ok,
-            "failures": n_failures,
-            "message": f"Repair complete. {files_ok} file(s) re-indexed, {n_failures} failure(s).",
-        }
+        result = op_repair_silo(_DB_PATH, silo, verbose=False)
+        if result.get("status") == "completed":
+            result["message"] = (
+                f"Repair complete. {result['files_indexed']} file(s) re-indexed, "
+                f"{result['failures']} failure(s)."
+            )
+        return result
     except Exception as e:
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
     finally:

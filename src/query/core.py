@@ -10,8 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import chromadb
-from chromadb.config import Settings
+from chroma_client import get_client
 
 from constants import (
     DB_PATH,
@@ -1655,8 +1654,8 @@ def run_ask(
             + f" Keep the answer grounded to evidence from {code_activity_requested_year} code files."
         )
 
-    ef = get_embedding_function()
-    client = chromadb.PersistentClient(path=db, settings=Settings(anonymized_telemetry=False))
+    ef = get_embedding_function(batch_size=1)
+    client = get_client(str(db))
     collection = client.get_or_create_collection(
         name=collection_name,
         embedding_function=ef,
@@ -2910,8 +2909,8 @@ def run_retrieve(
     if intent not in (INTENT_FIELD_LOOKUP, INTENT_CAPABILITIES, INTENT_CODE_LANGUAGE):
         query_for_retrieval = expand_query(query_for_retrieval)
 
-    ef = get_embedding_function()
-    client = chromadb.PersistentClient(path=db, settings=Settings(anonymized_telemetry=False))
+    ef = get_embedding_function(batch_size=1)
+    client = get_client(str(db))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
 
     query_kw: dict = {

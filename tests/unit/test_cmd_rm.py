@@ -24,10 +24,8 @@ class _FakeClient:
 
 
 def _patch_chromadb(monkeypatch, collection):
-    fake_chromadb = SimpleNamespace(PersistentClient=lambda *a, **k: _FakeClient(collection))
-    fake_config = SimpleNamespace(Settings=lambda **_k: object())
-    monkeypatch.setitem(sys.modules, "chromadb", fake_chromadb)
-    monkeypatch.setitem(sys.modules, "chromadb.config", fake_config)
+    import chroma_client
+    monkeypatch.setattr(chroma_client, "get_client", lambda db_path: _FakeClient(collection))
 
 
 def test_cmd_rm_requires_silo(capsys):

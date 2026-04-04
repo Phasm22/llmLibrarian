@@ -38,8 +38,7 @@ from constants import (
     MAX_WORKERS,
 )
 
-import chromadb
-from chromadb.config import Settings
+from chroma_client import get_client
 try:
     from tqdm import tqdm  # type: ignore[import-not-found]
 except Exception:
@@ -1842,8 +1841,8 @@ def run_index(
     folders = arch.get("folders") or []
     collection_name = arch["collection"]
 
-    ef = get_embedding_function()
-    client = chromadb.PersistentClient(path=DB_PATH, settings=Settings(anonymized_telemetry=False))
+    ef = get_embedding_function(batch_size=64)
+    client = get_client(DB_PATH)
 
     try:
         client.delete_collection(name=collection_name)
@@ -2080,6 +2079,12 @@ def run_add(
     else:
         existing_slug = resolve_silo_by_path(db_path, path)
         silo_slug = existing_slug if existing_slug else slugify(display_name, str(path))
+    # Self-healing: if a previous ingest for this silo was interrupted mid-write,
+    # force a full re-index so we don't end up with a partial state.
+    from ingest_journal import check_pending
+    if incremental and silo_slug in check_pending(str(db_path)):
+        incremental = False
+
     effective_image_vision_enabled = _resolve_image_vision_enabled(
         db_path=db_path,
         silo_slug=silo_slug,
@@ -2152,26 +2157,38 @@ def run_add(
     # MPS (Apple Silicon) is not thread-safe for concurrent inference; cap to 1
     # to prevent heap corruption when multiple threads call into PyTorch/MPS.
     # CPU and CUDA handle concurrent calls safely.
-    try:
-        import torch as _torch
-        _device_override = os.environ.get("LLMLIBRARIAN_EMBEDDING_DEVICE", "").strip().lower()
-        _using_mps = (
-            not _device_override
-            and _torch.backends.mps.is_available()
-        ) or _device_override == "mps"
-        if _using_mps:
-            embedding_workers = 1
-    except ImportError:
-        pass
+    # Use the same device logic as get_embedding_function() so that if
+    # batch_size is below the MPS threshold (we routed to CPU), we don't
+    # unnecessarily cap workers to 1.
+    from embeddings import _best_device as _pick_device
+    if _pick_device(batch_size=len(file_list) or 64) == "mps":
+        embedding_workers = 1
 
     if not quiet:
         print(dim(no_color, _format_preflight_summary(file_list, collect_stats)))
         print(dim(no_color, f"  Workers: file={workers}, embedding={embedding_workers}"))
 
-    ef = get_embedding_function()
-    client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
+    ef = get_embedding_function(batch_size=len(file_list) or 64)
+    client = get_client(str(db_path))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
     image_collection = _get_image_collection(client)
+
+    # Cheap consistency check: if manifest says files are indexed but ChromaDB has 0
+    # chunks for this silo, the previous ingest was incomplete — force a full re-index.
+    if incremental:
+        try:
+            if collection.count() == 0:
+                # collection.count() is total; check silo-specific count
+                silo_result = collection.get(where={"silo": silo_slug}, limit=1)
+                silo_ids = silo_result.get("ids") or []
+                if not silo_ids:
+                    prior_manifest = _read_file_manifest(db_path)
+                    prior_silo = (prior_manifest.get("silos") or {}).get(silo_slug, {})
+                    prior_files = (prior_silo.get("files") or {}) if isinstance(prior_silo, dict) else {}
+                    if prior_files:
+                        incremental = False
+        except Exception:
+            pass
 
     if not incremental:
         try:
@@ -2422,9 +2439,6 @@ def run_add(
             elif kind == "image":
                 image_done += 1
 
-    for fhash, path_str in to_register:
-        _file_registry_add(db_path, fhash, silo_slug, path_str)
-
     for zip_path in zips:
         if zip_path.stat().st_size > max_archive_bytes:
             continue
@@ -2502,7 +2516,10 @@ def run_add(
                 except OSError:
                     continue
 
-        _update_file_manifest(db_path, _update_manifest)
+    # Write-ahead marker: if we crash between here and clear_pending, the next
+    # run will detect this silo as interrupted and force a full non-incremental re-index.
+    from ingest_journal import write_pending, clear_pending
+    write_pending(str(db_path), silo_slug)
 
     if all_chunks:
         batch_size = ADD_BATCH_SIZE
@@ -2540,6 +2557,12 @@ def run_add(
                 started_at=extraction_started_at,
                 no_color=no_color,
             )
+
+    # State writes — all happen after ChromaDB batch_add succeeds.
+    for fhash, path_str in to_register:
+        _file_registry_add(db_path, fhash, silo_slug, path_str)
+    if incremental:
+        _update_file_manifest(db_path, _update_manifest)
 
     if (not incremental) or ledger_sources_to_replace or tax_rows:
         replace_tax_rows_for_sources(
@@ -2595,6 +2618,7 @@ def run_add(
         image_vision_enabled=effective_image_vision_enabled,
     )
     set_last_failures(db_path, failures)
+    clear_pending(str(db_path), silo_slug)
 
     # Summary: trust + usability (per-file FAIL still printed above)
     if not quiet:
@@ -2664,12 +2688,12 @@ def update_silo_counts(db_path: str | Path, silo_slug: str, display_name: str | 
                 break
     name = display_name or existing_display or silo_slug
 
-    ef = get_embedding_function()
-    client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
+    ef = get_embedding_function(batch_size=1)
+    client = get_client(str(db_path))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
     chunks_count = 0
     try:
-        result = collection.get(where={"silo": silo_slug}, include=["ids"])
+        result = collection.get(where={"silo": silo_slug})
         ids = result.get("ids") if isinstance(result, dict) else None
         if isinstance(ids, list):
             chunks_count = len(ids)
@@ -2717,8 +2741,8 @@ def remove_single_file(
     manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
     prev = manifest_files.get(path_str) if isinstance(manifest_files, dict) else None
 
-    ef = get_embedding_function()
-    client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
+    ef = get_embedding_function(batch_size=1)
+    client = get_client(str(db_path))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
     image_collection = _get_image_collection(client)
     _delete_source_from_collections(
@@ -2838,8 +2862,8 @@ def update_single_file(
         if prev and prev.get("mtime") == mtime and prev.get("size") == size:
             return ("unchanged", path_str)
 
-    ef = get_embedding_function()
-    client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
+    ef = get_embedding_function(batch_size=1)
+    client = get_client(str(db_path))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
     image_collection = _get_image_collection(client)
 

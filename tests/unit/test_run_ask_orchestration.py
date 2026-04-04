@@ -34,8 +34,8 @@ class _NamedClient:
 
 
 def _patch_query_runtime(monkeypatch, mock_collection):
-    monkeypatch.setattr("query.core.get_embedding_function", lambda: None)
-    monkeypatch.setattr("query.core.chromadb.PersistentClient", lambda *a, **k: _DummyClient(mock_collection))
+    monkeypatch.setattr("query.core.get_embedding_function", lambda **_kw: None)
+    monkeypatch.setattr("query.core.get_client", lambda db_path: _DummyClient(mock_collection))
 
 
 def test_run_ask_capabilities_bypasses_llm(monkeypatch, mock_ollama):
@@ -81,10 +81,10 @@ def test_run_ask_uses_image_vector_hits_to_pull_image_context(monkeypatch, mock_
     image_collection.query = _image_query
     image_collection.get = lambda **_kwargs: {"ids": [], "documents": [], "metadatas": []}
 
-    monkeypatch.setattr("query.core.get_embedding_function", lambda: None)
+    monkeypatch.setattr("query.core.get_embedding_function", lambda **_kw: None)
     monkeypatch.setattr(
-        "query.core.chromadb.PersistentClient",
-        lambda *a, **k: _NamedClient({"llmli": text_collection, "llmli_image": image_collection}),
+        "query.core.get_client",
+        lambda db_path: _NamedClient({"llmli": text_collection, "llmli_image": image_collection}),
     )
 
     class _FakeAdapter:
@@ -440,8 +440,8 @@ def test_run_ask_file_list_short_circuits_without_retrieval_or_llm(monkeypatch, 
         },
     )
     monkeypatch.setattr(
-        "query.core.chromadb.PersistentClient",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not create client for FILE_LIST")),
+        "query.core.get_client",
+        lambda db_path: (_ for _ in ()).throw(AssertionError("should not create client for FILE_LIST")),
     )
     out = run_ask(
         archetype_id=None,
@@ -551,8 +551,8 @@ def test_run_ask_structure_short_circuits_without_retrieval(monkeypatch, mock_ol
     )
     monkeypatch.setattr("query.core.validate_catalog_freshness", lambda _db, _silo: {"stale": False, "stale_reason": None, "scanned_count": 10})
     monkeypatch.setattr(
-        "query.core.chromadb.PersistentClient",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("structure path should not create chroma client")),
+        "query.core.get_client",
+        lambda db_path: (_ for _ in ()).throw(AssertionError("structure path should not create chroma client")),
     )
     out = run_ask(
         archetype_id=None,
@@ -657,8 +657,8 @@ def test_run_ask_structure_extension_count_short_circuits_llm(monkeypatch, mock_
     )
     monkeypatch.setattr("query.core.validate_catalog_freshness", lambda _db, _silo: {"stale": False, "stale_reason": None, "scanned_count": 519})
     monkeypatch.setattr(
-        "query.core.chromadb.PersistentClient",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("ext_count should not create chroma client")),
+        "query.core.get_client",
+        lambda db_path: (_ for _ in ()).throw(AssertionError("ext_count should not create chroma client")),
     )
     out_quiet = run_ask(
         archetype_id=None,
@@ -2223,8 +2223,8 @@ def test_run_ask_tax_resolver_short_circuits_llm(monkeypatch, mock_ollama):
         },
     )
     monkeypatch.setattr(
-        "query.core.chromadb.PersistentClient",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("tax resolver should bypass chroma retrieval")),
+        "query.core.get_client",
+        lambda db_path: (_ for _ in ()).throw(AssertionError("tax resolver should bypass chroma retrieval")),
     )
     out = run_ask(
         archetype_id=None,

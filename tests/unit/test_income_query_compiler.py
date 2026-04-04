@@ -11,8 +11,8 @@ class _DummyClient:
 
 
 def _patch_query_runtime(monkeypatch, mock_collection):
-    monkeypatch.setattr("query.core.get_embedding_function", lambda: None)
-    monkeypatch.setattr("query.core.chromadb.PersistentClient", lambda *a, **k: _DummyClient(mock_collection))
+    monkeypatch.setattr("query.core.get_embedding_function", lambda **_kw: None)
+    monkeypatch.setattr("query.core.get_client", lambda db_path: _DummyClient(mock_collection))
 
 
 def test_income_plan_returns_line9_when_present(monkeypatch, mock_collection, mock_ollama):
