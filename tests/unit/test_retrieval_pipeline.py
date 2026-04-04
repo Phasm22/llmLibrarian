@@ -22,7 +22,7 @@ from query.retrieval import (
 
 
 def test_rrf_merge_keeps_vector_and_adds_lexical_only_ids():
-    docs, metas, dists = rrf_merge(
+    docs, metas, dists, _signals = rrf_merge(
         ids_v=["v1", "v2"],
         docs_v=["doc-v1", "doc-v2"],
         metas_v=[{"source": "a"}, {"source": "b"}],

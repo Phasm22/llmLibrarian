@@ -288,6 +288,7 @@ def _safe_query(
     collection: Any,
     query_kw: dict[str, Any],
     silo_slug: str | None = None,
+    db_path: str | None = None,
 ) -> tuple[list[str], list[dict | None], list[float | None], list[str], str | None]:
     """
     Run collection.query(**query_kw) with a graceful fallback when ChromaDB throws an
@@ -314,6 +315,14 @@ def _safe_query(
             "Results were retrieved globally and filtered to this silo in Python. "
             "Fix: run `llmli repair <silo>` or `llmli add --full <folder>` to re-index."
         )
+        import sys as _sys
+        print(f"[llmli WARNING] {warning}", file=_sys.stderr)
+        if db_path:
+            try:
+                from state import record_index_error as _record
+                _record(db_path, silo_slug, exc)
+            except Exception:
+                pass
         fallback_kw = {k: v for k, v in query_kw.items() if k != "where"}
         results = collection.query(**fallback_kw)
         docs = (results.get("documents") or [[]])[0] or []
@@ -2920,7 +2929,7 @@ def run_retrieve(
     elif len(where_parts) > 1:
         query_kw["where"] = {"$and": where_parts}
 
-    docs, metas, dists, ids_v, _silo_warning = _safe_query(collection, query_kw, silo_slug)
+    docs, metas, dists, ids_v, _silo_warning = _safe_query(collection, query_kw, silo_slug, db_path=db_path)
 
     # Universal hybrid: vector + lexical (RRF) for all intents
     _hybrid_where = query_kw.get("where") if isinstance(query_kw.get("where"), dict) else None

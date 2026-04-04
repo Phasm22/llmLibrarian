@@ -44,6 +44,17 @@ def _resolve_db_path() -> str:
 _DB_PATH = _resolve_db_path()
 _CONFIG_PATH = str(Path(os.environ.get("LLMLIBRARIAN_CONFIG", str(_ROOT / "archetypes.yaml"))).resolve())
 
+# Lock wrapper script used by trigger_reindex to serialize concurrent ChromaDB writes.
+# Arguments: <lock_file_path> <cmd> [args...]
+# Uses fcntl.LOCK_EX so concurrent reindex calls queue instead of racing.
+_LOCK_WRAPPER = """\
+import fcntl, subprocess, sys
+with open(sys.argv[1], 'w') as lf:
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    r = subprocess.run(sys.argv[2:])
+    sys.exit(r.returncode)
+"""
+
 if not Path(_DB_PATH).exists():
     print(
         f"[llmLibrarian WARNING] DB path does not exist: {_DB_PATH}\n"
@@ -71,7 +82,7 @@ mcp = FastMCP(
         "Use `trigger_reindex(silo=..., confirm=True)` to re-index a registered silo in the background when "
         "source files have changed. Only works on already-registered paths. "
         "WARNING: both `trigger_reindex` and `llmli repair` re-crawl the source folder — files no longer present at their original path will be silently dropped from the silo. "
-        "Use `llmli repair <silo>` (CLI only, not an MCP tool) for ChromaDB index corruption/inconsistency errors — it does a hard wipe + full non-incremental re-index. "
+        "Use `repair_silo(silo=..., confirm=True)` for ChromaDB index corruption/inconsistency errors (e.g. 0-chunk silo, 'Error finding id' errors) — it does a hard wipe + full non-incremental re-index in-process (safe). "
         "Use `trigger_reindex` when source files have changed and you want to update the index incrementally. "
         "`retrieve` responses include `answer_confidence` (high/medium/low), `answer_confidence_score`, and "
         "`coverage_note` — use these to calibrate how much to hedge your answer. When no silo filter is passed, "
@@ -93,6 +104,17 @@ mcp = FastMCP(
 
 
 # ---------------------------------------------------------------------------
+# Helper: release ChromaDB connections after each tool call.
+# Without this, the Rust bindings keep HNSW index files open in write mode,
+# which causes SIGSEGV when a concurrent process (repair, reindex) tries to write.
+def _release_chroma() -> None:
+    try:
+        import chromadb
+        chromadb.PersistentClient.clear_system_cache()
+    except Exception:
+        pass
+
+
 # Helper: answer-level confidence signal
 # ---------------------------------------------------------------------------
 
@@ -204,6 +226,8 @@ def retrieve(
         return {"db_path": _DB_PATH, **result}
     except Exception as e:
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}
+    finally:
+        _release_chroma()
 
 
 @mcp.tool()
@@ -257,6 +281,7 @@ def retrieve_bulk(
     # Feature 6: answer-level confidence on merged results
     conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
 
+    _release_chroma()
     return {
         "db_path": _DB_PATH,
         "queries": queries,
@@ -347,6 +372,8 @@ def explain_retrieval(
         }
     except Exception as e:
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "ranked_chunks": []}
+    finally:
+        _release_chroma()
 
 
 @mcp.tool()
@@ -360,13 +387,31 @@ def list_silos(check_staleness: bool = False) -> dict:
     Pass check_staleness=True to also get is_stale, stale_file_count, and
     newest_source_mtime_iso per silo (walks source directory — may be slow for large silos).
     """
-    from state import list_silos as _list_silos
+    from state import list_silos as _list_silos, get_query_health
     silos = _list_silos(_DB_PATH)
+
+    # Build per-silo error index from query health log (single read)
+    health_entries = get_query_health(_DB_PATH)
+    silo_errors: dict[str, str] = {}  # slug -> most recent error time
+    for entry in health_entries:
+        slug = entry.get("silo") or ""
+        t = entry.get("time") or ""
+        if slug and (slug not in silo_errors or t > silo_errors[slug]):
+            silo_errors[slug] = t
 
     for s in silos:
         # Feature 4: doc type breakdown
         by_ext = (s.get("language_stats") or {}).get("by_ext") or {}
         s["doc_type_breakdown"] = _doc_type_breakdown(by_ext)
+
+        # Health: surface recorded query-time index errors
+        slug = s.get("slug") or ""
+        if slug in silo_errors:
+            s["has_index_errors"] = True
+            s["last_index_error_time"] = silo_errors[slug]
+        else:
+            s["has_index_errors"] = False
+            s["last_index_error_time"] = None
 
         # Feature 1: staleness detection (opt-in)
         if check_staleness:
@@ -492,6 +537,7 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
         for src, count in sorted_files
     ]
 
+    _release_chroma()
     return {
         "slug": slug,
         "display_name": display,
@@ -543,10 +589,12 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
         return {"status": "error", "error": f"llmli binary not found at {llmli_bin}"}
 
     import subprocess
+    import sys
     env = {**os.environ, "LLMLIBRARIAN_DB": _DB_PATH}
+    lock_path = str(Path(_DB_PATH) / ".reindex.lock")
     try:
         proc = subprocess.Popen(
-            [llmli_bin, "add", source_path],
+            [sys.executable, "-c", _LOCK_WRAPPER, lock_path, llmli_bin, "add", source_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
@@ -558,10 +606,84 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
             "silo": slug,
             "display_name": info.get("display_name", slug),
             "path": source_path,
-            "message": "Reindex running in background. Call list_silos() after a few minutes to see the updated timestamp.",
+            "message": "Reindex running in background (serialized via lock). Call list_silos() after a few minutes to see the updated timestamp.",
         }
     except Exception as e:
         return {"status": "error", "error": f"failed to launch process: {e}"}
+
+
+@mcp.tool()
+def repair_silo(silo: str, confirm: bool = False) -> dict:
+    """
+    Hard-wipe and fully re-index a silo to fix ChromaDB index corruption or 0-chunk inconsistencies.
+    Runs inside this process (safe even when the MCP server has the DB open).
+    Equivalent to `llmli repair <silo>` but avoids the concurrent-write crash that happens
+    when a second process opens the same ChromaDB path.
+    Requires confirm=True to proceed (safety guard).
+    This is synchronous — it blocks until complete (may take a few minutes for large silos).
+    """
+    if not confirm:
+        return {
+            "status": "not_started",
+            "message": "Pass confirm=True to start the repair. This wipes and fully re-indexes the silo.",
+        }
+
+    from state import list_silos as _list_silos, resolve_silo_to_slug, remove_manifest_silo
+    from ingest import run_add, _file_registry_remove_silo
+    from constants import LLMLI_COLLECTION
+    import chromadb
+    from chromadb.config import Settings
+
+    slug = resolve_silo_to_slug(_DB_PATH, silo)
+    if slug is None:
+        return {"status": "error", "error": f"silo not found: {silo!r}"}
+
+    all_silos = _list_silos(_DB_PATH)
+    info = next((s for s in all_silos if s.get("slug") == slug), None)
+    if not info:
+        return {"status": "error", "error": f"silo registry entry missing for slug: {slug}"}
+
+    source_path = info.get("path", "")
+    if not source_path:
+        return {"status": "error", "error": "silo has no registered source path"}
+
+    if not Path(source_path).exists():
+        return {"status": "error", "error": f"source path does not exist: {source_path}"}
+
+    try:
+        # Release any open ChromaDB handles before wiping
+        _release_chroma()
+
+        # Wipe existing chunks
+        client = chromadb.PersistentClient(path=_DB_PATH, settings=Settings(anonymized_telemetry=False))
+        coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
+        coll.delete(where={"silo": slug})
+        del coll, client
+        _release_chroma()
+
+        # Clear file registry and manifest
+        _file_registry_remove_silo(_DB_PATH, slug)
+        remove_manifest_silo(_DB_PATH, slug)
+
+        # Full non-incremental re-index
+        files_ok, n_failures = run_add(
+            path=source_path,
+            db_path=_DB_PATH,
+            incremental=False,
+        )
+        return {
+            "status": "completed",
+            "silo": slug,
+            "display_name": info.get("display_name", slug),
+            "path": source_path,
+            "files_indexed": files_ok,
+            "failures": n_failures,
+            "message": f"Repair complete. {files_ok} file(s) re-indexed, {n_failures} failure(s).",
+        }
+    except Exception as e:
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    finally:
+        _release_chroma()
 
 
 @mcp.tool()

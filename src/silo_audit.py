@@ -114,15 +114,28 @@ def find_count_mismatches(registry: list[dict[str, Any]], manifest: dict[str, An
     return mismatches
 
 
+def find_orphaned_sources(registry: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return silos whose registered source path no longer exists on disk."""
+    orphans = []
+    for s in registry:
+        slug = s.get("slug")
+        path = s.get("path")
+        if slug and path and not Path(path).exists():
+            orphans.append({"slug": slug, "path": path})
+    return orphans
+
+
 def format_report(
     registry: list[dict[str, Any]],
     dupes: list[dict[str, Any]],
     overlaps: list[dict[str, Any]],
     mismatches: list[dict[str, Any]],
+    orphans: list[dict[str, Any]] | None = None,
     max_paths: int = 4,
 ) -> str:
+    orphans = orphans or []
     lines: list[str] = []
-    lines.append(f"Silos: {len(registry)}  Dupes: {len(dupes)}  Overlaps: {len(overlaps)}  Mismatches: {len(mismatches)}")
+    lines.append(f"Silos: {len(registry)}  Dupes: {len(dupes)}  Overlaps: {len(overlaps)}  Mismatches: {len(mismatches)}  Orphans: {len(orphans)}")
 
     if dupes:
         lines.append("")
@@ -156,7 +169,14 @@ def format_report(
             )
             lines.append("    fix: pal pull --full")
 
-    if not dupes and not overlaps and not mismatches:
+    if orphans:
+        lines.append("")
+        lines.append("Orphaned sources (source folder deleted):")
+        for o in orphans:
+            lines.append(f"  {o.get('slug')}: {o.get('path')}")
+            lines.append("    fix: llmli rm <silo>")
+
+    if not dupes and not overlaps and not mismatches and not orphans:
         lines.append("All clean.")
 
     return "\n".join(lines)

@@ -1269,6 +1269,17 @@ def _batch_add(
             ids_b = [c[0] for c in batch]
             docs_b = [c[1] for c in batch]
             metas_b = [c[2] for c in batch]
+            # Deduplicate within batch — chromadb 1.4+ rejects duplicate IDs in a single add()
+            seen_ids: set[str] = set()
+            dedup: list[int] = []
+            for idx, cid in enumerate(ids_b):
+                if cid not in seen_ids:
+                    seen_ids.add(cid)
+                    dedup.append(idx)
+            if len(dedup) < len(ids_b):
+                ids_b = [ids_b[i] for i in dedup]
+                docs_b = [docs_b[i] for i in dedup]
+                metas_b = [metas_b[i] for i in dedup]
             collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b)
         return
 
@@ -1295,6 +1306,18 @@ def _batch_add(
                 if log_line:
                     log_line(msg.strip())
             ids_b, docs_b, metas_b, embeddings = future.result()
+            # Deduplicate within batch — chromadb 1.4+ rejects duplicate IDs in a single add()
+            seen_ids: set[str] = set()
+            dedup: list[int] = []
+            for idx, cid in enumerate(ids_b):
+                if cid not in seen_ids:
+                    seen_ids.add(cid)
+                    dedup.append(idx)
+            if len(dedup) < len(ids_b):
+                ids_b = [ids_b[i] for i in dedup]
+                docs_b = [docs_b[i] for i in dedup]
+                metas_b = [metas_b[i] for i in dedup]
+                embeddings = [embeddings[i] for i in dedup]
             collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b, embeddings=embeddings)
             completed += 1
             if pbar is not None:

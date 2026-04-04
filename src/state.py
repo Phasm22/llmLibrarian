@@ -32,6 +32,12 @@ def _failures_path(db_path: str | Path) -> Path:
         return p / "llmli_last_failures.json"
     return p.parent / "llmli_last_failures.json"
 
+def _query_health_path(db_path: str | Path) -> Path:
+    p = Path(db_path).resolve()
+    if p.is_dir():
+        return p / "llmli_query_health.json"
+    return p.parent / "llmli_query_health.json"
+
 def _read_registry(db_path: str | Path) -> dict[str, Any]:
     path = _registry_path(db_path)
     if not path.exists():
@@ -216,5 +222,52 @@ def get_last_failures(db_path: str | Path) -> list[dict[str, str]]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
+    except Exception:
+        return []
+
+_QUERY_HEALTH_MAX = 100
+
+def record_index_error(db_path: str | Path, silo_slug: str | None, exc: Exception) -> None:
+    """Append a query-time ChromaDB index error to llmli_query_health.json.
+
+    Capped at _QUERY_HEALTH_MAX entries (oldest dropped). Safe to call from query path —
+    errors writing the health file are silently swallowed so they don't mask query results.
+    """
+    import datetime
+    path = _query_health_path(db_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing: list[dict] = []
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                if not isinstance(existing, list):
+                    existing = []
+            except Exception:
+                existing = []
+        entry = {
+            "silo": silo_slug or "",
+            "error": f"{type(exc).__name__}: {exc}",
+            "time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "type": "index_corruption",
+        }
+        existing.append(entry)
+        if len(existing) > _QUERY_HEALTH_MAX:
+            existing = existing[-_QUERY_HEALTH_MAX:]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2)
+    except Exception:
+        pass  # never let health recording crash the query path
+
+def get_query_health(db_path: str | Path) -> list[dict]:
+    """Return logged query-time index errors from llmli_query_health.json."""
+    path = _query_health_path(db_path)
+    if not path.exists():
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
     except Exception:
         return []

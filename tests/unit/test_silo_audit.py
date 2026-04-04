@@ -2,6 +2,7 @@ from pathlib import Path
 
 from silo_audit import (
     find_duplicate_hashes,
+    find_orphaned_sources,
     find_path_overlaps,
     find_count_mismatches,
     format_report,
@@ -48,3 +49,48 @@ def test_find_count_mismatches():
 def test_format_report_empty():
     report = format_report([], [], [], [])
     assert "All clean." in report
+
+
+def test_find_orphaned_sources_flags_missing_path(tmp_path):
+    gone = str(tmp_path / "gone")  # never created
+    reg = [{"slug": "missing-silo", "path": gone}]
+    orphans = find_orphaned_sources(reg)
+    assert len(orphans) == 1
+    assert orphans[0]["slug"] == "missing-silo"
+    assert orphans[0]["path"] == gone
+
+
+def test_find_orphaned_sources_ignores_existing_path(tmp_path):
+    existing = tmp_path / "real"
+    existing.mkdir()
+    reg = [{"slug": "live-silo", "path": str(existing)}]
+    orphans = find_orphaned_sources(reg)
+    assert orphans == []
+
+
+def test_find_orphaned_sources_mixed(tmp_path):
+    existing = tmp_path / "real"
+    existing.mkdir()
+    gone = str(tmp_path / "gone")
+    reg = [
+        {"slug": "live-silo", "path": str(existing)},
+        {"slug": "dead-silo", "path": gone},
+    ]
+    orphans = find_orphaned_sources(reg)
+    assert len(orphans) == 1
+    assert orphans[0]["slug"] == "dead-silo"
+
+
+def test_format_report_includes_orphans(tmp_path):
+    orphans = [{"slug": "dead-silo", "path": "/gone/path"}]
+    report = format_report([], [], [], [], orphans=orphans)
+    assert "Orphaned sources" in report
+    assert "dead-silo" in report
+    assert "llmli rm" in report
+    assert "All clean." not in report
+
+
+def test_format_report_orphans_count_in_header(tmp_path):
+    orphans = [{"slug": "x", "path": "/x"}]
+    report = format_report([], [], [], [], orphans=orphans)
+    assert "Orphans: 1" in report

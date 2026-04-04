@@ -40,11 +40,10 @@ def _patch_runtime(monkeypatch, coll):
     monkeypatch.setattr("ingest.load_config", lambda *a, **k: {"limits": {}})
 
 
-def test_run_add_raises_for_non_directory(tmp_path):
-    file_path = tmp_path / "file.txt"
-    file_path.write_text("x", encoding="utf-8")
+def test_run_add_raises_for_nonexistent_path(tmp_path):
+    missing = tmp_path / "does_not_exist"
     with pytest.raises(NotADirectoryError):
-        run_add(file_path, db_path=tmp_path / "db")
+        run_add(missing, db_path=tmp_path / "db")
 
 
 def test_run_add_refuses_symlink_root_by_default(tmp_path):
