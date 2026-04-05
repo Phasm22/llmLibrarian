@@ -27,11 +27,14 @@ def get_client(db_path: str) -> chromadb.PersistentClient:
 
 
 def release() -> None:
-    """Release all open ChromaDB handles. Call after write operations."""
-    try:
-        chromadb.PersistentClient.clear_system_cache()
-    except Exception:
-        pass
+    """Release the Python-side client references after write operations.
+
+    We intentionally do NOT call clear_system_cache() here. On ChromaDB 1.4+
+    that call tears down the Rust/tokio runtime while background threads are
+    still live, causing a SIGSEGV (KERN_INVALID_ADDRESS) on the next access.
+    Dropping the Python reference is sufficient — the Rust destructor will
+    drain its thread pool before freeing memory.
+    """
     with _lock:
         _clients.clear()
 

@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
     # Core: always required for llmli, pal, and MCP server
-    "chromadb>=0.4.0",
+    "chromadb>=1.5.5",
     "ollama>=0.1.0",
     "PyYAML>=6.0",
     "pymupdf>=1.23.0",
