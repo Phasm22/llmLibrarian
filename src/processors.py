@@ -118,7 +118,7 @@ _PADDLE_OCR_INIT_ATTEMPTED = False
 _PADDLE_OCR_USE_ANGLE: bool | None = None
 _OCR_PREPROCESS_WARNED: set[str] = set()
 _PROCESSOR_LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
-_VALID_OCR_BACKENDS = frozenset({"auto", "vision", "paddleocr", "tesseract"})
+_VALID_OCR_BACKENDS = frozenset({"auto", "none", "vision", "paddleocr", "tesseract"})
 _VISION_HELPER_BINARY: Path | None = None
 _VISION_HELPER_READY: bool | None = None
 _VISION_MODEL_READY: dict[str, bool] = {}
@@ -206,6 +206,8 @@ def _vision_ocr_available() -> bool:
 
 def _preferred_ocr_backends() -> list[str]:
     configured = _configured_ocr_backend()
+    if configured == "none":
+        return []
     if configured != "auto":
         return [configured]
     ordered: list[str] = []
@@ -232,6 +234,8 @@ def _tesseract_available() -> bool:
 
 
 def _ocr_backend_available(name: str) -> bool:
+    if name == "none":
+        return False
     if name == "vision":
         return _vision_ocr_available()
     if name == "paddleocr":
@@ -1121,6 +1125,8 @@ def _ocr_pdf_page_text(page: Any, source_path: str) -> tuple[str | None, str | N
 
 def _ocr_pdf_page_result(page: Any, source_path: str) -> _OCRResult | None:
     """OCR fallback for image-only PDF pages with quality gate metadata."""
+    if not _available_ocr_backends():
+        return None
     use_preprocess = _ocr_preprocess_enabled()
     try:
         dpi = 400 if use_preprocess else 300

@@ -91,6 +91,10 @@ mcp = FastMCP(
         "diagnosing missed results or unexpected rankings before re-querying. "
         "Use `add_silo(path=...)` to index a new folder as a silo (equivalent to `llmli add`). "
         "Prefer this over the CLI — no PYTHONPATH setup required. path must be a directory; for a single file, put it in its own folder first. "
+        "Use `watch_coverage` when the user asks what is auto-watched vs indexed-only — read-only summary of pal bookmarks, derived daemon jobs, and silos not in bookmarks. "
+        "Do not substitute `watch_coverage` for index problems: it does not read or fix ChromaDB. "
+        "`repair_silo` = hard reset of vector index data for one silo when the DB/registry is corrupt or wildly inconsistent (then full re-index from disk). "
+        "`trigger_reindex` = incremental re-crawl from disk when files changed; not a bookmark/daemon diagnostic. "
         "Call `health` first if tools are failing — it reports db and model status. "
         "Use `capabilities` to see supported file types."
     ),
@@ -98,12 +102,14 @@ mcp = FastMCP(
 
 
 # ---------------------------------------------------------------------------
-# Helper: release ChromaDB connections after each tool call.
-# Without this, the Rust bindings keep HNSW index files open in write mode,
-# which causes SIGSEGV when a concurrent process (repair, reindex) tries to write.
+# Serializes ALL ChromaDB I/O across concurrent MCP tool calls.
+# ChromaDB's Rust HNSW writer is not safe for concurrent use — simultaneous
+# reads and background reindex writes corrupted link_lists.bin to 680 GB.
+_chroma_lock = threading.Lock()
+
+
 def _release_chroma() -> None:
-    from chroma_client import release
-    release()
+    pass  # kept for call-site compatibility; no-op — singleton client persists
 
 
 # Helper: answer-level confidence signal
@@ -347,6 +353,20 @@ def explain_retrieval(
 
 
 @mcp.tool()
+def watch_coverage() -> dict:
+    """
+    Read-only: pal bookmarks (~/.pal/registry.json) vs indexed silos vs derived watch jobs.
+    Returns bookmark rows (path, resolved_path, silo_slug, path_exists, indexed, would_watch),
+    watch_jobs (what `pal daemon` would sync), service unit file presence when daemon is installed,
+    warnings (skipped bookmarks), and indexed_not_bookmarked (llmli silos with no matching bookmark path).
+    Does not start watchers or modify launchd/systemd.
+    Unrelated to ChromaDB health: for corrupt/zero-chunk index issues use `repair_silo`; for stale content after edits use `trigger_reindex`.
+    """
+    from operations import op_watch_coverage
+    return op_watch_coverage(_DB_PATH)
+
+
+@mcp.tool()
 def list_silos(check_staleness: bool = False) -> dict:
     """
     List all indexed silos. Returns db_path (the database this server is using),
@@ -384,6 +404,7 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     Returns immediately; the reindex runs in-process (uses the shared ChromaDB client,
     no concurrent-write crash risk). Concurrent calls are serialized via a lock.
     Check list_silos() for updated timestamp after completion.
+    This updates indexed chunks from files; it is not `repair_silo` (no wipe) and not `watch_coverage` (not about pal bookmarks/daemons).
     """
     if not confirm:
         return {
@@ -411,11 +432,12 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
 
     def _run_reindex() -> None:
         with _reindex_lock:
-            try:
-                from ingest import run_add
-                run_add(path=source_path, db_path=_DB_PATH, incremental=True)
-            except Exception:
-                pass
+            with _chroma_lock:
+                try:
+                    from ingest import run_add
+                    run_add(path=source_path, db_path=_DB_PATH, incremental=True)
+                except Exception:
+                    pass
 
     t = threading.Thread(target=_run_reindex, daemon=True)
     t.start()
@@ -437,6 +459,7 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
     when a second process opens the same ChromaDB path.
     Requires confirm=True to proceed (safety guard).
     This is synchronous — it blocks until complete (may take a few minutes for large silos).
+    Unrelated to pal auto-watch: for bookmarks/daemon job coverage use `watch_coverage` (read-only).
     """
     if not confirm:
         return {
@@ -446,7 +469,8 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
 
     from operations import op_repair_silo
     try:
-        result = op_repair_silo(_DB_PATH, silo, verbose=False)
+        with _chroma_lock:
+            result = op_repair_silo(_DB_PATH, silo, verbose=False)
         if result.get("status") == "completed":
             result["message"] = (
                 f"Repair complete. {result['files_indexed']} file(s) re-indexed, "
@@ -455,8 +479,6 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
         return result
     except Exception as e:
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
-    finally:
-        _release_chroma()
 
 
 @mcp.tool()
@@ -489,14 +511,15 @@ def add_silo(
 
     try:
         from ingest import run_add
-        files_ok, n_failures = run_add(
-            path=path,
-            db_path=_DB_PATH,
-            forced_silo_slug=silo,
-            display_name_override=display_name,
-            allow_cloud=allow_cloud,
-            incremental=not full,
-        )
+        with _chroma_lock:
+            files_ok, n_failures = run_add(
+                path=path,
+                db_path=_DB_PATH,
+                forced_silo_slug=silo,
+                display_name_override=display_name,
+                allow_cloud=allow_cloud,
+                incremental=not full,
+            )
         from state import resolve_silo_by_path, resolve_silo_to_slug
         slug = (
             resolve_silo_to_slug(_DB_PATH, silo) if silo
@@ -517,18 +540,24 @@ def add_silo(
 @mcp.tool()
 def health() -> dict:
     """
-    Diagnostic check. Returns db_path, db_exists, embedding model, and Python version.
-    Call this first if tools are failing or returning unexpected results.
+    Diagnostic check. Returns db_path, db_exists, embedding model, Python version,
+    and on-disk Chroma layout stats (including HNSW link_lists.bin bloat detection).
+    Call this first if tools are failing, the disk is filling, or Python keeps spawning.
     """
+    from operations import op_db_storage_summary
+
     embedding_model = os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2")
     embedding_kind = os.environ.get("LLMLIBRARIAN_EMBEDDING", "") or "sentence_transformer"
-    return {
+    out: dict = {
         "db_path": _DB_PATH,
         "db_exists": Path(_DB_PATH).exists(),
         "embedding_model": embedding_model,
         "embedding_kind": embedding_kind,
         "python_version": sys.version,
     }
+    if Path(_DB_PATH).is_dir():
+        out["storage"] = op_db_storage_summary(_DB_PATH)
+    return out
 
 
 @mcp.tool()

@@ -121,7 +121,10 @@ def get_capabilities_text() -> str:
         else:
             lines.append(f"  Image embeddings: no (run `uv sync` to install the multimodal embedding backend for {LLMLI_IMAGE_COLLECTION})")
     else:
-        if sys.platform == "darwin":
+        if (os.environ.get("LLMLIBRARIAN_OCR_BACKEND") or "").strip().lower() == "none":
+            lines.append("  PDF OCR fallback: no (LLMLIBRARIAN_OCR_BACKEND=none)")
+            lines.append("  Image OCR: no (LLMLIBRARIAN_OCR_BACKEND=none)")
+        elif sys.platform == "darwin":
             lines.append("  PDF OCR fallback: no (Vision needs the macOS Swift toolchain; otherwise install paddleocr or tesseract)")
             lines.append("  Image OCR: no (Vision needs the macOS Swift toolchain; otherwise install paddleocr or tesseract)")
         else:
