@@ -15,6 +15,10 @@ class _FakeCollection:
         self.add_calls = []
         self._metadatas = []
 
+    def count(self) -> int:
+        """Non-zero so ingest's consistency check does not force full re-index with a fake client."""
+        return 1
+
     def add(self, **kwargs):
         self.add_calls.append(kwargs)
         self._metadatas.extend(kwargs.get("metadatas") or [])
@@ -225,6 +229,8 @@ def test_run_add_incremental_skips_unchanged_files(monkeypatch, tmp_path):
     stat = f.resolve().stat()
 
     db_path = tmp_path / "db"
+    # _file_manifest_path only resolves under db_path when that path exists as a directory.
+    db_path.mkdir(parents=True, exist_ok=True)
     manifest_path = _file_manifest_path(db_path)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(

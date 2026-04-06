@@ -17,7 +17,7 @@ from typing import Any
 
 # Chroma HNSW `link_lists.bin` should stay modest for a single-user index.
 # Concurrent writers (multiple processes on one PersistentClient path) can
-# corrupt it to hundreds of GiB; see mcp_server.py _chroma_lock note.
+# corrupt it to hundreds of GiB; see chroma_lock.py and mcp_server.py _chroma_lock.
 _HNSW_BLOAT_BYTES = 1 << 30  # 1 GiB
 
 
@@ -93,9 +93,12 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
     slug_to_clean = removed_slug if removed_slug is not None else slugify(raw)
 
     chroma_error: str | None = None
+    from chroma_lock import chroma_exclusive_lock
+
     try:
-        coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
-        coll.delete(where={"silo": slug_to_clean})
+        with chroma_exclusive_lock(db_path):
+            coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
+            coll.delete(where={"silo": slug_to_clean})
     except Exception as e:
         chroma_error = str(e)
 
@@ -145,24 +148,27 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
             ),
         }
 
-    if verbose:
-        print(f"[repair] Wiping ChromaDB chunks for silo '{slug}'...")
-    try:
-        coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
-        coll.delete(where={"silo": slug})
-    except Exception as e:
-        msg = f"could not wipe Chroma chunks: {e}"
+    from chroma_lock import chroma_exclusive_lock
+
+    with chroma_exclusive_lock(db_path):
         if verbose:
-            print(f"[repair] Warning: {msg}", file=sys.stderr)
+            print(f"[repair] Wiping ChromaDB chunks for silo '{slug}'...")
+        try:
+            coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
+            coll.delete(where={"silo": slug})
+        except Exception as e:
+            msg = f"could not wipe Chroma chunks: {e}"
+            if verbose:
+                print(f"[repair] Warning: {msg}", file=sys.stderr)
 
-    if verbose:
-        print(f"[repair] Clearing file registry for silo '{slug}'...")
-    _file_registry_remove_silo(db_path, slug)
-    remove_manifest_silo(db_path, slug)
+        if verbose:
+            print(f"[repair] Clearing file registry for silo '{slug}'...")
+        _file_registry_remove_silo(db_path, slug)
+        remove_manifest_silo(db_path, slug)
 
-    if verbose:
-        print(f"[repair] Re-indexing '{source_path}' (full, non-incremental)...")
-    files_ok, n_failures = run_add(path=source_path, db_path=db_path, incremental=False)
+        if verbose:
+            print(f"[repair] Re-indexing '{source_path}' (full, non-incremental)...")
+        files_ok, n_failures = run_add(path=source_path, db_path=db_path, incremental=False)
 
     if verbose:
         print(f"[repair] Done: {files_ok} file(s) re-indexed, {n_failures} failure(s).")
@@ -205,10 +211,13 @@ def op_inspect_silo(db_path: str, slug_or_name: str, top: int = 50) -> dict:
     path = (info or {}).get("path", "")
     total_registry = (info or {}).get("chunks_count", 0)
 
+    from chroma_lock import chroma_shared_lock
+
     try:
-        coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
-        result = coll.get(where={"silo": slug}, include=["metadatas"])
-        metas = result.get("metadatas") or []
+        with chroma_shared_lock(db_path):
+            coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
+            result = coll.get(where={"silo": slug}, include=["metadatas"])
+            metas = result.get("metadatas") or []
     except Exception as e:
         return {"error": f"ChromaDB error: {e}"}
 

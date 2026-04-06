@@ -22,7 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Chunk tuple: (id, document, metadata)
 ChunkTuple = tuple[str, str, dict[str, Any]]
@@ -1844,198 +1844,204 @@ def run_index(
     folders = arch.get("folders") or []
     collection_name = arch["collection"]
 
-    ef = get_embedding_function(batch_size=64)
-    client = get_client(DB_PATH)
+    from chroma_lock import chroma_exclusive_lock
 
-    try:
-        client.delete_collection(name=collection_name)
-    except Exception:
-        pass  # collection may not exist
-    try:
-        client.delete_collection(name=image_collection_name(collection_name))
-    except Exception:
-        pass
-    collection = client.get_or_create_collection(
-        name=collection_name,
-        embedding_function=ef,
-    )
-    image_collection = _get_image_collection(client, collection_name)
-
-    log_line, log_close = _make_log_writer(log_path)
-    t0 = time.perf_counter()
-
-    def log(msg: str) -> None:
-        log_line(msg)
-
-    print(label_style(no_color, f"Indexing archetype: {arch.get('name', archetype_id)} ({collection_name})"))
-    log(f"Indexing archetype: {arch.get('name', archetype_id)} ({collection_name})")
-    print(dim(no_color, f"  Folders: {folders}"))
-
-    # 1. Collect file list (path, kind) from all folders
-    log("Collecting file list...")
-    file_list: list[tuple[Path, str]] = []
-    for folder in folders:
-        p = Path(folder)
-        if p.is_symlink() and not follow_symlinks:
-            print(warn_style(no_color, f"  ⚠️ Skipping symlinked folder: {folder} (use --follow-symlinks to allow)"))
-            continue
-        if not p.exists():
-            print(warn_style(no_color, f"  ⚠️ Folder does not exist: {folder}"))
-            continue
-        if not p.is_dir():
-            print(warn_style(no_color, f"  ⚠️ Not a directory: {folder}"))
-            continue
-        print(dim(no_color, f"  📁 {folder}"))
-        file_list.extend(collect_files(p, include, exclude, max_depth, max_file_bytes, follow_symlinks=follow_symlinks))
-
-    log(f"Collected {len(file_list)} files")
-    _image_embed_ok = True
-    if _requires_standalone_image_enrichment(file_list):
-        ensure_vision_model_ready()  # always required in run_index (archetype-driven indexing)
+    def _run_index_chroma_phase() -> None:
+        ef = get_embedding_function(batch_size=64)
+        client = get_client(DB_PATH)
+    
         try:
-            ensure_image_embedding_adapter_ready()
-        except Exception as _img_err:
-            print(warn_style(no_color, f"  ⚠️ Image embedding unavailable ({_img_err}); image files will be skipped."))
-            _image_embed_ok = False
-    # 2. Split: regular files (parallel) vs zips (main thread, limits)
-    regular = [(path, kind) for path, kind in file_list if kind != "zip"]
-    zips = [path for path, kind in file_list if kind == "zip"]
-    total_to_process = len(regular) + len(zips)
-
-    all_chunks: list[ChunkTuple] = []
-    all_image_vectors: list[ImageVectorTuple] = []
-    files_indexed = 0
-
-    # 3. Process regular files in parallel
-    log("Processing files (parallel)...")
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_item = {}
-        for path, kind in regular:
+            client.delete_collection(name=collection_name)
+        except Exception:
+            pass  # collection may not exist
+        try:
+            client.delete_collection(name=image_collection_name(collection_name))
+        except Exception:
+            pass
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            embedding_function=ef,
+        )
+        image_collection = _get_image_collection(client, collection_name)
+    
+        log_line, log_close = _make_log_writer(log_path)
+        t0 = time.perf_counter()
+    
+        def log(msg: str) -> None:
+            log_line(msg)
+    
+        print(label_style(no_color, f"Indexing archetype: {arch.get('name', archetype_id)} ({collection_name})"))
+        log(f"Indexing archetype: {arch.get('name', archetype_id)} ({collection_name})")
+        print(dim(no_color, f"  Folders: {folders}"))
+    
+        # 1. Collect file list (path, kind) from all folders
+        log("Collecting file list...")
+        file_list: list[tuple[Path, str]] = []
+        for folder in folders:
+            p = Path(folder)
+            if p.is_symlink() and not follow_symlinks:
+                print(warn_style(no_color, f"  ⚠️ Skipping symlinked folder: {folder} (use --follow-symlinks to allow)"))
+                continue
+            if not p.exists():
+                print(warn_style(no_color, f"  ⚠️ Folder does not exist: {folder}"))
+                continue
+            if not p.is_dir():
+                print(warn_style(no_color, f"  ⚠️ Not a directory: {folder}"))
+                continue
+            print(dim(no_color, f"  📁 {folder}"))
+            file_list.extend(collect_files(p, include, exclude, max_depth, max_file_bytes, follow_symlinks=follow_symlinks))
+    
+        log(f"Collected {len(file_list)} files")
+        _image_embed_ok = True
+        if _requires_standalone_image_enrichment(file_list):
+            ensure_vision_model_ready()  # always required in run_index (archetype-driven indexing)
             try:
-                p_res = path.resolve()
-            except OSError:
-                p_res = None
-            future_to_item[executor.submit(process_one_file, path, kind, None, follow_symlinks, p_res)] = (path, kind)
-        for future in as_completed(future_to_item):
-            path, kind = future_to_item[future]
+                ensure_image_embedding_adapter_ready()
+            except Exception as _img_err:
+                print(warn_style(no_color, f"  ⚠️ Image embedding unavailable ({_img_err}); image files will be skipped."))
+                _image_embed_ok = False
+        # 2. Split: regular files (parallel) vs zips (main thread, limits)
+        regular = [(path, kind) for path, kind in file_list if kind != "zip"]
+        zips = [path for path, kind in file_list if kind == "zip"]
+        total_to_process = len(regular) + len(zips)
+    
+        all_chunks: list[ChunkTuple] = []
+        all_image_vectors: list[ImageVectorTuple] = []
+        files_indexed = 0
+    
+        # 3. Process regular files in parallel
+        log("Processing files (parallel)...")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_item = {}
+            for path, kind in regular:
+                try:
+                    p_res = path.resolve()
+                except OSError:
+                    p_res = None
+                future_to_item[executor.submit(process_one_file, path, kind, None, follow_symlinks, p_res)] = (path, kind)
+            for future in as_completed(future_to_item):
+                path, kind = future_to_item[future]
+                try:
+                    chunks = future.result()
+                except Exception as e:
+                    _log_event(
+                        "ERROR",
+                        "Worker failed",
+                        path=str(path),
+                        kind=kind,
+                        error=str(e),
+                        traceback=traceback.format_exc(),
+                    )
+                    print(f"[llmlibrarian] FAIL {path}: {e}", file=sys.stderr)
+                    continue
+                if chunks:
+                    all_chunks.extend(chunks)
+                    if any(str((meta or {}).get("source_modality") or "") == "image" for _cid, _doc, meta in chunks):
+                        source_path = str((chunks[0][2] or {}).get("source") or path)
+                        vector_row = _image_vector_from_chunks(source_path=source_path, chunks=chunks)
+                        if vector_row is not None:
+                            all_image_vectors.append(vector_row)
+                    files_indexed += 1
+                    if sys.stdout.isatty():
+                        status_line(f"↻ {files_indexed}/{total_to_process}: {path.name}")
+                    else:
+                        print(success_style(no_color, f"  ✅ {path.name} ({len(chunks)} chunks)"))
+                elif kind == "pdf" and not _suppress_recoverable_warnings():
+                    print(
+                        warn_style(
+                            no_color,
+                            f"  ⚠️ {path.name}: no extractable text (image-only, empty, or OCR unavailable)",
+                        )
+                    )
+    
+        # 4. Process ZIPs in main thread (limits, encrypted check)
+        for zip_path in zips:
+            if zip_path.stat().st_size > max_archive_bytes:
+                print(warn_style(no_color, f"  ⚠️ Skip ZIP (over max size): {zip_path.name}"))
+                continue
+            encrypted = False
             try:
-                chunks = future.result()
+                with zipfile.ZipFile(zip_path, "r") as z:
+                    for info in z.infolist():
+                        if info.flag_bits & 0x1:
+                            encrypted = True
+                            break
+            except zipfile.BadZipFile as e:
+                print(warn_style(no_color, f"  ⚠️ Bad ZIP: {zip_path.name} — {e}"))
+                continue
             except Exception as e:
                 _log_event(
                     "ERROR",
-                    "Worker failed",
-                    path=str(path),
-                    kind=kind,
+                    "ZIP inspection failed",
+                    path=str(zip_path),
                     error=str(e),
                     traceback=traceback.format_exc(),
                 )
-                print(f"[llmlibrarian] FAIL {path}: {e}", file=sys.stderr)
+                print(warn_style(no_color, f"  ⚠️ ZIP error: {zip_path.name} — {e}"))
                 continue
+            if encrypted:
+                print(warn_style(no_color, f"  ⚠️ Skip ZIP (encrypted): {zip_path.name}"))
+                continue
+            chunks = process_zip_to_chunks(
+                zip_path,
+                include,
+                exclude,
+                max_archive_bytes,
+                max_file_bytes,
+                max_files_per_zip,
+                max_extracted_per_zip,
+                db_path=DB_PATH,
+            )
             if chunks:
                 all_chunks.extend(chunks)
-                if any(str((meta or {}).get("source_modality") or "") == "image" for _cid, _doc, meta in chunks):
-                    source_path = str((chunks[0][2] or {}).get("source") or path)
-                    vector_row = _image_vector_from_chunks(source_path=source_path, chunks=chunks)
-                    if vector_row is not None:
-                        all_image_vectors.append(vector_row)
                 files_indexed += 1
                 if sys.stdout.isatty():
-                    status_line(f"↻ {files_indexed}/{total_to_process}: {path.name}")
+                    status_line(f"↻ {files_indexed}/{total_to_process}: {zip_path.name}")
                 else:
-                    print(success_style(no_color, f"  ✅ {path.name} ({len(chunks)} chunks)"))
-            elif kind == "pdf" and not _suppress_recoverable_warnings():
-                print(
-                    warn_style(
-                        no_color,
-                        f"  ⚠️ {path.name}: no extractable text (image-only, empty, or OCR unavailable)",
-                    )
-                )
-
-    # 4. Process ZIPs in main thread (limits, encrypted check)
-    for zip_path in zips:
-        if zip_path.stat().st_size > max_archive_bytes:
-            print(warn_style(no_color, f"  ⚠️ Skip ZIP (over max size): {zip_path.name}"))
-            continue
-        encrypted = False
-        try:
-            with zipfile.ZipFile(zip_path, "r") as z:
-                for info in z.infolist():
-                    if info.flag_bits & 0x1:
-                        encrypted = True
-                        break
-        except zipfile.BadZipFile as e:
-            print(warn_style(no_color, f"  ⚠️ Bad ZIP: {zip_path.name} — {e}"))
-            continue
-        except Exception as e:
-            _log_event(
-                "ERROR",
-                "ZIP inspection failed",
-                path=str(zip_path),
-                error=str(e),
-                traceback=traceback.format_exc(),
+                    print(success_style(no_color, f"  ✅ {zip_path.name} ({len(chunks)} chunks)"))
+    
+        # 5. Batch add to ChromaDB (embedding runs here; progress so you can see where it hangs)
+        if all_chunks:
+            batch_size = ADD_BATCH_SIZE
+            try:
+                batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
+            except (ValueError, TypeError):
+                pass
+            batch_size = max(1, min(batch_size, 2000))  # sane range
+            try:
+                embedding_workers = int(os.environ.get("LLMLIBRARIAN_EMBEDDING_WORKERS", "1"))
+            except (TypeError, ValueError):
+                embedding_workers = 1
+            embedding_workers = max(1, min(embedding_workers, 32))
+            if not _should_use_tqdm():
+                log(f"Adding {len(all_chunks)} chunks to collection (embedding, batch_size={batch_size})...")
+            _batch_add(
+                collection,
+                all_chunks,
+                batch_size=batch_size,
+                no_color=no_color,
+                log_line=log_line,
+                embedding_fn=ef,
+                embedding_workers=embedding_workers,
             )
-            print(warn_style(no_color, f"  ⚠️ ZIP error: {zip_path.name} — {e}"))
-            continue
-        if encrypted:
-            print(warn_style(no_color, f"  ⚠️ Skip ZIP (encrypted): {zip_path.name}"))
-            continue
-        chunks = process_zip_to_chunks(
-            zip_path,
-            include,
-            exclude,
-            max_archive_bytes,
-            max_file_bytes,
-            max_files_per_zip,
-            max_extracted_per_zip,
-            db_path=DB_PATH,
-        )
-        if chunks:
-            all_chunks.extend(chunks)
-            files_indexed += 1
-            if sys.stdout.isatty():
-                status_line(f"↻ {files_indexed}/{total_to_process}: {zip_path.name}")
-            else:
-                print(success_style(no_color, f"  ✅ {zip_path.name} ({len(chunks)} chunks)"))
+        if all_image_vectors and _image_embed_ok:
+            _batch_add_image_vectors(
+                image_collection,
+                all_image_vectors,
+                batch_size=max(1, min(64, ADD_BATCH_SIZE)),
+                no_color=no_color,
+                log_line=log_line,
+            )
+    
+        clear_status_line()
+        elapsed = time.perf_counter() - t0
+        done_msg = f"Done: {files_indexed} files, {len(all_chunks)} chunks in {elapsed:.1f}s"
+        print(bold(no_color, done_msg))
+        log(done_msg)
+        log_close()
 
-    # 5. Batch add to ChromaDB (embedding runs here; progress so you can see where it hangs)
-    if all_chunks:
-        batch_size = ADD_BATCH_SIZE
-        try:
-            batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
-        except (ValueError, TypeError):
-            pass
-        batch_size = max(1, min(batch_size, 2000))  # sane range
-        try:
-            embedding_workers = int(os.environ.get("LLMLIBRARIAN_EMBEDDING_WORKERS", "1"))
-        except (TypeError, ValueError):
-            embedding_workers = 1
-        embedding_workers = max(1, min(embedding_workers, 32))
-        if not _should_use_tqdm():
-            log(f"Adding {len(all_chunks)} chunks to collection (embedding, batch_size={batch_size})...")
-        _batch_add(
-            collection,
-            all_chunks,
-            batch_size=batch_size,
-            no_color=no_color,
-            log_line=log_line,
-            embedding_fn=ef,
-            embedding_workers=embedding_workers,
-        )
-    if all_image_vectors and _image_embed_ok:
-        _batch_add_image_vectors(
-            image_collection,
-            all_image_vectors,
-            batch_size=max(1, min(64, ADD_BATCH_SIZE)),
-            no_color=no_color,
-            log_line=log_line,
-        )
-
-    clear_status_line()
-    elapsed = time.perf_counter() - t0
-    done_msg = f"Done: {files_indexed} files, {len(all_chunks)} chunks in {elapsed:.1f}s"
-    print(bold(no_color, done_msg))
-    log(done_msg)
-    log_close()
+    with chroma_exclusive_lock(str(Path(DB_PATH).resolve())):
+        _run_index_chroma_phase()
 
 
 def run_add(
@@ -2050,6 +2056,7 @@ def run_add(
     image_vision_enabled: bool | None = None,
     workers: int | None = None,
     embedding_workers: int | None = None,
+    get_chroma_client: Callable[[str], Any] | None = None,
 ) -> tuple[int, int]:
     """
     Index a folder or a single file into the unified collection (llmli). Silo name = basename(path) unless forced.
@@ -2171,130 +2178,162 @@ def run_add(
         print(dim(no_color, _format_preflight_summary(file_list, collect_stats)))
         print(dim(no_color, f"  Workers: file={workers}, embedding={embedding_workers}"))
 
-    ef = get_embedding_function(batch_size=len(file_list) or 64)
-    client = get_client(str(db_path))
-    collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-    image_collection = _get_image_collection(client)
+    from chroma_lock import chroma_exclusive_lock
 
-    # Cheap consistency check: if manifest says files are indexed but ChromaDB has 0
-    # chunks for this silo, the previous ingest was incomplete — force a full re-index.
-    if incremental:
-        try:
-            if collection.count() == 0:
-                # collection.count() is total; check silo-specific count
-                silo_result = collection.get(where={"silo": silo_slug}, limit=1)
-                silo_ids = silo_result.get("ids") or []
-                if not silo_ids:
-                    prior_manifest = _read_file_manifest(db_path)
-                    prior_silo = (prior_manifest.get("silos") or {}).get(silo_slug, {})
-                    prior_files = (prior_silo.get("files") or {}) if isinstance(prior_silo, dict) else {}
-                    if prior_files:
-                        incremental = False
-        except Exception:
-            pass
-
-    if not incremental:
-        try:
-            collection.delete(where={"silo": silo_slug})
-        except Exception:
-            pass  # no chunks for this silo yet
-        try:
-            image_collection.delete(where={"silo": silo_slug})
-        except Exception:
-            pass
-        _file_registry_remove_silo(db_path, silo_slug)
-
-    # Pre-pass: resolve paths, hash, skip duplicates (same file already indexed in any silo)
-    regular_with_hash: list[tuple[Path, str, str, Path | None]] = []
-    manifest = _read_file_manifest(db_path) if incremental else {"silos": {}}
-    silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
-    manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
-    ledger_sources_to_replace: set[str] = set()
-    current_paths: set[str] = set()
-    if incremental:
-        for zp in zips:
+    def _run_add_chroma_phase() -> tuple[int, int]:
+        nonlocal incremental
+        ef = get_embedding_function(batch_size=len(file_list) or 64)
+        _gc = get_chroma_client or get_client
+        client = _gc(str(db_path))
+        collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+        image_collection = _get_image_collection(client)
+    
+        # Cheap consistency check: if manifest says files are indexed but ChromaDB has 0
+        # chunks for this silo, the previous ingest was incomplete — force a full re-index.
+        if incremental:
             try:
-                current_paths.add(str(zp.resolve()))
-            except OSError:
-                current_paths.add(str(zp))
-    skipped = 0
-    precloned_by_path: dict[str, tuple[str, list[ChunkTuple]]] = {}
-    precloned_image_vectors_by_path: dict[str, list[ImageVectorTuple]] = {}
-    for p, k in regular:
-        try:
-            p_res = p.resolve()
-            if not p_res.is_file():
-                continue
-            current_paths.add(str(p_res))
-            stat = p_res.stat()
-            mtime = stat.st_mtime
-            size = stat.st_size
-            h = get_file_hash(p_res)
-            if incremental:
-                prev = manifest_files.get(str(p_res)) if isinstance(manifest_files, dict) else None
-                if prev and prev.get("mtime") == mtime and prev.get("size") == size:
-                    if not h:
-                        continue
-                    existing_same = any(
-                        str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") == str(p_res)
-                        for e in _file_registry_get(db_path, h)
+                if collection.count() == 0:
+                    # collection.count() is total; check silo-specific count
+                    silo_result = collection.get(where={"silo": silo_slug}, limit=1)
+                    silo_ids = silo_result.get("ids") or []
+                    if not silo_ids:
+                        prior_manifest = _read_file_manifest(db_path)
+                        prior_silo = (prior_manifest.get("silos") or {}).get(silo_slug, {})
+                        prior_files = (prior_silo.get("files") or {}) if isinstance(prior_silo, dict) else {}
+                        if prior_files:
+                            incremental = False
+            except Exception:
+                pass
+    
+        if not incremental:
+            try:
+                collection.delete(where={"silo": silo_slug})
+            except Exception:
+                pass  # no chunks for this silo yet
+            try:
+                image_collection.delete(where={"silo": silo_slug})
+            except Exception:
+                pass
+            _file_registry_remove_silo(db_path, silo_slug)
+    
+        # Pre-pass: resolve paths, hash, skip duplicates (same file already indexed in any silo)
+        regular_with_hash: list[tuple[Path, str, str, Path | None]] = []
+        manifest = _read_file_manifest(db_path) if incremental else {"silos": {}}
+        silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
+        manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
+        ledger_sources_to_replace: set[str] = set()
+        current_paths: set[str] = set()
+        if incremental:
+            for zp in zips:
+                try:
+                    current_paths.add(str(zp.resolve()))
+                except OSError:
+                    current_paths.add(str(zp))
+        skipped = 0
+        precloned_by_path: dict[str, tuple[str, list[ChunkTuple]]] = {}
+        precloned_image_vectors_by_path: dict[str, list[ImageVectorTuple]] = {}
+        for p, k in regular:
+            try:
+                p_res = p.resolve()
+                if not p_res.is_file():
+                    continue
+                current_paths.add(str(p_res))
+                stat = p_res.stat()
+                mtime = stat.st_mtime
+                size = stat.st_size
+                h = get_file_hash(p_res)
+                if incremental:
+                    prev = manifest_files.get(str(p_res)) if isinstance(manifest_files, dict) else None
+                    if prev and prev.get("mtime") == mtime and prev.get("size") == size:
+                        if not h:
+                            continue
+                        existing_same = any(
+                            str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") == str(p_res)
+                            for e in _file_registry_get(db_path, h)
+                        )
+                        if existing_same:
+                            continue
+                if h:
+                    existing_entries = _file_registry_get(db_path, h)
+                    # Warn when identical content is already indexed in this silo under a different path.
+                    same_silo_dupes = [
+                        str(e.get("path") or "")
+                        for e in existing_entries
+                        if str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") != str(p_res)
+                    ]
+                    if same_silo_dupes:
+                        print(
+                            f"[llmli][WARN] Duplicate content: {p_res} matches already-indexed"
+                            f" {same_silo_dupes[0]} — consider consolidating your folder structure.",
+                            file=sys.stderr,
+                        )
+                    clone_from = next(
+                        (str(e.get("silo") or "") for e in existing_entries if str(e.get("silo") or "") != silo_slug),
+                        "",
                     )
-                    if existing_same:
-                        continue
-            if h:
-                existing_entries = _file_registry_get(db_path, h)
-                # Warn when identical content is already indexed in this silo under a different path.
-                same_silo_dupes = [
-                    str(e.get("path") or "")
-                    for e in existing_entries
-                    if str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") != str(p_res)
-                ]
-                if same_silo_dupes:
-                    print(
-                        f"[llmli][WARN] Duplicate content: {p_res} matches already-indexed"
-                        f" {same_silo_dupes[0]} — consider consolidating your folder structure.",
-                        file=sys.stderr,
-                    )
-                clone_from = next(
-                    (str(e.get("silo") or "") for e in existing_entries if str(e.get("silo") or "") != silo_slug),
-                    "",
-                )
-                can_clone = bool(clone_from)
-                if can_clone and k == "image":
-                    source_mode = get_silo_image_vision_enabled(db_path, clone_from) if clone_from else None
-                    target_mode = effective_image_vision_enabled
-                    can_clone = source_mode is not None and target_mode is not None and source_mode == target_mode
-                if can_clone and clone_from:
-                    cloned = _clone_chunks_from_existing_silo(
-                        collection=collection,
-                        from_silo=clone_from,
-                        source_path=str(p_res),
-                        target_silo=silo_slug,
-                    )
-                    if cloned:
-                        precloned_by_path[str(p_res)] = (h, cloned)
-                        precloned_image_vectors_by_path[str(p_res)] = _clone_image_vectors_from_existing_silo(
-                            collection=image_collection,
+                    can_clone = bool(clone_from)
+                    if can_clone and k == "image":
+                        source_mode = get_silo_image_vision_enabled(db_path, clone_from) if clone_from else None
+                        target_mode = effective_image_vision_enabled
+                        can_clone = source_mode is not None and target_mode is not None and source_mode == target_mode
+                    if can_clone and clone_from:
+                        cloned = _clone_chunks_from_existing_silo(
+                            collection=collection,
                             from_silo=clone_from,
                             source_path=str(p_res),
                             target_silo=silo_slug,
                         )
-                        continue
-            if not h:
-                regular_with_hash.append((p, k, "", p_res))
-                continue
-            regular_with_hash.append((p, k, h, p_res))
-        except OSError:
-            regular_with_hash.append((p, k, "", None))
-
-    if incremental and isinstance(manifest_files, dict):
-        cleanup_targets: list[Path] = [p_res for _p, _k, _h, p_res in regular_with_hash if p_res is not None]
-        for p_res in cleanup_targets:
-            if p_res is None:
-                continue
-            path_str = str(p_res)
-            ledger_sources_to_replace.add(path_str)
-            if path_str in manifest_files:
+                        if cloned:
+                            precloned_by_path[str(p_res)] = (h, cloned)
+                            precloned_image_vectors_by_path[str(p_res)] = _clone_image_vectors_from_existing_silo(
+                                collection=image_collection,
+                                from_silo=clone_from,
+                                source_path=str(p_res),
+                                target_silo=silo_slug,
+                            )
+                            continue
+                if not h:
+                    regular_with_hash.append((p, k, "", p_res))
+                    continue
+                regular_with_hash.append((p, k, h, p_res))
+            except OSError:
+                regular_with_hash.append((p, k, "", None))
+    
+        if incremental and isinstance(manifest_files, dict):
+            cleanup_targets: list[Path] = [p_res for _p, _k, _h, p_res in regular_with_hash if p_res is not None]
+            for p_res in cleanup_targets:
+                if p_res is None:
+                    continue
+                path_str = str(p_res)
+                ledger_sources_to_replace.add(path_str)
+                if path_str in manifest_files:
+                    _delete_source_from_collections(
+                        collection=collection,
+                        image_collection=image_collection,
+                        silo_slug=silo_slug,
+                        source_path=path_str,
+                    )
+                    prev = manifest_files.get(path_str) or {}
+                    _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
+    
+        all_chunks = []
+        all_image_vectors: list[ImageVectorTuple] = []
+        tax_rows: list[dict[str, Any]] = []
+        files_indexed = 0
+        failures = []
+        to_register: list[tuple[str, str]] = []  # (file_hash, path_str) for main-thread registry update
+        image_total = sum(1 for _p, kind in regular if kind == "image")
+        image_done = 0
+        eager_summaries = 0
+        deferred_summaries = 0
+        image_embeddings_complete = 0
+        extraction_started_at = time.perf_counter()
+        last_image_progress_at = extraction_started_at
+    
+        if incremental and isinstance(manifest_files, dict):
+            removed = [path_str for path_str in manifest_files.keys() if path_str not in current_paths]
+            for path_str in removed:
+                ledger_sources_to_replace.add(path_str)
                 _delete_source_from_collections(
                     collection=collection,
                     image_collection=image_collection,
@@ -2303,93 +2342,150 @@ def run_add(
                 )
                 prev = manifest_files.get(path_str) or {}
                 _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
-
-    all_chunks = []
-    all_image_vectors: list[ImageVectorTuple] = []
-    tax_rows: list[dict[str, Any]] = []
-    files_indexed = 0
-    failures = []
-    to_register: list[tuple[str, str]] = []  # (file_hash, path_str) for main-thread registry update
-    image_total = sum(1 for _p, kind in regular if kind == "image")
-    image_done = 0
-    eager_summaries = 0
-    deferred_summaries = 0
-    image_embeddings_complete = 0
-    extraction_started_at = time.perf_counter()
-    last_image_progress_at = extraction_started_at
-
-    if incremental and isinstance(manifest_files, dict):
-        removed = [path_str for path_str in manifest_files.keys() if path_str not in current_paths]
-        for path_str in removed:
-            ledger_sources_to_replace.add(path_str)
-            _delete_source_from_collections(
-                collection=collection,
-                image_collection=image_collection,
-                silo_slug=silo_slug,
-                source_path=path_str,
-            )
-            prev = manifest_files.get(path_str) or {}
-            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
-
-    if precloned_by_path:
-        for path_str, (fhash, cloned_chunks) in precloned_by_path.items():
-            _now_iso = datetime.now(timezone.utc).isoformat()
-            cloned_norm = [
-                (
-                    hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20],
-                    doc,
-                    {**meta, "silo": silo_slug, "indexed_at": _now_iso},
-                )
-                for cid, doc, meta in cloned_chunks
-            ]
-            if not cloned_norm:
+    
+        if precloned_by_path:
+            for path_str, (fhash, cloned_chunks) in precloned_by_path.items():
+                _now_iso = datetime.now(timezone.utc).isoformat()
+                cloned_norm = [
+                    (
+                        hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20],
+                        doc,
+                        {**meta, "silo": silo_slug, "indexed_at": _now_iso},
+                    )
+                    for cid, doc, meta in cloned_chunks
+                ]
+                if not cloned_norm:
+                    continue
+                all_chunks.extend(cloned_norm)
+                cloned_vectors = precloned_image_vectors_by_path.get(path_str) or []
+                if cloned_vectors:
+                    all_image_vectors.extend(cloned_vectors)
+                summary_status, has_image = _image_progress_snapshot(cloned_norm)
+                if has_image:
+                    image_done += 1
+                    if summary_status == "eager":
+                        eager_summaries += 1
+                    else:
+                        deferred_summaries += 1
+                tax_rows.extend(extract_tax_rows_from_chunks(cloned_norm))
+                files_indexed += 1
+                if fhash:
+                    to_register.append((fhash, path_str))
+    
+        total_to_process = len(regular_with_hash) + len(zips)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_item = {
+                executor.submit(
+                    process_one_file,
+                    p,
+                    k,
+                    h,
+                    follow_symlinks,
+                    p_res,
+                    db_path,
+                    effective_image_vision_enabled,
+                ): (p, k, h)
+                for p, k, h, p_res in regular_with_hash
+            }
+            for future in as_completed(future_to_item):
+                p, kind, fhash = future_to_item[future]
+                try:
+                    chunks = future.result()
+                except Exception as e:
+                    _log_event(
+                        "ERROR",
+                        "Worker failed",
+                        path=str(p),
+                        kind=kind,
+                        error=str(e),
+                        traceback=traceback.format_exc(),
+                    )
+                    failures.append({"path": str(p), "error": str(e)})
+                    print(f"[llmli] FAIL {p}: {e}", file=sys.stderr)
+                    continue
+                if chunks:
+                    _now_iso = datetime.now(timezone.utc).isoformat()
+                    chunks = [
+                        (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug, "indexed_at": _now_iso})
+                        for cid, doc, meta in chunks
+                    ]
+                    all_chunks.extend(chunks)
+                    summary_status, has_image = _image_progress_snapshot(chunks)
+                    if has_image:
+                        source_path = str((chunks[0][2] or {}).get("source") or p)
+                        vector_row = _image_vector_from_chunks(source_path=source_path, chunks=chunks)
+                        if vector_row is not None:
+                            vid, vpath, vdoc, vmeta = vector_row
+                            all_image_vectors.append((vid, vpath, vdoc, {**vmeta, "silo": silo_slug}))
+                        image_done += 1
+                        if summary_status == "eager":
+                            eager_summaries += 1
+                        else:
+                            deferred_summaries += 1
+                        if not quiet:
+                            now = time.perf_counter()
+                            if image_done == image_total or (now - last_image_progress_at) >= 2.5:
+                                _print_image_progress(
+                                    image_done=image_done,
+                                    image_total=image_total,
+                                    eager_count=eager_summaries,
+                                    deferred_count=deferred_summaries,
+                                    embeddings_complete=image_embeddings_complete,
+                                    started_at=extraction_started_at,
+                                    no_color=no_color,
+                                )
+                                last_image_progress_at = now
+                    elif kind == "image":
+                        image_done += 1
+                    tax_rows.extend(extract_tax_rows_from_chunks(chunks))
+                    files_indexed += 1
+                    if not quiet and sys.stdout.isatty():
+                        status_line(f"↻ {files_indexed}/{total_to_process}: {p.name}")
+                    if fhash:
+                        to_register.append((fhash, str(p)))
+                elif kind == "pdf" and not _suppress_recoverable_warnings():
+                    print(
+                        warn_style(
+                            no_color,
+                            f"  ⚠️ {p.name}: no extractable text (image-only, empty, or OCR unavailable)",
+                        ),
+                        file=sys.stderr,
+                    )
+                elif kind == "image":
+                    image_done += 1
+    
+        for zip_path in zips:
+            if zip_path.stat().st_size > max_archive_bytes:
                 continue
-            all_chunks.extend(cloned_norm)
-            cloned_vectors = precloned_image_vectors_by_path.get(path_str) or []
-            if cloned_vectors:
-                all_image_vectors.extend(cloned_vectors)
-            summary_status, has_image = _image_progress_snapshot(cloned_norm)
-            if has_image:
-                image_done += 1
-                if summary_status == "eager":
-                    eager_summaries += 1
-                else:
-                    deferred_summaries += 1
-            tax_rows.extend(extract_tax_rows_from_chunks(cloned_norm))
-            files_indexed += 1
-            if fhash:
-                to_register.append((fhash, path_str))
-
-    total_to_process = len(regular_with_hash) + len(zips)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_item = {
-            executor.submit(
-                process_one_file,
-                p,
-                k,
-                h,
-                follow_symlinks,
-                p_res,
-                db_path,
-                effective_image_vision_enabled,
-            ): (p, k, h)
-            for p, k, h, p_res in regular_with_hash
-        }
-        for future in as_completed(future_to_item):
-            p, kind, fhash = future_to_item[future]
+            ledger_sources_to_replace.add(str(zip_path))
+            if incremental:
+                try:
+                    zstat = zip_path.stat()
+                    prev = manifest_files.get(str(zip_path)) if isinstance(manifest_files, dict) else None
+                    if prev and prev.get("mtime") == zstat.st_mtime and prev.get("size") == zstat.st_size:
+                        continue
+                    try:
+                        collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": str(zip_path)}]})
+                    except Exception as e:
+                        _log_event("WARN", "Failed to delete ZIP chunks", path=str(zip_path), error=str(e))
+                except OSError:
+                    pass
             try:
-                chunks = future.result()
+                chunks = process_zip_to_chunks(
+                    zip_path, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE,
+                    max_archive_bytes, max_file_bytes, max_files_per_zip, max_extracted_per_zip,
+                    db_path=db_path,
+                )
             except Exception as e:
                 _log_event(
                     "ERROR",
-                    "Worker failed",
-                    path=str(p),
-                    kind=kind,
+                    "ZIP processing failed",
+                    path=str(zip_path),
                     error=str(e),
                     traceback=traceback.format_exc(),
                 )
-                failures.append({"path": str(p), "error": str(e)})
-                print(f"[llmli] FAIL {p}: {e}", file=sys.stderr)
+                failures.append({"path": str(zip_path), "error": str(e)})
+                print(f"[llmli] FAIL {zip_path}: {e}", file=sys.stderr)
                 continue
             if chunks:
                 _now_iso = datetime.now(timezone.utc).isoformat()
@@ -2398,260 +2494,179 @@ def run_add(
                     for cid, doc, meta in chunks
                 ]
                 all_chunks.extend(chunks)
-                summary_status, has_image = _image_progress_snapshot(chunks)
-                if has_image:
-                    source_path = str((chunks[0][2] or {}).get("source") or p)
-                    vector_row = _image_vector_from_chunks(source_path=source_path, chunks=chunks)
-                    if vector_row is not None:
-                        vid, vpath, vdoc, vmeta = vector_row
-                        all_image_vectors.append((vid, vpath, vdoc, {**vmeta, "silo": silo_slug}))
-                    image_done += 1
-                    if summary_status == "eager":
-                        eager_summaries += 1
-                    else:
-                        deferred_summaries += 1
-                    if not quiet:
-                        now = time.perf_counter()
-                        if image_done == image_total or (now - last_image_progress_at) >= 2.5:
-                            _print_image_progress(
-                                image_done=image_done,
-                                image_total=image_total,
-                                eager_count=eager_summaries,
-                                deferred_count=deferred_summaries,
-                                embeddings_complete=image_embeddings_complete,
-                                started_at=extraction_started_at,
-                                no_color=no_color,
-                            )
-                            last_image_progress_at = now
-                elif kind == "image":
-                    image_done += 1
                 tax_rows.extend(extract_tax_rows_from_chunks(chunks))
                 files_indexed += 1
-                if not quiet and sys.stdout.isatty():
-                    status_line(f"↻ {files_indexed}/{total_to_process}: {p.name}")
-                if fhash:
-                    to_register.append((fhash, str(p)))
-            elif kind == "pdf" and not _suppress_recoverable_warnings():
-                print(
-                    warn_style(
-                        no_color,
-                        f"  ⚠️ {p.name}: no extractable text (image-only, empty, or OCR unavailable)",
-                    ),
-                    file=sys.stderr,
-                )
-            elif kind == "image":
-                image_done += 1
-
-    for zip_path in zips:
-        if zip_path.stat().st_size > max_archive_bytes:
-            continue
-        ledger_sources_to_replace.add(str(zip_path))
+    
+        if regular_with_hash:
+            for _p, _k, _h, p_res in regular_with_hash:
+                if p_res is not None:
+                    ledger_sources_to_replace.add(str(p_res))
+    
         if incremental:
+            def _update_manifest(manifest_data: dict) -> None:
+                silos = manifest_data.setdefault("silos", {})
+                silo_entry = silos.setdefault(silo_slug, {"path": str(path), "files": {}})
+                files_map = silo_entry.setdefault("files", {})
+                if not isinstance(files_map, dict):
+                    files_map = {}
+                    silo_entry["files"] = files_map
+                # Remove deleted
+                for path_str in list(files_map.keys()):
+                    if path_str not in current_paths and path_str not in [str(z) for z in zips]:
+                        del files_map[path_str]
+                # Update regular files
+                for p, _k, h, p_res in regular_with_hash:
+                    if p_res is None:
+                        continue
+                    try:
+                        st = p_res.stat()
+                        files_map[str(p_res)] = {"mtime": st.st_mtime, "size": st.st_size, "hash": h}
+                    except OSError:
+                        continue
+                # Update zips
+                for zp in zips:
+                    try:
+                        st = zp.stat()
+                        files_map[str(zp)] = {"mtime": st.st_mtime, "size": st.st_size, "hash": ""}
+                    except OSError:
+                        continue
+    
+        # Write-ahead marker: if we crash between here and clear_pending, the next
+        # run will detect this silo as interrupted and force a full non-incremental re-index.
+        from ingest_journal import write_pending, clear_pending
+        write_pending(str(db_path), silo_slug)
+    
+        if all_chunks:
+            batch_size = ADD_BATCH_SIZE
             try:
-                zstat = zip_path.stat()
-                prev = manifest_files.get(str(zip_path)) if isinstance(manifest_files, dict) else None
-                if prev and prev.get("mtime") == zstat.st_mtime and prev.get("size") == zstat.st_size:
-                    continue
-                try:
-                    collection.delete(where={"$and": [{"silo": silo_slug}, {"zip_path": str(zip_path)}]})
-                except Exception as e:
-                    _log_event("WARN", "Failed to delete ZIP chunks", path=str(zip_path), error=str(e))
-            except OSError:
+                batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
+            except (TypeError, ValueError):
                 pass
-        try:
-            chunks = process_zip_to_chunks(
-                zip_path, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE,
-                max_archive_bytes, max_file_bytes, max_files_per_zip, max_extracted_per_zip,
-                db_path=db_path,
+            batch_size = max(1, min(batch_size, 2000))
+            total_batches = (len(all_chunks) + batch_size - 1) // batch_size
+            if not _should_use_tqdm():
+                print(dim(no_color, f"  Adding {len(all_chunks)} chunks in {total_batches} batches (batch_size={batch_size})..."))
+            _batch_add(
+                collection,
+                all_chunks,
+                batch_size=batch_size,
+                no_color=no_color,
+                embedding_fn=ef,
+                embedding_workers=embedding_workers,
             )
-        except Exception as e:
-            _log_event(
-                "ERROR",
-                "ZIP processing failed",
-                path=str(zip_path),
-                error=str(e),
-                traceback=traceback.format_exc(),
-            )
-            failures.append({"path": str(zip_path), "error": str(e)})
-            print(f"[llmli] FAIL {zip_path}: {e}", file=sys.stderr)
-            continue
-        if chunks:
-            _now_iso = datetime.now(timezone.utc).isoformat()
-            chunks = [
-                (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug, "indexed_at": _now_iso})
-                for cid, doc, meta in chunks
-            ]
-            all_chunks.extend(chunks)
-            tax_rows.extend(extract_tax_rows_from_chunks(chunks))
-            files_indexed += 1
-
-    if regular_with_hash:
-        for _p, _k, _h, p_res in regular_with_hash:
-            if p_res is not None:
-                ledger_sources_to_replace.add(str(p_res))
-
-    if incremental:
-        def _update_manifest(manifest_data: dict) -> None:
-            silos = manifest_data.setdefault("silos", {})
-            silo_entry = silos.setdefault(silo_slug, {"path": str(path), "files": {}})
-            files_map = silo_entry.setdefault("files", {})
-            if not isinstance(files_map, dict):
-                files_map = {}
-                silo_entry["files"] = files_map
-            # Remove deleted
-            for path_str in list(files_map.keys()):
-                if path_str not in current_paths and path_str not in [str(z) for z in zips]:
-                    del files_map[path_str]
-            # Update regular files
-            for p, _k, h, p_res in regular_with_hash:
-                if p_res is None:
-                    continue
-                try:
-                    st = p_res.stat()
-                    files_map[str(p_res)] = {"mtime": st.st_mtime, "size": st.st_size, "hash": h}
-                except OSError:
-                    continue
-            # Update zips
-            for zp in zips:
-                try:
-                    st = zp.stat()
-                    files_map[str(zp)] = {"mtime": st.st_mtime, "size": st.st_size, "hash": ""}
-                except OSError:
-                    continue
-
-    # Write-ahead marker: if we crash between here and clear_pending, the next
-    # run will detect this silo as interrupted and force a full non-incremental re-index.
-    from ingest_journal import write_pending, clear_pending
-    write_pending(str(db_path), silo_slug)
-
-    if all_chunks:
-        batch_size = ADD_BATCH_SIZE
-        try:
-            batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
-        except (TypeError, ValueError):
-            pass
-        batch_size = max(1, min(batch_size, 2000))
-        total_batches = (len(all_chunks) + batch_size - 1) // batch_size
-        if not _should_use_tqdm():
-            print(dim(no_color, f"  Adding {len(all_chunks)} chunks in {total_batches} batches (batch_size={batch_size})..."))
-        _batch_add(
-            collection,
-            all_chunks,
-            batch_size=batch_size,
-            no_color=no_color,
-            embedding_fn=ef,
-            embedding_workers=embedding_workers,
-        )
-    if all_image_vectors and _image_embed_ok:
-        _batch_add_image_vectors(
-            image_collection,
-            all_image_vectors,
-            batch_size=max(1, min(64, ADD_BATCH_SIZE)),
-            no_color=no_color,
-        )
-        image_embeddings_complete = len(all_image_vectors)
-        if not quiet and image_total:
-            _print_image_progress(
-                image_done=image_done,
-                image_total=image_total,
-                eager_count=eager_summaries,
-                deferred_count=deferred_summaries,
-                embeddings_complete=image_embeddings_complete,
-                started_at=extraction_started_at,
+        if all_image_vectors and _image_embed_ok:
+            _batch_add_image_vectors(
+                image_collection,
+                all_image_vectors,
+                batch_size=max(1, min(64, ADD_BATCH_SIZE)),
                 no_color=no_color,
             )
-
-    # State writes — all happen after ChromaDB batch_add succeeds.
-    for fhash, path_str in to_register:
-        _file_registry_add(db_path, fhash, silo_slug, path_str)
-    if incremental:
-        _update_file_manifest(db_path, _update_manifest)
-
-    if (not incremental) or ledger_sources_to_replace or tax_rows:
-        replace_tax_rows_for_sources(
+            image_embeddings_complete = len(all_image_vectors)
+            if not quiet and image_total:
+                _print_image_progress(
+                    image_done=image_done,
+                    image_total=image_total,
+                    eager_count=eager_summaries,
+                    deferred_count=deferred_summaries,
+                    embeddings_complete=image_embeddings_complete,
+                    started_at=extraction_started_at,
+                    no_color=no_color,
+                )
+    
+        # State writes — all happen after ChromaDB batch_add succeeds.
+        for fhash, path_str in to_register:
+            _file_registry_add(db_path, fhash, silo_slug, path_str)
+        if incremental:
+            _update_file_manifest(db_path, _update_manifest)
+    
+        if (not incremental) or ledger_sources_to_replace or tax_rows:
+            replace_tax_rows_for_sources(
+                db_path,
+                silo=silo_slug,
+                sources=ledger_sources_to_replace,
+                new_rows=tax_rows,
+                replace_all_in_silo=(not incremental),
+            )
+    
+        now_iso = datetime.now(timezone.utc).isoformat()
+        language_stats = None
+        if all_chunks:
+            unique_by_ext: dict[str, set[str]] = {}
+            for _id, _doc, meta in all_chunks:
+                src = (meta or {}).get("source") or ""
+                if not src:
+                    continue
+                ext = Path(src).suffix.lower()
+                if ext not in ADD_CODE_EXTENSIONS:
+                    continue
+                unique_by_ext.setdefault(ext, set()).add(src)
+            if unique_by_ext:
+                language_stats = {
+                    "by_ext": {ext: len(paths) for ext, paths in unique_by_ext.items()},
+                    "sample_paths": {ext: list(paths)[:3] for ext, paths in unique_by_ext.items()},
+                }
+        chunks_count = len(all_chunks)
+        total_files = files_indexed
+        if incremental:
+            try:
+                result = collection.get(where={"silo": silo_slug}, include=["metadatas"])
+                chunks_count = len(result.get("metadatas") or [])
+            except Exception:
+                pass
+            try:
+                manifest = _read_file_manifest(db_path)
+                silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
+                manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
+                if isinstance(manifest_files, dict):
+                    total_files = len(manifest_files)
+            except Exception:
+                pass
+        update_silo(
             db_path,
-            silo=silo_slug,
-            sources=ledger_sources_to_replace,
-            new_rows=tax_rows,
-            replace_all_in_silo=(not incremental),
+            silo_slug,
+            str(path),
+            total_files,
+            chunks_count,
+            now_iso,
+            display_name=display_name,
+            language_stats=language_stats,
+            image_vision_enabled=effective_image_vision_enabled,
         )
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    language_stats = None
-    if all_chunks:
-        unique_by_ext: dict[str, set[str]] = {}
-        for _id, _doc, meta in all_chunks:
-            src = (meta or {}).get("source") or ""
-            if not src:
-                continue
-            ext = Path(src).suffix.lower()
-            if ext not in ADD_CODE_EXTENSIONS:
-                continue
-            unique_by_ext.setdefault(ext, set()).add(src)
-        if unique_by_ext:
-            language_stats = {
-                "by_ext": {ext: len(paths) for ext, paths in unique_by_ext.items()},
-                "sample_paths": {ext: list(paths)[:3] for ext, paths in unique_by_ext.items()},
-            }
-    chunks_count = len(all_chunks)
-    total_files = files_indexed
-    if incremental:
-        try:
-            result = collection.get(where={"silo": silo_slug}, include=["metadatas"])
-            chunks_count = len(result.get("metadatas") or [])
-        except Exception:
-            pass
-        try:
-            manifest = _read_file_manifest(db_path)
-            silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
-            manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
-            if isinstance(manifest_files, dict):
-                total_files = len(manifest_files)
-        except Exception:
-            pass
-    update_silo(
-        db_path,
-        silo_slug,
-        str(path),
-        total_files,
-        chunks_count,
-        now_iso,
-        display_name=display_name,
-        language_stats=language_stats,
-        image_vision_enabled=effective_image_vision_enabled,
-    )
-    set_last_failures(db_path, failures)
-    clear_pending(str(db_path), silo_slug)
-
-    # Summary: trust + usability (per-file FAIL still printed above)
-    if not quiet:
-        clear_status_line()
-        if failures:
-            print(warn_style(no_color, f"Indexed {files_indexed} files ({len(failures)} failed). pal log or llmli log --last to see failures."), file=sys.stderr)
-        else:
-            if files_indexed == 0:
-                print(success_style(no_color, "All files up to date."))
+        set_last_failures(db_path, failures)
+        clear_pending(str(db_path), silo_slug)
+    
+        # Summary: trust + usability (per-file FAIL still printed above)
+        if not quiet:
+            clear_status_line()
+            if failures:
+                print(warn_style(no_color, f"Indexed {files_indexed} files ({len(failures)} failed). pal log or llmli log --last to see failures."), file=sys.stderr)
             else:
-                print(success_style(no_color, f"Indexed {files_indexed} files."))
+                if files_indexed == 0:
+                    print(success_style(no_color, "All files up to date."))
+                else:
+                    print(success_style(no_color, f"Indexed {files_indexed} files."))
+    
+        # Optional status file for tooling (e.g., pal pull). Avoid writing to silos.
+        status_path = os.environ.get("LLMLIBRARIAN_STATUS_FILE")
+        if status_path:
+            try:
+                status = {
+                    "path": str(path),
+                    "slug": silo_slug,
+                    "files_indexed": files_indexed,
+                    "failures": len(failures),
+                    "chunks_count": chunks_count,
+                    "updated": now_iso,
+                    "image_vision_enabled": effective_image_vision_enabled,
+                }
+                with open(status_path, "w", encoding="utf-8") as f:
+                    json.dump(status, f)
+            except Exception:
+                pass
+        return (files_indexed, len(failures))
 
-    # Optional status file for tooling (e.g., pal pull). Avoid writing to silos.
-    status_path = os.environ.get("LLMLIBRARIAN_STATUS_FILE")
-    if status_path:
-        try:
-            status = {
-                "path": str(path),
-                "slug": silo_slug,
-                "files_indexed": files_indexed,
-                "failures": len(failures),
-                "chunks_count": chunks_count,
-                "updated": now_iso,
-                "image_vision_enabled": effective_image_vision_enabled,
-            }
-            with open(status_path, "w", encoding="utf-8") as f:
-                json.dump(status, f)
-        except Exception:
-            pass
-    return (files_indexed, len(failures))
+    with chroma_exclusive_lock(str(Path(db_path).resolve())):
+        return _run_add_chroma_phase()
 
 
 def _load_limits_config() -> tuple[int, int, int, int, int]:
@@ -2691,17 +2706,20 @@ def update_silo_counts(db_path: str | Path, silo_slug: str, display_name: str | 
                 break
     name = display_name or existing_display or silo_slug
 
-    ef = get_embedding_function(batch_size=1)
-    client = get_client(str(db_path))
-    collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-    chunks_count = 0
-    try:
-        result = collection.get(where={"silo": silo_slug})
-        ids = result.get("ids") if isinstance(result, dict) else None
-        if isinstance(ids, list):
-            chunks_count = len(ids)
-    except Exception:
-        pass
+    from chroma_lock import chroma_shared_lock
+
+    with chroma_shared_lock(str(Path(db_path).resolve())):
+        ef = get_embedding_function(batch_size=1)
+        client = get_client(str(db_path))
+        collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+        chunks_count = 0
+        try:
+            result = collection.get(where={"silo": silo_slug})
+            ids = result.get("ids") if isinstance(result, dict) else None
+            if isinstance(ids, list):
+                chunks_count = len(ids)
+        except Exception:
+            pass
 
     now_iso = datetime.now(timezone.utc).isoformat()
     update_silo(db_path, silo_slug, silo_path, total_files, chunks_count, now_iso, display_name=name)
@@ -2744,35 +2762,38 @@ def remove_single_file(
     manifest_files = (silo_manifest.get("files") or {}) if isinstance(silo_manifest, dict) else {}
     prev = manifest_files.get(path_str) if isinstance(manifest_files, dict) else None
 
-    ef = get_embedding_function(batch_size=1)
-    client = get_client(str(db_path))
-    collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-    image_collection = _get_image_collection(client)
-    _delete_source_from_collections(
-        collection=collection,
-        image_collection=image_collection,
-        silo_slug=silo_slug,
-        source_path=path_str,
-    )
-    if prev:
-        _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
+    from chroma_lock import chroma_exclusive_lock
 
-    def _update_manifest(manifest_data: dict) -> None:
-        silos = manifest_data.setdefault("silos", {})
-        silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
-        if not silo_entry.get("path"):
-            silo_entry["path"] = str(p.parent)
-        files_map = silo_entry.setdefault("files", {})
-        if isinstance(files_map, dict) and path_str in files_map:
-            del files_map[path_str]
+    with chroma_exclusive_lock(str(Path(db_path).resolve())):
+        ef = get_embedding_function(batch_size=1)
+        client = get_client(str(db_path))
+        collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+        image_collection = _get_image_collection(client)
+        _delete_source_from_collections(
+            collection=collection,
+            image_collection=image_collection,
+            silo_slug=silo_slug,
+            source_path=path_str,
+        )
+        if prev:
+            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
-    _update_file_manifest(db_path, _update_manifest)
-    replace_tax_rows_for_sources(
-        db_path,
-        silo=silo_slug,
-        sources={path_str},
-        new_rows=[],
-    )
+        def _update_manifest(manifest_data: dict) -> None:
+            silos = manifest_data.setdefault("silos", {})
+            silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
+            if not silo_entry.get("path"):
+                silo_entry["path"] = str(p.parent)
+            files_map = silo_entry.setdefault("files", {})
+            if isinstance(files_map, dict) and path_str in files_map:
+                del files_map[path_str]
+
+        _update_file_manifest(db_path, _update_manifest)
+        replace_tax_rows_for_sources(
+            db_path,
+            silo=silo_slug,
+            sources={path_str},
+            new_rows=[],
+        )
     if update_counts:
         update_silo_counts(db_path, silo_slug)
     return ("removed" if prev else "skipped", path_str)
@@ -2865,131 +2886,135 @@ def update_single_file(
         if prev and prev.get("mtime") == mtime and prev.get("size") == size:
             return ("unchanged", path_str)
 
-    ef = get_embedding_function(batch_size=1)
-    client = get_client(str(db_path))
-    collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-    image_collection = _get_image_collection(client)
+    from chroma_lock import chroma_exclusive_lock
 
-    chunks: list[ChunkTuple] = []
-    image_vectors: list[ImageVectorTuple] = []
-    if kind == "zip":
-        try:
-            chunks = process_zip_to_chunks(
-                p,
-                ADD_DEFAULT_INCLUDE,
-                ADD_DEFAULT_EXCLUDE,
-                max_archive_bytes,
-                max_file_bytes,
-                max_files_per_zip,
-                max_extracted_per_zip,
-                db_path=db_path,
-            )
-        except Exception:
-            return ("error", path_str)
-    else:
-        clone_from = next(
-            (str(e.get("silo") or "") for e in existing if str(e.get("silo") or "") != silo_slug),
-            "",
-        )
-        can_clone = bool(clone_from and file_hash)
-        if can_clone and kind == "image":
-            from state import get_silo_image_vision_enabled
-
-            source_mode = get_silo_image_vision_enabled(db_path, clone_from) if clone_from else None
-            can_clone = source_mode is not None and source_mode == effective_image_vision_enabled
-        if can_clone and clone_from and file_hash:
-            chunks = _clone_chunks_from_existing_silo(
-                collection=collection,
-                from_silo=clone_from,
-                source_path=path_str,
-                target_silo=silo_slug,
-            )
-            image_vectors = _clone_image_vectors_from_existing_silo(
-                collection=image_collection,
-                from_silo=clone_from,
-                source_path=path_str,
-                        target_silo=silo_slug,
-                    )
-        if not chunks:
+    with chroma_exclusive_lock(str(Path(db_path).resolve())):
+        ef = get_embedding_function(batch_size=1)
+        client = get_client(str(db_path))
+        collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+        image_collection = _get_image_collection(client)
+    
+        chunks: list[ChunkTuple] = []
+        image_vectors: list[ImageVectorTuple] = []
+        if kind == "zip":
             try:
-                chunks = process_one_file(
+                chunks = process_zip_to_chunks(
                     p,
-                    kind,
-                    file_hash or None,
-                    follow_symlinks,
-                    p,
+                    ADD_DEFAULT_INCLUDE,
+                    ADD_DEFAULT_EXCLUDE,
+                    max_archive_bytes,
+                    max_file_bytes,
+                    max_files_per_zip,
+                    max_extracted_per_zip,
                     db_path=db_path,
-                    image_vision_enabled=effective_image_vision_enabled,
                 )
             except Exception:
                 return ("error", path_str)
-
-    _delete_source_from_collections(
-        collection=collection,
-        image_collection=image_collection,
-        silo_slug=silo_slug,
-        source_path=path_str,
-    )
-    if prev:
-        _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
-
-    if chunks:
-        _now_iso = datetime.now(timezone.utc).isoformat()
-        chunks = [
-            (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug, "indexed_at": _now_iso})
-            for cid, doc, meta in chunks
-        ]
-        batch_size = ADD_BATCH_SIZE
-        try:
-            batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
-        except (TypeError, ValueError):
-            pass
-        batch_size = max(1, min(batch_size, 2000))
-        embedding_workers = _resolve_worker_override(
-            embedding_workers,
-            "LLMLIBRARIAN_EMBEDDING_WORKERS",
-            1,
-        )
-        _batch_add(
-            collection,
-            chunks,
-            batch_size=batch_size,
-            no_color=no_color,
-            embedding_fn=ef,
-            embedding_workers=embedding_workers,
-        )
-        if not image_vectors:
-            vector_row = _image_vector_from_chunks(source_path=path_str, chunks=chunks)
-            if vector_row is not None:
-                vid, vpath, vdoc, vmeta = vector_row
-                image_vectors = [(vid, vpath, vdoc, {**vmeta, "silo": silo_slug})]
-        if image_vectors:
-            _batch_add_image_vectors(
-                image_collection,
-                image_vectors,
-                batch_size=1,
-                no_color=no_color,
+        else:
+            clone_from = next(
+                (str(e.get("silo") or "") for e in existing if str(e.get("silo") or "") != silo_slug),
+                "",
             )
-        if file_hash:
-            _file_registry_add(db_path, file_hash, silo_slug, path_str)
-    tax_rows = extract_tax_rows_from_chunks(chunks) if chunks else []
+            can_clone = bool(clone_from and file_hash)
+            if can_clone and kind == "image":
+                from state import get_silo_image_vision_enabled
+    
+                source_mode = get_silo_image_vision_enabled(db_path, clone_from) if clone_from else None
+                can_clone = source_mode is not None and source_mode == effective_image_vision_enabled
+            if can_clone and clone_from and file_hash:
+                chunks = _clone_chunks_from_existing_silo(
+                    collection=collection,
+                    from_silo=clone_from,
+                    source_path=path_str,
+                    target_silo=silo_slug,
+                )
+                image_vectors = _clone_image_vectors_from_existing_silo(
+                    collection=image_collection,
+                    from_silo=clone_from,
+                    source_path=path_str,
+                    target_silo=silo_slug,
+                )
+            if not chunks:
+                try:
+                    chunks = process_one_file(
+                        p,
+                        kind,
+                        file_hash or None,
+                        follow_symlinks,
+                        p,
+                        db_path=db_path,
+                        image_vision_enabled=effective_image_vision_enabled,
+                    )
+                except Exception:
+                    return ("error", path_str)
+    
+        _delete_source_from_collections(
+            collection=collection,
+            image_collection=image_collection,
+            silo_slug=silo_slug,
+            source_path=path_str,
+        )
+        if prev:
+            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
+    
+        if chunks:
+            _now_iso = datetime.now(timezone.utc).isoformat()
+            chunks = [
+                (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug, "indexed_at": _now_iso})
+                for cid, doc, meta in chunks
+            ]
+            batch_size = ADD_BATCH_SIZE
+            try:
+                batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
+            except (TypeError, ValueError):
+                pass
+            batch_size = max(1, min(batch_size, 2000))
+            embedding_workers = _resolve_worker_override(
+                embedding_workers,
+                "LLMLIBRARIAN_EMBEDDING_WORKERS",
+                1,
+            )
+            _batch_add(
+                collection,
+                chunks,
+                batch_size=batch_size,
+                no_color=no_color,
+                embedding_fn=ef,
+                embedding_workers=embedding_workers,
+            )
+            if not image_vectors:
+                vector_row = _image_vector_from_chunks(source_path=path_str, chunks=chunks)
+                if vector_row is not None:
+                    vid, vpath, vdoc, vmeta = vector_row
+                    image_vectors = [(vid, vpath, vdoc, {**vmeta, "silo": silo_slug})]
+            if image_vectors:
+                _batch_add_image_vectors(
+                    image_collection,
+                    image_vectors,
+                    batch_size=1,
+                    no_color=no_color,
+                )
+            if file_hash:
+                _file_registry_add(db_path, file_hash, silo_slug, path_str)
+        tax_rows = extract_tax_rows_from_chunks(chunks) if chunks else []
+    
+        def _update_manifest(manifest_data: dict) -> None:
+            silos = manifest_data.setdefault("silos", {})
+            silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
+            files_map = silo_entry.setdefault("files", {})
+            if not isinstance(files_map, dict):
+                files_map = {}
+                silo_entry["files"] = files_map
+            files_map[path_str] = {"mtime": mtime, "size": size, "hash": file_hash if kind != "zip" else ""}
+    
+        _update_file_manifest(db_path, _update_manifest)
+        replace_tax_rows_for_sources(
+            db_path,
+            silo=silo_slug,
+            sources={path_str},
+            new_rows=tax_rows,
+        )
 
-    def _update_manifest(manifest_data: dict) -> None:
-        silos = manifest_data.setdefault("silos", {})
-        silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
-        files_map = silo_entry.setdefault("files", {})
-        if not isinstance(files_map, dict):
-            files_map = {}
-            silo_entry["files"] = files_map
-        files_map[path_str] = {"mtime": mtime, "size": size, "hash": file_hash if kind != "zip" else ""}
-
-    _update_file_manifest(db_path, _update_manifest)
-    replace_tax_rows_for_sources(
-        db_path,
-        silo=silo_slug,
-        sources={path_str},
-        new_rows=tax_rows,
-    )
     if update_counts:
         update_silo_counts(db_path, silo_slug)
     return ("updated", path_str)

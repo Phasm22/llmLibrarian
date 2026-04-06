@@ -1,39 +1,18 @@
 # llmLibrarian
 
-Local-first search + reasoning over files you choose to index.
+Local-first search and Q&A over folders you choose to index. Data stays on disk; you pick what becomes a **silo** (one indexed folder per silo).
 
-Your data stays on your machine. You decide what gets indexed. 
-You own the silo.
+This repo is built as **personal infrastructure**: opinionated defaults, my workflows first, and a path for others who want the same shape of tool. It is not positioned as a generic product for every team or OS.
 
-`pal` is the operator-facing CLI — indexing, querying, and keeping 
-the index healthy.
-`llmli` is the direct engine CLI for scripting and lower-level automation.
+**Primary job:** give an LLM **grounded retrieval** over *your* files (chunk text, scores, sources, silo scope)—via the **MCP server** and the same engine the CLI calls. The human shell is mainly **how you build and maintain** that index (pull folders, repair Chroma, inspect coverage), not the only reason the project exists.
 
----
-
-## What This Actually Is
-
-llmLibrarian turns folders into searchable silos, then lets you (or an 
-AI assistant) ask grounded questions against them — with citations back 
-to the source.
-
-The RAG layer is wide by design. It can handle documents, code, journals, 
-PDFs, images, tax records, old schoolwork — whatever you choose to pull in.
-
-But the real value isn't retrieval. It's what you can do *with* retrieval:
-
-- A journal silo becomes a thinking partner that remembers everything 
-  you've written and reads between your lines
-- A project folder becomes an agent that knows your actual codebase, 
-  not a hallucinated version of it
-- A document archive becomes a research assistant that cites before it claims
-- Multiple silos become a unified view across different domains of your life
-
-The tool is wide. What you point it at is up to you.
+- `**pal`** — operator CLI for ingest, health, and occasional direct `ask` when you are not going through an assistant.
+- `**llmli**` — engine CLI for scripting, automation, and low-level debugging.
 
 ---
 
-## Quick Start
+## Quick start
+
 ```bash
 uv venv
 source .venv/bin/activate
@@ -41,106 +20,129 @@ uv sync
 ollama pull llama3.1:8b
 ```
 
-For multimodal image summaries, set a vision-capable Ollama model:
+Optional vision model for image-heavy silos:
+
 ```bash
 export LLMLIBRARIAN_VISION_MODEL=qwen2.5vl:7b
 ```
 
 ---
 
-## Typical Flow
+## Telescope vs pinpoint (query width)
+
+Retrieval behaves differently when you ask **wide** questions (survey the corpus) vs **narrow** ones (one fact, one file, one identifier). Below: same tool, different scopes.
+
+### Wide (telescope) — “what’s going on here?”
+
+Loose language, big picture, often **unified** across silos or a whole folder.
+
+```bash
+# First time: what did I even put in this silo?
+pal ask --in <silo> "what kinds of documents are in here?"
+
+# Patterns across everything you indexed
+pal ask --unified "what themes show up in more than one place?"
+
+# Vague but useful for exploration (still scoped to one silo)
+pal ask --in <silo> "what was I preoccupied with last year?"
+```
+
+### Medium — scoped but still interpretive
+
+You name a silo (or topic) and want synthesis, not a single cell from a spreadsheet.
+
+```bash
+pal ask --in <silo> "summarize decisions about the API redesign"
+pal ask --unified "compare how I describe project A vs project B"
+```
+
+### Narrow (pinpoint) — one place, one answer
+
+Tight language helps: filenames, years, IDs, “where does it say…”. Prefer `**--in**` when you know the silo.
+
+```bash
+# Silo known: reduce noise
+pal ask --in <silo> "where is chroma_shared_lock used?"
+
+# Exact-ish lookup style
+pal ask --in <silo> "what line or box reports total tax for 2023?"
+
+# Shorthand (normalized to --in)
+pal ask in <silo> "W-2 employer name"
+```
+
+**Rule of thumb:** if the answer should cite **one** chunk, ask like a librarian (specific noun + silo). If you want **overview**, ask like a reviewer and expect more breadth and more hedging.
+
+---
+
+## Typical flow
+
 ```bash
 pal pull /path/to/folder
-pal ask --in <silo> "what is this folder mostly about?"
-pal ask --unified "what themes repeat across my indexed folders?"
-pal inspect <silo>
+pal ls
+pal ask --in <silo> "pinpoint or telescope question from above"
+pal inspect <silo> --top 20
 ```
 
-Natural shorthand is supported:
+Unified query (no `--in`):
+
 ```bash
-pal ask in <silo> "what files are from 2022"
+pal ask --unified "telescope-style question only when you mean all silos"
 ```
 
 ---
 
-## Silo Ideas
+## What gets indexed
 
-The tool is only as useful as what you put in it. Some starting points:
+Supported types include common text/code, PDF, DOCX, XLSX, PPTX, ZIPs of those, and optional image/vision paths. See:
 
-**Personal**
-- Daily journal → reflective AI conversations grounded in your actual 
-  writing, not generic advice
-- Notes & ideas → surface patterns and connections you forgot you made
-- Health/habit logs → correlate energy, sleep, and output over time
+```bash
+pal capabilities
+# or
+llmli capabilities
+```
 
-**Professional**
-- Codebase or project folder → grounded code assistance without hallucination
-- Work documents → ask questions across meeting notes, specs, and 
-  decisions without digging manually
-- Research archive → cited answers from your own collected sources
-
-**Multi-silo**
-- Index multiple folders and use `--unified` to ask questions that 
-  cut across all of them
-- Each silo can feed a dedicated AI conversation with its own lens — 
-  same data, different angle of inquiry
+Cloud-sync roots (OneDrive, iCloud, Dropbox, etc.) are **blocked by default**; use `--allow-cloud` only when paths are really local and stable.
 
 ---
 
-## What It Is For
+## Maintenance and health
 
-`pal pull` handles ingest and refresh. Cloud-sync folders are blocked 
-by default; use `--allow-cloud` only if files are fully local and pinned.
+```bash
+pal status
+pal pull --status
+llmli log --last
+```
 
-`pal ask` searches indexed data and cites sources so you can verify 
-the answer.
+Chroma or registry inconsistency (e.g. `Error finding id`, empty silo after a crash): repair re-wipes that silo’s vectors and re-indexes from disk:
 
-`pal capabilities`, `pal log`, `pal status`, and `pal diff` are the 
-main maintenance views — check what changed, what's supported, or 
-whether an index is drifting.
+```bash
+llmli repair <silo>
+```
 
 ---
 
 ## Images and OCR
 
-- PDFs use normal text extraction first.
-- On macOS, OCR fallback order is Vision → PaddleOCR → tesseract.
-- On other platforms: PaddleOCR → tesseract.
-- Multimodal image summaries are off by default. Enable per silo 
-  with `pal pull <path> --image-vision`.
-- Standalone images index as one `image_summary` chunk, zero or more 
-  `image_region` chunks when OCR finds useful text, and one image-vector 
-  row in a sibling image collection.
-- Low-signal OCR gibberish is dropped, not indexed.
-
-If standalone images are present:
-- `LLMLIBRARIAN_VISION_MODEL` required only when `--image-vision` enabled
-- OpenCLIP image embedding dependencies must be installed (`uv sync`)
+- PDFs: text extraction first; OCR fallback chain depends on OS (macOS Vision where available; else PaddleOCR / tesseract).
+- Per-silo multimodal summaries: `pal pull <path> --image-vision` (requires a vision-capable `LLMLIBRARIAN_VISION_MODEL`).
+- Image embedding extras: install with your chosen optional deps / `uv sync` as documented in `pyproject.toml`.
 
 ---
 
 ## Troubleshooting
 
-`Low confidence ...`
-Retrieval was weak or mixed. Scope with `--in`, ask a narrower 
-question, or add better source files.
+**Low confidence / sparse context**  
+Narrow the question, add `--in <silo>`, or improve source files. Retrieval is only as good as what was indexed.
 
-`InternalError: Error finding id` (silo-scoped queries fail)
-ChromaDB index is inconsistent — usually from a partially-interrupted 
-ingest. The retrieve tool will fall back automatically, but to fully 
-fix it: `llmli repair <silo>`. This wipes and re-indexes from the 
-source folder.
+`**InternalError: Error finding id`**  
+Chroma index inconsistency; run `llmli repair <silo>` (full re-index from source folder).
 
-`no extractable text`
-The PDF is scanned/image-only or OCR is unavailable. On macOS, 
-confirm `swiftc` exists. Otherwise install `paddleocr` or `tesseract`.
+`**no extractable text` (PDF)**  
+Likely scan-only PDF or missing OCR. On macOS, `swiftc` for Vision path; otherwise install OCR optional deps.
 
-Standalone image ingest fails
-Set `LLMLIBRARIAN_VISION_MODEL` to a vision-capable Ollama model 
-and run `uv sync`.
+**Wrong binary / old checkout**
 
-Behavior does not match the repo
-Check which binary is running:
 ```bash
 which pal
 which llmli
@@ -150,7 +152,9 @@ uv run python cli.py --help
 
 ---
 
-## More Detail
+## Further reading
 
-- Technical/runtime contracts: [`docs/TECH.md`](docs/TECH.md)
-- Security and test notes: [`SECURITY_AND_TESTING.md`](SECURITY_AND_TESTING.md)
+- Runtime and architecture: `[docs/TECH.md](docs/TECH.md)`
+- Security and testing notes: `[SECURITY_AND_TESTING.md](SECURITY_AND_TESTING.md)`
+- Agent and contributor contracts: `[AGENTS.md](AGENTS.md)`
+
