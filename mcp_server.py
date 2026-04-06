@@ -1,11 +1,17 @@
+import logging
 import os
 import sys
+import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
 _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
+
+_logger = logging.getLogger("llmLibrarian.mcp")
+
 
 def _resolve_db_path() -> str:
     """Resolve DB path, falling back gracefully when env vars contain unresolved templates."""
@@ -91,6 +97,10 @@ mcp = FastMCP(
         "diagnosing missed results or unexpected rankings before re-querying. "
         "Use `add_silo(path=...)` to index a new folder as a silo (equivalent to `llmli add`). "
         "Prefer this over the CLI — no PYTHONPATH setup required. path must be a directory; for a single file, put it in its own folder first. "
+        "Use `watch_coverage` when the user asks what is auto-watched vs indexed-only — read-only summary of pal bookmarks, derived daemon jobs, and silos not in bookmarks. "
+        "Do not substitute `watch_coverage` for index problems: it does not read or fix ChromaDB. "
+        "`repair_silo` = hard reset of vector index data for one silo when the DB/registry is corrupt or wildly inconsistent (then full re-index from disk). "
+        "`trigger_reindex` = incremental re-crawl from disk when files changed; not a bookmark/daemon diagnostic. "
         "Call `health` first if tools are failing — it reports db and model status. "
         "Use `capabilities` to see supported file types."
     ),
@@ -98,12 +108,19 @@ mcp = FastMCP(
 
 
 # ---------------------------------------------------------------------------
-# Helper: release ChromaDB connections after each tool call.
-# Without this, the Rust bindings keep HNSW index files open in write mode,
-# which causes SIGSEGV when a concurrent process (repair, reindex) tries to write.
+# Serializes ALL ChromaDB client use across concurrent MCP tool calls (in-process).
+# Cross-process safety uses flock in src/chroma_lock.py (shared reads, exclusive writes).
+# ChromaDB's Rust HNSW writer is not safe for concurrent use — simultaneous
+# reads and background reindex writes corrupted link_lists.bin to 680 GB.
+_chroma_lock = threading.Lock()
+
+# Last background reindex outcome per silo (for health / debugging).
+_reindex_outcome_lock = threading.Lock()
+_last_reindex_outcome: dict[str, dict] = {}
+
+
 def _release_chroma() -> None:
-    from chroma_client import release
-    release()
+    pass  # kept for call-site compatibility; no-op — singleton client persists
 
 
 # Helper: answer-level confidence signal
@@ -163,37 +180,38 @@ def retrieve(
     """
     from query.core import run_retrieve
     try:
-        result = run_retrieve(
-            query=query,
-            silo=silo,
-            n_results=n_results,
-            section=section,
-            doc_type=doc_type,
-            db_path=_DB_PATH,
-            config_path=_CONFIG_PATH,
-        )
-        chunks = result.get("chunks", [])
+        with _chroma_lock:
+            result = run_retrieve(
+                query=query,
+                silo=silo,
+                n_results=n_results,
+                section=section,
+                doc_type=doc_type,
+                db_path=_DB_PATH,
+                config_path=_CONFIG_PATH,
+            )
+            chunks = result.get("chunks", [])
 
-        # Answer-level confidence signal
-        conf_level, conf_score, coverage_note = _compute_answer_confidence(chunks)
-        result["answer_confidence"] = conf_level
-        result["answer_confidence_score"] = conf_score
-        result["coverage_note"] = coverage_note
+            # Answer-level confidence signal
+            conf_level, conf_score, coverage_note = _compute_answer_confidence(chunks)
+            result["answer_confidence"] = conf_level
+            result["answer_confidence_score"] = conf_score
+            result["coverage_note"] = coverage_note
 
-        # Retrieval signal summary — helps LLM calibrate how to weight chunks
-        lexical_hits = sum(1 for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is not None)
-        vector_hits = sum(1 for c in chunks if (c.get("_signals") or {}).get("vector_rank") is not None)
-        result["lexical_hit_count"] = lexical_hits
-        result["vector_hit_count"] = vector_hits
+            # Retrieval signal summary — helps LLM calibrate how to weight chunks
+            lexical_hits = sum(1 for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is not None)
+            vector_hits = sum(1 for c in chunks if (c.get("_signals") or {}).get("vector_rank") is not None)
+            result["lexical_hit_count"] = lexical_hits
+            result["vector_hit_count"] = vector_hits
 
-        # Cross-silo grouping (only when unscoped)
-        if not silo and chunks:
-            by_silo: dict[str, list] = {}
-            for c in chunks:
-                by_silo.setdefault(c.get("silo", ""), []).append(c)
-            result["chunks_by_silo"] = by_silo
+            # Cross-silo grouping (only when unscoped)
+            if not silo and chunks:
+                by_silo: dict[str, list] = {}
+                for c in chunks:
+                    by_silo.setdefault(c.get("silo", ""), []).append(c)
+                result["chunks_by_silo"] = by_silo
 
-        return {"db_path": _DB_PATH, **result}
+            return {"db_path": _DB_PATH, **result}
     except Exception as e:
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}
     finally:
@@ -224,32 +242,33 @@ def retrieve_bulk(
     seen: set[str] = set()
     all_chunks: list[dict] = []
     errors: list[str] = []
-    for q in queries:
-        try:
-            res = run_retrieve(
-                query=q,
-                silo=silo,
-                n_results=n_results,
-                section=section,
-                doc_type=doc_type,
-                db_path=_DB_PATH,
-                config_path=_CONFIG_PATH,
-            )
-            for chunk in res.get("chunks", []):
-                key = (chunk.get("text") or "")[:200]
-                if key and key not in seen:
-                    seen.add(key)
-                    chunk["query"] = q
-                    all_chunks.append(chunk)
-        except Exception as e:
-            errors.append(f"{q!r}: {type(e).__name__}: {e}")
-    all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
-    truncated = len(all_chunks) > max_total_chunks
-    if truncated:
-        all_chunks = all_chunks[:max_total_chunks]
+    with _chroma_lock:
+        for q in queries:
+            try:
+                res = run_retrieve(
+                    query=q,
+                    silo=silo,
+                    n_results=n_results,
+                    section=section,
+                    doc_type=doc_type,
+                    db_path=_DB_PATH,
+                    config_path=_CONFIG_PATH,
+                )
+                for chunk in res.get("chunks", []):
+                    key = (chunk.get("text") or "")[:200]
+                    if key and key not in seen:
+                        seen.add(key)
+                        chunk["query"] = q
+                        all_chunks.append(chunk)
+            except Exception as e:
+                errors.append(f"{q!r}: {type(e).__name__}: {e}")
+        all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
+        truncated = len(all_chunks) > max_total_chunks
+        if truncated:
+            all_chunks = all_chunks[:max_total_chunks]
 
-    # Feature 6: answer-level confidence on merged results
-    conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
+        # Feature 6: answer-level confidence on merged results
+        conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
 
     _release_chroma()
     return {
@@ -285,65 +304,80 @@ def explain_retrieval(
     """
     from query.core import run_retrieve
     try:
-        result = run_retrieve(
-            query=query,
-            silo=silo,
-            n_results=n_results,
-            db_path=_DB_PATH,
-            config_path=_CONFIG_PATH,
-        )
-        chunks = result.get("chunks", [])
-        method = result.get("retrieval_method", "unknown")
+        with _chroma_lock:
+            result = run_retrieve(
+                query=query,
+                silo=silo,
+                n_results=n_results,
+                db_path=_DB_PATH,
+                config_path=_CONFIG_PATH,
+            )
+            chunks = result.get("chunks", [])
+            method = result.get("retrieval_method", "unknown")
 
-        lexical_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is not None]
-        vector_only_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is None]
+            lexical_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is not None]
+            vector_only_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is None]
 
-        ranked_chunks = []
-        for c in chunks:
-            sig = c.get("_signals") or {}
-            ranked_chunks.append({
-                "rank": c.get("rank"),
-                "score": c.get("score"),
-                "source": c.get("source", ""),
-                "silo": c.get("silo", ""),
-                "text_preview": (c.get("text") or "")[:200],
-                "vector_rank": sig.get("vector_rank"),
-                "lexical_rank": sig.get("lexical_rank"),
-                "rrf_score": sig.get("rrf_score"),
-            })
+            ranked_chunks = []
+            for c in chunks:
+                sig = c.get("_signals") or {}
+                ranked_chunks.append({
+                    "rank": c.get("rank"),
+                    "score": c.get("score"),
+                    "source": c.get("source", ""),
+                    "silo": c.get("silo", ""),
+                    "text_preview": (c.get("text") or "")[:200],
+                    "vector_rank": sig.get("vector_rank"),
+                    "lexical_rank": sig.get("lexical_rank"),
+                    "rrf_score": sig.get("rrf_score"),
+                })
 
-        # Build human-readable signal summary
-        if method == "hybrid":
-            summary_parts = [
-                f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had exact-text matches (lexical_rank set), "
-                f"{len(vector_only_hits)} chunk(s) matched semantically only.",
-            ]
-            if lexical_hits:
-                top_lex = lexical_hits[0]
-                summary_parts.append(
-                    f"Top lexical hit (rank {top_lex['rank']}): {top_lex.get('source','?')} "
-                    f"— score {top_lex.get('score')}"
-                )
-        else:
-            summary_parts = [
-                f"Vector-only retrieval: no exact-text terms were extracted from the query or lexical search returned no results. "
-                f"All {len(chunks)} chunk(s) matched semantically."
-            ]
+            # Build human-readable signal summary
+            if method == "hybrid":
+                summary_parts = [
+                    f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had exact-text matches (lexical_rank set), "
+                    f"{len(vector_only_hits)} chunk(s) matched semantically only.",
+                ]
+                if lexical_hits:
+                    top_lex = lexical_hits[0]
+                    summary_parts.append(
+                        f"Top lexical hit (rank {top_lex['rank']}): {top_lex.get('source','?')} "
+                        f"— score {top_lex.get('score')}"
+                    )
+            else:
+                summary_parts = [
+                    f"Vector-only retrieval: no exact-text terms were extracted from the query or lexical search returned no results. "
+                    f"All {len(chunks)} chunk(s) matched semantically."
+                ]
 
-        return {
-            "db_path": _DB_PATH,
-            "query": query,
-            "intent": result.get("intent"),
-            "retrieval_method": method,
-            "lexical_hit_count": len(lexical_hits),
-            "vector_hit_count": len(vector_only_hits),
-            "signal_summary": " ".join(summary_parts),
-            "ranked_chunks": ranked_chunks,
-        }
+            return {
+                "db_path": _DB_PATH,
+                "query": query,
+                "intent": result.get("intent"),
+                "retrieval_method": method,
+                "lexical_hit_count": len(lexical_hits),
+                "vector_hit_count": len(vector_only_hits),
+                "signal_summary": " ".join(summary_parts),
+                "ranked_chunks": ranked_chunks,
+            }
     except Exception as e:
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "ranked_chunks": []}
     finally:
         _release_chroma()
+
+
+@mcp.tool()
+def watch_coverage() -> dict:
+    """
+    Read-only: pal bookmarks (~/.pal/registry.json) vs indexed silos vs derived watch jobs.
+    Returns bookmark rows (path, resolved_path, silo_slug, path_exists, indexed, would_watch),
+    watch_jobs (what `pal daemon` would sync), service unit file presence when daemon is installed,
+    warnings (skipped bookmarks), and indexed_not_bookmarked (llmli silos with no matching bookmark path).
+    Does not start watchers or modify launchd/systemd.
+    Unrelated to ChromaDB health: for corrupt/zero-chunk index issues use `repair_silo`; for stale content after edits use `trigger_reindex`.
+    """
+    from operations import op_watch_coverage
+    return op_watch_coverage(_DB_PATH)
 
 
 @mcp.tool()
@@ -370,7 +404,8 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
     or verify coverage after indexing. top= limits how many files are returned (default 50).
     """
     from operations import op_inspect_silo
-    result = op_inspect_silo(_DB_PATH, silo, top=top)
+    with _chroma_lock:
+        result = op_inspect_silo(_DB_PATH, silo, top=top)
     _release_chroma()
     return result
 
@@ -384,6 +419,7 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     Returns immediately; the reindex runs in-process (uses the shared ChromaDB client,
     no concurrent-write crash risk). Concurrent calls are serialized via a lock.
     Check list_silos() for updated timestamp after completion.
+    This updates indexed chunks from files; it is not `repair_silo` (no wipe) and not `watch_coverage` (not about pal bookmarks/daemons).
     """
     if not confirm:
         return {
@@ -410,12 +446,28 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
         return {"status": "error", "error": f"source path does not exist: {source_path}"}
 
     def _run_reindex() -> None:
-        with _reindex_lock:
-            try:
-                from ingest import run_add
-                run_add(path=source_path, db_path=_DB_PATH, incremental=True)
-            except Exception:
-                pass
+        err: str | None = None
+        try:
+            with _reindex_lock:
+                with _chroma_lock:
+                    from ingest import run_add
+
+                    run_add(path=source_path, db_path=_DB_PATH, incremental=True)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _logger.exception("trigger_reindex failed silo=%s path=%s", slug, source_path)
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            finished = datetime.now(timezone.utc).isoformat()
+            rec = {
+                "silo": slug,
+                "path": source_path,
+                "finished_at": finished,
+                "ok": err is None,
+                **({"error": err} if err else {}),
+            }
+            with _reindex_outcome_lock:
+                _last_reindex_outcome[slug] = rec
 
     t = threading.Thread(target=_run_reindex, daemon=True)
     t.start()
@@ -424,7 +476,11 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
         "silo": slug,
         "display_name": info.get("display_name", slug),
         "path": source_path,
-        "message": "Reindex running in background thread (in-process, serialized). Call list_silos() after a few minutes to see the updated timestamp.",
+        "message": (
+            "Reindex running in background thread (in-process, serialized). "
+            "Call list_silos() after a few minutes to see the updated timestamp. "
+            "Call health() for last_background_reindex status after completion."
+        ),
     }
 
 
@@ -437,6 +493,7 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
     when a second process opens the same ChromaDB path.
     Requires confirm=True to proceed (safety guard).
     This is synchronous — it blocks until complete (may take a few minutes for large silos).
+    Unrelated to pal auto-watch: for bookmarks/daemon job coverage use `watch_coverage` (read-only).
     """
     if not confirm:
         return {
@@ -446,7 +503,8 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
 
     from operations import op_repair_silo
     try:
-        result = op_repair_silo(_DB_PATH, silo, verbose=False)
+        with _chroma_lock:
+            result = op_repair_silo(_DB_PATH, silo, verbose=False)
         if result.get("status") == "completed":
             result["message"] = (
                 f"Repair complete. {result['files_indexed']} file(s) re-indexed, "
@@ -455,8 +513,6 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
         return result
     except Exception as e:
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
-    finally:
-        _release_chroma()
 
 
 @mcp.tool()
@@ -489,14 +545,15 @@ def add_silo(
 
     try:
         from ingest import run_add
-        files_ok, n_failures = run_add(
-            path=path,
-            db_path=_DB_PATH,
-            forced_silo_slug=silo,
-            display_name_override=display_name,
-            allow_cloud=allow_cloud,
-            incremental=not full,
-        )
+        with _chroma_lock:
+            files_ok, n_failures = run_add(
+                path=path,
+                db_path=_DB_PATH,
+                forced_silo_slug=silo,
+                display_name_override=display_name,
+                allow_cloud=allow_cloud,
+                incremental=not full,
+            )
         from state import resolve_silo_by_path, resolve_silo_to_slug
         slug = (
             resolve_silo_to_slug(_DB_PATH, silo) if silo
@@ -517,18 +574,26 @@ def add_silo(
 @mcp.tool()
 def health() -> dict:
     """
-    Diagnostic check. Returns db_path, db_exists, embedding model, and Python version.
-    Call this first if tools are failing or returning unexpected results.
+    Diagnostic check. Returns db_path, db_exists, embedding model, Python version,
+    and on-disk Chroma layout stats (including HNSW link_lists.bin bloat detection).
+    Call this first if tools are failing, the disk is filling, or Python keeps spawning.
     """
+    from operations import op_db_storage_summary
+
     embedding_model = os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2")
     embedding_kind = os.environ.get("LLMLIBRARIAN_EMBEDDING", "") or "sentence_transformer"
-    return {
+    out: dict = {
         "db_path": _DB_PATH,
         "db_exists": Path(_DB_PATH).exists(),
         "embedding_model": embedding_model,
         "embedding_kind": embedding_kind,
         "python_version": sys.version,
     }
+    if Path(_DB_PATH).is_dir():
+        out["storage"] = op_db_storage_summary(_DB_PATH)
+    with _reindex_outcome_lock:
+        out["last_background_reindex"] = dict(_last_reindex_outcome)
+    return out
 
 
 @mcp.tool()

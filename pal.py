@@ -20,6 +20,8 @@ from pathlib import Path
 
 import typer
 
+from pal_registry import read_pal_registry, write_pal_registry
+
 PAL_HOME = Path(os.environ.get("PAL_HOME", os.path.expanduser("~/.pal")))
 REGISTRY_PATH = PAL_HOME / "registry.json"
 WATCH_LOCKS_DIR = PAL_HOME / "watch_locks"
@@ -532,6 +534,21 @@ def _fmt_int(n: int) -> str:
         return str(n)
 
 
+def _fmt_bytes_iec(n: int) -> str:
+    """Human-readable size using IEC (1024) steps."""
+    try:
+        x = float(int(n))
+    except Exception:
+        return str(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if x < 1024.0 or unit == "TiB":
+            if unit == "B":
+                return f"{int(x):,} B"
+            return f"{x:.2f} {unit}"
+        x /= 1024.0
+    return f"{x:.2f} TiB"
+
+
 def _status_action_for_mismatch(slug: str, registry_files: int, manifest_files: int, path: str | None) -> str:
     if slug == "__adversarial_eval__" and manifest_files == 0:
         return "remove transient eval silo: pal remove __adversarial_eval__"
@@ -567,31 +584,12 @@ def _render_health_summary(
 
 
 def _read_registry() -> dict:
-    """Read the pal registry. Migrates legacy 'sources' key to 'bookmarks' transparently."""
-    empty: dict = {"bookmarks": []}
-    if not REGISTRY_PATH.exists():
-        return empty
-    try:
-        with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return empty
-    # Migrate legacy format: 'sources' → 'bookmarks', strip index-state fields.
-    if "sources" in data and "bookmarks" not in data:
-        raw = data.get("sources") or []
-        data["bookmarks"] = [
-            {k: v for k, v in entry.items() if k in ("path", "name", "silo")}
-            for entry in raw
-            if isinstance(entry, dict) and entry.get("path")
-        ]
-        del data["sources"]
-    return data
+    return read_pal_registry(REGISTRY_PATH)
 
 
 def _write_registry(data: dict) -> None:
     _ensure_pal_home()
-    with open(REGISTRY_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    write_pal_registry(REGISTRY_PATH, data)
 
 
 def _remove_source_path(path: str | Path) -> bool:
@@ -2452,6 +2450,28 @@ def status_command() -> None:
     overlaps = find_path_overlaps(registry)
     mismatches = find_count_mismatches(registry, manifest)
     print(_render_health_summary(registry, dupes, overlaps, mismatches))
+
+    _ensure_src_on_path()
+    from operations import op_db_storage_summary
+
+    stor = op_db_storage_summary(db_path)
+    if "error" not in stor:
+        print()
+        print("On-disk index (Chroma persist folder)")
+        print(f"  Folder size (approx): {_fmt_bytes_iec(int(stor.get('db_total_bytes') or 0))}")
+        if int(stor.get("disk_free_bytes") or -1) >= 0:
+            print(f"  Volume free space: {_fmt_bytes_iec(int(stor['disk_free_bytes']))}")
+        for entry in stor.get("link_lists") or []:
+            p = str(entry.get("path") or "")
+            b = int(entry.get("bytes") or 0)
+            print(f"  link_lists.bin: {_fmt_bytes_iec(b)}")
+            if p:
+                print(f"    ({p})")
+        if stor.get("chroma_hnsw_bloat"):
+            print("  WARNING: HNSW index file is abnormally large.")
+            note = stor.get("chroma_hnsw_bloat_note")
+            if note:
+                print(f"    {note}")
 
     if not (dupes or overlaps or mismatches):
         return

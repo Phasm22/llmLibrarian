@@ -6,10 +6,68 @@ Both cli.py and mcp_server.py call these functions; neither duplicates the logic
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import sys
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+# Chroma HNSW `link_lists.bin` should stay modest for a single-user index.
+# Concurrent writers (multiple processes on one PersistentClient path) can
+# corrupt it to hundreds of GiB; see chroma_lock.py and mcp_server.py _chroma_lock.
+_HNSW_BLOAT_BYTES = 1 << 30  # 1 GiB
+
+
+def op_db_storage_summary(db_path: str) -> dict[str, Any]:
+    """
+    Disk usage under the Chroma persist directory without opening Chroma.
+
+    Surfaces oversized `link_lists.bin` (HNSW) which indicates unsafe concurrent
+    writes or index corruption.
+    """
+    root = Path(db_path).expanduser().resolve()
+    if not root.is_dir():
+        return {"error": f"not a directory: {root}"}
+
+    link_lists: list[dict[str, int | str]] = []
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            fp = Path(dirpath) / fn
+            try:
+                sz = int(fp.stat().st_size)
+            except OSError:
+                continue
+            total += sz
+            if fn == "link_lists.bin":
+                link_lists.append({"path": str(fp), "bytes": sz})
+
+    bloated = any(int(x.get("bytes") or 0) > _HNSW_BLOAT_BYTES for x in link_lists)
+    note: str | None = None
+    if bloated:
+        note = (
+            "At least one link_lists.bin is unusually large — typical cause is multiple "
+            "processes writing the same Chroma path at once (e.g. several `pal pull --watch`, "
+            "plus MCP/llmli). Stop all watchers and extra MCP servers, then repair silos or "
+            "rebuild the DB; see README / mcp_server Chroma lock comment."
+        )
+
+    try:
+        free = int(shutil.disk_usage(root).free)
+    except OSError:
+        free = -1
+
+    return {
+        "db_path": str(root),
+        "db_total_bytes": total,
+        "disk_free_bytes": free,
+        "link_lists": link_lists,
+        "chroma_hnsw_bloat": bloated,
+        "chroma_hnsw_bloat_note": note,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -35,9 +93,12 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
     slug_to_clean = removed_slug if removed_slug is not None else slugify(raw)
 
     chroma_error: str | None = None
+    from chroma_lock import chroma_exclusive_lock
+
     try:
-        coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
-        coll.delete(where={"silo": slug_to_clean})
+        with chroma_exclusive_lock(db_path):
+            coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
+            coll.delete(where={"silo": slug_to_clean})
     except Exception as e:
         chroma_error = str(e)
 
@@ -87,24 +148,27 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
             ),
         }
 
-    if verbose:
-        print(f"[repair] Wiping ChromaDB chunks for silo '{slug}'...")
-    try:
-        coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
-        coll.delete(where={"silo": slug})
-    except Exception as e:
-        msg = f"could not wipe Chroma chunks: {e}"
+    from chroma_lock import chroma_exclusive_lock
+
+    with chroma_exclusive_lock(db_path):
         if verbose:
-            print(f"[repair] Warning: {msg}", file=sys.stderr)
+            print(f"[repair] Wiping ChromaDB chunks for silo '{slug}'...")
+        try:
+            coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
+            coll.delete(where={"silo": slug})
+        except Exception as e:
+            msg = f"could not wipe Chroma chunks: {e}"
+            if verbose:
+                print(f"[repair] Warning: {msg}", file=sys.stderr)
 
-    if verbose:
-        print(f"[repair] Clearing file registry for silo '{slug}'...")
-    _file_registry_remove_silo(db_path, slug)
-    remove_manifest_silo(db_path, slug)
+        if verbose:
+            print(f"[repair] Clearing file registry for silo '{slug}'...")
+        _file_registry_remove_silo(db_path, slug)
+        remove_manifest_silo(db_path, slug)
 
-    if verbose:
-        print(f"[repair] Re-indexing '{source_path}' (full, non-incremental)...")
-    files_ok, n_failures = run_add(path=source_path, db_path=db_path, incremental=False)
+        if verbose:
+            print(f"[repair] Re-indexing '{source_path}' (full, non-incremental)...")
+        files_ok, n_failures = run_add(path=source_path, db_path=db_path, incremental=False)
 
     if verbose:
         print(f"[repair] Done: {files_ok} file(s) re-indexed, {n_failures} failure(s).")
@@ -147,10 +211,13 @@ def op_inspect_silo(db_path: str, slug_or_name: str, top: int = 50) -> dict:
     path = (info or {}).get("path", "")
     total_registry = (info or {}).get("chunks_count", 0)
 
+    from chroma_lock import chroma_shared_lock
+
     try:
-        coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
-        result = coll.get(where={"silo": slug}, include=["metadatas"])
-        metas = result.get("metadatas") or []
+        with chroma_shared_lock(db_path):
+            coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
+            result = coll.get(where={"silo": slug}, include=["metadatas"])
+            metas = result.get("metadatas") or []
     except Exception as e:
         return {"error": f"ChromaDB error: {e}"}
 
@@ -311,4 +378,167 @@ def op_list_silos(db_path: str, check_staleness: bool = False) -> dict:
         "db_exists": Path(db_path).exists(),
         "silo_count": len(silos),
         "silos": silos,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pal bookmarks + daemon watch coverage (read-only, for MCP / diagnostics)
+# ---------------------------------------------------------------------------
+
+def _read_pal_source_registry(pal_home: Path) -> dict[str, Any]:
+    """Load ~/.pal/registry.json shape expected by jobs_runtime.derive_watch_jobs."""
+    path = pal_home / "registry.json"
+    empty: dict[str, Any] = {"bookmarks": []}
+    if not path.exists():
+        return empty
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    if "sources" in data and "bookmarks" not in data:
+        raw = data.get("sources") or []
+        data = dict(data)
+        data["bookmarks"] = [
+            {k: v for k, v in entry.items() if k in ("path", "name", "silo")}
+            for entry in raw
+            if isinstance(entry, dict) and entry.get("path")
+        ]
+        del data["sources"]
+    if "bookmarks" not in data:
+        data["bookmarks"] = []
+    return data
+
+
+def op_watch_coverage(db_path: str | Path, pal_home: str | Path | None = None) -> dict[str, Any]:
+    """
+    Summarize pal bookmarks vs llmli silos vs derived daemon watch jobs (read-only).
+
+    Does not start watchers or mutate launchd/systemd. When daemon metadata exists,
+    reports whether each job's unit file is present on disk.
+    """
+    import jobs_runtime as jobsrt
+    from state import list_silos, resolve_silo_by_path
+
+    db_resolved = str(Path(db_path).resolve())
+    pal_home_p = (
+        Path(pal_home).expanduser().resolve()
+        if pal_home is not None
+        else Path(os.environ.get("PAL_HOME", str(Path.home() / ".pal"))).expanduser().resolve()
+    )
+
+    source_registry = _read_pal_source_registry(pal_home_p)
+    silos_list = list_silos(db_resolved)
+    llmli_registry: dict[str, Any] = {str(s["slug"]): s for s in silos_list if s.get("slug")}
+
+    manager = jobsrt.supported_service_manager() or "launchd"
+    jobs, warnings = jobsrt.derive_watch_jobs(
+        source_registry,
+        llmli_registry,
+        pal_home=pal_home_p,
+        db_path=db_resolved,
+        manager=manager,
+    )
+
+    bookmarks_out: list[dict[str, Any]] = []
+    bookmark_resolved_paths: set[str] = set()
+    for raw in source_registry.get("bookmarks") or []:
+        if not isinstance(raw, dict):
+            continue
+        path_raw = str(raw.get("path") or "").strip()
+        name = raw.get("name")
+        name_str = str(name) if name is not None else ""
+        silo_hint = raw.get("silo")
+        hint_str = str(silo_hint) if silo_hint is not None else None
+
+        resolved: Path | None = None
+        path_exists = False
+        if path_raw:
+            try:
+                resolved = Path(path_raw).expanduser().resolve()
+                path_exists = resolved.exists() and resolved.is_dir()
+            except Exception:
+                resolved = None
+                path_exists = False
+
+        silo_slug: str | None = None
+        if resolved is not None and path_exists:
+            silo_slug = resolve_silo_by_path(db_resolved, resolved)
+        if resolved is not None:
+            bookmark_resolved_paths.add(str(resolved))
+
+        bookmarks_out.append(
+            {
+                "path": path_raw,
+                "resolved_path": str(resolved) if resolved is not None else None,
+                "name": name_str,
+                "silo_hint": hint_str,
+                "silo_slug": silo_slug,
+                "path_exists": path_exists,
+                "indexed": silo_slug is not None,
+                "would_watch": bool(silo_slug) and path_exists,
+            }
+        )
+
+    meta = jobsrt.read_daemon_metadata(pal_home_p)
+    daemon_block: dict[str, Any] = {"installed": meta is not None}
+    if isinstance(meta, dict):
+        daemon_block.update(
+            {
+                "manager": meta.get("manager"),
+                "python_executable": meta.get("python_executable"),
+                "pal_path": meta.get("pal_path"),
+                "workdir": meta.get("workdir"),
+                "db_path": meta.get("db_path"),
+            }
+        )
+
+    service_files: list[dict[str, Any]] = []
+    if isinstance(meta, dict):
+        manager_name = str(meta.get("manager") or "")
+        if manager_name:
+            try:
+                pm = jobsrt.PlatformManager(manager_name)
+                for job in jobs:
+                    unit = pm.desired_path(job.slug)
+                    service_files.append(
+                        {
+                            "slug": job.slug,
+                            "service_name": job.service_name,
+                            "unit_path": str(unit),
+                            "unit_file_exists": unit.exists(),
+                        }
+                    )
+            except ValueError:
+                pass
+
+    indexed_not_bookmarked: list[dict[str, Any]] = []
+    for s in silos_list:
+        sp = s.get("path") or ""
+        if not sp:
+            continue
+        try:
+            norm = str(Path(sp).resolve())
+        except Exception:
+            continue
+        if norm not in bookmark_resolved_paths:
+            indexed_not_bookmarked.append(
+                {
+                    "slug": s.get("slug"),
+                    "display_name": s.get("display_name", s.get("slug")),
+                    "path": sp,
+                }
+            )
+
+    return {
+        "pal_home": str(pal_home_p),
+        "db_path": db_resolved,
+        "daemon": daemon_block,
+        "bookmarks": bookmarks_out,
+        "watch_jobs": [asdict(j) for j in jobs],
+        "service_files": service_files,
+        "warnings": list(warnings),
+        "indexed_not_bookmarked": indexed_not_bookmarked,
     }

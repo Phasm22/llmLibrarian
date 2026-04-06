@@ -390,6 +390,12 @@ def test_available_ocr_backends_prefers_vision_on_darwin(monkeypatch):
     assert processors._available_ocr_backends() == ["vision", "paddleocr", "tesseract"]
 
 
+def test_ocr_backend_none_disables_all_backends(monkeypatch):
+    monkeypatch.setenv("LLMLIBRARIAN_OCR_BACKEND", "none")
+    assert processors._available_ocr_backends() == []
+    assert processors.ocr_backend_chain_for_capabilities() == []
+
+
 def test_pinned_ocr_backend_does_not_fallback(monkeypatch):
     events: list[dict] = []
 
