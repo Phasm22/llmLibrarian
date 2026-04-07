@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 import threading
 import getpass
 import re
@@ -85,6 +86,62 @@ import jobs_runtime as jobsrt
 
 def _ensure_pal_home() -> None:
     PAL_HOME.mkdir(parents=True, exist_ok=True)
+
+
+def _mcpb_hash_path() -> Path:
+    return PAL_HOME / "mcpb_source_hash"
+
+
+def _mcp_server_py_path() -> Path:
+    return (Path(__file__).resolve().parent / "mcp_server.py").resolve()
+
+
+def _read_mcpb_pack_record() -> dict | None:
+    path = _mcpb_hash_path()
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and data.get("sha256"):
+            return data
+    except json.JSONDecodeError:
+        pass
+    if len(raw) == 64 and all(c in "0123456789abcdef" for c in raw.lower()):
+        return {"sha256": raw.lower()}
+    return None
+
+
+def _mcp_server_py_sha256() -> str | None:
+    p = _mcp_server_py_path()
+    try:
+        if not p.is_file():
+            return None
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _warn_mcp_desktop_extension_stale() -> None:
+    current = _mcp_server_py_sha256()
+    if current is None:
+        return
+    rec = _read_mcpb_pack_record()
+    stored = str((rec or {}).get("sha256") or "").lower()
+    if stored == current:
+        return
+    print(
+        "Warning: mcp_server.py has changed since last `pal extension pack` run (or pack was never run). "
+        "Stdio users: run `pal extension pack --record-only` to update the hash. "
+        "Desktop MCP users: re-run your pack command via LLMLIBRARIAN_MCP_PACK_CMD.",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -978,15 +1035,18 @@ def ensure_self_silo(force: bool = False, emit_warning: bool = True) -> int:
             from operations import op_remove_silo
             op_remove_silo(db_path, existing_slug)
         try:
-            from ingest import run_add
-            files_ok, n_failures = run_add(
-                path=repo_str,
-                db_path=db_path,
-                forced_silo_slug="__self__",
-                display_name_override="self",
-                allow_cloud=is_dev,
+            from orchestration.ingest import IngestRequest, run_ingest
+
+            result = run_ingest(
+                IngestRequest(
+                    path=repo_str,
+                    db_path=db_path,
+                    forced_silo_slug="__self__",
+                    display_name="self",
+                    allow_cloud=is_dev,
+                )
             )
-            code = 0 if files_ok >= 0 else 1
+            code = 0 if result.failures == 0 or result.files_indexed > 0 else 1
         except Exception as e:
             print(f"Warning: failed to index self-silo: {e}", file=sys.stderr)
             code = 1
@@ -1511,8 +1571,8 @@ def _pull_path_mode(
     extra_env: dict[str, str] | None = None,
 ) -> int:
     path = Path(path_input).resolve()
-    if not path.is_dir():
-        print(f"Error: not a directory: {path}", file=sys.stderr)
+    if not path.is_dir() and not path.is_file():
+        print(f"Error: not a file or directory: {path}", file=sys.stderr)
         return 1
 
     _ensure_src_on_path()
@@ -1523,33 +1583,27 @@ def _pull_path_mode(
         "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
     }
     merged_env = {**(extra_env or {}), **suppress_env}
-    _prev_env: dict[str, str | None] = {}
-    for k, v in merged_env.items():
-        _prev_env[k] = os.environ.get(k)
-        os.environ[k] = v
     try:
-        from ingest import run_add
+        from orchestration.ingest import IngestRequest, run_ingest
+
         db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
-        files_ok, n_failures = run_add(
-            path=path,
-            db_path=db_path,
-            allow_cloud=allow_cloud,
-            follow_symlinks=follow_symlinks,
-            incremental=not full,
-            image_vision_enabled=image_vision,
-            workers=workers,
-            embedding_workers=embedding_workers,
+        result = run_ingest(
+            IngestRequest(
+                path=path,
+                db_path=db_path,
+                allow_cloud=allow_cloud,
+                follow_symlinks=follow_symlinks,
+                incremental=not full,
+                image_vision_enabled=image_vision,
+                workers=workers,
+                embedding_workers=embedding_workers,
+                extra_env=merged_env,
+            )
         )
-        code = 0 if n_failures == 0 or files_ok > 0 else 1
+        code = 0 if result.failures == 0 or result.files_indexed > 0 else 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         code = 1
-    finally:
-        for k, prev in _prev_env.items():
-            if prev is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = prev
 
     if code == 0:
         _record_source_path(path)
@@ -1701,8 +1755,13 @@ def _pull_status_line(current: int, total: int, name: str, detail: str = "") -> 
         print(line.strip())
 
 
-def _build_pull_env(status_file_path: str) -> dict[str, str]:
-    """Minimize env passthrough for pull subprocesses while keeping runtime essentials."""
+def _build_pull_env(status_file_path: str, *, quiet_subprocess: bool = True) -> dict[str, str]:
+    """Minimize env passthrough for pull subprocesses while keeping runtime essentials.
+
+    When quiet_subprocess is True (default), LLMLIBRARIAN_QUIET=1 hides most ingest chatter—used only
+    if stdout/stderr are captured. For pal pull (all) we stream the child process and set False so
+    llmli add logs are visible live.
+    """
     allow_exact = {
         "PATH", "HOME", "SHELL", "TERM", "LANG", "LC_ALL", "TMPDIR",
         "VIRTUAL_ENV", "OLLAMA_HOST", "NO_PROXY", "HTTP_PROXY", "HTTPS_PROXY",
@@ -1714,7 +1773,11 @@ def _build_pull_env(status_file_path: str) -> dict[str, str]:
     _cli, src = _resolve_llmli_paths()
     _prepend_pythonpath(out, src)
     out["LLMLIBRARIAN_STATUS_FILE"] = status_file_path
-    out["LLMLIBRARIAN_QUIET"] = "1"
+    if quiet_subprocess:
+        out["LLMLIBRARIAN_QUIET"] = "1"
+    else:
+        # Parent shell may set QUIET; streaming pull-all needs live ingest logs.
+        out.pop("LLMLIBRARIAN_QUIET", None)
     return out
 
 
@@ -1732,6 +1795,9 @@ def pull_all_sources(
     if not bookmarks:
         print("No registered folders. Use: pal pull <path>", file=sys.stderr)
         return 1
+    _ensure_src_on_path()
+    from orchestration.ingest import IngestRequest, llmli_add_argv
+
     import tempfile
     is_tty = sys.stderr.isatty()
     total = len(bookmarks)
@@ -1743,30 +1809,31 @@ def pull_all_sources(
         if not path:
             continue
         name = src.get("name") or Path(path).name
-        _pull_status_line(idx, total, name)
+        if is_tty:
+            sys.stderr.write("\033[2K\r")
+            sys.stderr.flush()
+        print(f"\n=== pal pull (all) [{idx}/{total}] {name} ===", file=sys.stderr, flush=True)
+        print(f"    path: {path}", file=sys.stderr, flush=True)
 
-        llmli_args = ["add"]
-        if full:
-            llmli_args.append("--full")
-        if allow_cloud:
-            llmli_args.append("--allow-cloud")
-        if follow_symlinks:
-            llmli_args.append("--follow-symlinks")
-        if image_vision:
-            llmli_args.append("--image-vision")
-        if workers is not None:
-            llmli_args.extend(["--workers", str(workers)])
-        if embedding_workers is not None:
-            llmli_args.extend(["--embedding-workers", str(embedding_workers)])
-        llmli_args.append(path)
+        llmli_args = llmli_add_argv(
+            IngestRequest(
+                path=path,
+                incremental=not full,
+                allow_cloud=allow_cloud,
+                follow_symlinks=follow_symlinks,
+                image_vision_enabled=image_vision,
+                workers=workers,
+                embedding_workers=embedding_workers,
+            )
+        )
 
         status_file = tempfile.NamedTemporaryFile(prefix="llmli_status_", delete=False)
         status_file_path = status_file.name
         status_file.close()
-        env = _build_pull_env(status_file_path)
+        env = _build_pull_env(status_file_path, quiet_subprocess=False)
         cli_path, _src = _resolve_llmli_paths()
         cmd = [sys.executable, str(cli_path)] + llmli_args
-        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        r = subprocess.run(cmd, env=env)
         code = r.returncode
 
         files_indexed = 0
@@ -1784,10 +1851,12 @@ def pull_all_sources(
         if code != 0:
             fail_count += 1
             failed_silos.append(name)
-            _pull_status_line(idx, total, name, "FAILED")
+            print(f"--- pal pull (all): {name} FAILED (exit {code}) ---\n", file=sys.stderr, flush=True)
         elif files_indexed > 0:
             updated_silos.append(f"{name} ({files_indexed} files)")
-            _pull_status_line(idx, total, name, f"+{files_indexed} files")
+            print(f"--- pal pull (all): {name} done (+{files_indexed} files) ---\n", file=sys.stderr, flush=True)
+        else:
+            print(f"--- pal pull (all): {name} done (up to date) ---\n", file=sys.stderr, flush=True)
 
     if is_tty:
         sys.stderr.write("\033[2K\r")
@@ -1989,8 +2058,10 @@ app = typer.Typer(
 )
 daemon_app = typer.Typer(help="Install and manage background silo watchers.", add_completion=False, invoke_without_command=True)
 jobs_app = typer.Typer(help="Inspect derived background jobs.", add_completion=False, invoke_without_command=True)
+extension_app = typer.Typer(help="Claude Desktop MCP packaging (records mcp_server.py hash).", add_completion=False)
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(jobs_app, name="jobs")
+app.add_typer(extension_app, name="extension")
 
 
 @daemon_app.callback()
@@ -2003,6 +2074,54 @@ def daemon_callback(ctx: typer.Context) -> None:
 def jobs_callback(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is None:
         _jobs_ls_impl()
+
+
+@extension_app.command(
+    "pack",
+    help=(
+        "Record sha256 of mcp_server.py for staleness tracking, optionally running a pack command first.\n\n"
+        "Stdio MCP users: run `pal extension pack --record-only` after editing mcp_server.py "
+        "so `pal status` / `pal sync` can warn when the server needs restarting.\n\n"
+        "Desktop MCP users: set LLMLIBRARIAN_MCP_PACK_CMD to your pack/install command "
+        "and run without --record-only."
+    ),
+)
+def extension_pack_command(
+    record_only: bool = typer.Option(
+        False,
+        "--record-only",
+        help="Skip LLMLIBRARIAN_MCP_PACK_CMD; just record the current sha256 of mcp_server.py.",
+    ),
+) -> None:
+    _ensure_pal_home()
+    if not record_only:
+        cmd = (os.environ.get("LLMLIBRARIAN_MCP_PACK_CMD") or "").strip()
+        if not cmd:
+            print(
+                "Error: set LLMLIBRARIAN_MCP_PACK_CMD to your pack/install command, then re-run.",
+                file=sys.stderr,
+            )
+            print(
+                "Tip: for stdio users who only need staleness tracking, use --record-only instead.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(code=2)
+        repo_root = Path(__file__).resolve().parent
+        r = subprocess.run(cmd, shell=True, cwd=str(repo_root))
+        if r.returncode != 0:
+            raise typer.Exit(code=r.returncode)
+    mcp_py = _mcp_server_py_path()
+    digest = _mcp_server_py_sha256()
+    if digest is None:
+        print(f"Error: cannot hash mcp_server.py at {mcp_py}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    record = {
+        "sha256": digest,
+        "path": str(mcp_py),
+        "packed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _mcpb_hash_path().write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    print(f"Recorded MCP server source hash in {_mcpb_hash_path()}")
 
 
 def _exit(rc: int) -> None:
@@ -2219,6 +2338,7 @@ def remove_command(
 
 @app.command("sync", help="Re-index the project's own source (dev mode).")
 def sync_command() -> None:
+    _warn_mcp_desktop_extension_stale()
     _exit(ensure_self_silo(force=True))
 
 
@@ -2433,6 +2553,7 @@ def diff_command(
 @app.command("status", help="Quick health check.")
 def status_command() -> None:
     _ensure_src_on_path()
+    _warn_mcp_desktop_extension_stale()
     from silo_audit import (
         load_registry,
         load_manifest,

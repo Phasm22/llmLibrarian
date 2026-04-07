@@ -21,7 +21,7 @@ def test_ensure_self_silo_adds_when_missing(monkeypatch):
     def _fake_write_registry(reg):
         saved.append(reg)
 
-    monkeypatch.setattr("ingest.run_add", _fake_run_add)
+    monkeypatch.setattr("orchestration.ingest.run_add", _fake_run_add)
     monkeypatch.setattr("pal._write_registry", _fake_write_registry)
 
     rc = pal.ensure_self_silo(force=True)
@@ -77,7 +77,7 @@ def test_ensure_self_silo_reindexes_when_slug_differs(monkeypatch):
         "operations.op_remove_silo",
         lambda _db, slug: remove_calls.append(slug) or {"removed_slug": slug, "cleaned_slug": slug, "not_found": False},
     )
-    monkeypatch.setattr("ingest.run_add", lambda *_a, **_k: (5, 0))
+    monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._write_registry", lambda _reg: None)
 
     rc = pal.ensure_self_silo(force=True)

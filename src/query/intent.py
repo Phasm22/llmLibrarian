@@ -83,9 +83,9 @@ def route_intent(query: str) -> str:
     if (
         re.search(
             r"\b("
-            r"structure|folder\s+outline|outline|directory|layout|snapshot|"
+            r"(?:file|folder|directory)\s+structure|folder\s+outline|directory|layout|snapshot|"
             r"recent\s+(?:changes?|files?)|what\s+changed\s+recently|"
-            r"file\s+types?|extensions?|inventory"
+            r"file\s+types?|file\s+extensions?|inventory"
             r")\b",
             q,
         )
@@ -194,8 +194,16 @@ def route_intent(query: str) -> str:
     # PROJECT_COUNT: how many coding projects in this folder/silo
     if re.search(r"\bhow\s+(many|much)\b", q) and re.search(r"\bprojects?\b", q):
         return INTENT_PROJECT_COUNT
-    # REFLECT: analyze / reflect on a pasted entry (often short or pasted)
-    if re.search(r"\breflect(?:ive)?\b|\bsummarize\s+this\b|\banalyze\s+this\b", q) and len(q) < 120:
+    # REFLECT: analyze / reflect on a pasted entry (often short or pasted).
+    # Avoid bare "reflect" — it fires on meta questions about INTENT_REFLECT / routing.
+    if (
+        re.search(
+            r"\breflect\s+on\b|\breflect\s+upon\b|\breflective\s+writer\b|"
+            r"\bsummarize\s+this\b|\banalyze\s+this\b",
+            q,
+        )
+        and len(q) < 120
+    ):
         return INTENT_REFLECT
     # EVIDENCE_PROFILE: abstract self-questions needing wide cross-entry synthesis.
     # These are identity/pattern questions that require scanning many entries, not just keyword hits.

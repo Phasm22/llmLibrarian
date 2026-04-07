@@ -74,6 +74,11 @@ def test_route_intent_self_reflective_writer_query():
     assert route_intent("what kind of reflective writer am i") == INTENT_REFLECT
 
 
+def test_route_intent_meta_question_about_reflect_intent_is_not_reflect():
+    q = "how does intent routing decide between reflect and evidence_profile?"
+    assert route_intent(q) == INTENT_LOOKUP
+
+
 def test_route_intent_evidence_profile_query():
     assert route_intent("what do i like about this project?") == INTENT_EVIDENCE_PROFILE
 

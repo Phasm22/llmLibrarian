@@ -212,15 +212,17 @@ def test_cmd_add_honors_env_db_path(monkeypatch, tmp_path: Path):
     target_dir.mkdir(parents=True, exist_ok=True)
     seen = {}
 
-    def _fake_run_add(path, **kwargs):
-        seen["path"] = path
-        seen["kwargs"] = kwargs
+    def _fake_run_ingest(request):
+        seen["path"] = request.path
+        seen["db_path"] = request.db_path
+        seen["image_vision_enabled"] = request.image_vision_enabled
+        seen["workers"] = request.workers
+        seen["embedding_workers"] = request.embedding_workers
+        from orchestration.ingest import IngestResult
 
-    fake_ingest = SimpleNamespace(
-        run_add=_fake_run_add,
-        CloudSyncPathError=RuntimeError,
-    )
-    monkeypatch.setitem(sys.modules, "ingest", fake_ingest)
+        return IngestResult(files_indexed=1, failures=0, silo_slug=None)
+
+    monkeypatch.setattr("orchestration.ingest.run_ingest", _fake_run_ingest)
     env_db = tmp_path / "dbdir"
     monkeypatch.setenv("LLMLIBRARIAN_DB", str(env_db))
     args = argparse.Namespace(
@@ -240,7 +242,7 @@ def test_cmd_add_honors_env_db_path(monkeypatch, tmp_path: Path):
     rc = cli.cmd_add(args)
     assert rc == 0
     assert str(seen["path"]) == str(target_dir.resolve())
-    assert seen["kwargs"]["db_path"] == env_db
-    assert seen["kwargs"]["image_vision_enabled"] is False
-    assert seen["kwargs"]["workers"] == 5
-    assert seen["kwargs"]["embedding_workers"] == 3
+    assert seen["db_path"] == env_db
+    assert seen["image_vision_enabled"] is False
+    assert seen["workers"] == 5
+    assert seen["embedding_workers"] == 3

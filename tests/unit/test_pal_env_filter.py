@@ -15,6 +15,14 @@ def test_build_pull_env_filters_unrelated_vars(monkeypatch):
     assert "RANDOM_UNSAFE_VAR" not in env
 
 
+def test_build_pull_env_streaming_omits_quiet(monkeypatch):
+    monkeypatch.setenv("LLMLIBRARIAN_DB", "/tmp/db")
+    monkeypatch.setenv("LLMLIBRARIAN_QUIET", "1")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = _build_pull_env("/tmp/status.json", quiet_subprocess=False)
+    assert "LLMLIBRARIAN_QUIET" not in env
+
+
 def test_run_llmli_prefers_workspace_cli_and_sets_pythonpath(monkeypatch, tmp_path):
     workspace = tmp_path / "repo"
     workspace.mkdir()

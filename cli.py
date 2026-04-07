@@ -118,26 +118,29 @@ def _truncate_mid(text: str, max_len: int) -> str:
 
 def cmd_add(args: argparse.Namespace) -> int:
     """Index a folder into the unified llmli collection; silo name = basename(path)."""
-    from ingest import run_add
     from ingest import CloudSyncPathError
+    from orchestration.ingest import IngestRequest, run_ingest
+
     path = Path(args.path).resolve()
     db = _db_path(args)
-    if not path.is_dir():
-        print(f"Error: not a directory: {path}", file=sys.stderr)
+    if not path.is_dir() and not path.is_file():
+        print(f"Error: not a file or directory: {path}", file=sys.stderr)
         return 1
     try:
-        run_add(
-            path,
-            db_path=db,
-            no_color=args.no_color,
-            allow_cloud=getattr(args, "allow_cloud", False),
-            follow_symlinks=getattr(args, "follow_symlinks", False),
-            incremental=not getattr(args, "full", False),
-            forced_silo_slug=getattr(args, "silo", None),
-            display_name_override=getattr(args, "display_name", None),
-            image_vision_enabled=getattr(args, "image_vision", None),
-            workers=getattr(args, "workers", None),
-            embedding_workers=getattr(args, "embedding_workers", None),
+        run_ingest(
+            IngestRequest(
+                path=path,
+                db_path=db,
+                no_color=args.no_color,
+                allow_cloud=getattr(args, "allow_cloud", False),
+                follow_symlinks=getattr(args, "follow_symlinks", False),
+                incremental=not getattr(args, "full", False),
+                forced_silo_slug=getattr(args, "silo", None),
+                display_name=getattr(args, "display_name", None),
+                image_vision_enabled=getattr(args, "image_vision", None),
+                workers=getattr(args, "workers", None),
+                embedding_workers=getattr(args, "embedding_workers", None),
+            )
         )
         return 0
     except CloudSyncPathError as e:

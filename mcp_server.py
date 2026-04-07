@@ -81,9 +81,8 @@ mcp = FastMCP(
         "Use `inspect_silo` to see per-file chunk counts — useful to diagnose coverage gaps or zero-chunk files. "
         "Use `trigger_reindex(silo=..., confirm=True)` to re-index a registered silo in the background when "
         "source files have changed. Only works on already-registered paths. "
-        "WARNING: both `trigger_reindex` and `llmli repair` re-crawl the source folder — files no longer present at their original path will be silently dropped from the silo. "
-        "Use `repair_silo(silo=..., confirm=True)` for ChromaDB index corruption/inconsistency errors (e.g. 0-chunk silo, 'Error finding id' errors) — it does a hard wipe + full non-incremental re-index in-process (safe). "
-        "Use `trigger_reindex` when source files have changed and you want to update the index incrementally. "
+        "WARNING: reindex/repair re-crawl from disk — missing files at the original path are dropped from the silo. "
+        "Use `repair_silo(silo=..., confirm=True)` for Chroma corruption ('Error finding id', 0-chunk silo); use `trigger_reindex` for normal refresh after file changes. "
         "`retrieve` responses include `answer_confidence` (high/medium/low), `answer_confidence_score`, and "
         "`coverage_note` — use these to calibrate how much to hedge your answer. When no silo filter is passed, "
         "`retrieve` also returns `chunks_by_silo` grouping results by silo for provenance reasoning. "
@@ -92,11 +91,13 @@ mcp = FastMCP(
         "When `lexical_rank` is non-null, the chunk matched the query text exactly — weight it highly for precise "
         "factual lookups (IDs, error codes, config keys, exact names). When only `vector_rank` is set, the chunk "
         "matched semantically. The top-level `retrieval_method` field ('hybrid' or 'vector_only') tells you which "
-        "path fired overall; `lexical_hit_count` and `vector_hit_count` give the breakdown. "
+        "path fired overall; `lexical_hit_count` counts chunks with an exact-text match (`lexical_rank`); "
+        "`vector_hit_count` counts chunks that appeared in semantic ranking (`vector_rank`). "
+        "For hybrid diagnostics, prefer `explain_retrieval` (`vector_only_chunk_count` vs `chunk_with_vector_rank_count`). "
         "Use `explain_retrieval` to get a structured breakdown of why results ranked as they did — useful for "
         "diagnosing missed results or unexpected rankings before re-querying. "
-        "Use `add_silo(path=...)` to index a new folder as a silo (equivalent to `llmli add`). "
-        "Prefer this over the CLI — no PYTHONPATH setup required. path must be a directory; for a single file, put it in its own folder first. "
+        "Use `add_silo(path=...)` to index a path as a silo (equivalent to `llmli add`). "
+        "Prefer this over the CLI — no PYTHONPATH setup required. path may be a directory or a single file (same rules as `llmli add`). "
         "Use `watch_coverage` when the user asks what is auto-watched vs indexed-only — read-only summary of pal bookmarks, derived daemon jobs, and silos not in bookmarks. "
         "Do not substitute `watch_coverage` for index problems: it does not read or fix ChromaDB. "
         "`repair_silo` = hard reset of vector index data for one silo when the DB/registry is corrupt or wildly inconsistent (then full re-index from disk). "
@@ -242,9 +243,9 @@ def retrieve_bulk(
     seen: set[str] = set()
     all_chunks: list[dict] = []
     errors: list[str] = []
-    with _chroma_lock:
-        for q in queries:
-            try:
+    for q in queries:
+        try:
+            with _chroma_lock:
                 res = run_retrieve(
                     query=q,
                     silo=silo,
@@ -254,21 +255,21 @@ def retrieve_bulk(
                     db_path=_DB_PATH,
                     config_path=_CONFIG_PATH,
                 )
-                for chunk in res.get("chunks", []):
-                    key = (chunk.get("text") or "")[:200]
-                    if key and key not in seen:
-                        seen.add(key)
-                        chunk["query"] = q
-                        all_chunks.append(chunk)
-            except Exception as e:
-                errors.append(f"{q!r}: {type(e).__name__}: {e}")
-        all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
-        truncated = len(all_chunks) > max_total_chunks
-        if truncated:
-            all_chunks = all_chunks[:max_total_chunks]
+            for chunk in res.get("chunks", []):
+                key = (chunk.get("text") or "")[:200]
+                if key and key not in seen:
+                    seen.add(key)
+                    chunk["query"] = q
+                    all_chunks.append(chunk)
+        except Exception as e:
+            errors.append(f"{q!r}: {type(e).__name__}: {e}")
+    all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
+    truncated = len(all_chunks) > max_total_chunks
+    if truncated:
+        all_chunks = all_chunks[:max_total_chunks]
 
-        # Feature 6: answer-level confidence on merged results
-        conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
+    # Feature 6: answer-level confidence on merged results
+    conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
 
     _release_chroma()
     return {
@@ -297,7 +298,10 @@ def explain_retrieval(
 
     Returns:
     - retrieval_method: 'hybrid' (vector + lexical RRF) or 'vector_only'
-    - lexical_hit_count / vector_hit_count: how many chunks came from each signal
+    - lexical_hit_count: chunks with lexical_rank set (exact-text match)
+    - vector_only_chunk_count: chunks with no lexical_rank (semantic-only in this result set)
+    - chunk_with_vector_rank_count: chunks that participated in vector ranking (includes hybrid rows)
+    - vector_hit_count: deprecated alias for vector_only_chunk_count
     - ranked_chunks: each chunk with its _signals (vector_rank, lexical_rank, rrf_score),
       score, source, and a short text preview
     - signal_summary: plain-text explanation of what signals fired and why
@@ -317,6 +321,9 @@ def explain_retrieval(
 
             lexical_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is not None]
             vector_only_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is None]
+            with_vector_rank = sum(
+                1 for c in chunks if (c.get("_signals") or {}).get("vector_rank") is not None
+            )
 
             ranked_chunks = []
             for c in chunks:
@@ -335,8 +342,9 @@ def explain_retrieval(
             # Build human-readable signal summary
             if method == "hybrid":
                 summary_parts = [
-                    f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had exact-text matches (lexical_rank set), "
-                    f"{len(vector_only_hits)} chunk(s) matched semantically only.",
+                    f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had exact-text matches (lexical_rank set); "
+                    f"{with_vector_rank} chunk(s) have vector_rank (semantic ranking); "
+                    f"{len(vector_only_hits)} chunk(s) are semantic-only in this set (no lexical_rank).",
                 ]
                 if lexical_hits:
                     top_lex = lexical_hits[0]
@@ -356,6 +364,8 @@ def explain_retrieval(
                 "intent": result.get("intent"),
                 "retrieval_method": method,
                 "lexical_hit_count": len(lexical_hits),
+                "vector_only_chunk_count": len(vector_only_hits),
+                "chunk_with_vector_rank_count": with_vector_rank,
                 "vector_hit_count": len(vector_only_hits),
                 "signal_summary": " ".join(summary_parts),
                 "ranked_chunks": ranked_chunks,
@@ -524,36 +534,36 @@ def add_silo(
     full: bool = False,
 ) -> dict:
     """
-    Index a folder as a new silo (or update an existing one). Equivalent to `llmli add <path>`.
-    path must be a directory — individual files are not supported (put the file in its own folder first).
-    silo: optional slug override (default: folder basename, slugified).
+    Index a file or folder as a new silo (or update an existing one). Equivalent to `llmli add <path>`.
+    silo: optional slug override (default: basename, slugified).
     display_name: optional human-readable name override.
     allow_cloud: set True to allow OneDrive/iCloud/Dropbox paths (blocked by default).
     full: set True to force a full non-incremental reindex (default: incremental).
-    Runs synchronously — large folders may take a while. Returns files_indexed and failure count.
+    Runs synchronously — large trees may take a while. Returns files_indexed and failure count.
     """
     from pathlib import Path as _Path
 
     p = _Path(path)
     if not p.exists():
         return {"status": "error", "error": f"path does not exist: {path}"}
-    if not p.is_dir():
-        return {
-            "status": "error",
-            "error": f"path must be a directory, not a file: {path}. Put the file in its own folder first.",
-        }
+    if not p.is_dir() and not p.is_file():
+        return {"status": "error", "error": f"path must be a file or directory: {path}"}
 
     try:
-        from ingest import run_add
+        from orchestration.ingest import IngestRequest, run_ingest
+
         with _chroma_lock:
-            files_ok, n_failures = run_add(
-                path=path,
-                db_path=_DB_PATH,
-                forced_silo_slug=silo,
-                display_name_override=display_name,
-                allow_cloud=allow_cloud,
-                incremental=not full,
+            result = run_ingest(
+                IngestRequest(
+                    path=path,
+                    db_path=_DB_PATH,
+                    forced_silo_slug=silo,
+                    display_name=display_name,
+                    allow_cloud=allow_cloud,
+                    incremental=not full,
+                )
             )
+        files_ok, n_failures = result.files_indexed, result.failures
         from state import resolve_silo_by_path, resolve_silo_to_slug
         slug = (
             resolve_silo_to_slug(_DB_PATH, silo) if silo

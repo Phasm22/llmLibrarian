@@ -56,7 +56,7 @@ pal ask --in <silo> "query"
 - `tests/fixtures/sample_silo/` — Sample files (md, txt, py, json) for quick add/ask testing
 
 **Data flow:**
-1. `add` → collect files → chunk (line-aware, 1000 chars, 100 overlap) → extract text (pymupdf/python-docx/openpyxl/python-pptx) → embed → ChromaDB
+1. `add` → collect files → chunk (line-aware, 1000 chars, 150 overlap) → extract text (pymupdf/python-docx/openpyxl/python-pptx) → embed → ChromaDB
 2. `ask` → intent route → retrieve from ChromaDB (with optional silo filter) → diversify (max 4 chunks/file) → optional rerank → build prompt → Ollama → styled output with sources
 
 **Storage:**
@@ -77,7 +77,7 @@ pal ask --in <silo> "query"
 - `LLMLIBRARIAN_MODEL` — Ollama model (default: `llama3.1:8b`)
 - `LLMLIBRARIAN_TRACE` — JSON-lines trace file for debugging
 - `LLMLIBRARIAN_RERANK=1` — Enable cross-encoder reranker
-- `LLMLIBRARIAN_CHUNK_SIZE` / `LLMLIBRARIAN_CHUNK_OVERLAP` — Tuning (default: 1000/100)
+- `LLMLIBRARIAN_CHUNK_SIZE` / `LLMLIBRARIAN_CHUNK_OVERLAP` — Tuning (default: 1000/150)
 
 ## Configuration
 

@@ -13,6 +13,9 @@ Other env vars:
                                         384-dim, uses CoreML EP automatically on macOS)
   - LLMLIBRARIAN_EMBEDDING_MODEL    -> override model name (default: all-mpnet-base-v2)
   - LLMLIBRARIAN_MPS_BATCH_THRESHOLD -> chunk count above which MPS is preferred (default: 24)
+  - LLMLIBRARIAN_LARGE_INGEST_FILE_THRESHOLD -> during `add`/`pull`, if the file list is at least this
+    many entries and auto device would be MPS, pin embeddings to CPU so parallel workers (default 8)
+    are safe. Set to 0 to disable. Default: 400.
 """
 import os
 from typing import Any
@@ -52,12 +55,33 @@ def _best_device(batch_size: int | None = None) -> str:
     return "cpu"
 
 
-def get_embedding_function(batch_size: int | None = None) -> Any:
+def ingest_parallel_embedding_device(file_count: int) -> str | None:
+    """
+    For large multi-file ingests on Apple Silicon, auto device picks MPS, but ingest then
+    forces embedding_workers=1 (MPS is not thread-safe). Prefer CPU for those runs so
+    multiple embedding threads can run without overriding the user's device env.
+    """
+    if os.environ.get("LLMLIBRARIAN_EMBEDDING_DEVICE", "").strip():
+        return None
+    try:
+        thresh = int(os.environ.get("LLMLIBRARIAN_LARGE_INGEST_FILE_THRESHOLD", "400"))
+    except (TypeError, ValueError):
+        thresh = 400
+    if thresh <= 0 or file_count < thresh:
+        return None
+    batch_hint = max(file_count, 64)
+    if _best_device(batch_size=batch_hint) != "mps":
+        return None
+    return "cpu"
+
+
+def get_embedding_function(batch_size: int | None = None, device: str | None = None) -> Any:
     """
     Return a Chroma-compatible embedding function for indexing and query.
 
     Pass batch_size when known (e.g. number of chunks to embed) so the
     function can pick the optimal device for the workload.
+    If device is set (e.g. "cpu" from ingest_parallel_embedding_device), it overrides auto selection.
     """
     from chromadb.utils import embedding_functions
     kind = os.environ.get("LLMLIBRARIAN_EMBEDDING", "").lower()
@@ -66,5 +90,5 @@ def get_embedding_function(batch_size: int | None = None) -> Any:
         # use CoreMLExecutionProvider on macOS when available.
         return embedding_functions.DefaultEmbeddingFunction()
     model = os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2")
-    device = _best_device(batch_size)
-    return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model, device=device)
+    resolved = device if device is not None else _best_device(batch_size)
+    return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model, device=resolved)

@@ -7,7 +7,7 @@ This repo is built as **personal infrastructure**: opinionated defaults, my work
 **Primary job:** give an LLM **grounded retrieval** over *your* files (chunk text, scores, sources, silo scope)—via the **MCP server** and the same engine the CLI calls. The human shell is mainly **how you build and maintain** that index (pull folders, repair Chroma, inspect coverage), not the only reason the project exists.
 
 - `**pal`** — operator CLI for ingest, health, and occasional direct `ask` when you are not going through an assistant.
-- `**llmli**` — engine CLI for scripting, automation, and low-level debugging.
+- `**llmli`** — engine CLI for scripting, automation, and low-level debugging.
 
 ---
 

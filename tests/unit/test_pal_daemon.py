@@ -13,7 +13,7 @@ runner = CliRunner()
 def test_pull_path_mode_syncs_daemon_when_installed(monkeypatch):
     seen = {"sync": 0}
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
-    monkeypatch.setattr("ingest.run_add", lambda *_a, **_k: (5, 0))
+    monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
     monkeypatch.setattr("pal._daemon_is_installed", lambda: True)
     monkeypatch.setattr("pal._sync_daemon_services", lambda emit_output=False: seen.__setitem__("sync", seen["sync"] + 1) or 0)

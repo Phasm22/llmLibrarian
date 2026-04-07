@@ -89,9 +89,7 @@ ADD_DEFAULT_EXCLUDE = [
 ]
 
 # Code-file extensions for language_stats (CODE_LANGUAGE pipeline). Excludes .md, .txt, .pdf, .docx.
-ADD_CODE_EXTENSIONS = frozenset(
-    {".py", ".js", ".ts", ".tsx", ".jsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".rb", ".sh", ".bash", ".zsh", ".php", ".kt", ".sql"}
-)
+from doc_type_taxonomy import CODE_EXTENSIONS as ADD_CODE_EXTENSIONS, doc_type_bucket_for_extension
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"})
 _PREVIEW_SKIPPED_EXTENSIONS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".wav", ".mp3", ".aac"})
 # Text extensions we decode as UTF-8 when found inside ZIPs (no binary handling).
@@ -162,20 +160,30 @@ def _doc_type_from_path(path_str: str) -> str:
         return "homework"
     if "paper" in p or "essay" in p:
         return "paper"
+    bucket = doc_type_bucket_for_extension(Path(path_str or "").suffix.lower())
+    if bucket != "other":
+        return bucket
     return "other"
 
 
 # Content-first doc_type: override path-based when first 500 chars match (e.g. "Form 1040" → tax_return)
 CONTENT_SAMPLE_LEN = 500
+# Prose docs often cite tax tokens in examples (README W-2); skip content-only tax_return for these.
+_DOC_TYPE_MARKDOWN_LIKE_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".mdx"})
 
 
-def _doc_type_from_content(sample: str) -> str:
+def _doc_type_from_content(sample: str, path_suffix: str = "") -> str:
     """Categorize from first N chars (e.g. Form 1040 → tax_return). Overrides path when not 'other'."""
     s = (sample or "").replace("\r", " ").replace("\n", " ")[:CONTENT_SAMPLE_LEN]
     if not s.strip():
         return "other"
-    # Tax forms / returns
-    if re.search(r"\bForm\s+1040\b|Schedule\s+[A-C]\b|W-2|1099|IRS|adjusted\s+gross\s+income\b", s, re.IGNORECASE):
+    suf = (path_suffix or "").lower()
+    # Tax forms / returns (not from markdown-like sources — avoids README/documentation false positives)
+    if suf not in _DOC_TYPE_MARKDOWN_LIKE_SUFFIXES and re.search(
+        r"\bForm\s+1040\b|Schedule\s+[A-C]\b|W-2|1099|IRS|adjusted\s+gross\s+income\b",
+        s,
+        re.IGNORECASE,
+    ):
         return "tax_return"
     # Transcript / academic record (use specific transcript anchors; avoid broad course-planning docs)
     if re.search(
@@ -615,7 +623,7 @@ def _chunks_from_content(
     extra_meta: dict[str, Any] | None = None,
 ) -> list[ChunkTuple]:
     """Build chunk list (id, doc, meta). doc_type from content (first 500 chars) overrides path when not 'other'."""
-    content_type = _doc_type_from_content(text[:CONTENT_SAMPLE_LEN])
+    content_type = _doc_type_from_content(text[:CONTENT_SAMPLE_LEN], Path(source_path).suffix.lower())
     doc_type = content_type if content_type != "other" else _doc_type_from_path(source_path)
 
     # Build line→section map from §SECTION: ...§ markers before chunking
@@ -665,7 +673,9 @@ def _image_parent_id(source_path: str, file_hash: str | None, mtime: float) -> s
 
 def _image_doc_type_from_text(source_path: str, *parts: str) -> str:
     sample = "\n".join(part for part in parts if part).strip()
-    content_type = _doc_type_from_content(sample[:CONTENT_SAMPLE_LEN])
+    content_type = _doc_type_from_content(
+        sample[:CONTENT_SAMPLE_LEN], Path(source_path).suffix.lower()
+    )
     return content_type if content_type != "other" else _doc_type_from_path(source_path)
 
 
@@ -1094,7 +1104,9 @@ def _chunks_from_pdf_pages(
         first_page_text = pages[0].text[:CONTENT_SAMPLE_LEN]
     else:
         first_page_text = (pages[0][0] if pages else "")[:CONTENT_SAMPLE_LEN]
-    content_type = _doc_type_from_content(first_page_text)
+    content_type = _doc_type_from_content(
+        first_page_text, Path(source_path).suffix.lower()
+    )
     doc_type = content_type if content_type != "other" else _doc_type_from_path(source_path)
     out: list[ChunkTuple] = []
     for page in pages:
@@ -2165,13 +2177,17 @@ def run_add(
         8,
     )
     # MPS (Apple Silicon) is not thread-safe for concurrent inference; cap to 1
-    # to prevent heap corruption when multiple threads call into PyTorch/MPS.
-    # CPU and CUDA handle concurrent calls safely.
-    # Use the same device logic as get_embedding_function() so that if
-    # batch_size is below the MPS threshold (we routed to CPU), we don't
-    # unnecessarily cap workers to 1.
+    # when embeddings run on MPS. Large multi-file ingests force CPU instead so
+    # parallel embedding workers stay enabled (see ingest_parallel_embedding_device).
     from embeddings import _best_device as _pick_device
-    if _pick_device(batch_size=len(file_list) or 64) == "mps":
+    from embeddings import ingest_parallel_embedding_device
+
+    _ingest_embed_device = ingest_parallel_embedding_device(len(file_list))
+    _embed_batch_hint = len(file_list) or 64
+    _effective_embed_device = (
+        _ingest_embed_device if _ingest_embed_device is not None else _pick_device(batch_size=_embed_batch_hint)
+    )
+    if _effective_embed_device == "mps":
         embedding_workers = 1
 
     if not quiet:
@@ -2182,7 +2198,10 @@ def run_add(
 
     def _run_add_chroma_phase() -> tuple[int, int]:
         nonlocal incremental
-        ef = get_embedding_function(batch_size=len(file_list) or 64)
+        ef = get_embedding_function(
+            batch_size=len(file_list) or 64,
+            device=_ingest_embed_device,
+        )
         _gc = get_chroma_client or get_client
         client = _gc(str(db_path))
         collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)

@@ -10,7 +10,8 @@ LLMLI_IMAGE_COLLECTION = "llmli_image"
 
 # Chunking
 CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 100
+# ~15% of CHUNK_SIZE; reduces boundary splits vs 10% (100) for sentence/code continuity.
+CHUNK_OVERLAP = 150
 
 # Ingestion
 ADD_BATCH_SIZE = 256
