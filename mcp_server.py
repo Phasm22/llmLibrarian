@@ -243,9 +243,9 @@ def retrieve_bulk(
     seen: set[str] = set()
     all_chunks: list[dict] = []
     errors: list[str] = []
-    with _chroma_lock:
-        for q in queries:
-            try:
+    for q in queries:
+        try:
+            with _chroma_lock:
                 res = run_retrieve(
                     query=q,
                     silo=silo,
@@ -255,21 +255,21 @@ def retrieve_bulk(
                     db_path=_DB_PATH,
                     config_path=_CONFIG_PATH,
                 )
-                for chunk in res.get("chunks", []):
-                    key = (chunk.get("text") or "")[:200]
-                    if key and key not in seen:
-                        seen.add(key)
-                        chunk["query"] = q
-                        all_chunks.append(chunk)
-            except Exception as e:
-                errors.append(f"{q!r}: {type(e).__name__}: {e}")
-        all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
-        truncated = len(all_chunks) > max_total_chunks
-        if truncated:
-            all_chunks = all_chunks[:max_total_chunks]
+            for chunk in res.get("chunks", []):
+                key = (chunk.get("text") or "")[:200]
+                if key and key not in seen:
+                    seen.add(key)
+                    chunk["query"] = q
+                    all_chunks.append(chunk)
+        except Exception as e:
+            errors.append(f"{q!r}: {type(e).__name__}: {e}")
+    all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
+    truncated = len(all_chunks) > max_total_chunks
+    if truncated:
+        all_chunks = all_chunks[:max_total_chunks]
 
-        # Feature 6: answer-level confidence on merged results
-        conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
+    # Feature 6: answer-level confidence on merged results
+    conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
 
     _release_chroma()
     return {

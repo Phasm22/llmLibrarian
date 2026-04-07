@@ -215,11 +215,24 @@ def op_inspect_silo(db_path: str, slug_or_name: str, top: int = 50) -> dict:
 
     from chroma_lock import chroma_shared_lock
 
+    _PAGE_SIZE = 200
     try:
         with chroma_shared_lock(db_path):
             coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
-            result = coll.get(where={"silo": slug}, include=["metadatas"])
-            metas = result.get("metadatas") or []
+            metas: list = []
+            offset = 0
+            while True:
+                result = coll.get(
+                    where={"silo": slug},
+                    include=["metadatas"],
+                    limit=_PAGE_SIZE,
+                    offset=offset,
+                )
+                page = result.get("metadatas") or []
+                metas.extend(page)
+                if len(page) < _PAGE_SIZE:
+                    break
+                offset += _PAGE_SIZE
     except Exception as e:
         return {"error": f"ChromaDB error: {e}"}
 

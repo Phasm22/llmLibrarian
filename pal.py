@@ -136,9 +136,9 @@ def _warn_mcp_desktop_extension_stale() -> None:
     if stored == current:
         return
     print(
-        "Warning: Claude Desktop MCP extension may be stale (mcp_server.py differs from last "
-        "`pal extension pack` record, or pack was never run). Set LLMLIBRARIAN_MCP_PACK_CMD and run "
-        "`pal extension pack` before relying on the packaged .mcpb.",
+        "Warning: mcp_server.py has changed since last `pal extension pack` run (or pack was never run). "
+        "Stdio users: run `pal extension pack --record-only` to update the hash. "
+        "Desktop MCP users: re-run your pack command via LLMLIBRARIAN_MCP_PACK_CMD.",
         file=sys.stderr,
         flush=True,
     )
@@ -2078,25 +2078,38 @@ def jobs_callback(ctx: typer.Context) -> None:
 
 @extension_app.command(
     "pack",
-    help="Run LLMLIBRARIAN_MCP_PACK_CMD (e.g. claude mcp pack …), then record sha256 of mcp_server.py.",
+    help=(
+        "Record sha256 of mcp_server.py for staleness tracking, optionally running a pack command first.\n\n"
+        "Stdio MCP users: run `pal extension pack --record-only` after editing mcp_server.py "
+        "so `pal status` / `pal sync` can warn when the server needs restarting.\n\n"
+        "Desktop MCP users: set LLMLIBRARIAN_MCP_PACK_CMD to your pack/install command "
+        "and run without --record-only."
+    ),
 )
-def extension_pack_command() -> None:
+def extension_pack_command(
+    record_only: bool = typer.Option(
+        False,
+        "--record-only",
+        help="Skip LLMLIBRARIAN_MCP_PACK_CMD; just record the current sha256 of mcp_server.py.",
+    ),
+) -> None:
     _ensure_pal_home()
-    cmd = (os.environ.get("LLMLIBRARIAN_MCP_PACK_CMD") or "").strip()
-    if not cmd:
-        print(
-            "Error: set LLMLIBRARIAN_MCP_PACK_CMD to your Desktop MCP pack/install command, then re-run.",
-            file=sys.stderr,
-        )
-        print(
-            "Example: export LLMLIBRARIAN_MCP_PACK_CMD='claude mcp pack ...'",
-            file=sys.stderr,
-        )
-        raise typer.Exit(code=2)
-    repo_root = Path(__file__).resolve().parent
-    r = subprocess.run(cmd, shell=True, cwd=str(repo_root))
-    if r.returncode != 0:
-        raise typer.Exit(code=r.returncode)
+    if not record_only:
+        cmd = (os.environ.get("LLMLIBRARIAN_MCP_PACK_CMD") or "").strip()
+        if not cmd:
+            print(
+                "Error: set LLMLIBRARIAN_MCP_PACK_CMD to your pack/install command, then re-run.",
+                file=sys.stderr,
+            )
+            print(
+                "Tip: for stdio users who only need staleness tracking, use --record-only instead.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(code=2)
+        repo_root = Path(__file__).resolve().parent
+        r = subprocess.run(cmd, shell=True, cwd=str(repo_root))
+        if r.returncode != 0:
+            raise typer.Exit(code=r.returncode)
     mcp_py = _mcp_server_py_path()
     digest = _mcp_server_py_sha256()
     if digest is None:

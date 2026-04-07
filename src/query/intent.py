@@ -83,9 +83,9 @@ def route_intent(query: str) -> str:
     if (
         re.search(
             r"\b("
-            r"structure|folder\s+outline|outline|directory|layout|snapshot|"
+            r"(?:file|folder|directory)\s+structure|folder\s+outline|directory|layout|snapshot|"
             r"recent\s+(?:changes?|files?)|what\s+changed\s+recently|"
-            r"file\s+types?|extensions?|inventory"
+            r"file\s+types?|file\s+extensions?|inventory"
             r")\b",
             q,
         )
