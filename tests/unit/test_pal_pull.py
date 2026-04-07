@@ -11,13 +11,31 @@ def _mock_subprocess(monkeypatch, files_indexed_by_path=None, failures_by_path=N
     failures_by_path = failures_by_path or set()
     seen_cmds = seen_cmds if seen_cmds is not None else []
 
-    def fake_run(cmd, env=None, capture_output=False, text=False):
+    def _lookup_files_indexed(path_arg: str) -> int:
+        if path_arg in files_indexed_by_path:
+            return files_indexed_by_path[path_arg]
+        p = Path(path_arg).resolve()
+        for k, v in files_indexed_by_path.items():
+            if Path(k).resolve() == p:
+                return v
+        return 0
+
+    def _path_in_failures(path_arg: str) -> bool:
+        if path_arg in failures_by_path:
+            return True
+        p = Path(path_arg).resolve()
+        for k in failures_by_path:
+            if Path(k).resolve() == p:
+                return True
+        return False
+
+    def fake_run(cmd, env=None, **kwargs):
         path = cmd[-1]
         seen_cmds.append(cmd)
-        payload = {"files_indexed": files_indexed_by_path.get(path, 0)}
+        payload = {"files_indexed": _lookup_files_indexed(path)}
         with open(env["LLMLIBRARIAN_STATUS_FILE"], "w", encoding="utf-8") as f:
             json.dump(payload, f)
-        return SimpleNamespace(returncode=(1 if path in failures_by_path else 0), stdout="", stderr="")
+        return SimpleNamespace(returncode=(1 if _path_in_failures(path) else 0), stdout="", stderr="")
 
     monkeypatch.setattr("pal.subprocess.run", fake_run)
     return seen_cmds
@@ -65,8 +83,9 @@ def test_pull_all_non_tty_emits_progress_lines(monkeypatch, capsys):
     monkeypatch.setattr("sys.stderr.isatty", lambda: False)
     _mock_subprocess(monkeypatch, files_indexed_by_path={"/tmp/stuff": 0})
     pal.pull_all_sources()
-    out = capsys.readouterr().out
-    assert "1/1" in out
+    err = capsys.readouterr().err
+    assert "[1/1]" in err
+    assert "Stuff" in err
 
 
 def test_pull_all_passes_full_and_follow_flags(monkeypatch):
@@ -316,7 +335,7 @@ def test_pull_with_path_passes_clear_prompt_option(monkeypatch):
 
 def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
-    monkeypatch.setattr("ingest.run_add", lambda *_a, **_k: (5, 0))
+    monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
     calls = {}
 
@@ -334,7 +353,7 @@ def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
 
 def test_pull_path_mode_errors_when_prompt_override_target_missing(monkeypatch):
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
-    monkeypatch.setattr("ingest.run_add", lambda *_a, **_k: (5, 0))
+    monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
     monkeypatch.setattr("pal._set_silo_prompt_for_path", lambda *_a, **_k: False)
 

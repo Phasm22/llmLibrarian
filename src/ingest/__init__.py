@@ -2165,13 +2165,17 @@ def run_add(
         8,
     )
     # MPS (Apple Silicon) is not thread-safe for concurrent inference; cap to 1
-    # to prevent heap corruption when multiple threads call into PyTorch/MPS.
-    # CPU and CUDA handle concurrent calls safely.
-    # Use the same device logic as get_embedding_function() so that if
-    # batch_size is below the MPS threshold (we routed to CPU), we don't
-    # unnecessarily cap workers to 1.
+    # when embeddings run on MPS. Large multi-file ingests force CPU instead so
+    # parallel embedding workers stay enabled (see ingest_parallel_embedding_device).
     from embeddings import _best_device as _pick_device
-    if _pick_device(batch_size=len(file_list) or 64) == "mps":
+    from embeddings import ingest_parallel_embedding_device
+
+    _ingest_embed_device = ingest_parallel_embedding_device(len(file_list))
+    _embed_batch_hint = len(file_list) or 64
+    _effective_embed_device = (
+        _ingest_embed_device if _ingest_embed_device is not None else _pick_device(batch_size=_embed_batch_hint)
+    )
+    if _effective_embed_device == "mps":
         embedding_workers = 1
 
     if not quiet:
@@ -2182,7 +2186,10 @@ def run_add(
 
     def _run_add_chroma_phase() -> tuple[int, int]:
         nonlocal incremental
-        ef = get_embedding_function(batch_size=len(file_list) or 64)
+        ef = get_embedding_function(
+            batch_size=len(file_list) or 64,
+            device=_ingest_embed_device,
+        )
         _gc = get_chroma_client or get_client
         client = _gc(str(db_path))
         collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
