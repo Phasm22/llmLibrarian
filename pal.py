@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 import threading
 import getpass
 import re
@@ -85,6 +86,62 @@ import jobs_runtime as jobsrt
 
 def _ensure_pal_home() -> None:
     PAL_HOME.mkdir(parents=True, exist_ok=True)
+
+
+def _mcpb_hash_path() -> Path:
+    return PAL_HOME / "mcpb_source_hash"
+
+
+def _mcp_server_py_path() -> Path:
+    return (Path(__file__).resolve().parent / "mcp_server.py").resolve()
+
+
+def _read_mcpb_pack_record() -> dict | None:
+    path = _mcpb_hash_path()
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and data.get("sha256"):
+            return data
+    except json.JSONDecodeError:
+        pass
+    if len(raw) == 64 and all(c in "0123456789abcdef" for c in raw.lower()):
+        return {"sha256": raw.lower()}
+    return None
+
+
+def _mcp_server_py_sha256() -> str | None:
+    p = _mcp_server_py_path()
+    try:
+        if not p.is_file():
+            return None
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _warn_mcp_desktop_extension_stale() -> None:
+    current = _mcp_server_py_sha256()
+    if current is None:
+        return
+    rec = _read_mcpb_pack_record()
+    stored = str((rec or {}).get("sha256") or "").lower()
+    if stored == current:
+        return
+    print(
+        "Warning: Claude Desktop MCP extension may be stale (mcp_server.py differs from last "
+        "`pal extension pack` record, or pack was never run). Set LLMLIBRARIAN_MCP_PACK_CMD and run "
+        "`pal extension pack` before relying on the packaged .mcpb.",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -2001,8 +2058,10 @@ app = typer.Typer(
 )
 daemon_app = typer.Typer(help="Install and manage background silo watchers.", add_completion=False, invoke_without_command=True)
 jobs_app = typer.Typer(help="Inspect derived background jobs.", add_completion=False, invoke_without_command=True)
+extension_app = typer.Typer(help="Claude Desktop MCP packaging (records mcp_server.py hash).", add_completion=False)
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(jobs_app, name="jobs")
+app.add_typer(extension_app, name="extension")
 
 
 @daemon_app.callback()
@@ -2015,6 +2074,41 @@ def daemon_callback(ctx: typer.Context) -> None:
 def jobs_callback(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is None:
         _jobs_ls_impl()
+
+
+@extension_app.command(
+    "pack",
+    help="Run LLMLIBRARIAN_MCP_PACK_CMD (e.g. claude mcp pack …), then record sha256 of mcp_server.py.",
+)
+def extension_pack_command() -> None:
+    _ensure_pal_home()
+    cmd = (os.environ.get("LLMLIBRARIAN_MCP_PACK_CMD") or "").strip()
+    if not cmd:
+        print(
+            "Error: set LLMLIBRARIAN_MCP_PACK_CMD to your Desktop MCP pack/install command, then re-run.",
+            file=sys.stderr,
+        )
+        print(
+            "Example: export LLMLIBRARIAN_MCP_PACK_CMD='claude mcp pack ...'",
+            file=sys.stderr,
+        )
+        raise typer.Exit(code=2)
+    repo_root = Path(__file__).resolve().parent
+    r = subprocess.run(cmd, shell=True, cwd=str(repo_root))
+    if r.returncode != 0:
+        raise typer.Exit(code=r.returncode)
+    mcp_py = _mcp_server_py_path()
+    digest = _mcp_server_py_sha256()
+    if digest is None:
+        print(f"Error: cannot hash mcp_server.py at {mcp_py}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    record = {
+        "sha256": digest,
+        "path": str(mcp_py),
+        "packed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _mcpb_hash_path().write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    print(f"Recorded MCP server source hash in {_mcpb_hash_path()}")
 
 
 def _exit(rc: int) -> None:
@@ -2231,6 +2325,7 @@ def remove_command(
 
 @app.command("sync", help="Re-index the project's own source (dev mode).")
 def sync_command() -> None:
+    _warn_mcp_desktop_extension_stale()
     _exit(ensure_self_silo(force=True))
 
 
@@ -2445,6 +2540,7 @@ def diff_command(
 @app.command("status", help="Quick health check.")
 def status_command() -> None:
     _ensure_src_on_path()
+    _warn_mcp_desktop_extension_stale()
     from silo_audit import (
         load_registry,
         load_manifest,

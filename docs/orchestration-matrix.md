@@ -32,6 +32,7 @@ Single reference for how ingest and recovery behave across entry points. Core im
 - Two concurrent `add`/`pull` processes on the **same** DB: second may block on Chroma lock or corrupt if bypassed—serialize.
 - Directory crawl **excludes** `*.sqlite` / paths containing `Firefox`; single-file `add` bypasses that.
 - MCP `repair_silo` / `trigger_reindex`: see tool docs; re-crawl drops missing files from disk.
+- After a **doc_type metadata** change in the engine, re-index affected silos (`pal pull`, `trigger_reindex`, or `repair_silo`) so existing chunks pick up updated `doc_type` tags.
 
 ## Git history themes (representative)
 

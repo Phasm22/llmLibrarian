@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from doc_type_taxonomy import doc_type_bucket_for_extension
+
 # Chroma HNSW `link_lists.bin` should stay modest for a single-user index.
 # Concurrent writers (multiple processes on one PersistentClient path) can
 # corrupt it to hundreds of GiB; see chroma_lock.py and mcp_server.py _chroma_lock.
@@ -267,27 +269,10 @@ def op_inspect_silo(db_path: str, slug_or_name: str, top: int = 50) -> dict:
 # op_list_silos
 # ---------------------------------------------------------------------------
 
-_CODE_EXTS = {
-    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".c", ".cpp",
-    ".cs", ".rb", ".sh", ".swift", ".kt", ".scala", ".r", ".lua", ".pl", ".php",
-}
-_DOC_TYPE_MAP = {
-    ".pdf": "pdf", ".docx": "docx", ".doc": "docx",
-    ".xlsx": "xlsx", ".xls": "xlsx", ".csv": "xlsx",
-    ".pptx": "pptx", ".ppt": "pptx",
-}
-
-
 def _doc_type_breakdown(by_ext: dict) -> dict:
     breakdown: dict[str, int] = {}
     for ext, count in (by_ext or {}).items():
-        ext_lower = ext.lower()
-        if ext_lower in _DOC_TYPE_MAP:
-            cat = _DOC_TYPE_MAP[ext_lower]
-        elif ext_lower in _CODE_EXTS:
-            cat = "code"
-        else:
-            cat = "other"
+        cat = doc_type_bucket_for_extension(str(ext or "").lower())
         breakdown[cat] = breakdown.get(cat, 0) + count
     return breakdown
 

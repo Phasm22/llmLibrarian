@@ -91,7 +91,9 @@ mcp = FastMCP(
         "When `lexical_rank` is non-null, the chunk matched the query text exactly — weight it highly for precise "
         "factual lookups (IDs, error codes, config keys, exact names). When only `vector_rank` is set, the chunk "
         "matched semantically. The top-level `retrieval_method` field ('hybrid' or 'vector_only') tells you which "
-        "path fired overall; `lexical_hit_count` and `vector_hit_count` give the breakdown. "
+        "path fired overall; `lexical_hit_count` counts chunks with an exact-text match (`lexical_rank`); "
+        "`vector_hit_count` counts chunks that appeared in semantic ranking (`vector_rank`). "
+        "For hybrid diagnostics, prefer `explain_retrieval` (`vector_only_chunk_count` vs `chunk_with_vector_rank_count`). "
         "Use `explain_retrieval` to get a structured breakdown of why results ranked as they did — useful for "
         "diagnosing missed results or unexpected rankings before re-querying. "
         "Use `add_silo(path=...)` to index a path as a silo (equivalent to `llmli add`). "
@@ -296,7 +298,10 @@ def explain_retrieval(
 
     Returns:
     - retrieval_method: 'hybrid' (vector + lexical RRF) or 'vector_only'
-    - lexical_hit_count / vector_hit_count: how many chunks came from each signal
+    - lexical_hit_count: chunks with lexical_rank set (exact-text match)
+    - vector_only_chunk_count: chunks with no lexical_rank (semantic-only in this result set)
+    - chunk_with_vector_rank_count: chunks that participated in vector ranking (includes hybrid rows)
+    - vector_hit_count: deprecated alias for vector_only_chunk_count
     - ranked_chunks: each chunk with its _signals (vector_rank, lexical_rank, rrf_score),
       score, source, and a short text preview
     - signal_summary: plain-text explanation of what signals fired and why
@@ -316,6 +321,9 @@ def explain_retrieval(
 
             lexical_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is not None]
             vector_only_hits = [c for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is None]
+            with_vector_rank = sum(
+                1 for c in chunks if (c.get("_signals") or {}).get("vector_rank") is not None
+            )
 
             ranked_chunks = []
             for c in chunks:
@@ -334,8 +342,9 @@ def explain_retrieval(
             # Build human-readable signal summary
             if method == "hybrid":
                 summary_parts = [
-                    f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had exact-text matches (lexical_rank set), "
-                    f"{len(vector_only_hits)} chunk(s) matched semantically only.",
+                    f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had exact-text matches (lexical_rank set); "
+                    f"{with_vector_rank} chunk(s) have vector_rank (semantic ranking); "
+                    f"{len(vector_only_hits)} chunk(s) are semantic-only in this set (no lexical_rank).",
                 ]
                 if lexical_hits:
                     top_lex = lexical_hits[0]
@@ -355,6 +364,8 @@ def explain_retrieval(
                 "intent": result.get("intent"),
                 "retrieval_method": method,
                 "lexical_hit_count": len(lexical_hits),
+                "vector_only_chunk_count": len(vector_only_hits),
+                "chunk_with_vector_rank_count": with_vector_rank,
                 "vector_hit_count": len(vector_only_hits),
                 "signal_summary": " ".join(summary_parts),
                 "ranked_chunks": ranked_chunks,

@@ -12,7 +12,23 @@ runner = CliRunner()
 def test_pal_help_shows_expected_commands():
     res = runner.invoke(pal.app, ["--help"])
     assert res.exit_code == 0
-    for cmd in ("pull", "ask", "ls", "inspect", "capabilities", "log", "remove", "sync", "diff", "status", "silos", "tool", "daemon", "jobs"):
+    for cmd in (
+        "pull",
+        "ask",
+        "ls",
+        "inspect",
+        "capabilities",
+        "log",
+        "remove",
+        "sync",
+        "diff",
+        "status",
+        "silos",
+        "tool",
+        "daemon",
+        "jobs",
+        "extension",
+    ):
         assert cmd in res.stdout
 
 
