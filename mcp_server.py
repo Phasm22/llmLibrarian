@@ -10,6 +10,17 @@ _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+def _bootstrap_process_env() -> None:
+    try:
+        from env_bootstrap import bootstrap_llmlibrarian_env
+
+        bootstrap_llmlibrarian_env(repo_root=_ROOT)
+    except Exception:
+        return
+
+
+_bootstrap_process_env()
+
 _logger = logging.getLogger("llmLibrarian.mcp")
 
 

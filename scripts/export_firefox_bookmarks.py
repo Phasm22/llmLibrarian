@@ -55,6 +55,13 @@ def main() -> int:
     sys.path.insert(0, str(src))
     os.chdir(REPO)
 
+    try:
+        from env_bootstrap import bootstrap_llmlibrarian_env
+
+        bootstrap_llmlibrarian_env(repo_root=REPO)
+    except Exception:
+        pass
+
     from processors import SQLiteProcessor
 
     data = places.read_bytes()

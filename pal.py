@@ -19,10 +19,6 @@ from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-import typer
-
-from pal_registry import read_pal_registry, write_pal_registry
-
 PAL_HOME = Path(os.environ.get("PAL_HOME", os.path.expanduser("~/.pal")))
 REGISTRY_PATH = PAL_HOME / "registry.json"
 WATCH_LOCKS_DIR = PAL_HOME / "watch_locks"
@@ -80,6 +76,21 @@ def _bootstrap_src_path() -> None:
 
 
 _bootstrap_src_path()
+
+def _bootstrap_process_env() -> None:
+    try:
+        from env_bootstrap import bootstrap_llmlibrarian_env
+
+        bootstrap_llmlibrarian_env(repo_root=_PAL_ROOT)
+    except Exception:
+        return
+
+
+_bootstrap_process_env()
+
+import typer
+
+from pal_registry import read_pal_registry, write_pal_registry
 
 import jobs_runtime as jobsrt
 

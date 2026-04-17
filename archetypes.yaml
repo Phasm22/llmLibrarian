@@ -6,6 +6,13 @@ archetypes:
     name: Journal / Reflection
     model: phi4:14b
     temperature: 0.8
+    # Used by pal pull via unified ingest: per-path excludes are ADD_DEFAULT_EXCLUDE in
+    # src/ingest/__init__.py. These apply to archetype-driven index (run_index) if folders are set.
+    include:
+      - "*.md"
+      - "*.txt"
+    exclude:
+      - "/cortex/"
     prompt: |
       You are reading someone's private journal entries and answering their questions about themselves.
       Speak directly to them as "you."

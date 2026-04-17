@@ -80,6 +80,8 @@ ADD_DEFAULT_INCLUDE = [
     "*.png", "*.jpg", "*.jpeg", "*.heic", "*.heif", "*.tif", "*.tiff",
 ]
 ADD_DEFAULT_EXCLUDE = [
+    # Obsidian / journalLinker intent cortex lives under .../cortex/; keep out of retrieval silos.
+    "/cortex/",
     "node_modules/", ".venv/", "venv/", "env/", "__pycache__/", "vendor", "dist", "build", ".git",
     "llmLibrarianVenv/", "site-packages/", "Old Firefox Data", "Firefox", ".app/",
     ".env", ".env.*", ".aws/", ".ssh/", "*.pem", "*.key", "secrets.json", "credentials.json", "credentials*.json",

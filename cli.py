@@ -84,6 +84,19 @@ def _bootstrap_src_path() -> None:
 
 _bootstrap_src_path()
 
+def _bootstrap_process_env() -> None:
+    """Load non-repo-local env files (preferred) before command dispatch."""
+    try:
+        from env_bootstrap import bootstrap_llmlibrarian_env
+
+        bootstrap_llmlibrarian_env(repo_root=_ROOT)
+    except Exception:
+        # Never block CLI startup on env bootstrap; missing secrets will fail later with context.
+        return
+
+
+_bootstrap_process_env()
+
 def _db_path(args: argparse.Namespace) -> Path:
     return Path(getattr(args, "db", None) or os.environ.get("LLMLIBRARIAN_DB", str(_ROOT / "my_brain_db"))).resolve()
 

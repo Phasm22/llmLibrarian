@@ -20,6 +20,25 @@ uv sync
 ollama pull llama3.1:8b
 ```
 
+## Secrets / environment variables
+
+Do **not** keep API keys in a repo-local `.env` (easy to leak via backups, screen sharing, or accidental copies).
+
+Preferred order (`pal` / `llmli` / `mcp_server.py` all call the same bootstrap):
+
+1. **Explicit file**: set `LLMLIBRARIAN_ENV_FILE=/path/to/llmlibrarian.env` (recommended for systemd units).
+   - If this variable is set but the file **does not exist**, bootstrap falls through to (2) and then (3).
+2. **XDG config file**: create `~/.config/llmLibrarian/llmlibrarian.env` (or `$XDG_CONFIG_HOME/llmLibrarian/llmlibrarian.env`) with `chmod 600`.
+3. **Legacy dev only**: repo-root `.env` is supported **only** when `LLMLIBRARIAN_DOTENV=1`.
+
+Example user config file:
+
+```bash
+install -d -m 700 ~/.config/llmLibrarian
+${EDITOR:-nano} ~/.config/llmLibrarian/llmlibrarian.env
+chmod 600 ~/.config/llmLibrarian/llmlibrarian.env
+```
+
 Optional vision model for image-heavy silos:
 
 ```bash
