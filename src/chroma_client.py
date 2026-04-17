@@ -7,6 +7,7 @@ SIGSEGV caused by multiple Rust HNSW handles on the same files.
 """
 
 import threading
+from typing import Any
 
 import chromadb
 from chromadb.config import Settings
@@ -21,24 +22,37 @@ class _SafeClient:
 
     This lets silos created before the mpnet upgrade continue to work without a
     full re-index. New silos still get the caller-supplied (mpnet) function.
+
+    Tracks which EF was actually used per collection so callers can use the same
+    one for explicit embedding (avoiding dimension mismatches in parallel ingest).
     """
 
     def __init__(self, client: chromadb.PersistentClient) -> None:
         self._client = client
+        self._effective_efs: dict[str, Any] = {}
 
     def get_or_create_collection(self, name: str, embedding_function=None, **kwargs):
         try:
-            return self._client.get_or_create_collection(
+            coll = self._client.get_or_create_collection(
                 name=name, embedding_function=embedding_function, **kwargs
             )
+            self._effective_efs[name] = embedding_function
+            return coll
         except Exception as exc:
             msg = str(exc).lower()
             if embedding_function is not None and "conflict" in msg and "default" in msg:
                 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-                return self._client.get_or_create_collection(
-                    name=name, embedding_function=DefaultEmbeddingFunction(), **kwargs
+                fallback_ef = DefaultEmbeddingFunction()
+                coll = self._client.get_or_create_collection(
+                    name=name, embedding_function=fallback_ef, **kwargs
                 )
+                self._effective_efs[name] = fallback_ef
+                return coll
             raise
+
+    def get_effective_ef(self, name: str):
+        """Return the EF that was actually used when opening the named collection."""
+        return self._effective_efs.get(name)
 
     def __getattr__(self, name: str):
         return getattr(self._client, name)

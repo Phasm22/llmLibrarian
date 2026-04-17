@@ -2205,8 +2205,10 @@ def run_add(
         _gc = get_chroma_client or get_client
         client = _gc(str(db_path))
         collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+        if hasattr(client, "get_effective_ef"):
+            ef = client.get_effective_ef(LLMLI_COLLECTION) or ef
         image_collection = _get_image_collection(client)
-    
+
         # Cheap consistency check: if manifest says files are indexed but ChromaDB has 0
         # chunks for this silo, the previous ingest was incomplete — force a full re-index.
         if incremental:
@@ -2911,8 +2913,9 @@ def update_single_file(
         ef = get_embedding_function(batch_size=1)
         client = get_client(str(db_path))
         collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+        ef = client.get_effective_ef(LLMLI_COLLECTION) or ef
         image_collection = _get_image_collection(client)
-    
+
         chunks: list[ChunkTuple] = []
         image_vectors: list[ImageVectorTuple] = []
         if kind == "zip":
