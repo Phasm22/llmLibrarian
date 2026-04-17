@@ -12,17 +12,47 @@ import chromadb
 from chromadb.config import Settings
 
 _lock = threading.Lock()
-_clients: dict[str, chromadb.PersistentClient] = {}
+_clients: dict[str, "_SafeClient"] = {}
 
 
-def get_client(db_path: str) -> chromadb.PersistentClient:
+class _SafeClient:
+    """Thin wrapper that retries get_or_create_collection with DefaultEmbeddingFunction
+    when an embedding-function conflict is detected against an existing collection.
+
+    This lets silos created before the mpnet upgrade continue to work without a
+    full re-index. New silos still get the caller-supplied (mpnet) function.
+    """
+
+    def __init__(self, client: chromadb.PersistentClient) -> None:
+        self._client = client
+
+    def get_or_create_collection(self, name: str, embedding_function=None, **kwargs):
+        try:
+            return self._client.get_or_create_collection(
+                name=name, embedding_function=embedding_function, **kwargs
+            )
+        except Exception as exc:
+            msg = str(exc).lower()
+            if embedding_function is not None and "conflict" in msg and "default" in msg:
+                from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+                return self._client.get_or_create_collection(
+                    name=name, embedding_function=DefaultEmbeddingFunction(), **kwargs
+                )
+            raise
+
+    def __getattr__(self, name: str):
+        return getattr(self._client, name)
+
+
+def get_client(db_path: str) -> "_SafeClient":
     """Return (or create) the shared PersistentClient for db_path."""
     with _lock:
         if db_path not in _clients:
-            _clients[db_path] = chromadb.PersistentClient(
+            raw = chromadb.PersistentClient(
                 path=db_path,
                 settings=Settings(anonymized_telemetry=False),
             )
+            _clients[db_path] = _SafeClient(raw)
         return _clients[db_path]
 
 
