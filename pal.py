@@ -865,10 +865,12 @@ def _llmli_registry_path(db_path: str | Path) -> Path:
 
 
 def _read_llmli_registry(db_path: str | Path) -> dict:
+    from pal_registry import cleanup_stale_registry_entries
     path = _llmli_registry_path(db_path)
     if not path.exists():
         return {}
     try:
+        cleanup_stale_registry_entries(path)
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f) or {}
     except Exception:
@@ -1194,6 +1196,19 @@ def _normalize_natural_ask_scope(
     return None, query_tokens, None
 
 
+def _merge_path_patterns(*groups: list[str] | None) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw in group or []:
+            pattern = str(raw).strip()
+            if not pattern or pattern in seen:
+                continue
+            seen.add(pattern)
+            merged.append(pattern)
+    return merged
+
+
 class _SiloEventHandler(FileSystemEventHandler):
     def __init__(self, watcher: "SiloWatcher") -> None:
         super().__init__()
@@ -1232,6 +1247,7 @@ class SiloWatcher:
         allow_cloud: bool = False,
         label: str = "this folder",
         startup_message: str | None = None,
+        exclude_patterns: list[str] | None = None,
     ) -> None:
         if Observer is None:
             raise RuntimeError("watchdog is not installed. Install `watchdog` to use watch mode.")
@@ -1247,6 +1263,7 @@ class SiloWatcher:
             ADD_DEFAULT_INCLUDE,
             ADD_DEFAULT_EXCLUDE,
         )
+        from state import get_silo_exclude_patterns
 
         self.root = root.resolve()
         self.db_path = str(db_path)
@@ -1278,7 +1295,11 @@ class SiloWatcher:
         self._collect_files = collect_files
         self._should_index = should_index
         self._include = ADD_DEFAULT_INCLUDE
-        self._exclude = ADD_DEFAULT_EXCLUDE
+        self._exclude = _merge_path_patterns(
+            ADD_DEFAULT_EXCLUDE,
+            get_silo_exclude_patterns(self.db_path, self.silo_slug),
+            exclude_patterns,
+        )
 
         self._observer = Observer()
         self._handler = _SiloEventHandler(self)
@@ -1389,6 +1410,7 @@ class SiloWatcher:
                             follow_symlinks=False,
                             no_color=True,
                             update_counts=True,
+                            exclude_patterns=self._exclude,
                         )
             except Exception as exc:
                 status = "error"
@@ -1563,6 +1585,7 @@ def _pull_path_mode(
     allow_cloud: bool = False,
     follow_symlinks: bool = False,
     full: bool = False,
+    exclude_patterns: list[str] | None = None,
     prompt: str | None = None,
     clear_prompt: bool = False,
     image_vision: bool | None = None,
@@ -1594,6 +1617,7 @@ def _pull_path_mode(
                 allow_cloud=allow_cloud,
                 follow_symlinks=follow_symlinks,
                 incremental=not full,
+                exclude_patterns=exclude_patterns,
                 image_vision_enabled=image_vision,
                 workers=workers,
                 embedding_workers=embedding_workers,
@@ -1621,6 +1645,7 @@ def _pull_watch_path_mode(
     debounce: float,
     allow_cloud: bool,
     follow_symlinks: bool,
+    exclude_patterns: list[str] | None = None,
     prompt: str | None = None,
     clear_prompt: bool = False,
     image_vision: bool | None = None,
@@ -1644,6 +1669,7 @@ def _pull_watch_path_mode(
             allow_cloud=allow_cloud,
             follow_symlinks=follow_symlinks,
             full=False,
+            exclude_patterns=exclude_patterns,
             prompt=prompt,
             clear_prompt=clear_prompt,
             image_vision=image_vision,
@@ -1667,6 +1693,7 @@ def _pull_watch_path_mode(
             silo_slug=slug,
             allow_cloud=allow_cloud,
             label="this folder",
+            exclude_patterns=exclude_patterns,
         )
         return _run_watcher(watcher, db_path, slug)
     finally:
@@ -1785,6 +1812,7 @@ def pull_all_sources(
     full: bool = False,
     allow_cloud: bool = False,
     follow_symlinks: bool = False,
+    exclude_patterns: list[str] | None = None,
     image_vision: bool | None = None,
     workers: int | None = None,
     embedding_workers: int | None = None,
@@ -1821,6 +1849,7 @@ def pull_all_sources(
                 incremental=not full,
                 allow_cloud=allow_cloud,
                 follow_symlinks=follow_symlinks,
+                exclude_patterns=exclude_patterns,
                 image_vision_enabled=image_vision,
                 workers=workers,
                 embedding_workers=embedding_workers,
@@ -2141,6 +2170,7 @@ def pull_command(
     prompt: str | None = typer.Option(None, "--prompt", help="Custom system prompt override for this silo."),
     clear_prompt: bool = typer.Option(False, "--clear-prompt", help="Clear custom prompt override for this silo."),
     allow_cloud: bool = typer.Option(False, "--allow-cloud", help="Allow cloud-synced folders."),
+    exclude_patterns: list[str] | None = typer.Option(None, "--exclude", help="Extra path exclusion pattern (repeatable)."),
     image_vision: bool = typer.Option(False, "--image-vision", help="Enable multimodal image summaries for this silo (default: off unless previously enabled)."),
     workers: int | None = typer.Option(None, "--workers", help="Override file/extraction worker count for this run."),
     embedding_workers: int | None = typer.Option(None, "--embedding-workers", help="Override embedding worker count for this run."),
@@ -2198,6 +2228,7 @@ def pull_command(
                 debounce,
                 allow_cloud,
                 follow_symlinks,
+                exclude_patterns,
                 prompt=prompt,
                 clear_prompt=clear_prompt,
                 image_vision=image_vision_requested,
@@ -2213,6 +2244,7 @@ def pull_command(
                 allow_cloud=allow_cloud,
                 follow_symlinks=follow_symlinks,
                 full=full,
+                exclude_patterns=exclude_patterns,
                 prompt=prompt,
                 clear_prompt=clear_prompt,
                 image_vision=image_vision_requested,
@@ -2226,6 +2258,7 @@ def pull_command(
             full=full,
             allow_cloud=allow_cloud,
             follow_symlinks=follow_symlinks,
+            exclude_patterns=exclude_patterns,
             image_vision=image_vision_requested,
             workers=workers,
             embedding_workers=embedding_workers,

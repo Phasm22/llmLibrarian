@@ -25,7 +25,7 @@ def test_llmli_root_help_lists_all_subcommands(monkeypatch, capsys):
 @pytest.mark.parametrize(
     ("subcmd", "tokens"),
     [
-        ("add", ["--allow-cloud", "--follow-symlinks", "--full", "--image-vision", "--workers", "--embedding-workers"]),
+        ("add", ["--allow-cloud", "--follow-symlinks", "--full", "--exclude", "--image-vision", "--workers", "--embedding-workers"]),
         ("ask", ["--in", "--unified", "--strict", "--quiet", "--explain", "--force", "--model", "--n-results"]),
         ("inspect", ["--top", "--filter"]),
         ("index", ["--archetype", "--mode", "--follow-symlinks"]),
@@ -63,6 +63,10 @@ def test_llmli_add_parses_all_modifiers(monkeypatch):
             "--allow-cloud",
             "--follow-symlinks",
             "--full",
+            "--exclude",
+            "node_modules/",
+            "--exclude",
+            "*.tmp",
             "--image-vision",
             "--workers",
             "6",
@@ -84,6 +88,7 @@ def test_llmli_add_parses_all_modifiers(monkeypatch):
     assert args.allow_cloud is True
     assert args.follow_symlinks is True
     assert args.full is True
+    assert args.exclude_patterns == ["node_modules/", "*.tmp"]
     assert args.image_vision is True
     assert args.workers == 6
     assert args.embedding_workers == 4
@@ -215,6 +220,7 @@ def test_cmd_add_honors_env_db_path(monkeypatch, tmp_path: Path):
     def _fake_run_ingest(request):
         seen["path"] = request.path
         seen["db_path"] = request.db_path
+        seen["exclude_patterns"] = request.exclude_patterns
         seen["image_vision_enabled"] = request.image_vision_enabled
         seen["workers"] = request.workers
         seen["embedding_workers"] = request.embedding_workers
@@ -235,6 +241,7 @@ def test_cmd_add_honors_env_db_path(monkeypatch, tmp_path: Path):
         image_vision=False,
         workers=5,
         embedding_workers=3,
+        exclude_patterns=["node_modules/", "*.tmp"],
         silo=None,
         display_name=None,
     )
@@ -243,6 +250,7 @@ def test_cmd_add_honors_env_db_path(monkeypatch, tmp_path: Path):
     assert rc == 0
     assert str(seen["path"]) == str(target_dir.resolve())
     assert seen["db_path"] == env_db
+    assert seen["exclude_patterns"] == ["node_modules/", "*.tmp"]
     assert seen["image_vision_enabled"] is False
     assert seen["workers"] == 5
     assert seen["embedding_workers"] == 3

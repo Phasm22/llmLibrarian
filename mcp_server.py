@@ -5,6 +5,19 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ── MCP stdio guard ──────────────────────────────────────────────────────────
+# This process communicates with the MCP client over stdout (JSON-RPC).
+# Any non-JSON written to stdout corrupts the protocol stream.
+# Suppress progress/warning output from HF Hub, tqdm, and transformers
+# BEFORE any library imports that might trigger model loading.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TQDM_DISABLE", "1")
+# ─────────────────────────────────────────────────────────────────────────────
+
 _ROOT = Path(__file__).resolve().parent
 _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
@@ -63,47 +76,76 @@ if not Path(_DB_PATH).exists():
     )
 
 from fastmcp import FastMCP
+from fastmcp.server.auth.auth import AuthProvider
+from mcp.server.auth.provider import AccessToken
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class StaticBearerTokenAuth(AuthProvider):
+    """Simple static bearer token verifier for MCP HTTP transports."""
+
+    def __init__(self, token: str):
+        super().__init__()
+        self._token = token.strip()
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        if token != self._token:
+            return None
+        return AccessToken(
+            token=token,
+            client_id="llmli-mcp-client",
+            scopes=["mcp"],
+        )
+
+
+def _auth_for_transport(transport: str) -> AuthProvider | None:
+    if transport == "stdio":
+        return None
+    require_auth = _env_bool("LLMLIBRARIAN_MCP_REQUIRE_AUTH", False)
+    if not require_auth:
+        return None
+    token = os.environ.get("LLMLIBRARIAN_MCP_AUTH_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError(
+            "LLMLIBRARIAN_MCP_AUTH_TOKEN is required when "
+            "LLMLIBRARIAN_MCP_REQUIRE_AUTH=true."
+        )
+    return StaticBearerTokenAuth(token)
 
 mcp = FastMCP(
     name="llmLibrarian",
     instructions=(
-        "ALWAYS use `retrieve` for document questions — returns raw chunks for you to reason over. "
-        "Use `retrieve_bulk` when a topic needs multiple retrieval angles (e.g. all risk factor categories). "
-        "`retrieve_bulk` caps merged output at `max_total_chunks` (default 50) to prevent context overflow — if `truncated=True` is returned, lower `n_results` or reduce the number of queries. "
-        "Pass `section=` to scope retrieval to a document section (e.g. 'Item 1A', 'Risk Factors'). "
-        "Pass `doc_type=` to restrict retrieval to a specific document type — useful when you want only "
-        "resumes, transcripts, tax returns, or code files (e.g. doc_type='transcript', 'resume', 'tax_return', 'code', 'other'). "
-        "For tax questions (`TAX_QUERY` intent), `retrieve` also returns a `tax_ledger` field alongside chunks — "
-        "this contains structured, ingest-time extracted values (AGI, total tax, W-2 boxes, etc.) with exact amounts. "
-        "Prefer `tax_ledger` rows over raw chunk text for precise tax figures; fall back to chunks for context. "
-        "Use `list_silos` to discover silo slugs before scoping a query. Pass `check_staleness=True` to also get "
-        "is_stale/stale_file_count per silo (compares source file mtimes against last index time). "
-        "Use `inspect_silo` to see per-file chunk counts — useful to diagnose coverage gaps or zero-chunk files. "
-        "Use `trigger_reindex(silo=..., confirm=True)` to re-index a registered silo in the background when "
-        "source files have changed. Only works on already-registered paths. "
-        "WARNING: reindex/repair re-crawl from disk — missing files at the original path are dropped from the silo. "
-        "Use `repair_silo(silo=..., confirm=True)` for Chroma corruption ('Error finding id', 0-chunk silo); use `trigger_reindex` for normal refresh after file changes. "
-        "`retrieve` responses include `answer_confidence` (high/medium/low), `answer_confidence_score`, and "
-        "`coverage_note` — use these to calibrate how much to hedge your answer. When no silo filter is passed, "
-        "`retrieve` also returns `chunks_by_silo` grouping results by silo for provenance reasoning. "
-        "Each chunk includes `_signals` with retrieval attribution: `vector_rank` (position in semantic results), "
-        "`lexical_rank` (position in exact-text results, null if not matched), and `rrf_score` (combined score). "
-        "When `lexical_rank` is non-null, the chunk matched the query text exactly — weight it highly for precise "
-        "factual lookups (IDs, error codes, config keys, exact names). When only `vector_rank` is set, the chunk "
-        "matched semantically. The top-level `retrieval_method` field ('hybrid' or 'vector_only') tells you which "
-        "path fired overall; `lexical_hit_count` counts chunks with an exact-text match (`lexical_rank`); "
-        "`vector_hit_count` counts chunks that appeared in semantic ranking (`vector_rank`). "
-        "For hybrid diagnostics, prefer `explain_retrieval` (`vector_only_chunk_count` vs `chunk_with_vector_rank_count`). "
-        "Use `explain_retrieval` to get a structured breakdown of why results ranked as they did — useful for "
-        "diagnosing missed results or unexpected rankings before re-querying. "
-        "Use `add_silo(path=...)` to index a path as a silo (equivalent to `llmli add`). "
-        "Prefer this over the CLI — no PYTHONPATH setup required. path may be a directory or a single file (same rules as `llmli add`). "
-        "Use `watch_coverage` when the user asks what is auto-watched vs indexed-only — read-only summary of pal bookmarks, derived daemon jobs, and silos not in bookmarks. "
-        "Do not substitute `watch_coverage` for index problems: it does not read or fix ChromaDB. "
-        "`repair_silo` = hard reset of vector index data for one silo when the DB/registry is corrupt or wildly inconsistent (then full re-index from disk). "
-        "`trigger_reindex` = incremental re-crawl from disk when files changed; not a bookmark/daemon diagnostic. "
-        "Call `health` first if tools are failing — it reports db and model status. "
-        "Use `capabilities` to see supported file types."
+        "Use these tools when a task requires context from the user's personal knowledge base. "
+        "Call list_silos first to get current silo state. Key silos include: "
+        "- much-thinks: personal journal and reflection writing "
+        "- hot_seat: interview and conversation transcripts "
+        "- llmLibrarian: project notes and development history "
+        "- (others — call list_silos for full current list) "
+        ""
+        "For any task involving the user's past thinking, decisions, habits, or writing, "
+        "call query_personal_knowledge before responding. Use multi_query_knowledge when "
+        "a task needs multiple angles of context simultaneously. "
+        ""
+        "multi_query_knowledge caps merged output at max_total_chunks (default 50) — if "
+        "truncated=True is returned, lower n_results or reduce the number of queries. "
+        "Pass section= to scope retrieval to a document section. Pass doc_type= to "
+        "restrict by file type (e.g. 'transcript', 'resume', 'tax_return', 'code'). "
+        "For tax queries, query_personal_knowledge also returns a tax_ledger field with structured "
+        "extracted values (AGI, total tax, W-2 boxes). Prefer tax_ledger over raw "
+        "chunks for precise figures. "
+        ""
+        "Use inspect_silo to diagnose coverage gaps. Use trigger_reindex after file "
+        "changes. Use repair_silo for Chroma corruption. Use watch_coverage to monitor "
+        "stale silos. Use health for server diagnostics. Use capabilities for supported "
+        "file types."
     ),
 )
 
@@ -159,7 +201,7 @@ from operations import _doc_type_breakdown, _inject_staleness
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def retrieve(
+def query_personal_knowledge(
     query: str,
     silo: str | None = None,
     n_results: int = 40,
@@ -167,17 +209,20 @@ def retrieve(
     doc_type: str | None = None,
 ) -> dict:
     """
-    Retrieve raw document chunks without LLM synthesis. Returns ranked chunks with
-    text, score (0–1), confidence (high/medium/low), section heading, source path,
-    date, doc type, and position metadata.
-    Pass section= to restrict results to a specific document section
-    (e.g. section='Item 1A' or section='Risk Factors').
-    Pass doc_type= to restrict to a specific document type
-    (e.g. doc_type='transcript', 'resume', 'pdf', 'code', 'other').
-    Intent routing is applied automatically to govern retrieval scope.
-    Response includes answer_confidence (high/medium/low), answer_confidence_score,
-    and coverage_note to help calibrate how much to hedge the answer.
-    When no silo filter is passed, also returns chunks_by_silo grouping results by silo.
+    Call this when a task requires the user's personal context — past writing,
+    decisions, reflections, or domain knowledge. Returns semantically ranked
+    chunks from indexed silos.
+
+    Specify silo_id to scope retrieval (e.g. much-thinks for personal reflection,
+    hot_seat for interview content). Returns chunks with text, score (0–1),
+    confidence, section heading, source path, date, doc_type, and position.
+
+    Pass section= to restrict to a document section.
+    Pass doc_type= to restrict by file type.
+    Intent routing is applied automatically.
+    For tax queries, also returns a tax_ledger field with structured extracted values.
+    Response includes answer_confidence and coverage_note to calibrate hedging.
+    When no silo filter is passed, also returns chunks_by_silo grouped by silo.
     """
     from query.core import run_retrieve
     try:
@@ -220,7 +265,7 @@ def retrieve(
 
 
 @mcp.tool()
-def retrieve_bulk(
+def multi_query_knowledge(
     queries: list[str],
     silo: str | None = None,
     n_results: int = 20,
@@ -229,13 +274,14 @@ def retrieve_bulk(
     max_total_chunks: int = 50,
 ) -> dict:
     """
+    Call this when a task needs multiple angles of context from personal knowledge.
     Fire multiple semantic queries and return merged, deduplicated chunks ranked
     by best score. Use when a topic requires several retrieval angles — for example,
-    to cover all risk factor categories in a 10-K with one call instead of many.
+    to cover the user's thinking on related topics in one call instead of many.
     Each chunk is tagged with the query that retrieved it. Pass section= to restrict
-    all queries to a specific document section. Pass doc_type= to restrict all queries
-    to a specific document type (e.g. 'transcript', 'resume', 'pdf', 'code', 'other').
-    max_total_chunks caps the merged output (default 50) to avoid context window overflow.
+    all queries to a document section. Pass doc_type= to restrict by file type
+    (e.g. 'transcript', 'resume', 'tax_return', 'code', 'other').
+    max_total_chunks caps the merged output (default 50) to avoid context overflow.
     If the cap is hit, response includes truncated=True — lower n_results or reduce queries.
     Response includes answer_confidence, answer_confidence_score, and coverage_note.
     """
@@ -397,7 +443,7 @@ def list_silos(check_staleness: bool = False) -> dict:
     db_exists (false means LLMLIBRARIAN_DB is misconfigured), silo_count, and
     a silos array with slug, display name, path, file count, chunk count, last-indexed
     timestamp, and doc_type_breakdown (counts by category: pdf/code/docx/xlsx/pptx/other).
-    Use slugs with `retrieve`/`retrieve_bulk` to scope queries.
+    Use slugs with `query_personal_knowledge`/`multi_query_knowledge` to scope queries.
     Pass check_staleness=True to also get is_stale, stale_file_count, and
     newest_source_mtime_iso per silo (walks source directory — may be slow for large silos).
     """
@@ -531,6 +577,7 @@ def add_silo(
     silo: str | None = None,
     display_name: str | None = None,
     allow_cloud: bool = False,
+    exclude_patterns: list[str] | None = None,
     full: bool = False,
 ) -> dict:
     """
@@ -539,46 +586,77 @@ def add_silo(
     display_name: optional human-readable name override.
     allow_cloud: set True to allow OneDrive/iCloud/Dropbox paths (blocked by default).
     full: set True to force a full non-incremental reindex (default: incremental).
-    Runs synchronously — large trees may take a while. Returns files_indexed and failure count.
+    Returns immediately; indexing runs in a background thread (same process, serialized via lock).
+    Call list_silos() or health() after a minute or two to confirm completion.
     """
     from pathlib import Path as _Path
 
-    p = _Path(path)
+    p = _Path(path).resolve()
     if not p.exists():
         return {"status": "error", "error": f"path does not exist: {path}"}
     if not p.is_dir() and not p.is_file():
         return {"status": "error", "error": f"path must be a file or directory: {path}"}
 
-    try:
-        from orchestration.ingest import IngestRequest, run_ingest
+    # Pre-derive a key for outcome tracking (best-guess slug; real slug written by thread)
+    outcome_key = silo if silo else p.name
 
-        with _chroma_lock:
-            result = run_ingest(
-                IngestRequest(
-                    path=path,
-                    db_path=_DB_PATH,
-                    forced_silo_slug=silo,
-                    display_name=display_name,
-                    allow_cloud=allow_cloud,
-                    incremental=not full,
-                )
-            )
-        files_ok, n_failures = result.files_indexed, result.failures
-        from state import resolve_silo_by_path, resolve_silo_to_slug
-        slug = (
-            resolve_silo_to_slug(_DB_PATH, silo) if silo
-            else resolve_silo_by_path(_DB_PATH, _Path(path).resolve())
-        )
-        return {
-            "status": "ok",
-            "silo": slug,
-            "path": str(_Path(path).resolve()),
-            "files_indexed": files_ok,
-            "failures": n_failures,
-            "message": f"Indexed {files_ok} file(s) into silo '{slug}'" + (f" with {n_failures} failure(s). Run `llmli log` for details." if n_failures else "."),
-        }
-    except Exception as e:
-        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    def _run_add() -> None:
+        err: str | None = None
+        files_ok = 0
+        n_failures = 0
+        final_slug: str | None = None
+        try:
+            with _reindex_lock:
+                with _chroma_lock:
+                    from orchestration.ingest import IngestRequest, run_ingest
+                    from state import resolve_silo_by_path, resolve_silo_to_slug
+
+                    result = run_ingest(
+                        IngestRequest(
+                            path=str(p),
+                            db_path=_DB_PATH,
+                            forced_silo_slug=silo,
+                            display_name=display_name,
+                            allow_cloud=allow_cloud,
+                            incremental=not full,
+                            exclude_patterns=exclude_patterns,
+                        )
+                    )
+                    files_ok = result.files_indexed
+                    n_failures = result.failures
+                    final_slug = (
+                        resolve_silo_to_slug(_DB_PATH, silo) if silo
+                        else resolve_silo_by_path(_DB_PATH, p)
+                    )
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            _logger.exception("add_silo failed path=%s", p)
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            finished = datetime.now(timezone.utc).isoformat()
+            rec: dict = {
+                "silo": final_slug or outcome_key,
+                "path": str(p),
+                "finished_at": finished,
+                "ok": err is None,
+                "files_indexed": files_ok,
+                "failures": n_failures,
+                **({"error": err} if err else {}),
+            }
+            with _reindex_outcome_lock:
+                _last_reindex_outcome[outcome_key] = rec
+
+    t = threading.Thread(target=_run_add, daemon=True)
+    t.start()
+    return {
+        "status": "started",
+        "path": str(p),
+        "message": (
+            "Indexing running in background thread (in-process, serialized). "
+            "Call list_silos() after a minute or two to confirm the silo appears. "
+            "Call health() to check last_background_reindex status after completion."
+        ),
+    }
 
 
 @mcp.tool()
@@ -618,11 +696,62 @@ def capabilities() -> str:
 
 @mcp.resource("silos://list")
 def resource_silos() -> str:
-    """Read-only JSON snapshot of all registered silos."""
+    """Read-only JSON snapshot of all registered silos. May be stale — call list_silos tool for live data."""
     import json
     from state import list_silos as _list_silos
-    return json.dumps(_list_silos(_DB_PATH), indent=2)
+    return json.dumps({
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "silos": _list_silos(_DB_PATH),
+    }, indent=2)
+
+
+@mcp.resource("silos://{slug}")
+def get_silo(slug: str) -> str:
+    """
+    Fetch live silo metadata by slug (e.g. silos://much-thinks, silos://hot_seat).
+    Returns JSON with silo details: slug, display_name, path, file_count, chunk_count,
+    last_indexed, and doc_type_breakdown. Resolved dynamically at request time.
+    """
+    import json
+    from state import list_silos as _list_silos
+    all_silos = _list_silos(_DB_PATH)
+    silo_info = next((s for s in all_silos if s.get("slug") == slug), None)
+    if silo_info is None:
+        raise ValueError(f"silo not found: {slug}")
+    return json.dumps(silo_info, indent=2)
+
+
+@mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+async def healthz(_: Request) -> Response:
+    """Simple liveness check for process supervisors and reverse proxies."""
+    return JSONResponse({"ok": True, "service": "llmLibrarian-mcp"})
 
 
 if __name__ == "__main__":
-    mcp.run()  # STDIO transport by default
+    transport = os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower()
+    if transport not in {"stdio", "http", "sse", "streamable-http"}:
+        raise RuntimeError(
+            "LLMLIBRARIAN_MCP_TRANSPORT must be one of: "
+            "stdio, http, sse, streamable-http"
+        )
+
+    auth_provider = _auth_for_transport(transport)
+    if auth_provider is not None:
+        mcp.auth = auth_provider
+
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1")
+        port = int(os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765"))
+        path = os.environ.get("LLMLIBRARIAN_MCP_PATH", "/mcp")
+        log_level = os.environ.get("LLMLIBRARIAN_MCP_LOG_LEVEL", "warning")
+        stateless_http = _env_bool("LLMLIBRARIAN_MCP_STATELESS_HTTP", True)
+        mcp.run(
+            transport=transport,
+            host=host,
+            port=port,
+            path=path,
+            log_level=log_level,
+            stateless_http=stateless_http,
+        )

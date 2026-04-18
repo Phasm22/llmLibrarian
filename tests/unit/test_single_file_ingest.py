@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from ingest import update_single_file, remove_single_file, _file_manifest_path
+from state import get_silo_exclude_patterns, update_silo
 
 
 class _DummyClient:
@@ -194,3 +195,31 @@ def test_update_single_file_returns_error_when_image_model_unavailable(monkeypat
     )
     assert status == "error"
     assert path_str == str(target.resolve())
+
+
+def test_update_single_file_honors_persisted_excludes(monkeypatch, mock_collection, db_path: Path, tmp_path: Path):
+    _patch_ingest_runtime(monkeypatch, mock_collection)
+    root = tmp_path / "docs"
+    root.mkdir()
+    target = root / "skip.txt"
+    target.write_text("hello", encoding="utf-8")
+    db_path.mkdir(parents=True, exist_ok=True)
+    slug = "docs-silo"
+    update_silo(
+        db_path,
+        slug,
+        str(root.resolve()),
+        0,
+        0,
+        "2024-01-01T00:00:00+00:00",
+        exclude_patterns=["skip.txt"],
+    )
+    monkeypatch.setattr(
+        "ingest.remove_single_file",
+        lambda path, db_path=None, silo_slug="__self__", update_counts=True: ("removed", str(Path(path).resolve())),
+    )
+
+    status, path_str = update_single_file(target, db_path=db_path, silo_slug=slug, allow_cloud=True)
+    assert status == "removed"
+    assert path_str == str(target.resolve())
+    assert get_silo_exclude_patterns(db_path, slug) == ["skip.txt"]

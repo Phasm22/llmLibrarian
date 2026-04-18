@@ -25,6 +25,7 @@ class IngestRequest:
     incremental: bool = True
     forced_silo_slug: str | None = None
     display_name: str | None = None
+    exclude_patterns: list[str] | None = None
     image_vision_enabled: bool | None = None
     workers: int | None = None
     embedding_workers: int | None = None
@@ -94,6 +95,7 @@ def run_ingest(request: IngestRequest) -> IngestResult:
             incremental=request.incremental,
             forced_silo_slug=request.forced_silo_slug,
             display_name_override=request.display_name,
+            exclude_patterns=request.exclude_patterns,
             image_vision_enabled=request.image_vision_enabled,
             workers=request.workers,
             embedding_workers=request.embedding_workers,
@@ -120,6 +122,8 @@ def llmli_add_argv(request: IngestRequest) -> list[str]:
         out.append("--allow-cloud")
     if request.follow_symlinks:
         out.append("--follow-symlinks")
+    for pattern in request.exclude_patterns or []:
+        out.extend(["--exclude", pattern])
     if request.image_vision_enabled:
         out.append("--image-vision")
     if request.workers is not None:

@@ -70,6 +70,22 @@ def test_pal_sync_forces_self_index(monkeypatch):
     assert seen["force"] is True
 
 
+def test_pal_pull_forwards_exclude_patterns(monkeypatch):
+    seen = {}
+
+    def _fake_pull_path_mode(*args, **kwargs):
+        seen["path"] = {"args": args, "kwargs": kwargs}
+        return 0
+
+    monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path_mode)
+    res = runner.invoke(
+        pal.app,
+        ["pull", "/tmp/src", "--exclude", "node_modules/", "--exclude", "*.tmp"],
+    )
+    assert res.exit_code == 0
+    assert seen["path"]["kwargs"]["exclude_patterns"] == ["node_modules/", "*.tmp"]
+
+
 def test_pal_diff_command_runs_without_identifiable_error(monkeypatch, tmp_path: Path):
     root = tmp_path / "srcsilo"
     root.mkdir(parents=True, exist_ok=True)

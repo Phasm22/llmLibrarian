@@ -1,0 +1,7 @@
+{
+  "name": "llmLibrarian",
+  "version": "1.0.0",
+  "description": "Personal knowledge base — journals, transcripts, project notes. Call query_personal_knowledge for the user's past thinking.",
+  "author": "tjm4",
+  "mcp": ".mcp.json"
+}

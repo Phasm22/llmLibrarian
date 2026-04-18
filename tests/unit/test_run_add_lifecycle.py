@@ -7,6 +7,7 @@ from ingest import CloudSyncPathError, _file_manifest_path, run_add
 from file_registry import _file_registry_path
 from processors import ImageExtractionError
 from image_embeddings import ImageEmbeddingError
+from state import get_silo_exclude_patterns, update_silo, resolve_silo_by_path
 
 
 class _FakeCollection:
@@ -137,6 +138,50 @@ def test_run_add_persists_image_vision_enabled(monkeypatch, tmp_path):
     slug = resolve_silo_by_path(tmp_path / "db", root)
     assert slug is not None
     assert get_silo_image_vision_enabled(tmp_path / "db", slug) is True
+
+
+def test_run_add_uses_and_persists_saved_excludes(monkeypatch, tmp_path):
+    root = tmp_path / "docs"
+    root.mkdir()
+    file_path = root / "keep.txt"
+    file_path.write_text("hello world", encoding="utf-8")
+    db_path = tmp_path / "db"
+    db_path.mkdir(parents=True, exist_ok=True)
+    slug = "docs-silo"
+    update_silo(
+        db_path,
+        slug,
+        str(root.resolve()),
+        0,
+        0,
+        "2024-01-01T00:00:00+00:00",
+        exclude_patterns=["vendor/"],
+    )
+
+    coll = _FakeCollection()
+    _patch_runtime(monkeypatch, coll)
+    captured: dict[str, list[str]] = {}
+
+    def _fake_collect_files(_root, include, exclude, max_depth, max_file_bytes, follow_symlinks=False, stats=None):
+        captured["exclude"] = list(exclude)
+        return [(file_path.resolve(), "code")]
+
+    monkeypatch.setattr("ingest.collect_files", _fake_collect_files)
+    monkeypatch.setattr("ingest.process_one_file", lambda *a, **k: [])
+    monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _path: slug)
+
+    files_indexed, failures = run_add(
+        root,
+        db_path=db_path,
+        allow_cloud=True,
+        exclude_patterns=["*.tmp"],
+    )
+
+    assert failures == 0
+    assert files_indexed == 0
+    assert "vendor/" in captured["exclude"]
+    assert "*.tmp" in captured["exclude"]
+    assert get_silo_exclude_patterns(db_path, slug) == ["vendor/", "*.tmp"]
 
 
 def test_run_add_writes_status_file(monkeypatch, tmp_path):
