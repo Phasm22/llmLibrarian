@@ -1926,7 +1926,7 @@ def _daemon_runtime_metadata(manager: str | None = None) -> dict[str, object]:
     return {
         "version": 1,
         "manager": detected_manager,
-        "python_executable": str(Path(sys.executable).resolve()),
+        "python_executable": sys.executable,
         "pal_path": str(Path(__file__).resolve()),
         "workdir": _daemon_workdir(),
         "db_path": str(db_path),
