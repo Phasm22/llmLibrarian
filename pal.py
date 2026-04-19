@@ -2097,23 +2097,15 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 daemon_app = typer.Typer(help="Install and manage background silo watchers.", add_completion=False, invoke_without_command=True)
-jobs_app = typer.Typer(help="Inspect derived background jobs.", add_completion=False, invoke_without_command=True)
 extension_app = typer.Typer(help="Claude Desktop MCP packaging (records mcp_server.py hash).", add_completion=False)
 app.add_typer(daemon_app, name="daemon")
-app.add_typer(jobs_app, name="jobs")
 app.add_typer(extension_app, name="extension")
 
 
 @daemon_app.callback()
 def daemon_callback(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand is None:
-        _daemon_status_impl()
-
-
-@jobs_app.callback()
-def jobs_callback(ctx: typer.Context) -> None:
-    if ctx.invoked_subcommand is None:
-        _jobs_ls_impl()
+        print("Use 'pal ls --status' to see silo and daemon health.")
 
 
 @extension_app.command(
@@ -2438,29 +2430,6 @@ def ls_command(
         _exit(_run_llmli(["ls"]))
 
 
-@app.command("inspect", help="Show details for a silo.")
-def inspect_command(
-    silo: str = typer.Argument(..., help="Silo slug or display name.", autocompletion=_complete_silo),
-    top: int | None = typer.Option(None, "--top", help="Show top N files by chunks."),
-    filter: str | None = typer.Option(None, "--filter", help="Show only pdf, docx, or code."),
-) -> None:
-    llmli_args = ["inspect", silo]
-    if top is not None:
-        llmli_args.extend(["--top", str(top)])
-    if filter:
-        llmli_args.extend(["--filter", filter])
-    _exit(_run_llmli(llmli_args))
-
-
-@app.command("capabilities", help="Supported file types.")
-def capabilities_command() -> None:
-    ensure_self_silo(force=False)
-    _exit(_run_llmli(["capabilities"]))
-
-
-@app.command("log", help="Show recent failures.")
-def log_command() -> None:
-    _exit(_run_llmli(["log", "--last"]))
 
 
 @app.command("remove", help="Remove a silo.")
@@ -2486,12 +2455,6 @@ def remove_command(
     _sync_daemon_if_installed()
 
 
-@app.command("sync", help="Re-index the project's own source (dev mode).")
-def sync_command() -> None:
-    _warn_mcp_desktop_extension_stale()
-    _exit(ensure_self_silo(force=True))
-
-
 @daemon_app.command("install", help="Install user-space watch services for registered silos.")
 def daemon_install_command() -> None:
     metadata = _daemon_runtime_metadata()
@@ -2504,36 +2467,6 @@ def daemon_install_command() -> None:
 @daemon_app.command("sync", help="Reconcile daemon services against registered silos.")
 def daemon_sync_command() -> None:
     _exit(_sync_daemon_services(emit_output=True))
-
-
-def _daemon_status_impl() -> None:
-    metadata, jobs, warnings, records = _daemon_status_rows()
-    if not metadata:
-        print("Daemon: not installed")
-        return
-    print("Daemon")
-    print(f"  Installed: yes")
-    print(f"  Manager: {metadata.get('manager')}")
-    print(f"  Python: {metadata.get('python_executable')}")
-    print(f"  Jobs: {len(jobs)}")
-    if warnings:
-        print(f"  ({len(warnings)} sources skipped — not indexed or missing)")
-    record_by_slug = {str((record or {}).get("silo") or ""): record for record in records if isinstance(record, dict)}
-    print("\nSilo                      State      Service")
-    print("---------------------------------------------------------------")
-    manager_name = str(metadata.get("manager") or "")
-    manager = jobsrt.PlatformManager(manager_name)
-    for job in jobs:
-        record = record_by_slug.get(job.slug)
-        state = str((record or {}).get("state") or "installed")
-        if not manager.desired_path(job.slug).exists():
-            state = "missing"
-        print(f"{job.slug:24} {state:10} {job.service_name}")
-
-
-@daemon_app.command("status", help="Show daemon install state and job health.")
-def daemon_status_command() -> None:
-    _daemon_status_impl()
 
 
 @daemon_app.command("logs", help="Show recent daemon logs for one silo.")
@@ -2619,241 +2552,6 @@ def _jobs_ls_impl() -> None:
         log_name = Path(job.log_path).name
         log_cell = link_style(no_color, f"file://{job.log_path}", log_name)
         print(f"{job.kind:10} {job.slug:24} {state:10} {job.service_name:28} {log_cell}")
-
-
-@jobs_app.command("ls", help="List derived daemon jobs.")
-def jobs_ls_command() -> None:
-    _jobs_ls_impl()
-
-
-@app.command("diff", help="Show files changed since last pull.")
-def diff_command(
-    silo: str = typer.Argument(..., help="Silo slug or display name.", autocompletion=_complete_silo),
-) -> None:
-    _ensure_src_on_path()
-    from state import resolve_silo_to_slug, resolve_silo_prefix, list_silos
-    from file_registry import _read_file_manifest
-    from ingest import _load_limits_config, collect_files, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE
-
-    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
-    slug = resolve_silo_to_slug(db_path, silo) or resolve_silo_prefix(db_path, silo)
-    if not slug:
-        print(f"Error: silo not found: {silo}", file=sys.stderr)
-        raise typer.Exit(code=1)
-
-    silos = list_silos(db_path)
-    info = next((s for s in silos if s.get("slug") == slug), None)
-    root_path = (info or {}).get("path")
-    if not root_path:
-        print(f"Error: silo has no path: {slug}", file=sys.stderr)
-        raise typer.Exit(code=1)
-    root = Path(root_path).resolve()
-    if not root.exists() or not root.is_dir():
-        print(f"Error: silo path missing: {root}", file=sys.stderr)
-        raise typer.Exit(code=1)
-
-    manifest = _read_file_manifest(db_path)
-    manifest_files = (((manifest.get("silos") or {}).get(slug) or {}).get("files") or {})
-    if not isinstance(manifest_files, dict):
-        manifest_files = {}
-
-    changed: list[str] = []
-    removed: list[str] = []
-    for path_str, meta in manifest_files.items():
-        p = Path(path_str)
-        if not p.exists():
-            removed.append(path_str)
-            continue
-        try:
-            st = p.stat()
-        except OSError:
-            removed.append(path_str)
-            continue
-        if st.st_mtime != meta.get("mtime") or st.st_size != meta.get("size"):
-            changed.append(path_str)
-
-    max_file_bytes, max_depth, _max_archive_bytes, _max_files_per_zip, _max_extracted = _load_limits_config()
-    current_entries = collect_files(
-        root,
-        ADD_DEFAULT_INCLUDE,
-        ADD_DEFAULT_EXCLUDE,
-        max_depth,
-        max_file_bytes,
-        follow_symlinks=False,
-    )
-    current_set = {str(p.resolve()) for p, _kind in current_entries}
-    manifest_set = set(manifest_files.keys())
-    added = sorted(current_set - manifest_set)
-    changed = sorted(changed)
-    removed = sorted(removed)
-
-    if not changed and not added and not removed:
-        print("No changes.")
-        return
-
-    print(f"{slug}: +{len(added)} added, ~{len(changed)} changed, -{len(removed)} removed")
-    for f in added:
-        print(f"  A {f}")
-    for f in changed:
-        print(f"  M {f}")
-    for f in removed:
-        print(f"  D {f}")
-
-
-@app.command("status", help="Quick health check.")
-def status_command() -> None:
-    _ensure_src_on_path()
-    _warn_mcp_desktop_extension_stale()
-    from silo_audit import (
-        load_registry,
-        load_manifest,
-        load_file_registry,
-        find_count_mismatches,
-        find_duplicate_hashes,
-        find_path_overlaps,
-    )
-
-    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
-    registry = load_registry(db_path)
-    file_registry = load_file_registry(db_path)
-    manifest = load_manifest(db_path)
-    dupes = find_duplicate_hashes(file_registry)
-    overlaps = find_path_overlaps(registry)
-    mismatches = find_count_mismatches(registry, manifest)
-    print(_render_health_summary(registry, dupes, overlaps, mismatches))
-
-    _ensure_src_on_path()
-    from operations import op_db_storage_summary
-
-    stor = op_db_storage_summary(db_path)
-    if "error" not in stor:
-        print()
-        print("On-disk index (Chroma persist folder)")
-        print(f"  Folder size (approx): {_fmt_bytes_iec(int(stor.get('db_total_bytes') or 0))}")
-        if int(stor.get("disk_free_bytes") or -1) >= 0:
-            print(f"  Volume free space: {_fmt_bytes_iec(int(stor['disk_free_bytes']))}")
-        for entry in stor.get("link_lists") or []:
-            p = str(entry.get("path") or "")
-            b = int(entry.get("bytes") or 0)
-            print(f"  link_lists.bin: {_fmt_bytes_iec(b)}")
-            if p:
-                print(f"    ({p})")
-        if stor.get("chroma_hnsw_bloat"):
-            print("  WARNING: HNSW index file is abnormally large.")
-            note = stor.get("chroma_hnsw_bloat_note")
-            if note:
-                print(f"    {note}")
-
-    if not (dupes or overlaps or mismatches):
-        return
-
-    print("\nTop Issues")
-    if mismatches:
-        top = sorted(
-            mismatches,
-            key=lambda m: abs(int(m.get("registry_files", 0) or 0) - int(m.get("manifest_files", 0) or 0)),
-            reverse=True,
-        )[:3]
-        reg_by_slug = {str((s or {}).get("slug") or ""): s for s in registry if isinstance(s, dict)}
-        print(f"  Count mismatches: {len(mismatches)}")
-        for m in top:
-            slug = str(m.get("slug") or "?")
-            rf = int(m.get("registry_files", 0) or 0)
-            mf = int(m.get("manifest_files", 0) or 0)
-            delta = mf - rf
-            sign = "+" if delta >= 0 else ""
-            path = str((reg_by_slug.get(slug) or {}).get("path") or "")
-            action = _status_action_for_mismatch(slug, rf, mf, path or None)
-            print(f"    - {slug}: indexed={rf}, manifest={mf} (delta {sign}{delta})")
-            print(f"      action: {action}")
-    if overlaps:
-        print(f"  Path overlaps: {len(overlaps)}")
-        first = overlaps[0]
-        if first.get("type") == "nested":
-            print(f"    - nested: {first.get('child')} inside {first.get('parent')}")
-            print(f"      action: remove duplicate scope: pal remove {first.get('child')}")
-        else:
-            silos = first.get("silos") or []
-            print(f"    - same path: {', '.join(str(s) for s in silos)}")
-            if silos:
-                print(f"      action: keep one scope: pal remove {silos[-1]}")
-    if dupes:
-        print(f"  Duplicate groups: {len(dupes)}")
-
-    print("\nNext Actions")
-    print("  1. Inspect full details: pal silos")
-    print("  2. Re-index out-of-sync silos: pal pull --full")
-
-
-@app.command("silos", help="Audit silo health.")
-def silos_command() -> None:
-    _ensure_src_on_path()
-    from silo_audit import (
-        load_registry,
-        load_file_registry,
-        load_manifest,
-        find_duplicate_hashes,
-        find_path_overlaps,
-        find_count_mismatches,
-    )
-    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
-    registry = load_registry(db_path)
-    file_registry = load_file_registry(db_path)
-    manifest = load_manifest(db_path)
-    dupes = find_duplicate_hashes(file_registry)
-    overlaps = find_path_overlaps(registry)
-    mismatches = find_count_mismatches(registry, manifest)
-    print(_render_health_summary(registry, dupes, overlaps, mismatches))
-
-    reg_by_slug = {str((s or {}).get("slug") or ""): s for s in registry if isinstance(s, dict)}
-    action_lines: list[str] = []
-
-    if overlaps:
-        print("\nPath Overlaps")
-        for o in overlaps:
-            if o.get("type") == "same_path":
-                silos = [str(s) for s in (o.get("silos") or [])]
-                path = str(o.get("path") or "?")
-                print(f"  - same path: {', '.join(silos)}")
-                print(f"    path: {path}")
-                if silos:
-                    action_lines.append(f"keep one overlapping scope: pal remove {silos[-1]}")
-            else:
-                parent = str(o.get("parent") or "?")
-                child = str(o.get("child") or "?")
-                print(f"  - nested scope: {child} inside {parent}")
-                action_lines.append(f"remove nested duplicate scope: pal remove {child}")
-
-    if mismatches:
-        print("\nCount Mismatches")
-        ordered = sorted(
-            mismatches,
-            key=lambda m: abs(int(m.get("registry_files", 0) or 0) - int(m.get("manifest_files", 0) or 0)),
-            reverse=True,
-        )
-        for m in ordered:
-            slug = str(m.get("slug") or "?")
-            rf = int(m.get("registry_files", 0) or 0)
-            mf = int(m.get("manifest_files", 0) or 0)
-            delta = mf - rf
-            sign = "+" if delta >= 0 else ""
-            path = str((reg_by_slug.get(slug) or {}).get("path") or "")
-            print(f"  - {slug}: indexed={rf}, manifest={mf} (delta {sign}{delta})")
-            if path:
-                print(f"    path: {path}")
-            action_lines.append(_status_action_for_mismatch(slug, rf, mf, path or None))
-
-    if dupes:
-        print("\nDuplicate Content")
-        print(f"  - {len(dupes)} duplicate hash group(s) found")
-
-    if action_lines:
-        deduped = list(dict.fromkeys(action_lines))
-        print("\nRecommended Actions")
-        for idx, action in enumerate(deduped, start=1):
-            print(f"  {idx}. {action}")
-    else:
-        print("\nNo action needed.")
 
 
 @app.command("tool", help="Pass-through to llmli.")
