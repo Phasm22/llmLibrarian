@@ -1,0 +1,15 @@
+[Unit]
+Description=llmLibrarian MCP HTTP service
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/llmLibrarian
+ExecStart=/home/%i/llmLibrarian/scripts/run_mcp_http.sh
+Restart=always
+RestartSec=2
+Environment=LLMLI_MCP_ENV_FILE=/home/%i/llmLibrarian/.env.mcp
+
+[Install]
+WantedBy=multi-user.target

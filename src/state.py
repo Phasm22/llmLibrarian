@@ -69,6 +69,7 @@ def update_silo(
     display_name: str | None = None,
     language_stats: dict | None = None,
     image_vision_enabled: bool | None = None,
+    exclude_patterns: list[str] | None = None,
 ) -> None:
     """Record silo after add. Preserves unknown keys (e.g. prompt overrides)."""
     reg = _read_registry(db_path)
@@ -88,6 +89,9 @@ def update_silo(
         entry["language_stats"] = language_stats
     if image_vision_enabled is not None:
         entry["image_vision_enabled"] = bool(image_vision_enabled)
+    if exclude_patterns is not None:
+        cleaned = [str(p).strip() for p in exclude_patterns if str(p).strip()]
+        entry["exclude_patterns"] = cleaned
     reg[slug] = entry
     _write_registry(db_path, reg)
 
@@ -137,6 +141,25 @@ def get_silo_image_vision_enabled(db_path: str | Path, slug: str) -> bool | None
     if isinstance(value, bool):
         return value
     return None
+
+def get_silo_exclude_patterns(db_path: str | Path, slug: str) -> list[str]:
+    """Get persisted per-silo exclude patterns, if present."""
+    reg = _read_registry(db_path)
+    entry = reg.get(slug)
+    if not isinstance(entry, dict):
+        return []
+    value = entry.get("exclude_patterns")
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in value:
+        pattern = str(raw).strip()
+        if not pattern or pattern in seen:
+            continue
+        seen.add(pattern)
+        out.append(pattern)
+    return out
 
 def list_silos(db_path: str | Path) -> list[dict[str, Any]]:
     """Return list of silo dicts (slug, display_name, path, files_indexed, chunks_count, updated)."""

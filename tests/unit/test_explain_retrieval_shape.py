@@ -62,3 +62,27 @@ def test_explain_retrieval_vector_only_summary(monkeypatch):
     assert out["lexical_hit_count"] == 0
     assert out["vector_only_chunk_count"] == 1
     assert out["chunk_with_vector_rank_count"] == 1
+
+
+def test_add_silo_forwards_exclude_patterns(monkeypatch, tmp_path):
+    target = tmp_path / "src"
+    target.mkdir()
+    seen = {}
+
+    def _fake_run_ingest(request):
+        seen["exclude_patterns"] = request.exclude_patterns
+        from orchestration.ingest import IngestResult
+
+        return IngestResult(files_indexed=1, failures=0, silo_slug="src")
+
+    monkeypatch.setattr("orchestration.ingest.run_ingest", _fake_run_ingest)
+    out = mcp_server.add_silo(path=str(target), exclude_patterns=["node_modules/", "*.tmp"])
+    assert out["status"] == "started"
+    # the background thread should get the same values once it runs
+    import time
+
+    for _ in range(50):
+        if "exclude_patterns" in seen:
+            break
+        time.sleep(0.02)
+    assert seen["exclude_patterns"] == ["node_modules/", "*.tmp"]

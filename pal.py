@@ -876,10 +876,12 @@ def _llmli_registry_path(db_path: str | Path) -> Path:
 
 
 def _read_llmli_registry(db_path: str | Path) -> dict:
+    from pal_registry import cleanup_stale_registry_entries
     path = _llmli_registry_path(db_path)
     if not path.exists():
         return {}
     try:
+        cleanup_stale_registry_entries(path)
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f) or {}
     except Exception:
@@ -1205,6 +1207,19 @@ def _normalize_natural_ask_scope(
     return None, query_tokens, None
 
 
+def _merge_path_patterns(*groups: list[str] | None) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw in group or []:
+            pattern = str(raw).strip()
+            if not pattern or pattern in seen:
+                continue
+            seen.add(pattern)
+            merged.append(pattern)
+    return merged
+
+
 class _SiloEventHandler(FileSystemEventHandler):
     def __init__(self, watcher: "SiloWatcher") -> None:
         super().__init__()
@@ -1243,6 +1258,7 @@ class SiloWatcher:
         allow_cloud: bool = False,
         label: str = "this folder",
         startup_message: str | None = None,
+        exclude_patterns: list[str] | None = None,
     ) -> None:
         if Observer is None:
             raise RuntimeError("watchdog is not installed. Install `watchdog` to use watch mode.")
@@ -1258,6 +1274,7 @@ class SiloWatcher:
             ADD_DEFAULT_INCLUDE,
             ADD_DEFAULT_EXCLUDE,
         )
+        from state import get_silo_exclude_patterns
 
         self.root = root.resolve()
         self.db_path = str(db_path)
@@ -1289,7 +1306,11 @@ class SiloWatcher:
         self._collect_files = collect_files
         self._should_index = should_index
         self._include = ADD_DEFAULT_INCLUDE
-        self._exclude = ADD_DEFAULT_EXCLUDE
+        self._exclude = _merge_path_patterns(
+            ADD_DEFAULT_EXCLUDE,
+            get_silo_exclude_patterns(self.db_path, self.silo_slug),
+            exclude_patterns,
+        )
 
         self._observer = Observer()
         self._handler = _SiloEventHandler(self)
@@ -1400,6 +1421,7 @@ class SiloWatcher:
                             follow_symlinks=False,
                             no_color=True,
                             update_counts=True,
+                            exclude_patterns=self._exclude,
                         )
             except Exception as exc:
                 status = "error"
@@ -1574,6 +1596,7 @@ def _pull_path_mode(
     allow_cloud: bool = False,
     follow_symlinks: bool = False,
     full: bool = False,
+    exclude_patterns: list[str] | None = None,
     prompt: str | None = None,
     clear_prompt: bool = False,
     image_vision: bool | None = None,
@@ -1605,6 +1628,7 @@ def _pull_path_mode(
                 allow_cloud=allow_cloud,
                 follow_symlinks=follow_symlinks,
                 incremental=not full,
+                exclude_patterns=exclude_patterns,
                 image_vision_enabled=image_vision,
                 workers=workers,
                 embedding_workers=embedding_workers,
@@ -1632,6 +1656,7 @@ def _pull_watch_path_mode(
     debounce: float,
     allow_cloud: bool,
     follow_symlinks: bool,
+    exclude_patterns: list[str] | None = None,
     prompt: str | None = None,
     clear_prompt: bool = False,
     image_vision: bool | None = None,
@@ -1655,6 +1680,7 @@ def _pull_watch_path_mode(
             allow_cloud=allow_cloud,
             follow_symlinks=follow_symlinks,
             full=False,
+            exclude_patterns=exclude_patterns,
             prompt=prompt,
             clear_prompt=clear_prompt,
             image_vision=image_vision,
@@ -1678,6 +1704,7 @@ def _pull_watch_path_mode(
             silo_slug=slug,
             allow_cloud=allow_cloud,
             label="this folder",
+            exclude_patterns=exclude_patterns,
         )
         return _run_watcher(watcher, db_path, slug)
     finally:
@@ -1796,6 +1823,7 @@ def pull_all_sources(
     full: bool = False,
     allow_cloud: bool = False,
     follow_symlinks: bool = False,
+    exclude_patterns: list[str] | None = None,
     image_vision: bool | None = None,
     workers: int | None = None,
     embedding_workers: int | None = None,
@@ -1832,6 +1860,7 @@ def pull_all_sources(
                 incremental=not full,
                 allow_cloud=allow_cloud,
                 follow_symlinks=follow_symlinks,
+                exclude_patterns=exclude_patterns,
                 image_vision_enabled=image_vision,
                 workers=workers,
                 embedding_workers=embedding_workers,
@@ -2152,6 +2181,7 @@ def pull_command(
     prompt: str | None = typer.Option(None, "--prompt", help="Custom system prompt override for this silo."),
     clear_prompt: bool = typer.Option(False, "--clear-prompt", help="Clear custom prompt override for this silo."),
     allow_cloud: bool = typer.Option(False, "--allow-cloud", help="Allow cloud-synced folders."),
+    exclude_patterns: list[str] | None = typer.Option(None, "--exclude", help="Extra path exclusion pattern (repeatable)."),
     image_vision: bool = typer.Option(False, "--image-vision", help="Enable multimodal image summaries for this silo (default: off unless previously enabled)."),
     workers: int | None = typer.Option(None, "--workers", help="Override file/extraction worker count for this run."),
     embedding_workers: int | None = typer.Option(None, "--embedding-workers", help="Override embedding worker count for this run."),
@@ -2209,6 +2239,7 @@ def pull_command(
                 debounce,
                 allow_cloud,
                 follow_symlinks,
+                exclude_patterns,
                 prompt=prompt,
                 clear_prompt=clear_prompt,
                 image_vision=image_vision_requested,
@@ -2224,6 +2255,7 @@ def pull_command(
                 allow_cloud=allow_cloud,
                 follow_symlinks=follow_symlinks,
                 full=full,
+                exclude_patterns=exclude_patterns,
                 prompt=prompt,
                 clear_prompt=clear_prompt,
                 image_vision=image_vision_requested,
@@ -2237,6 +2269,7 @@ def pull_command(
             full=full,
             allow_cloud=allow_cloud,
             follow_symlinks=follow_symlinks,
+            exclude_patterns=exclude_patterns,
             image_vision=image_vision_requested,
             workers=workers,
             embedding_workers=embedding_workers,
@@ -2294,9 +2327,115 @@ def ask_command(
     _exit(_run_llmli(llmli_args))
 
 
-@app.command("ls", help="List indexed silos.")
-def ls_command() -> None:
-    _exit(_run_llmli(["ls"]))
+def _ls_status() -> None:
+    """Show silo health summary + daemon status table + recommended actions."""
+    _ensure_src_on_path()
+    from silo_audit import (
+        load_registry,
+        load_manifest,
+        load_file_registry,
+        find_count_mismatches,
+        find_duplicate_hashes,
+        find_path_overlaps,
+    )
+
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
+    registry = load_registry(db_path)
+    file_registry = load_file_registry(db_path)
+    manifest = load_manifest(db_path)
+    dupes = find_duplicate_hashes(file_registry)
+    overlaps = find_path_overlaps(registry)
+    mismatches = find_count_mismatches(registry, manifest)
+
+    print(_render_health_summary(registry, dupes, overlaps, mismatches))
+    print()
+
+    # Daemon status table
+    metadata, jobs, warnings, records = _daemon_status_rows()
+    if metadata:
+        print("Daemon")
+        print(f"  Installed: yes")
+        print(f"  Manager: {metadata.get('manager')}")
+        print(f"  Python: {metadata.get('python_executable')}")
+        print(f"  Jobs: {len(jobs)}")
+        if warnings:
+            print(f"  ({len(warnings)} sources skipped — not indexed or missing)")
+        record_by_slug = {str((record or {}).get("silo") or ""): record for record in records if isinstance(record, dict)}
+        print("\nSilo                      State      Service")
+        print("---------------------------------------------------------------")
+        manager_name = str(metadata.get("manager") or "")
+        manager = jobsrt.PlatformManager(manager_name)
+        for job in jobs:
+            record = record_by_slug.get(job.slug)
+            state = str((record or {}).get("state") or "installed")
+            if not manager.desired_path(job.slug).exists():
+                state = "missing"
+            print(f"{job.slug:24} {state:10} {job.service_name}")
+        print()
+
+    # Recommended actions from silos_command logic
+    reg_by_slug = {str((s or {}).get("slug") or ""): s for s in registry if isinstance(s, dict)}
+    action_lines: list[str] = []
+
+    if overlaps:
+        print("Path Overlaps")
+        for o in overlaps:
+            if o.get("type") == "same_path":
+                silos = [str(s) for s in (o.get("silos") or [])]
+                path = str(o.get("path") or "?")
+                print(f"  - same path: {', '.join(silos)}")
+                print(f"    path: {path}")
+                if silos:
+                    action_lines.append(f"keep one overlapping scope: pal remove {silos[-1]}")
+            else:
+                parent = str(o.get("parent") or "?")
+                child = str(o.get("child") or "?")
+                print(f"  - nested scope: {child} inside {parent}")
+                action_lines.append(f"remove nested duplicate scope: pal remove {child}")
+
+    if mismatches:
+        print("Count Mismatches")
+        ordered = sorted(
+            mismatches,
+            key=lambda m: abs(int(m.get("registry_files", 0) or 0) - int(m.get("manifest_files", 0) or 0)),
+            reverse=True,
+        )
+        for m in ordered:
+            slug = str(m.get("slug") or "?")
+            rf = int(m.get("registry_files", 0) or 0)
+            mf = int(m.get("manifest_files", 0) or 0)
+            delta = mf - rf
+            sign = "+" if delta >= 0 else ""
+            path = str((reg_by_slug.get(slug) or {}).get("path") or "")
+            print(f"  - {slug}: indexed={rf}, manifest={mf} (delta {sign}{delta})")
+            if path:
+                print(f"    path: {path}")
+            action_lines.append(_status_action_for_mismatch(slug, rf, mf, path or None))
+
+    if dupes:
+        print("Duplicate Content")
+        print(f"  - {len(dupes)} duplicate hash group(s) found")
+
+    if action_lines:
+        deduped = list(dict.fromkeys(action_lines))
+        print("Recommended Actions")
+        for idx, action in enumerate(deduped, start=1):
+            print(f"  {idx}. {action}")
+    elif not (dupes or overlaps or mismatches):
+        print("No action needed.")
+
+
+@app.command("ls", help="List indexed silos (--status for health, --jobs for daemon jobs).")
+def ls_command(
+    status: bool = typer.Option(False, "--status", help="Show silo and daemon health with recommended actions."),
+    jobs: bool = typer.Option(False, "--jobs", help="Show daemon jobs and log paths."),
+) -> None:
+    if status:
+        _ls_status()
+    elif jobs:
+        _jobs_ls_impl()
+    else:
+        _exit(_run_llmli(["ls"]))
 
 
 @app.command("inspect", help="Show details for a silo.")

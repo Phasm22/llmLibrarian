@@ -110,6 +110,14 @@ def test_collect_files_skips_excluded_directory(tmp_path):
     assert out == []
 
 
+def test_collect_files_skips_nested_excluded_directory(tmp_path):
+    nested = tmp_path / "src" / "vendor" / "pkg"
+    nested.mkdir(parents=True)
+    (nested / "a.txt").write_text("x", encoding="utf-8")
+    out = collect_files(tmp_path, include=["*.txt"], exclude=["vendor/"], max_depth=10, max_file_bytes=1024)
+    assert out == []
+
+
 def test_collect_files_handles_permission_error(monkeypatch, tmp_path):
     root = tmp_path / "root"
     root.mkdir()

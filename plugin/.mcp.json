@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "llmLibrarian": {
+      "command": "/Users/tjm4/llmLibrarian/.venv/bin/python",
+      "args": ["/Users/tjm4/llmLibrarian/mcp_server.py"],
+      "env": {
+        "LLMLIBRARIAN_DB": "/Users/tjm4/llmLibrarian/my_brain_db",
+        "LLMLIBRARIAN_MODEL": "llama3.1:8b",
+        "LLMLIBRARIAN_CHUNK_SIZE": "1000",
+        "LLMLIBRARIAN_CHUNK_OVERLAP": "150",
+        "LLMLIBRARIAN_RERANK": "0"
+      }
+    }
+  }
+}

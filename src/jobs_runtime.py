@@ -408,7 +408,18 @@ class PlatformManager:
         workdir: str,
         env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        desired = {job.slug: job for job in jobs if job.enabled}
+        # Deduplicate jobs by source_path: keep the longest slug (newest format with hash suffix)
+        path_to_job: dict[str, JobSpec] = {}
+        for job in jobs:
+            if not job.enabled:
+                continue
+            path = str(Path(job.source_path).resolve())
+            existing = path_to_job.get(path)
+            if existing and len(job.slug) > len(existing.slug):
+                path_to_job[path] = job
+            elif not existing:
+                path_to_job[path] = job
+        desired = {job.slug: job for job in path_to_job.values()}
         written: list[str] = []
         activated: list[str] = []
         removed: list[str] = []

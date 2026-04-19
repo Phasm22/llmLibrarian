@@ -175,5 +175,6 @@ uv run python cli.py --help
 
 - Runtime and architecture: `[docs/TECH.md](docs/TECH.md)`
 - Security and testing notes: `[SECURITY_AND_TESTING.md](SECURITY_AND_TESTING.md)`
+- MCP over HTTPS via Tailscale Funnel: `[docs/MCP_TAILSCALE_FUNNEL.md](docs/MCP_TAILSCALE_FUNNEL.md)`
 - Agent and contributor contracts: `[AGENTS.md](AGENTS.md)`
 

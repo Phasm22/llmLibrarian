@@ -65,6 +65,7 @@ from file_registry import (
 )
 from load_config import load_config, get_archetype
 from style import bold, dim, label_style, success_style, warn_style, status_line, clear_status_line
+from state import get_silo_exclude_patterns
 
 # --- Default limits (overridden by config) ---
 DEFAULT_MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
@@ -89,6 +90,42 @@ ADD_DEFAULT_EXCLUDE = [
     "composer.lock", "Gemfile.lock", "Cargo.lock", "uv.lock",
     "my_brain_db/", "*.db", "*.sqlite", "*.sqlite3",
 ]
+
+
+def _normalize_patterns(patterns: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Return unique non-empty patterns in first-seen order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in patterns or []:
+        pattern = str(raw).strip()
+        if not pattern or pattern in seen:
+            continue
+        seen.add(pattern)
+        out.append(pattern)
+    return out
+
+
+def _merge_exclude_patterns(*pattern_groups: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Merge multiple exclude pattern lists while preserving order and removing duplicates."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in pattern_groups:
+        for pattern in _normalize_patterns(list(group) if isinstance(group, tuple) else group):
+            if pattern in seen:
+                continue
+            seen.add(pattern)
+            merged.append(pattern)
+    return merged
+
+
+def _effective_add_excludes(
+    db_path: str | Path,
+    silo_slug: str,
+    requested_excludes: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    """Return built-in excludes plus persisted silo excludes plus per-run overrides."""
+    saved = get_silo_exclude_patterns(db_path, silo_slug)
+    return _merge_exclude_patterns(ADD_DEFAULT_EXCLUDE, saved, requested_excludes)
 
 # Code-file extensions for language_stats (CODE_LANGUAGE pipeline). Excludes .md, .txt, .pdf, .docx.
 from doc_type_taxonomy import CODE_EXTENSIONS as ADD_CODE_EXTENSIONS, doc_type_bucket_for_extension
@@ -2067,6 +2104,7 @@ def run_add(
     incremental: bool = True,
     forced_silo_slug: str | None = None,
     display_name_override: str | None = None,
+    exclude_patterns: list[str] | None = None,
     image_vision_enabled: bool | None = None,
     workers: int | None = None,
     embedding_workers: int | None = None,
@@ -2103,6 +2141,10 @@ def run_add(
     else:
         existing_slug = resolve_silo_by_path(db_path, path)
         silo_slug = existing_slug if existing_slug else slugify(display_name, str(path))
+    requested_excludes = _normalize_patterns(exclude_patterns)
+    saved_excludes = get_silo_exclude_patterns(db_path, silo_slug)
+    effective_excludes = _effective_add_excludes(db_path, silo_slug, requested_excludes)
+    persisted_excludes = _merge_exclude_patterns(saved_excludes, requested_excludes)
     # Self-healing: if a previous ingest for this silo was interrupted mid-write,
     # force a full re-index so we don't end up with a partial state.
     from ingest_journal import check_pending
@@ -2150,7 +2192,7 @@ def run_add(
         file_list = collect_files(
             path,
             ADD_DEFAULT_INCLUDE,
-            ADD_DEFAULT_EXCLUDE,
+            effective_excludes,
             max_depth,
             max_file_bytes,
             follow_symlinks=follow_symlinks,
@@ -2495,7 +2537,9 @@ def run_add(
                     pass
             try:
                 chunks = process_zip_to_chunks(
-                    zip_path, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE,
+                    zip_path,
+                    ADD_DEFAULT_INCLUDE,
+                    effective_excludes,
                     max_archive_bytes, max_file_bytes, max_files_per_zip, max_extracted_per_zip,
                     db_path=db_path,
                 )
@@ -2654,6 +2698,7 @@ def run_add(
             display_name=display_name,
             language_stats=language_stats,
             image_vision_enabled=effective_image_vision_enabled,
+            exclude_patterns=persisted_excludes if persisted_excludes else None,
         )
         set_last_failures(db_path, failures)
         clear_pending(str(db_path), silo_slug)
@@ -2832,6 +2877,7 @@ def update_single_file(
     update_counts: bool = True,
     image_vision_enabled: bool | None = None,
     embedding_workers: int | None = None,
+    exclude_patterns: list[str] | None = None,
 ) -> tuple[str, str]:
     """
     Index or update a single file within a silo. Returns (status, path).
@@ -2861,7 +2907,8 @@ def update_single_file(
         silo_slug=silo_slug,
         requested=image_vision_enabled,
     )
-    if not should_index(path_str, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE):
+    effective_excludes = _effective_add_excludes(db_path, silo_slug, exclude_patterns)
+    if not should_index(path_str, ADD_DEFAULT_INCLUDE, effective_excludes):
         return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
     if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}:
         try:
@@ -2925,7 +2972,7 @@ def update_single_file(
                 chunks = process_zip_to_chunks(
                     p,
                     ADD_DEFAULT_INCLUDE,
-                    ADD_DEFAULT_EXCLUDE,
+                    effective_excludes,
                     max_archive_bytes,
                     max_file_bytes,
                     max_files_per_zip,
