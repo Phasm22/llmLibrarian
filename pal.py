@@ -2316,9 +2316,115 @@ def ask_command(
     _exit(_run_llmli(llmli_args))
 
 
-@app.command("ls", help="List indexed silos.")
-def ls_command() -> None:
-    _exit(_run_llmli(["ls"]))
+def _ls_status() -> None:
+    """Show silo health summary + daemon status table + recommended actions."""
+    _ensure_src_on_path()
+    from silo_audit import (
+        load_registry,
+        load_manifest,
+        load_file_registry,
+        find_count_mismatches,
+        find_duplicate_hashes,
+        find_path_overlaps,
+    )
+
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
+    registry = load_registry(db_path)
+    file_registry = load_file_registry(db_path)
+    manifest = load_manifest(db_path)
+    dupes = find_duplicate_hashes(file_registry)
+    overlaps = find_path_overlaps(registry)
+    mismatches = find_count_mismatches(registry, manifest)
+
+    print(_render_health_summary(registry, dupes, overlaps, mismatches))
+    print()
+
+    # Daemon status table
+    metadata, jobs, warnings, records = _daemon_status_rows()
+    if metadata:
+        print("Daemon")
+        print(f"  Installed: yes")
+        print(f"  Manager: {metadata.get('manager')}")
+        print(f"  Python: {metadata.get('python_executable')}")
+        print(f"  Jobs: {len(jobs)}")
+        if warnings:
+            print(f"  ({len(warnings)} sources skipped — not indexed or missing)")
+        record_by_slug = {str((record or {}).get("silo") or ""): record for record in records if isinstance(record, dict)}
+        print("\nSilo                      State      Service")
+        print("---------------------------------------------------------------")
+        manager_name = str(metadata.get("manager") or "")
+        manager = jobsrt.PlatformManager(manager_name)
+        for job in jobs:
+            record = record_by_slug.get(job.slug)
+            state = str((record or {}).get("state") or "installed")
+            if not manager.desired_path(job.slug).exists():
+                state = "missing"
+            print(f"{job.slug:24} {state:10} {job.service_name}")
+        print()
+
+    # Recommended actions from silos_command logic
+    reg_by_slug = {str((s or {}).get("slug") or ""): s for s in registry if isinstance(s, dict)}
+    action_lines: list[str] = []
+
+    if overlaps:
+        print("Path Overlaps")
+        for o in overlaps:
+            if o.get("type") == "same_path":
+                silos = [str(s) for s in (o.get("silos") or [])]
+                path = str(o.get("path") or "?")
+                print(f"  - same path: {', '.join(silos)}")
+                print(f"    path: {path}")
+                if silos:
+                    action_lines.append(f"keep one overlapping scope: pal remove {silos[-1]}")
+            else:
+                parent = str(o.get("parent") or "?")
+                child = str(o.get("child") or "?")
+                print(f"  - nested scope: {child} inside {parent}")
+                action_lines.append(f"remove nested duplicate scope: pal remove {child}")
+
+    if mismatches:
+        print("Count Mismatches")
+        ordered = sorted(
+            mismatches,
+            key=lambda m: abs(int(m.get("registry_files", 0) or 0) - int(m.get("manifest_files", 0) or 0)),
+            reverse=True,
+        )
+        for m in ordered:
+            slug = str(m.get("slug") or "?")
+            rf = int(m.get("registry_files", 0) or 0)
+            mf = int(m.get("manifest_files", 0) or 0)
+            delta = mf - rf
+            sign = "+" if delta >= 0 else ""
+            path = str((reg_by_slug.get(slug) or {}).get("path") or "")
+            print(f"  - {slug}: indexed={rf}, manifest={mf} (delta {sign}{delta})")
+            if path:
+                print(f"    path: {path}")
+            action_lines.append(_status_action_for_mismatch(slug, rf, mf, path or None))
+
+    if dupes:
+        print("Duplicate Content")
+        print(f"  - {len(dupes)} duplicate hash group(s) found")
+
+    if action_lines:
+        deduped = list(dict.fromkeys(action_lines))
+        print("Recommended Actions")
+        for idx, action in enumerate(deduped, start=1):
+            print(f"  {idx}. {action}")
+    elif not (dupes or overlaps or mismatches):
+        print("No action needed.")
+
+
+@app.command("ls", help="List indexed silos (--status for health, --jobs for daemon jobs).")
+def ls_command(
+    status: bool = typer.Option(False, "--status", help="Show silo and daemon health with recommended actions."),
+    jobs: bool = typer.Option(False, "--jobs", help="Show daemon jobs and log paths."),
+) -> None:
+    if status:
+        _ls_status()
+    elif jobs:
+        _jobs_ls_impl()
+    else:
+        _exit(_run_llmli(["ls"]))
 
 
 @app.command("inspect", help="Show details for a silo.")
