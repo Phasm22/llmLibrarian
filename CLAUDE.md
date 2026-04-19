@@ -25,9 +25,14 @@ llmli repair <silo>             # Fix ChromaDB index errors (wipe + re-index)
 llmli capabilities              # Supported file types
 
 # pal is the agent layer (delegates to llmli; state in ~/.pal/registry.json)
-pal add <folder>
-pal ask "question"
-pal ask --in <silo> "query"
+pal pull <folder>                # Index folder (watches if --watch appended)
+pal ask "question"               # Query all silos
+pal ask --in <silo> "query"      # Query specific silo
+pal ls                           # List all indexed silos
+pal ls --status                  # Show silo and daemon health with actions
+pal ls --jobs                    # Show daemon job status and log paths
+pal remove <silo>                # Delete a silo
+pal daemon install|sync|uninstall|logs  # Manage background watchers
 ```
 
 ## Architecture
