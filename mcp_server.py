@@ -174,7 +174,12 @@ _last_reindex_outcome: dict[str, dict] = {}
 
 
 def _release_chroma() -> None:
-    pass  # kept for call-site compatibility; no-op — singleton client persists
+    try:
+        from chroma_client import release
+
+        release()
+    except Exception:
+        pass
 
 
 # Helper: answer-level confidence signal
@@ -535,6 +540,7 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
             }
             with _reindex_outcome_lock:
                 _last_reindex_outcome[slug] = rec
+            _release_chroma()
 
     t = threading.Thread(target=_run_reindex, daemon=True)
     t.start()
@@ -580,6 +586,8 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
         return result
     except Exception as e:
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    finally:
+        _release_chroma()
 
 
 @mcp.tool()
@@ -656,6 +664,7 @@ def add_silo(
             }
             with _reindex_outcome_lock:
                 _last_reindex_outcome[outcome_key] = rec
+            _release_chroma()
 
     t = threading.Thread(target=_run_add, daemon=True)
     t.start()

@@ -72,7 +72,8 @@ def test_watch_coverage_jobs_and_warnings(tmp_path: Path, sample_trees: dict) ->
     assert out["daemon"]["installed"] is False
     assert len(out["warnings"]) == 2
     assert [j["slug"] for j in out["watch_jobs"]] == [slug]
-    assert out["watch_jobs"][0]["service_name"] == f"io.llmlibrarian.watch.{slug}"
+    manager = jobsrt.supported_service_manager() or "launchd"
+    assert out["watch_jobs"][0]["service_name"] == jobsrt.desired_service_name(manager, slug)
 
     by_resolved = {b["resolved_path"]: b for b in out["bookmarks"] if b["resolved_path"]}
     assert by_resolved[str(sample_trees["indexed"].resolve())]["would_watch"] is True

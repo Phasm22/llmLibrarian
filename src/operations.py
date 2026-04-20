@@ -86,7 +86,7 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
     from state import remove_silo, slugify, resolve_silo_by_path, resolve_silo_prefix, remove_manifest_silo
     from constants import LLMLI_COLLECTION
     from ingest import _file_registry_remove_silo
-    from chroma_client import get_client
+    from chroma_client import get_client, release
 
     raw = slug_or_name
     path_slug = resolve_silo_by_path(db_path, raw) if Path(raw).exists() else None
@@ -103,6 +103,8 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
             coll.delete(where={"silo": slug_to_clean})
     except Exception as e:
         chroma_error = str(e)
+    finally:
+        release()
 
     _file_registry_remove_silo(db_path, slug_to_clean)
     remove_manifest_silo(db_path, slug_to_clean)
@@ -130,7 +132,7 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
     from state import list_silos, resolve_silo_to_slug, resolve_silo_prefix, remove_manifest_silo
     from constants import LLMLI_COLLECTION
     from ingest import _file_registry_remove_silo, run_add
-    from chroma_client import get_client
+    from chroma_client import get_client, release
 
     raw = slug_or_name
     slug = resolve_silo_to_slug(db_path, raw) or resolve_silo_prefix(db_path, raw)
@@ -152,25 +154,28 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
 
     from chroma_lock import chroma_exclusive_lock
 
-    with chroma_exclusive_lock(db_path):
-        if verbose:
-            print(f"[repair] Wiping ChromaDB chunks for silo '{slug}'...")
-        try:
-            coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
-            coll.delete(where={"silo": slug})
-        except Exception as e:
-            msg = f"could not wipe Chroma chunks: {e}"
+    try:
+        with chroma_exclusive_lock(db_path):
             if verbose:
-                print(f"[repair] Warning: {msg}", file=sys.stderr)
+                print(f"[repair] Wiping ChromaDB chunks for silo '{slug}'...")
+            try:
+                coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
+                coll.delete(where={"silo": slug})
+            except Exception as e:
+                msg = f"could not wipe Chroma chunks: {e}"
+                if verbose:
+                    print(f"[repair] Warning: {msg}", file=sys.stderr)
 
-        if verbose:
-            print(f"[repair] Clearing file registry for silo '{slug}'...")
-        _file_registry_remove_silo(db_path, slug)
-        remove_manifest_silo(db_path, slug)
+            if verbose:
+                print(f"[repair] Clearing file registry for silo '{slug}'...")
+            _file_registry_remove_silo(db_path, slug)
+            remove_manifest_silo(db_path, slug)
 
-        if verbose:
-            print(f"[repair] Re-indexing '{source_path}' (full, non-incremental)...")
-        files_ok, n_failures = run_add(path=source_path, db_path=db_path, incremental=False)
+            if verbose:
+                print(f"[repair] Re-indexing '{source_path}' (full, non-incremental)...")
+            files_ok, n_failures = run_add(path=source_path, db_path=db_path, incremental=False)
+    finally:
+        release()
 
     if verbose:
         print(f"[repair] Done: {files_ok} file(s) re-indexed, {n_failures} failure(s).")
@@ -201,7 +206,7 @@ def op_inspect_silo(db_path: str, slug_or_name: str, top: int = 50) -> dict:
     """
     from state import list_silos, resolve_silo_to_slug
     from constants import LLMLI_COLLECTION
-    from chroma_client import get_client
+    from chroma_client import get_client, release
 
     slug = resolve_silo_to_slug(db_path, slug_or_name)
     if slug is None:
@@ -235,6 +240,8 @@ def op_inspect_silo(db_path: str, slug_or_name: str, top: int = 50) -> dict:
                 offset += _PAGE_SIZE
     except Exception as e:
         return {"error": f"ChromaDB error: {e}"}
+    finally:
+        release()
 
     total_chroma = len(metas)
 

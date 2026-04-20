@@ -217,13 +217,15 @@ def render_systemd_unit(
         "[Unit]",
         f"Description=llmLibrarian watch silo {job.slug}",
         "After=default.target",
+        "StartLimitIntervalSec=300",
+        "StartLimitBurst=3",
         "",
         "[Service]",
         "Type=simple",
         f"WorkingDirectory={workdir}",
         *env_lines,
         f"ExecStart={exec_start}",
-        "Restart=always",
+        "Restart=on-failure",
         f"RestartSec={int(restart_sec)}",
         f"StandardOutput=append:{job.log_path}",
         f"StandardError=append:{stderr_path or job.log_path}",
@@ -237,6 +239,7 @@ def render_systemd_unit(
 
 def _resolve_silo_by_path(llmli_registry: dict[str, Any], path: Path) -> tuple[str | None, dict[str, Any] | None]:
     target = str(path.resolve())
+    matches: list[tuple[str, dict[str, Any]]] = []
     for slug, data in llmli_registry.items():
         if not isinstance(data, dict):
             continue
@@ -248,8 +251,10 @@ def _resolve_silo_by_path(llmli_registry: dict[str, Any], path: Path) -> tuple[s
         except Exception:
             candidate = str(raw)
         if candidate == target:
-            return str(slug), data
-    return None, None
+            matches.append((str(slug), data))
+    if not matches:
+        return None, None
+    return max(matches, key=lambda item: len(item[0]))
 
 
 def derive_watch_jobs(

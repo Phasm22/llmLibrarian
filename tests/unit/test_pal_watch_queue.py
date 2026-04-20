@@ -1,5 +1,5 @@
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pal
 
@@ -36,15 +36,15 @@ def test_watch_debounce_collapses_updates(monkeypatch, tmp_path: Path):
     watcher._log = lambda message: logged.append(message)
 
     calls = []
-    watcher._update_single_file = lambda path, **_kwargs: (calls.append(path) or ("updated", path))
+    watcher._pull_once = lambda: (calls.append("pull") or SimpleNamespace(returncode=0, stdout="", stderr=""))
 
     now = pal.time.time()
     watcher.enqueue_update(str(target))
     watcher._drain_due(now=now + 0.5)
     assert calls == []
     watcher._drain_due(now=now + 2.0)
-    assert calls == [str(target.resolve())]
-    assert logged == ["this folder: +1 updated, -0 removed, 0 skipped"]
+    assert calls == ["pull"]
+    assert logged == ["this folder: pull complete after +1 queued, -0 queued, 0 skipped"]
 
 
 def test_reconcile_queues_missing_for_removal(monkeypatch, tmp_path: Path):
@@ -74,7 +74,7 @@ def test_watch_retries_error_with_backoff(monkeypatch, tmp_path: Path):
     watcher = _make_watcher(monkeypatch, root)
     logged = []
     watcher._log = lambda message: logged.append(message)
-    watcher._update_single_file = lambda *_args, **_kwargs: ("error", str(target.resolve()))
+    watcher._pull_once = lambda: SimpleNamespace(returncode=1, stdout="", stderr="boom")
 
     now = pal.time.time()
     watcher.enqueue_update(str(target))
@@ -83,4 +83,5 @@ def test_watch_retries_error_with_backoff(monkeypatch, tmp_path: Path):
     queued = watcher._queue[str(target.resolve())]
     assert queued["action"] == "update"
     assert int(queued["attempts"]) == 1
+    assert any("pull failed: boom" in line for line in logged)
     assert any("retrying file.py in 30s" in line for line in logged)

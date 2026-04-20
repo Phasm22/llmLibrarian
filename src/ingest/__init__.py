@@ -38,7 +38,7 @@ from constants import (
     MAX_WORKERS,
 )
 
-from chroma_client import get_client
+from chroma_client import get_client, release as release_chroma_client
 try:
     from tqdm import tqdm  # type: ignore[import-not-found]
 except Exception:
@@ -2091,8 +2091,11 @@ def run_index(
         log(done_msg)
         log_close()
 
-    with chroma_exclusive_lock(str(Path(DB_PATH).resolve())):
-        _run_index_chroma_phase()
+    try:
+        with chroma_exclusive_lock(str(Path(DB_PATH).resolve())):
+            _run_index_chroma_phase()
+    finally:
+        release_chroma_client()
 
 
 def run_add(
@@ -2733,8 +2736,11 @@ def run_add(
                 pass
         return (files_indexed, len(failures))
 
-    with chroma_exclusive_lock(str(Path(db_path).resolve())):
-        return _run_add_chroma_phase()
+    try:
+        with chroma_exclusive_lock(str(Path(db_path).resolve())):
+            return _run_add_chroma_phase()
+    finally:
+        release_chroma_client()
 
 
 def _load_limits_config() -> tuple[int, int, int, int, int]:
@@ -2776,18 +2782,21 @@ def update_silo_counts(db_path: str | Path, silo_slug: str, display_name: str | 
 
     from chroma_lock import chroma_shared_lock
 
-    with chroma_shared_lock(str(Path(db_path).resolve())):
-        ef = get_embedding_function(batch_size=1)
-        client = get_client(str(db_path))
-        collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-        chunks_count = 0
-        try:
-            result = collection.get(where={"silo": silo_slug})
-            ids = result.get("ids") if isinstance(result, dict) else None
-            if isinstance(ids, list):
-                chunks_count = len(ids)
-        except Exception:
-            pass
+    try:
+        with chroma_shared_lock(str(Path(db_path).resolve())):
+            ef = get_embedding_function(batch_size=1)
+            client = get_client(str(db_path))
+            collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+            chunks_count = 0
+            try:
+                result = collection.get(where={"silo": silo_slug})
+                ids = result.get("ids") if isinstance(result, dict) else None
+                if isinstance(ids, list):
+                    chunks_count = len(ids)
+            except Exception:
+                pass
+    finally:
+        release_chroma_client()
 
     now_iso = datetime.now(timezone.utc).isoformat()
     update_silo(db_path, silo_slug, silo_path, total_files, chunks_count, now_iso, display_name=name)
@@ -2832,36 +2841,39 @@ def remove_single_file(
 
     from chroma_lock import chroma_exclusive_lock
 
-    with chroma_exclusive_lock(str(Path(db_path).resolve())):
-        ef = get_embedding_function(batch_size=1)
-        client = get_client(str(db_path))
-        collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-        image_collection = _get_image_collection(client)
-        _delete_source_from_collections(
-            collection=collection,
-            image_collection=image_collection,
-            silo_slug=silo_slug,
-            source_path=path_str,
-        )
-        if prev:
-            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
+    try:
+        with chroma_exclusive_lock(str(Path(db_path).resolve())):
+            ef = get_embedding_function(batch_size=1)
+            client = get_client(str(db_path))
+            collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+            image_collection = _get_image_collection(client)
+            _delete_source_from_collections(
+                collection=collection,
+                image_collection=image_collection,
+                silo_slug=silo_slug,
+                source_path=path_str,
+            )
+            if prev:
+                _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
-        def _update_manifest(manifest_data: dict) -> None:
-            silos = manifest_data.setdefault("silos", {})
-            silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
-            if not silo_entry.get("path"):
-                silo_entry["path"] = str(p.parent)
-            files_map = silo_entry.setdefault("files", {})
-            if isinstance(files_map, dict) and path_str in files_map:
-                del files_map[path_str]
+            def _update_manifest(manifest_data: dict) -> None:
+                silos = manifest_data.setdefault("silos", {})
+                silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
+                if not silo_entry.get("path"):
+                    silo_entry["path"] = str(p.parent)
+                files_map = silo_entry.setdefault("files", {})
+                if isinstance(files_map, dict) and path_str in files_map:
+                    del files_map[path_str]
 
-        _update_file_manifest(db_path, _update_manifest)
-        replace_tax_rows_for_sources(
-            db_path,
-            silo=silo_slug,
-            sources={path_str},
-            new_rows=[],
-        )
+            _update_file_manifest(db_path, _update_manifest)
+            replace_tax_rows_for_sources(
+                db_path,
+                silo=silo_slug,
+                sources={path_str},
+                new_rows=[],
+            )
+    finally:
+        release_chroma_client()
     if update_counts:
         update_silo_counts(db_path, silo_slug)
     return ("removed" if prev else "skipped", path_str)
@@ -2958,133 +2970,137 @@ def update_single_file(
 
     from chroma_lock import chroma_exclusive_lock
 
-    with chroma_exclusive_lock(str(Path(db_path).resolve())):
-        ef = get_embedding_function(batch_size=1)
-        client = get_client(str(db_path))
-        collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-        ef = client.get_effective_ef(LLMLI_COLLECTION) or ef
-        image_collection = _get_image_collection(client)
+    try:
+        with chroma_exclusive_lock(str(Path(db_path).resolve())):
+            ef = get_embedding_function(batch_size=1)
+            client = get_client(str(db_path))
+            collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+            if hasattr(client, "get_effective_ef"):
+                ef = client.get_effective_ef(LLMLI_COLLECTION) or ef
+            image_collection = _get_image_collection(client)
 
-        chunks: list[ChunkTuple] = []
-        image_vectors: list[ImageVectorTuple] = []
-        if kind == "zip":
-            try:
-                chunks = process_zip_to_chunks(
-                    p,
-                    ADD_DEFAULT_INCLUDE,
-                    effective_excludes,
-                    max_archive_bytes,
-                    max_file_bytes,
-                    max_files_per_zip,
-                    max_extracted_per_zip,
-                    db_path=db_path,
-                )
-            except Exception:
-                return ("error", path_str)
-        else:
-            clone_from = next(
-                (str(e.get("silo") or "") for e in existing if str(e.get("silo") or "") != silo_slug),
-                "",
-            )
-            can_clone = bool(clone_from and file_hash)
-            if can_clone and kind == "image":
-                from state import get_silo_image_vision_enabled
-    
-                source_mode = get_silo_image_vision_enabled(db_path, clone_from) if clone_from else None
-                can_clone = source_mode is not None and source_mode == effective_image_vision_enabled
-            if can_clone and clone_from and file_hash:
-                chunks = _clone_chunks_from_existing_silo(
-                    collection=collection,
-                    from_silo=clone_from,
-                    source_path=path_str,
-                    target_silo=silo_slug,
-                )
-                image_vectors = _clone_image_vectors_from_existing_silo(
-                    collection=image_collection,
-                    from_silo=clone_from,
-                    source_path=path_str,
-                    target_silo=silo_slug,
-                )
-            if not chunks:
+            chunks: list[ChunkTuple] = []
+            image_vectors: list[ImageVectorTuple] = []
+            if kind == "zip":
                 try:
-                    chunks = process_one_file(
+                    chunks = process_zip_to_chunks(
                         p,
-                        kind,
-                        file_hash or None,
-                        follow_symlinks,
-                        p,
+                        ADD_DEFAULT_INCLUDE,
+                        effective_excludes,
+                        max_archive_bytes,
+                        max_file_bytes,
+                        max_files_per_zip,
+                        max_extracted_per_zip,
                         db_path=db_path,
-                        image_vision_enabled=effective_image_vision_enabled,
                     )
                 except Exception:
                     return ("error", path_str)
-    
-        _delete_source_from_collections(
-            collection=collection,
-            image_collection=image_collection,
-            silo_slug=silo_slug,
-            source_path=path_str,
-        )
-        if prev:
-            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
-    
-        if chunks:
-            _now_iso = datetime.now(timezone.utc).isoformat()
-            chunks = [
-                (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug, "indexed_at": _now_iso})
-                for cid, doc, meta in chunks
-            ]
-            batch_size = ADD_BATCH_SIZE
-            try:
-                batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
-            except (TypeError, ValueError):
-                pass
-            batch_size = max(1, min(batch_size, 2000))
-            embedding_workers = _resolve_worker_override(
-                embedding_workers,
-                "LLMLIBRARIAN_EMBEDDING_WORKERS",
-                1,
-            )
-            _batch_add(
-                collection,
-                chunks,
-                batch_size=batch_size,
-                no_color=no_color,
-                embedding_fn=ef,
-                embedding_workers=embedding_workers,
-            )
-            if not image_vectors:
-                vector_row = _image_vector_from_chunks(source_path=path_str, chunks=chunks)
-                if vector_row is not None:
-                    vid, vpath, vdoc, vmeta = vector_row
-                    image_vectors = [(vid, vpath, vdoc, {**vmeta, "silo": silo_slug})]
-            if image_vectors:
-                _batch_add_image_vectors(
-                    image_collection,
-                    image_vectors,
-                    batch_size=1,
-                    no_color=no_color,
+            else:
+                clone_from = next(
+                    (str(e.get("silo") or "") for e in existing if str(e.get("silo") or "") != silo_slug),
+                    "",
                 )
-            if file_hash:
-                _file_registry_add(db_path, file_hash, silo_slug, path_str)
-        tax_rows = extract_tax_rows_from_chunks(chunks) if chunks else []
-    
-        def _update_manifest(manifest_data: dict) -> None:
-            silos = manifest_data.setdefault("silos", {})
-            silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
-            files_map = silo_entry.setdefault("files", {})
-            if not isinstance(files_map, dict):
-                files_map = {}
-                silo_entry["files"] = files_map
-            files_map[path_str] = {"mtime": mtime, "size": size, "hash": file_hash if kind != "zip" else ""}
-    
-        _update_file_manifest(db_path, _update_manifest)
-        replace_tax_rows_for_sources(
-            db_path,
-            silo=silo_slug,
-            sources={path_str},
-            new_rows=tax_rows,
-        )
+                can_clone = bool(clone_from and file_hash)
+                if can_clone and kind == "image":
+                    from state import get_silo_image_vision_enabled
+        
+                    source_mode = get_silo_image_vision_enabled(db_path, clone_from) if clone_from else None
+                    can_clone = source_mode is not None and source_mode == effective_image_vision_enabled
+                if can_clone and clone_from and file_hash:
+                    chunks = _clone_chunks_from_existing_silo(
+                        collection=collection,
+                        from_silo=clone_from,
+                        source_path=path_str,
+                        target_silo=silo_slug,
+                    )
+                    image_vectors = _clone_image_vectors_from_existing_silo(
+                        collection=image_collection,
+                        from_silo=clone_from,
+                        source_path=path_str,
+                        target_silo=silo_slug,
+                    )
+                if not chunks:
+                    try:
+                        chunks = process_one_file(
+                            p,
+                            kind,
+                            file_hash or None,
+                            follow_symlinks,
+                            p,
+                            db_path=db_path,
+                            image_vision_enabled=effective_image_vision_enabled,
+                        )
+                    except Exception:
+                        return ("error", path_str)
+        
+            _delete_source_from_collections(
+                collection=collection,
+                image_collection=image_collection,
+                silo_slug=silo_slug,
+                source_path=path_str,
+            )
+            if prev:
+                _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
+        
+            if chunks:
+                _now_iso = datetime.now(timezone.utc).isoformat()
+                chunks = [
+                    (hashlib.sha256(f"{silo_slug}|{cid}".encode()).hexdigest()[:20], doc, {**meta, "silo": silo_slug, "indexed_at": _now_iso})
+                    for cid, doc, meta in chunks
+                ]
+                batch_size = ADD_BATCH_SIZE
+                try:
+                    batch_size = int(os.environ.get("LLMLIBRARIAN_ADD_BATCH_SIZE", batch_size))
+                except (TypeError, ValueError):
+                    pass
+                batch_size = max(1, min(batch_size, 2000))
+                embedding_workers = _resolve_worker_override(
+                    embedding_workers,
+                    "LLMLIBRARIAN_EMBEDDING_WORKERS",
+                    1,
+                )
+                _batch_add(
+                    collection,
+                    chunks,
+                    batch_size=batch_size,
+                    no_color=no_color,
+                    embedding_fn=ef,
+                    embedding_workers=embedding_workers,
+                )
+                if not image_vectors:
+                    vector_row = _image_vector_from_chunks(source_path=path_str, chunks=chunks)
+                    if vector_row is not None:
+                        vid, vpath, vdoc, vmeta = vector_row
+                        image_vectors = [(vid, vpath, vdoc, {**vmeta, "silo": silo_slug})]
+                if image_vectors:
+                    _batch_add_image_vectors(
+                        image_collection,
+                        image_vectors,
+                        batch_size=1,
+                        no_color=no_color,
+                    )
+                if file_hash:
+                    _file_registry_add(db_path, file_hash, silo_slug, path_str)
+            tax_rows = extract_tax_rows_from_chunks(chunks) if chunks else []
+        
+            def _update_manifest(manifest_data: dict) -> None:
+                silos = manifest_data.setdefault("silos", {})
+                silo_entry = silos.setdefault(silo_slug, {"path": "", "files": {}})
+                files_map = silo_entry.setdefault("files", {})
+                if not isinstance(files_map, dict):
+                    files_map = {}
+                    silo_entry["files"] = files_map
+                files_map[path_str] = {"mtime": mtime, "size": size, "hash": file_hash if kind != "zip" else ""}
+        
+            _update_file_manifest(db_path, _update_manifest)
+            replace_tax_rows_for_sources(
+                db_path,
+                silo=silo_slug,
+                sources={path_str},
+                new_rows=tax_rows,
+            )
+    finally:
+        release_chroma_client()
 
     if update_counts:
         update_silo_counts(db_path, silo_slug)

@@ -1220,6 +1220,73 @@ def _merge_path_patterns(*groups: list[str] | None) -> list[str]:
     return merged
 
 
+def _append_pull_child_options(
+    cmd: list[str],
+    *,
+    allow_cloud: bool = False,
+    follow_symlinks: bool = False,
+    full: bool = False,
+    exclude_patterns: list[str] | None = None,
+    prompt: str | None = None,
+    clear_prompt: bool = False,
+    image_vision: bool | None = None,
+    workers: int | None = None,
+    embedding_workers: int | None = None,
+) -> list[str]:
+    if allow_cloud:
+        cmd.append("--allow-cloud")
+    if follow_symlinks:
+        cmd.append("--follow-symlinks")
+    if full:
+        cmd.append("--full")
+    for pattern in exclude_patterns or []:
+        cmd.extend(["--exclude", pattern])
+    if prompt is not None:
+        cmd.extend(["--prompt", prompt])
+    if clear_prompt:
+        cmd.append("--clear-prompt")
+    if image_vision:
+        cmd.append("--image-vision")
+    if workers is not None:
+        cmd.extend(["--workers", str(workers)])
+    if embedding_workers is not None:
+        cmd.extend(["--embedding-workers", str(embedding_workers)])
+    return cmd
+
+
+def _run_pull_child(
+    path: Path,
+    *,
+    allow_cloud: bool = False,
+    follow_symlinks: bool = False,
+    full: bool = False,
+    exclude_patterns: list[str] | None = None,
+    prompt: str | None = None,
+    clear_prompt: bool = False,
+    image_vision: bool | None = None,
+    workers: int | None = None,
+    embedding_workers: int | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    cmd = [sys.executable, str(_PAL_ROOT / "pal.py"), "pull", str(path)]
+    _append_pull_child_options(
+        cmd,
+        allow_cloud=allow_cloud,
+        follow_symlinks=follow_symlinks,
+        full=full,
+        exclude_patterns=exclude_patterns,
+        prompt=prompt,
+        clear_prompt=clear_prompt,
+        image_vision=image_vision,
+        workers=workers,
+        embedding_workers=embedding_workers,
+    )
+    env = os.environ.copy()
+    env.update(extra_env or {})
+    env["PAL_SUPPRESS_DAEMON_SYNC"] = "1"
+    return subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+
+
 class _SiloEventHandler(FileSystemEventHandler):
     def __init__(self, watcher: "SiloWatcher") -> None:
         super().__init__()
@@ -1264,9 +1331,6 @@ class SiloWatcher:
             raise RuntimeError("watchdog is not installed. Install `watchdog` to use watch mode.")
         _ensure_src_on_path()
         from ingest import (
-            update_single_file,
-            remove_single_file,
-            update_silo_counts,
             _read_file_manifest,
             _load_limits_config,
             collect_files,
@@ -1289,18 +1353,6 @@ class SiloWatcher:
             "LLMLIBRARIAN_INGEST_LOG_LEVEL": "FATAL",
             "LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS": "1",
         }
-
-        def _quiet_update_single_file(*args, **kwargs):
-            with _temporary_env(watch_env):
-                return update_single_file(*args, **kwargs)
-
-        def _quiet_remove_single_file(*args, **kwargs):
-            with _temporary_env(watch_env):
-                return remove_single_file(*args, **kwargs)
-
-        self._update_single_file = _quiet_update_single_file
-        self._remove_single_file = _quiet_remove_single_file
-        self._update_silo_counts = update_silo_counts
         self._read_manifest = _read_file_manifest
         self._load_limits_config = _load_limits_config
         self._collect_files = collect_files
@@ -1310,6 +1362,12 @@ class SiloWatcher:
             ADD_DEFAULT_EXCLUDE,
             get_silo_exclude_patterns(self.db_path, self.silo_slug),
             exclude_patterns,
+        )
+        self._pull_once = lambda: _run_pull_child(
+            self.root,
+            allow_cloud=self.allow_cloud,
+            exclude_patterns=self._exclude,
+            extra_env=watch_env,
         )
 
         self._observer = Observer()
@@ -1402,45 +1460,33 @@ class SiloWatcher:
         updated = 0
         removed = 0
         skipped = 0
-        for path, action, attempts in due:
-            try:
-                with self._lock:
-                    if action == "delete":
-                        status, _ = self._remove_single_file(
-                            path,
-                            db_path=self.db_path,
-                            silo_slug=self.silo_slug,
-                            update_counts=True,
-                        )
-                    else:
-                        status, _ = self._update_single_file(
-                            path,
-                            db_path=self.db_path,
-                            silo_slug=self.silo_slug,
-                            allow_cloud=self.allow_cloud,
-                            follow_symlinks=False,
-                            no_color=True,
-                            update_counts=True,
-                            exclude_patterns=self._exclude,
-                        )
-            except Exception as exc:
+        status = "updated"
+        detail = ""
+        try:
+            with self._lock:
+                result = self._pull_once()
+            returncode = getattr(result, "returncode", 1)
+            if returncode != 0:
                 status = "error"
-                self._log(f"{self.label}: error processing {path}: {exc}")
-            if status == "error":
+                detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+        except Exception as exc:
+            status = "error"
+            detail = str(exc)
+        if status == "error":
+            for path, action, attempts in due:
                 next_attempt = attempts + 1
                 delay = self._retry_delay(next_attempt)
                 self._queue_action(path, action, delay=delay, attempts=next_attempt)
-                self._log(f"{self.label}: retrying {Path(path).name} in {int(delay)}s")
-                continue
-            if status == "updated":
-                updated += 1
-            elif status == "removed":
-                removed += 1
-            else:
-                skipped += 1
+            first_path = Path(due[0][0]).name
+            suffix = f": {detail.splitlines()[-1]}" if detail else ""
+            self._log(f"{self.label}: pull failed{suffix}")
+            self._log(f"{self.label}: retrying {first_path} in {int(self._retry_delay(int(due[0][2]) + 1))}s")
+            return 0
+        updated = sum(1 for _path, action, _attempts in due if action != "delete")
+        removed = sum(1 for _path, action, _attempts in due if action == "delete")
         processed = updated + removed
         if processed or skipped:
-            self._log(f"{self.label}: +{updated} updated, -{removed} removed, {skipped} skipped")
+            self._log(f"{self.label}: pull complete after +{updated} queued, -{removed} queued, {skipped} skipped")
         return processed
 
     def _process_loop(self) -> None:
@@ -1675,7 +1721,7 @@ def _pull_watch_path_mode(
     previous_env = {key: os.environ.get(key) for key in watch_env}
     try:
         os.environ.update(watch_env)
-        rc = _pull_path_mode(
+        initial = _run_pull_child(
             path,
             allow_cloud=allow_cloud,
             follow_symlinks=follow_symlinks,
@@ -1688,8 +1734,11 @@ def _pull_watch_path_mode(
             embedding_workers=embedding_workers,
             extra_env=watch_env,
         )
-        if rc != 0:
-            return rc
+        if initial.returncode != 0:
+            detail = (initial.stderr or initial.stdout or "").strip()
+            if detail:
+                print(detail, file=sys.stderr)
+            return int(initial.returncode)
         db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
         llmli_registry = _read_llmli_registry(db_path)
         slug = _resolve_llmli_silo_by_path(llmli_registry, path)
@@ -1996,6 +2045,8 @@ def _sync_daemon_services(emit_output: bool = True) -> int:
 
 
 def _sync_daemon_if_installed() -> None:
+    if os.environ.get("PAL_SUPPRESS_DAEMON_SYNC") == "1":
+        return
     if not _daemon_is_installed():
         return
     rc = _sync_daemon_services(emit_output=False)

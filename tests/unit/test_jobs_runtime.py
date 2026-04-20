@@ -39,6 +39,83 @@ def test_derive_watch_jobs_uses_registered_indexed_sources(tmp_path: Path):
     assert len(warnings) == 2
 
 
+def test_derive_watch_jobs_prefers_hashed_slug_for_duplicate_registry_path(tmp_path: Path):
+    pal_home = tmp_path / ".pal"
+    indexed = tmp_path / "journalLinker"
+    indexed.mkdir()
+    source_registry = {"bookmarks": [{"path": str(indexed)}]}
+    llmli_registry = {
+        "journallinker": {"path": str(indexed.resolve()), "display_name": "journalLinker"},
+        "journallinker-397f11d4": {"path": str(indexed.resolve()), "display_name": "journalLinker"},
+    }
+
+    jobs, warnings = jobs_runtime.derive_watch_jobs(
+        source_registry,
+        llmli_registry,
+        pal_home=pal_home,
+        db_path=tmp_path / "db",
+        manager="launchd",
+    )
+
+    assert warnings == []
+    assert [job.slug for job in jobs] == ["journallinker-397f11d4"]
+    assert jobs[0].service_name == "io.llmlibrarian.watch.journallinker-397f11d4"
+
+
+def test_platform_sync_deduplicates_jobs_by_source_path(monkeypatch, tmp_path: Path):
+    source = tmp_path / "journalLinker"
+    source.mkdir()
+    manager = jobs_runtime.PlatformManager("systemd", home=tmp_path)
+    written_slugs: list[str] = []
+    activated_slugs: list[str] = []
+
+    def _write(job, **_kwargs):
+        written_slugs.append(job.slug)
+        return tmp_path / f"{job.slug}.service"
+
+    def _activate(job):
+        activated_slugs.append(job.slug)
+        return True, None
+
+    monkeypatch.setattr(manager, "write_service", _write)
+    monkeypatch.setattr(manager, "activate", _activate)
+    monkeypatch.setattr(manager, "existing_service_paths", lambda: [])
+    monkeypatch.setattr(jobs_runtime, "_run_command", lambda _cmd: (0, ""))
+
+    old = jobs_runtime.JobSpec(
+        id="watch_silo:journallinker",
+        kind="watch_silo",
+        slug="journallinker",
+        source_path=str(source),
+        service_name="llmlibrarian-watch-journallinker.service",
+        log_path=str(tmp_path / "old.log"),
+        interval=60,
+        debounce=30,
+    )
+    new = jobs_runtime.JobSpec(
+        id="watch_silo:journallinker-397f11d4",
+        kind="watch_silo",
+        slug="journallinker-397f11d4",
+        source_path=str(source),
+        service_name="llmlibrarian-watch-journallinker-397f11d4.service",
+        log_path=str(tmp_path / "new.log"),
+        interval=60,
+        debounce=30,
+    )
+
+    result = manager.sync(
+        [old, new],
+        python_executable="/tmp/python",
+        pal_path="/tmp/pal.py",
+        workdir="/tmp",
+        env={"PAL_HOME": str(tmp_path / ".pal")},
+    )
+
+    assert written_slugs == ["journallinker-397f11d4"]
+    assert activated_slugs == ["journallinker-397f11d4"]
+    assert result["written"] == ["llmlibrarian-watch-journallinker-397f11d4.service"]
+
+
 def test_render_launchd_plist_contains_expected_paths(tmp_path: Path):
     job = jobs_runtime.JobSpec(
         id="watch_silo:docs",
@@ -89,7 +166,8 @@ def test_render_systemd_unit_contains_restart_and_logs(tmp_path: Path):
         stderr_path=str(tmp_path / "watch.err.log"),
     )
 
-    assert "Restart=always" in unit
+    assert "Restart=on-failure" in unit
+    assert "StartLimitBurst=3" in unit
     assert "RestartSec=15" in unit
     assert "StandardOutput=append:" in unit
     assert "ExecStart=/tmp/venv/bin/python /tmp/repo/pal.py pull /tmp/docs --watch --interval 60 --debounce 30" in unit

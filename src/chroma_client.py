@@ -6,7 +6,10 @@ directly. A single shared client per db_path eliminates the concurrent-write
 SIGSEGV caused by multiple Rust HNSW handles on the same files.
 """
 
+import os
+import shutil
 import threading
+from pathlib import Path
 from typing import Any
 
 import chromadb
@@ -14,6 +17,43 @@ from chromadb.config import Settings
 
 _lock = threading.Lock()
 _clients: dict[str, "_SafeClient"] = {}
+
+_HNSW_BLOAT_BYTES = 1 << 30
+_MIN_FREE_BYTES = 512 * 1024 * 1024
+
+
+def _storage_preflight(db_path: str) -> None:
+    """Fail before opening Chroma when the persist directory is visibly unsafe."""
+    root = Path(db_path).expanduser().resolve()
+    usage_root = root if root.exists() else next((p for p in [root.parent, *root.parents] if p.exists()), root)
+    try:
+        min_free = int(os.environ.get("LLMLIBRARIAN_MIN_FREE_BYTES", _MIN_FREE_BYTES))
+    except (TypeError, ValueError):
+        min_free = _MIN_FREE_BYTES
+    try:
+        free = shutil.disk_usage(usage_root).free
+    except OSError:
+        free = -1
+    if free >= 0 and free < min_free:
+        raise RuntimeError(
+            f"ChromaDB storage preflight failed: only {free} bytes free under {usage_root}. "
+            "Free disk space before opening the index."
+        )
+    if not root.is_dir():
+        return
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if "link_lists.bin" not in filenames:
+            continue
+        fp = Path(dirpath) / "link_lists.bin"
+        try:
+            size = fp.stat().st_size
+        except OSError:
+            continue
+        if size > _HNSW_BLOAT_BYTES:
+            raise RuntimeError(
+                f"ChromaDB storage preflight failed: bloated HNSW index {fp} is {size} bytes. "
+                "Stop llmLibrarian writers and rebuild my_brain_db before querying or indexing."
+            )
 
 
 class _SafeClient:
@@ -62,6 +102,7 @@ def get_client(db_path: str) -> "_SafeClient":
     """Return (or create) the shared PersistentClient for db_path."""
     with _lock:
         if db_path not in _clients:
+            _storage_preflight(db_path)
             raw = chromadb.PersistentClient(
                 path=db_path,
                 settings=Settings(anonymized_telemetry=False),

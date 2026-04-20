@@ -148,20 +148,35 @@ def test_pull_command_rejects_blank_prompt():
 
 def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     watched = {}
-    def _fake_pull_path_mode(*args, **kwargs):
+    def _fake_pull_child(*args, **kwargs):
         watched["processor_log_level"] = os.environ.get("LLMLIBRARIAN_PROCESSOR_LOG_LEVEL")
         watched["ingest_log_level"] = os.environ.get("LLMLIBRARIAN_INGEST_LOG_LEVEL")
         watched["suppress_recoverable"] = os.environ.get("LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS")
-        return 0
+        watched["child_path"] = str(args[0])
+        watched["child_extra_env"] = kwargs.get("extra_env")
+        from types import SimpleNamespace
 
-    monkeypatch.setattr("pal._pull_path_mode", _fake_pull_path_mode)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("pal._run_pull_child", _fake_pull_child)
     monkeypatch.setattr(
         "pal._read_llmli_registry",
         lambda _db: {"folder-slug": {"path": str(Path('/tmp/folder').resolve())}},
     )
 
     class _DummyWatcher:
-        def __init__(self, root, db_path, interval, debounce, silo_slug, allow_cloud=False, label="this folder", startup_message=None):
+        def __init__(
+            self,
+            root,
+            db_path,
+            interval,
+            debounce,
+            silo_slug,
+            allow_cloud=False,
+            label="this folder",
+            startup_message=None,
+            exclude_patterns=None,
+        ):
             watched["root"] = str(root)
             watched["interval"] = interval
             watched["debounce"] = debounce
@@ -185,6 +200,8 @@ def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     assert watched["interval"] == 12
     assert watched["debounce"] == 2
     assert watched["root"] == str(Path("/tmp/folder").resolve())
+    assert watched["child_path"] == str(Path("/tmp/folder").resolve())
+    assert watched["child_extra_env"]["LLMLIBRARIAN_INGEST_LOG_LEVEL"] == "FATAL"
     assert watched["processor_log_level"] == "ERROR"
     assert watched["ingest_log_level"] == "FATAL"
     assert watched["suppress_recoverable"] == "1"
@@ -211,7 +228,7 @@ def test_temporary_env_restores_previous_values(monkeypatch):
 def test_pull_with_path_calls_path_mode(monkeypatch):
     called = {}
 
-    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None):
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None, exclude_patterns=None):
         called["path"] = str(path_input)
         called["allow_cloud"] = allow_cloud
         called["follow_symlinks"] = follow_symlinks
@@ -240,7 +257,7 @@ def test_pull_with_path_calls_path_mode(monkeypatch):
 def test_pull_with_path_passes_image_vision_and_worker_flags(monkeypatch):
     called = {}
 
-    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None):
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None, exclude_patterns=None):
         called["path"] = str(path_input)
         called["image_vision"] = image_vision
         called["workers"] = workers
@@ -296,7 +313,7 @@ def test_pull_stop_mode_dispatches(monkeypatch):
 def test_pull_with_path_passes_prompt_option(monkeypatch):
     called = {}
 
-    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None):
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None, exclude_patterns=None):
         called["path"] = str(path_input)
         called["prompt"] = prompt
         called["clear_prompt"] = clear_prompt
@@ -316,7 +333,7 @@ def test_pull_with_path_passes_prompt_option(monkeypatch):
 def test_pull_with_path_passes_clear_prompt_option(monkeypatch):
     called = {}
 
-    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None):
+    def _fake_pull_path(path_input, allow_cloud=False, follow_symlinks=False, full=False, prompt=None, clear_prompt=False, image_vision=None, workers=None, embedding_workers=None, exclude_patterns=None):
         called["path"] = str(path_input)
         called["prompt"] = prompt
         called["clear_prompt"] = clear_prompt

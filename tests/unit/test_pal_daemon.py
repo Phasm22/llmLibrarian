@@ -51,6 +51,18 @@ def test_daemon_install_writes_metadata_and_syncs(monkeypatch, tmp_path: Path):
     assert (pal_home / "logs").exists()
 
 
+def test_daemon_runtime_metadata_preserves_venv_python_symlink(monkeypatch, tmp_path: Path):
+    python_path = tmp_path / ".venv" / "bin" / "python"
+    python_path.parent.mkdir(parents=True)
+    python_path.symlink_to("/usr/bin/python3")
+    monkeypatch.setattr("pal.sys.executable", str(python_path))
+    monkeypatch.setenv("LLMLIBRARIAN_DB", str(tmp_path / "db"))
+
+    metadata = pal._daemon_runtime_metadata("systemd")
+
+    assert metadata["python_executable"] == str(python_path)
+
+
 def test_jobs_ls_renders_derived_jobs(monkeypatch):
     job = pal.jobsrt.JobSpec(
         id="watch_silo:docs",
@@ -66,7 +78,7 @@ def test_jobs_ls_renders_derived_jobs(monkeypatch):
     monkeypatch.setattr("pal._derive_watch_jobs_for_daemon", lambda _manager, db_path=None: ([job], []))
     monkeypatch.setattr("pal._status_records", lambda _db, _path=None: ([{"silo": "docs-aaaa1111", "state": "running"}], None))
 
-    res = runner.invoke(pal.app, ["jobs", "ls"])
+    res = runner.invoke(pal.app, ["ls", "--jobs"])
     assert res.exit_code == 0
     assert "watch_silo" in res.stdout
     assert "docs-aaaa1111" in res.stdout
