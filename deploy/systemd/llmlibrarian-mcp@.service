@@ -4,12 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-User=%i
-WorkingDirectory=/home/%i/Desktop/llmLibrarian
-ExecStart=/home/%i/Desktop/llmLibrarian/scripts/run_mcp_http.sh
+WorkingDirectory={{INSTALL_DIR}}
+ExecStart={{INSTALL_DIR}}/scripts/run_mcp_http.sh
 Restart=always
 RestartSec=2
-Environment=LLMLI_MCP_ENV_FILE=/home/%i/Desktop/llmLibrarian/.env.mcp
+Environment=LLMLI_MCP_ENV_FILE={{INSTALL_DIR}}/.env.mcp
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.tjm4.llmlibrarian-mcp</string>
+  <string>com.llmlibrarian.mcp</string>
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/tjm4/llmLibrarian/scripts/run_mcp_http.sh</string>
+    <string>{{INSTALL_DIR}}/scripts/run_mcp_http.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>/Users/tjm4/llmLibrarian</string>
+  <string>{{INSTALL_DIR}}</string>
 
   <key>RunAtLoad</key>
   <true/>
@@ -19,9 +19,9 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/Users/tjm4/Library/Logs/llmlibrarian-mcp.stdout.log</string>
+  <string>{{LOG_DIR}}/llmlibrarian-mcp.stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/tjm4/Library/Logs/llmlibrarian-mcp.stderr.log</string>
+  <string>{{LOG_DIR}}/llmlibrarian-mcp.stderr.log</string>
 
   <key>ProcessType</key>
   <string>Background</string>

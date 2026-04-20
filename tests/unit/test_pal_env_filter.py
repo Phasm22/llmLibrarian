@@ -15,6 +15,12 @@ def test_build_pull_env_filters_unrelated_vars(monkeypatch):
     assert "RANDOM_UNSAFE_VAR" not in env
 
 
+def test_build_pull_env_sets_default_db_when_unset(monkeypatch):
+    monkeypatch.delenv("LLMLIBRARIAN_DB", raising=False)
+    env = _build_pull_env("/tmp/status.json")
+    assert env.get("LLMLIBRARIAN_DB") == str(pal.Path(pal._DEFAULT_DB).resolve())
+
+
 def test_build_pull_env_streaming_omits_quiet(monkeypatch):
     monkeypatch.setenv("LLMLIBRARIAN_DB", "/tmp/db")
     monkeypatch.setenv("LLMLIBRARIAN_QUIET", "1")
@@ -44,6 +50,7 @@ def test_run_llmli_prefers_workspace_cli_and_sets_pythonpath(monkeypatch, tmp_pa
     assert rc == 0
     assert seen["cmd"][1] == str((workspace / "cli.py").resolve())
     assert str((workspace / "src").resolve()) in (seen["env"].get("PYTHONPATH") or "")
+    assert seen["env"]["LLMLIBRARIAN_DB"] == str(pal.Path(pal._DEFAULT_DB).resolve())
 
 
 def test_run_llmli_falls_back_to_module_cli_when_no_workspace_cli(monkeypatch, tmp_path):

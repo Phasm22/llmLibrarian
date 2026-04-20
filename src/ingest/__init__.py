@@ -2126,6 +2126,7 @@ def run_add(
     """
     from state import update_silo, set_last_failures, slugify, resolve_silo_by_path, get_silo_image_vision_enabled
 
+    run_started_at = time.perf_counter()
     db_path = db_path or DB_PATH
     path = Path(path)
     if path.is_symlink() and not follow_symlinks:
@@ -2705,17 +2706,19 @@ def run_add(
         )
         set_last_failures(db_path, failures)
         clear_pending(str(db_path), silo_slug)
+        elapsed_seconds = time.perf_counter() - run_started_at
+        elapsed_label = f"{elapsed_seconds:.1f}s"
     
         # Summary: trust + usability (per-file FAIL still printed above)
         if not quiet:
             clear_status_line()
             if failures:
-                print(warn_style(no_color, f"Indexed {files_indexed} files ({len(failures)} failed). pal log or llmli log --last to see failures."), file=sys.stderr)
+                print(warn_style(no_color, f"Indexed {files_indexed} files in {elapsed_label} ({len(failures)} failed). pal log or llmli log --last to see failures."), file=sys.stderr)
             else:
                 if files_indexed == 0:
-                    print(success_style(no_color, "All files up to date."))
+                    print(success_style(no_color, f"All files up to date in {elapsed_label}."))
                 else:
-                    print(success_style(no_color, f"Indexed {files_indexed} files."))
+                    print(success_style(no_color, f"Indexed {files_indexed} files in {elapsed_label}."))
     
         # Optional status file for tooling (e.g., pal pull). Avoid writing to silos.
         status_path = os.environ.get("LLMLIBRARIAN_STATUS_FILE")
@@ -2728,6 +2731,7 @@ def run_add(
                     "failures": len(failures),
                     "chunks_count": chunks_count,
                     "updated": now_iso,
+                    "elapsed_seconds": round(elapsed_seconds, 3),
                     "image_vision_enabled": effective_image_vision_enabled,
                 }
                 with open(status_path, "w", encoding="utf-8") as f:

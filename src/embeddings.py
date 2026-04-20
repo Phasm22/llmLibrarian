@@ -12,6 +12,8 @@ Other env vars:
   - LLMLIBRARIAN_EMBEDDING=default  -> Chroma ONNX DefaultEmbeddingFunction (all-MiniLM-L6-v2,
                                         384-dim, uses CoreML EP automatically on macOS)
   - LLMLIBRARIAN_EMBEDDING_MODEL    -> override model name (default: all-mpnet-base-v2)
+  - LLMLIBRARIAN_EMBEDDING_BATCH_SIZE -> sentence-transformers encode batch size (default:
+                                        library default, usually 32)
   - LLMLIBRARIAN_MPS_BATCH_THRESHOLD -> chunk count above which MPS is preferred (default: 24)
   - LLMLIBRARIAN_LARGE_INGEST_FILE_THRESHOLD -> during `add`/`pull`, if the file list is at least this
     many entries and auto device would be MPS, pin embeddings to CPU so parallel workers (default 8)
@@ -75,6 +77,17 @@ def ingest_parallel_embedding_device(file_count: int) -> str | None:
     return "cpu"
 
 
+def _embedding_batch_size() -> int | None:
+    raw = os.environ.get("LLMLIBRARIAN_EMBEDDING_BATCH_SIZE", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return max(1, min(value, 4096))
+
+
 def get_embedding_function(batch_size: int | None = None, device: str | None = None) -> Any:
     """
     Return a Chroma-compatible embedding function for indexing and query.
@@ -91,4 +104,21 @@ def get_embedding_function(batch_size: int | None = None, device: str | None = N
         return embedding_functions.DefaultEmbeddingFunction()
     model = os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2")
     resolved = device if device is not None else _best_device(batch_size)
+    encode_batch_size = _embedding_batch_size()
+    if encode_batch_size is not None:
+        base_cls = embedding_functions.SentenceTransformerEmbeddingFunction
+
+        class BatchedSentenceTransformerEmbeddingFunction(base_cls):  # type: ignore[misc, valid-type]
+            def __call__(self, input: Any) -> Any:
+                import numpy as np
+
+                embeddings = self._model.encode(
+                    list(input),
+                    batch_size=encode_batch_size,
+                    convert_to_numpy=True,
+                    normalize_embeddings=self.normalize_embeddings,
+                )
+                return [np.array(embedding, dtype=np.float32) for embedding in embeddings]
+
+        return BatchedSentenceTransformerEmbeddingFunction(model_name=model, device=resolved)
     return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model, device=resolved)

@@ -71,8 +71,18 @@ dev-mode-dirs = [".", "src"]
 packages = ["src"]
 
 [tool.hatch.build.targets.wheel.force-include]
+"pal.py"          = "pal.py"
+"cli.py"          = "cli.py"
+"pal_registry.py" = "pal_registry.py"
+"pal_daemon.py"   = "pal_daemon.py"
+"pal_pull.py"     = "pal_pull.py"
+"pal_watch.py"    = "pal_watch.py"
+"mcp_server.py"   = "mcp_server.py"
 "archetypes.yaml" = "archetypes.yaml"
 "src/vision_ocr.swift" = "src/vision_ocr.swift"
+"deploy/systemd/llmlibrarian-mcp@.service" = "deploy/systemd/llmlibrarian-mcp@.service"
+"deploy/launchd/com.tjm4.llmlibrarian-mcp.plist" = "deploy/launchd/com.tjm4.llmlibrarian-mcp.plist"
+"scripts/run_mcp_http.sh" = "scripts/run_mcp_http.sh"
 
 [dependency-groups]
 dev = [

@@ -8,6 +8,7 @@ SIGSEGV caused by multiple Rust HNSW handles on the same files.
 
 import os
 import shutil
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from chromadb.config import Settings
 
 _lock = threading.Lock()
 _clients: dict[str, "_SafeClient"] = {}
+_fallback_warned: set[str] = set()
 
 _HNSW_BLOAT_BYTES = 1 << 30
 _MIN_FREE_BYTES = 512 * 1024 * 1024
@@ -87,6 +89,15 @@ class _SafeClient:
                     name=name, embedding_function=fallback_ef, **kwargs
                 )
                 self._effective_efs[name] = fallback_ef
+                key = f"{id(self._client)}:{name}"
+                if key not in _fallback_warned and os.environ.get("LLMLIBRARIAN_QUIET", "").strip().lower() not in {"1", "true", "yes"}:
+                    _fallback_warned.add(key)
+                    print(
+                        "[llmli][WARN] Existing Chroma collection uses the default ONNX embedding "
+                        "function; using that for compatibility. Rebuild the DB/collection to switch "
+                        "this DB to sentence-transformers/CUDA embeddings.",
+                        file=sys.stderr,
+                    )
                 return coll
             raise
 
