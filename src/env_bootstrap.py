@@ -4,8 +4,9 @@ Goal: stop treating a repo-local `.env` as the default secret store.
 
 Precedence (first match wins; never overwrites existing os.environ values):
 1) `LLMLIBRARIAN_ENV_FILE` if set **and the path exists** (explicit path to a KEY=VAL file)
-2) `XDG_CONFIG_HOME/llmLibrarian/llmlibrarian.env` (fallback: `~/.config/llmLibrarian/llmlibrarian.env`)
-3) Optional legacy: repo-root `.env` ONLY if `LLMLIBRARIAN_DOTENV=1`
+2) `XDG_CONFIG_HOME/llmLibrarian/.llmlibrarian.env` (fallback: `~/.config/llmLibrarian/.llmlibrarian.env`)
+3) Legacy user config: `XDG_CONFIG_HOME/llmLibrarian/llmlibrarian.env`
+4) Optional legacy: repo-root `.env` ONLY if `LLMLIBRARIAN_DOTENV=1`
 
 This intentionally does **not** depend on importing the rest of llmLibrarian.
 """
@@ -67,11 +68,16 @@ def bootstrap_llmlibrarian_env(*, repo_root: Path) -> None:
 
     xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
     cfg_home = Path(xdg).expanduser() if xdg else (Path.home() / ".config")
-    user_env = (cfg_home / "llmLibrarian" / "llmlibrarian.env").expanduser()
-    if user_env.exists():
-        load_key_value_file(user_env)
-        os.environ["LLMLIBRARIAN_ENV_BOOTSTRAPPED"] = "1"
-        return
+    config_dir = cfg_home / "llmLibrarian"
+    for user_env in (
+        config_dir / ".llmlibrarian.env",
+        config_dir / "llmlibrarian.env",
+    ):
+        user_env = user_env.expanduser()
+        if user_env.exists():
+            load_key_value_file(user_env)
+            os.environ["LLMLIBRARIAN_ENV_BOOTSTRAPPED"] = "1"
+            return
 
     dotenv_flag = (os.environ.get("LLMLIBRARIAN_DOTENV") or "").strip().lower()
     if dotenv_flag in {"1", "true", "yes", "on"}:

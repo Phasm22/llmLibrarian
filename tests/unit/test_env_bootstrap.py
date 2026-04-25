@@ -50,7 +50,7 @@ def test_bootstrap_legacy_dotenv_requires_flag(tmp_path: Path, monkeypatch: pyte
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("LLMLIBRARIAN_ENV_FILE", raising=False)
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty_config"))
     monkeypatch.delenv("LLMLIBRARIAN_DOTENV", raising=False)
     monkeypatch.delenv("LLMLIBRARIAN_ENV_BOOTSTRAPPED", raising=False)
 
@@ -62,6 +62,42 @@ def test_bootstrap_legacy_dotenv_requires_flag(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setenv("LLMLIBRARIAN_DOTENV", "1")
     bootstrap_llmlibrarian_env(repo_root=repo)
     assert os.environ["OPENAI_API_KEY"] == "legacy"
+
+
+def test_bootstrap_reads_hidden_xdg_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from env_bootstrap import bootstrap_llmlibrarian_env
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_dir = tmp_path / "config" / "llmLibrarian"
+    config_dir.mkdir(parents=True)
+    (config_dir / ".llmlibrarian.env").write_text("OPENAI_API_KEY=hidden\n", encoding="utf-8")
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLMLIBRARIAN_ENV_FILE", raising=False)
+    monkeypatch.delenv("LLMLIBRARIAN_ENV_BOOTSTRAPPED", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    bootstrap_llmlibrarian_env(repo_root=repo)
+    assert os.environ["OPENAI_API_KEY"] == "hidden"
+
+
+def test_bootstrap_falls_back_to_legacy_xdg_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from env_bootstrap import bootstrap_llmlibrarian_env
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_dir = tmp_path / "config" / "llmLibrarian"
+    config_dir.mkdir(parents=True)
+    (config_dir / "llmlibrarian.env").write_text("OPENAI_API_KEY=legacy_user\n", encoding="utf-8")
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLMLIBRARIAN_ENV_FILE", raising=False)
+    monkeypatch.delenv("LLMLIBRARIAN_ENV_BOOTSTRAPPED", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+    bootstrap_llmlibrarian_env(repo_root=repo)
+    assert os.environ["OPENAI_API_KEY"] == "legacy_user"
 
 
 def test_bootstrap_missing_explicit_env_file_falls_through_to_legacy_dotenv(
@@ -76,6 +112,7 @@ def test_bootstrap_missing_explicit_env_file_falls_through_to_legacy_dotenv(
     missing = tmp_path / "missing.env"
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "empty_config"))
     monkeypatch.delenv("LLMLIBRARIAN_ENV_BOOTSTRAPPED", raising=False)
     monkeypatch.setenv("LLMLIBRARIAN_ENV_FILE", str(missing))
     monkeypatch.setenv("LLMLIBRARIAN_DOTENV", "1")

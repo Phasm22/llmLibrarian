@@ -92,12 +92,12 @@ def main() -> int:
 
     with backup.open(encoding="utf-8") as f:
         reg = json.load(f)
-    items = sorted(reg.values(), key=lambda v: v.get("path") or "")
+    items = sorted(reg.items(), key=lambda item: (item[1].get("path") or "", item[0]))
 
     failures: list[str] = []
     vision_ok = bool(os.environ.get("LLMLIBRARIAN_VISION_MODEL", "").strip())
 
-    for v in items:
+    for slug, v in items:
         path = (v.get("path") or "").strip()
         if not path:
             continue
@@ -112,6 +112,9 @@ def main() -> int:
                 path=p,
                 db_path=db_resolved,
                 incremental=False,
+                forced_silo_slug=slug,
+                display_name_override=v.get("display_name") or v.get("name") or slug,
+                exclude_patterns=v.get("exclude_patterns"),
                 image_vision_enabled=True if want_vision else None,
             )
         except Exception as exc:

@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +38,26 @@ _bootstrap_process_env()
 _logger = logging.getLogger("llmLibrarian.mcp")
 
 
+def _looks_like_checkout(path: Path) -> bool:
+    return (path / "cli.py").exists() and (path / "src").is_dir()
+
+
+def _iter_editable_roots(site_root: Path) -> list[Path]:
+    roots: list[Path] = []
+    for pth_path in sorted(site_root.glob("*llmlibrarian*.pth")):
+        try:
+            for raw_line in pth_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or line.startswith("import "):
+                    continue
+                candidate = Path(line).expanduser()
+                if candidate.exists():
+                    roots.append(candidate.resolve())
+        except Exception:
+            continue
+    return roots
+
+
 def _resolve_db_path() -> str:
     """Resolve DB path, falling back gracefully when env vars contain unresolved templates."""
     raw = os.environ.get("LLMLIBRARIAN_DB", "")
@@ -59,15 +80,25 @@ def _resolve_db_path() -> str:
             except Exception:
                 pass
 
-    # Fall back: look for my_brain_db relative to script root or common locations
+    # Fall back to the active checkout before script root. When mcp_server.py is
+    # installed into site-packages, script-root fallback creates a hidden DB in
+    # .venv; that DB is easy to miss and can bloat.
     fallback_candidates = [
-        _ROOT / "my_brain_db",
+        Path.cwd() / "my_brain_db" if _looks_like_checkout(Path.cwd()) else None,
+        *[root / "my_brain_db" for root in _iter_editable_roots(_ROOT) if _looks_like_checkout(root)],
+        _ROOT / "my_brain_db" if _looks_like_checkout(_ROOT) else None,
         Path.home() / "llmLibrarian" / "my_brain_db",
     ]
     for candidate in fallback_candidates:
-        if candidate.exists():
+        if candidate is not None and candidate.exists():
             return str(candidate.resolve())
 
+    cwd = Path.cwd().resolve()
+    if _looks_like_checkout(cwd):
+        return str((cwd / "my_brain_db").resolve())
+    for root in _iter_editable_roots(_ROOT):
+        if _looks_like_checkout(root):
+            return str((root / "my_brain_db").resolve())
     return str((_ROOT / "my_brain_db").resolve())
 
 
@@ -135,11 +166,13 @@ mcp = FastMCP(
     name="llmLibrarian",
     instructions=(
         "Use these tools when a task requires context from the user's personal knowledge base. "
-        "Call list_silos first to get current silo state. Key silos include: "
-        "- much-thinks: personal journal and reflection writing "
-        "- hot_seat: interview and conversation transcripts "
-        "- llmLibrarian: project notes and development history "
-        "- (others — call list_silos for full current list) "
+        "Call list_silos first to get current silo state, domains, paths, chunk counts, "
+        "and diagnostic flags. Do not assume a silo's topic from its slug alone; names "
+        "can drift or be reused, so verify with list_silos metadata and retrieved sources. "
+        ""
+        "If retrieval returns zero chunks with no error, cross-check list_silos before treating "
+        "that as evidence of absence: chunks_count > 0, has_index_errors, or has_ingest_failures "
+        "means the empty result may be an index/tool problem. Call health for diagnostics. "
         ""
         "For any task involving the user's past thinking, decisions, habits, or writing, "
         "call query_personal_knowledge before responding. Use multi_query_knowledge when "
@@ -153,9 +186,11 @@ mcp = FastMCP(
         "extracted values (AGI, total tax, W-2 boxes). Prefer tax_ledger over raw "
         "chunks for precise figures. "
         ""
-        "Use inspect_silo to diagnose coverage gaps. Use trigger_reindex after file "
-        "changes. Use repair_silo for Chroma corruption. Use watch_coverage to monitor "
-        "stale silos. Use health for server diagnostics. Use capabilities for supported "
+        "Use inspect_silo to diagnose coverage gaps. Use watch_coverage to check whether "
+        "registered sources have watcher jobs, but do not assume watchers are active. "
+        "Use trigger_reindex after file changes or when list_silos shows an old updated "
+        "timestamp for a silo with active source changes. Use repair_silo for Chroma "
+        "corruption. Use health for server diagnostics. Use capabilities for supported "
         "file types."
     ),
 )
@@ -168,9 +203,53 @@ mcp = FastMCP(
 # reads and background reindex writes corrupted link_lists.bin to 680 GB.
 _chroma_lock = threading.Lock()
 
+
+def _mcp_lock_timeout_seconds() -> float:
+    raw = os.environ.get("LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        raw = os.environ.get("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return 10.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 10.0
+
+
+@contextmanager
+def _mcp_chroma_lock(operation: str):
+    timeout = _mcp_lock_timeout_seconds()
+    if not _chroma_lock.acquire(timeout=timeout):
+        raise TimeoutError(
+            f"Timed out after {timeout:g}s waiting for MCP Chroma lock during {operation}. "
+            "A background reindex or another tool call is still using Chroma; call health() "
+            "for last_background_reindex, then retry or restart the stuck MCP server."
+        )
+    try:
+        yield
+    finally:
+        _chroma_lock.release()
+
 # Last background reindex outcome per silo (for health / debugging).
 _reindex_outcome_lock = threading.Lock()
 _last_reindex_outcome: dict[str, dict] = {}
+_active_background_jobs: dict[str, dict] = {}
+
+
+def _mark_background_job_started(key: str, *, kind: str, path: str, silo: str | None = None) -> None:
+    with _reindex_outcome_lock:
+        _active_background_jobs[key] = {
+            "kind": kind,
+            "silo": silo or key,
+            "path": path,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def _mark_background_job_finished(key: str, outcome: dict) -> None:
+    with _reindex_outcome_lock:
+        _active_background_jobs.pop(key, None)
+        _last_reindex_outcome[key] = outcome
 
 
 def _release_chroma() -> None:
@@ -180,6 +259,17 @@ def _release_chroma() -> None:
         release()
     except Exception:
         pass
+
+
+def _db_missing_error() -> dict:
+    return {
+        "db_path": _DB_PATH,
+        "db_exists": False,
+        "error": (
+            f"LLMLIBRARIAN_DB does not exist: {_DB_PATH}. "
+            "Fix the MCP environment/config or create/re-index the DB before using knowledge retrieval."
+        ),
+    }
 
 
 # Helper: answer-level confidence signal
@@ -229,8 +319,8 @@ def query_personal_knowledge(
     decisions, reflections, or domain knowledge. Returns semantically ranked
     chunks from indexed silos.
 
-    Specify silo_id to scope retrieval (e.g. much-thinks for personal reflection,
-    hot_seat for interview content). Returns chunks with text, score (0–1),
+    Specify silo to scope retrieval by slug or display name; call list_silos first
+    rather than inferring a silo's domain from its slug. Returns chunks with text, score (0–1),
     confidence, section heading, source path, date, doc_type, and position.
 
     Pass section= to restrict to a document section.
@@ -241,8 +331,10 @@ def query_personal_knowledge(
     When no silo filter is passed, also returns chunks_by_silo grouped by silo.
     """
     from query.core import run_retrieve
+    if not Path(_DB_PATH).is_dir():
+        return {**_db_missing_error(), "chunks": []}
     try:
-        with _chroma_lock:
+        with _mcp_chroma_lock("query_personal_knowledge"):
             result = run_retrieve(
                 query=query,
                 silo=silo,
@@ -302,12 +394,14 @@ def multi_query_knowledge(
     Response includes answer_confidence, answer_confidence_score, and coverage_note.
     """
     from query.core import run_retrieve
+    if not Path(_DB_PATH).is_dir():
+        return {**_db_missing_error(), "queries": queries, "total_chunks": 0, "chunks": []}
     seen: set[str] = set()
     all_chunks: list[dict] = []
     errors: list[str] = []
     for q in queries:
         try:
-            with _chroma_lock:
+            with _mcp_chroma_lock("multi_query_knowledge"):
                 res = run_retrieve(
                     query=q,
                     silo=silo,
@@ -369,8 +463,10 @@ def explain_retrieval(
     - signal_summary: plain-text explanation of what signals fired and why
     """
     from query.core import run_retrieve
+    if not Path(_DB_PATH).is_dir():
+        return {**_db_missing_error(), "query": query, "ranked_chunks": []}
     try:
-        with _chroma_lock:
+        with _mcp_chroma_lock("explain_retrieval"):
             result = run_retrieve(
                 query=query,
                 silo=silo,
@@ -463,6 +559,8 @@ def list_silos(check_staleness: bool = False) -> dict:
     Pass check_staleness=True to also get is_stale, stale_file_count, and
     newest_source_mtime_iso per silo (walks source directory — may be slow for large silos).
     """
+    if not Path(_DB_PATH).is_dir():
+        return {**_db_missing_error(), "silo_count": 0, "silos": []}
     from operations import op_list_silos
     return op_list_silos(_DB_PATH, check_staleness=check_staleness)
 
@@ -475,11 +573,17 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
     Useful to diagnose zero-chunk files (likely failed to parse), detect duplicate content,
     or verify coverage after indexing. top= limits how many files are returned (default 50).
     """
+    if not Path(_DB_PATH).is_dir():
+        return _db_missing_error()
     from operations import op_inspect_silo
-    with _chroma_lock:
-        result = op_inspect_silo(_DB_PATH, silo, top=top)
-    _release_chroma()
-    return result
+    try:
+        with _mcp_chroma_lock("inspect_silo"):
+            result = op_inspect_silo(_DB_PATH, silo, top=top)
+        return result
+    except Exception as e:
+        return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        _release_chroma()
 
 
 @mcp.tool()
@@ -493,6 +597,8 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     Check list_silos() for updated timestamp after completion.
     This updates indexed chunks from files; it is not `repair_silo` (no wipe) and not `watch_coverage` (not about pal bookmarks/daemons).
     """
+    if not Path(_DB_PATH).is_dir():
+        return {"status": "error", **_db_missing_error()}
     if not confirm:
         return {
             "status": "not_started",
@@ -519,9 +625,10 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
 
     def _run_reindex() -> None:
         err: str | None = None
+        _mark_background_job_started(slug, kind="trigger_reindex", silo=slug, path=source_path)
         try:
             with _reindex_lock:
-                with _chroma_lock:
+                with _mcp_chroma_lock("trigger_reindex"):
                     from ingest import run_add
 
                     run_add(path=source_path, db_path=_DB_PATH, incremental=True)
@@ -538,8 +645,7 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
                 "ok": err is None,
                 **({"error": err} if err else {}),
             }
-            with _reindex_outcome_lock:
-                _last_reindex_outcome[slug] = rec
+            _mark_background_job_finished(slug, rec)
             _release_chroma()
 
     t = threading.Thread(target=_run_reindex, daemon=True)
@@ -568,6 +674,8 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
     This is synchronous — it blocks until complete (may take a few minutes for large silos).
     Unrelated to pal auto-watch: for bookmarks/daemon job coverage use `watch_coverage` (read-only).
     """
+    if not Path(_DB_PATH).is_dir():
+        return {"status": "error", **_db_missing_error()}
     if not confirm:
         return {
             "status": "not_started",
@@ -576,7 +684,7 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
 
     from operations import op_repair_silo
     try:
-        with _chroma_lock:
+        with _mcp_chroma_lock("repair_silo"):
             result = op_repair_silo(_DB_PATH, silo, verbose=False)
         if result.get("status") == "completed":
             result["message"] = (
@@ -624,9 +732,10 @@ def add_silo(
         files_ok = 0
         n_failures = 0
         final_slug: str | None = None
+        _mark_background_job_started(outcome_key, kind="add_silo", path=str(p), silo=silo)
         try:
             with _reindex_lock:
-                with _chroma_lock:
+                with _mcp_chroma_lock("add_silo"):
                     from orchestration.ingest import IngestRequest, run_ingest
                     from state import resolve_silo_by_path, resolve_silo_to_slug
 
@@ -662,8 +771,7 @@ def add_silo(
                 "failures": n_failures,
                 **({"error": err} if err else {}),
             }
-            with _reindex_outcome_lock:
-                _last_reindex_outcome[outcome_key] = rec
+            _mark_background_job_finished(outcome_key, rec)
             _release_chroma()
 
     t = threading.Thread(target=_run_add, daemon=True)
@@ -687,19 +795,56 @@ def health() -> dict:
     Call this first if tools are failing, the disk is filling, or Python keeps spawning.
     """
     from operations import op_db_storage_summary
+    from state import get_last_failures, get_query_health
+    from silo_audit import (
+        find_count_mismatches,
+        find_duplicate_hashes,
+        find_orphaned_sources,
+        find_path_overlaps,
+        load_file_registry,
+        load_manifest,
+        load_registry,
+    )
 
     embedding_model = os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2")
     embedding_kind = os.environ.get("LLMLIBRARIAN_EMBEDDING", "") or "sentence_transformer"
+    query_errors = get_query_health(_DB_PATH)
+    last_failures = get_last_failures(_DB_PATH)
+    registry = load_registry(_DB_PATH)
+    manifest = load_manifest(_DB_PATH)
+    file_registry = load_file_registry(_DB_PATH)
+    count_mismatches = find_count_mismatches(registry, manifest)
+    duplicate_hashes = find_duplicate_hashes(file_registry)
+    path_overlaps = find_path_overlaps(registry)
+    orphaned_sources = find_orphaned_sources(registry)
     out: dict = {
         "db_path": _DB_PATH,
         "db_exists": Path(_DB_PATH).exists(),
         "embedding_model": embedding_model,
         "embedding_kind": embedding_kind,
         "python_version": sys.version,
+        "query_health": {
+            "recent_error_count": len(query_errors),
+            "recent_errors": query_errors[-10:],
+        },
+        "ingest_failures": {
+            "last_failure_count": len(last_failures),
+            "last_failures": last_failures[:20],
+        },
+        "silo_audit": {
+            "silo_count": len(registry),
+            "count_mismatch_count": len(count_mismatches),
+            "count_mismatches": count_mismatches[:20],
+            "duplicate_hash_group_count": len(duplicate_hashes),
+            "path_overlap_count": len(path_overlaps),
+            "orphaned_source_count": len(orphaned_sources),
+            "orphaned_sources": orphaned_sources[:20],
+        },
     }
     if Path(_DB_PATH).is_dir():
         out["storage"] = op_db_storage_summary(_DB_PATH)
     with _reindex_outcome_lock:
+        out["active_background_jobs"] = dict(_active_background_jobs)
         out["last_background_reindex"] = dict(_last_reindex_outcome)
     return out
 
@@ -718,6 +863,8 @@ def capabilities() -> str:
 def resource_silos() -> str:
     """Read-only JSON snapshot of all registered silos. May be stale — call list_silos tool for live data."""
     import json
+    if not Path(_DB_PATH).is_dir():
+        return json.dumps({**_db_missing_error(), "silos": []}, indent=2)
     from state import list_silos as _list_silos
     return json.dumps({
         "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -733,6 +880,8 @@ def get_silo(slug: str) -> str:
     last_indexed, and doc_type_breakdown. Resolved dynamically at request time.
     """
     import json
+    if not Path(_DB_PATH).is_dir():
+        return json.dumps(_db_missing_error(), indent=2)
     from state import list_silos as _list_silos
     all_silos = _list_silos(_DB_PATH)
     silo_info = next((s for s in all_silos if s.get("slug") == slug), None)

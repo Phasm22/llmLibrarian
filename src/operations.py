@@ -62,6 +62,13 @@ def op_db_storage_summary(db_path: str) -> dict[str, Any]:
     except OSError:
         free = -1
 
+    try:
+        from chroma_lock import chroma_lock_snapshot
+
+        lock = chroma_lock_snapshot(root)
+    except Exception:
+        lock = None
+
     return {
         "db_path": str(root),
         "db_total_bytes": total,
@@ -69,6 +76,7 @@ def op_db_storage_summary(db_path: str) -> dict[str, Any]:
         "link_lists": link_lists,
         "chroma_hnsw_bloat": bloated,
         "chroma_hnsw_bloat_note": note,
+        "chroma_lock": lock,
     }
 
 
@@ -351,7 +359,7 @@ def op_list_silos(db_path: str, check_staleness: bool = False) -> dict:
     check_staleness=True walks source directories to detect changed files.
     Returns {"db_path": str, "db_exists": bool, "silo_count": int, "silos": list}
     """
-    from state import list_silos as _list_silos, get_query_health
+    from state import list_silos as _list_silos, get_last_failures, get_query_health
 
     silos = _list_silos(db_path)
 
@@ -362,6 +370,19 @@ def op_list_silos(db_path: str, check_staleness: bool = False) -> dict:
         t = entry.get("time") or ""
         if slug and (slug not in silo_errors or t > silo_errors[slug]):
             silo_errors[slug] = t
+
+    ingest_failures = get_last_failures(db_path)
+
+    def _failure_belongs_to_silo(failure: dict, silo_path: str) -> bool:
+        raw = (failure or {}).get("path") or ""
+        if not raw or not silo_path:
+            return False
+        try:
+            failure_path = Path(raw).expanduser().resolve()
+            root = Path(silo_path).expanduser().resolve()
+            return failure_path == root or failure_path.is_relative_to(root)
+        except Exception:
+            return str(raw).startswith(str(silo_path).rstrip("/") + "/")
 
     for s in silos:
         by_ext = (s.get("language_stats") or {}).get("by_ext") or {}
@@ -375,6 +396,17 @@ def op_list_silos(db_path: str, check_staleness: bool = False) -> dict:
             s["has_index_errors"] = False
             s["last_index_error_time"] = None
 
+        silo_failures = [
+            failure for failure in ingest_failures
+            if isinstance(failure, dict) and _failure_belongs_to_silo(failure, s.get("path") or "")
+        ]
+        s["has_ingest_failures"] = bool(silo_failures)
+        s["last_ingest_failure_count"] = len(silo_failures)
+        if silo_failures:
+            s["last_ingest_failures"] = silo_failures[:5]
+        else:
+            s["last_ingest_failures"] = []
+
         if check_staleness:
             _inject_staleness(s)
 
@@ -382,6 +414,7 @@ def op_list_silos(db_path: str, check_staleness: bool = False) -> dict:
         "db_path": db_path,
         "db_exists": Path(db_path).exists(),
         "silo_count": len(silos),
+        "last_ingest_failure_count": len(ingest_failures),
         "silos": silos,
     }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import operations as ops
+from state import record_index_error, set_last_failures, update_silo
 
 
 def test_storage_summary_missing_dir(tmp_path):
@@ -30,3 +31,21 @@ def test_storage_summary_totals_and_bloat(monkeypatch, tmp_path):
     r2 = ops.op_db_storage_summary(str(db))
     assert r2["chroma_hnsw_bloat"] is True
     assert r2["chroma_hnsw_bloat_note"]
+
+
+def test_list_silos_surfaces_query_and_ingest_failures(tmp_path):
+    db = tmp_path / "db"
+    root = tmp_path / "docs"
+    root.mkdir()
+    update_silo(db, "docs-1234abcd", str(root), 2, 10, "2026-04-24T00:00:00+00:00", display_name="Docs")
+    record_index_error(db, "docs-1234abcd", RuntimeError("chroma boom"))
+    set_last_failures(db, [{"path": str(root / "bad.pdf"), "error": "parse failed"}])
+
+    out = ops.op_list_silos(str(db))
+
+    row = out["silos"][0]
+    assert row["has_index_errors"] is True
+    assert row["last_index_error_time"]
+    assert row["has_ingest_failures"] is True
+    assert row["last_ingest_failure_count"] == 1
+    assert out["last_ingest_failure_count"] == 1

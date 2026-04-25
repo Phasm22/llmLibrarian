@@ -22,6 +22,8 @@ When integrated via MCP, prefer tools over shell so you do not depend on `PYTHON
 4. **`add_silo`** — index a **file or directory** (same rules as `llmli add`).
 5. **`trigger_reindex`** — incremental refresh for a registered silo; **`repair_silo`** — hard reset when Chroma/registry is inconsistent.
 
+If retrieval returns zero chunks with no `error`, do not assume the knowledge base is empty. Cross-check `list_silos`: if the target silo has `chunks_count > 0`, or `has_index_errors` / `has_ingest_failures` is true, treat the empty retrieval as a diagnostic signal and call `health` before answering from absence.
+
 Use **`pal`** / **`llmli`** only when MCP is unavailable or you need flags not exposed on tools (e.g. niche `llmli` options).
 
 **Entry-point behavior** (CLI vs MCP vs `pal pull` all vs `ensure_self_silo`): [docs/orchestration-matrix.md](docs/orchestration-matrix.md). Shared implementation: `orchestration.ingest.run_ingest` → `ingest.run_add`.
