@@ -62,8 +62,9 @@ llmli ask --in <silo> "question"
 ```bash
 pal ls
 pal inspect <silo> --top 20
+pal ls --status
+pal ls --jobs
 pal pull --status
-pal status
 ```
 
 ### 5) Test
@@ -76,7 +77,7 @@ uv run pytest -q tests/unit
 - `pal` is the operator-facing CLI.
 - `llmli` is the direct engine CLI.
 - `pal sync` refreshes the dev self-silo (`__self__`) when needed.
-- **Claude Desktop MCP (.mcpb):** after editing `mcp_server.py`, run `pal extension pack` (requires `LLMLIBRARIAN_MCP_PACK_CMD`) so the packaged extension matches the repo; stdio via `.mcp.json` does not update the Desktop binary. `pal status` / `pal sync` warn if the recorded hash is missing or stale.
+- **Claude Desktop MCP (.mcpb):** after editing `mcp_server.py`, run `pal extension pack` (requires `LLMLIBRARIAN_MCP_PACK_CMD`) so the packaged extension matches the repo; stdio via `.mcp.json` does not update the Desktop binary. `pal ls --status` / `pal sync` warn if the recorded hash is missing or stale.
 - Natural shorthand `pal ask in <silo> "..."` is supported and normalized to `--in`.
 
 ## Documentation Policy

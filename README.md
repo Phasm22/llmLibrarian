@@ -129,7 +129,8 @@ Cloud-sync roots (OneDrive, iCloud, Dropbox, etc.) are **blocked by default**; u
 ## Maintenance and health
 
 ```bash
-pal status
+pal ls --status
+pal ls --jobs
 pal pull --status
 llmli log --last
 ```
@@ -178,4 +179,3 @@ uv run python cli.py --help
 - Security and testing notes: `[SECURITY_AND_TESTING.md](SECURITY_AND_TESTING.md)`
 - MCP over HTTPS via Tailscale Funnel: `[docs/MCP_TAILSCALE_FUNNEL.md](docs/MCP_TAILSCALE_FUNNEL.md)`
 - Agent and contributor contracts: `[AGENTS.md](AGENTS.md)`
-
