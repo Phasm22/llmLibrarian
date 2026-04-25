@@ -352,6 +352,7 @@ def test_ocr_pdf_page_text_uses_expected_dpi(monkeypatch, env_value, expected_dp
             return _FakePixmap()
 
     monkeypatch.setenv("LLMLIBRARIAN_OCR_PREPROCESS", env_value)
+    monkeypatch.setattr(processors, "_available_ocr_backends", lambda: ["tesseract"])
     monkeypatch.setattr(processors, "_paddleocr_available", lambda: False)
     monkeypatch.setattr(processors, "_tesseract_available", lambda: False)
     text, backend = processors._ocr_pdf_page_text(_FakePage(), "scan.pdf")

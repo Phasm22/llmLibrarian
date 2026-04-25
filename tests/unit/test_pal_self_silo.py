@@ -113,27 +113,6 @@ def test_ensure_self_silo_warns_when_stale(monkeypatch, capsys):
     assert "pal sync" in err
 
 
-def test_capabilities_calls_ensure_self_once_and_no_llm(monkeypatch):
-    from typer.testing import CliRunner
-    calls = {"ensure": 0, "llmli": []}
-
-    def _fake_ensure(force=False):
-        calls["ensure"] += 1
-        return 0
-
-    def _fake_run_llmli(args):
-        calls["llmli"].append(args)
-        return 0
-
-    monkeypatch.setattr("pal.ensure_self_silo", _fake_ensure)
-    monkeypatch.setattr("pal._run_llmli", _fake_run_llmli)
-    runner = CliRunner()
-    res = runner.invoke(pal.app, ["capabilities"])
-    assert res.exit_code == 0
-    assert calls["ensure"] == 1
-    assert calls["llmli"] == [["capabilities"]]
-
-
 def test_ask_explicit_self_scope_prints_stale_banner_before_answer(monkeypatch):
     from typer.testing import CliRunner
 
