@@ -22,6 +22,15 @@ When integrated via MCP, prefer tools over shell so you do not depend on `PYTHON
 4. **`add_silo`** — index a **file or directory** (same rules as `llmli add`).
 5. **`trigger_reindex`** — incremental refresh for a registered silo; **`repair_silo`** — hard reset when Chroma/registry is inconsistent.
 
+## Session-start checklist (MCP)
+
+1. Call `list_silos(check_staleness=True)` before any retrieval.
+2. If `is_stale: true` and `stale_file_count` is substantial, call `trigger_reindex` before querying.
+3. If `stale_file_count` is small (<= 2-3) **and** `newest_source_mtime_iso` matches the silo's `updated` timestamp, treat the residual as write-during-index race noise; the index is usable, skip reindex.
+4. `db_exists: false` means the `LLMLIBRARIAN_DB` env var is misconfigured for this process. Fix the launch config before proceeding; retrieval results are invalid until resolved.
+
+`check_staleness` does a filesystem mtime walk; cheap for repo-sized silos (< 200ms observed on 175 files).
+
 If retrieval returns zero chunks with no `error`, do not assume the knowledge base is empty. Cross-check `list_silos`: if the target silo has `chunks_count > 0`, or `has_index_errors` / `has_ingest_failures` is true, treat the empty retrieval as a diagnostic signal and call `health` before answering from absence.
 
 Use **`pal`** / **`llmli`** only when MCP is unavailable or you need flags not exposed on tools (e.g. niche `llmli` options).
