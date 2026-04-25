@@ -29,6 +29,13 @@ if _cli_spec is not None and _cli_spec.loader is not None:
     sys.modules["cli"] = _cli_module
     _cli_spec.loader.exec_module(_cli_module)
 
+_mcp_path = (ROOT / "mcp_server.py").resolve()
+_mcp_spec = importlib.util.spec_from_file_location("mcp_server", _mcp_path)
+if _mcp_spec is not None and _mcp_spec.loader is not None:
+    _mcp_module = importlib.util.module_from_spec(_mcp_spec)
+    sys.modules["mcp_server"] = _mcp_module
+    _mcp_spec.loader.exec_module(_mcp_module)
+
 # Avoid color/style differences in test output formatting.
 os.environ.setdefault("LLMLIBRARIAN_EDITOR_SCHEME", "file")
 
