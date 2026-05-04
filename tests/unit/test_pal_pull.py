@@ -148,17 +148,18 @@ def test_pull_command_rejects_blank_prompt():
 
 def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     watched = {}
-    def _fake_pull_child(*args, **kwargs):
+
+    def _fake_mcp_call(tool, **kwargs):
         watched["processor_log_level"] = os.environ.get("LLMLIBRARIAN_PROCESSOR_LOG_LEVEL")
         watched["ingest_log_level"] = os.environ.get("LLMLIBRARIAN_INGEST_LOG_LEVEL")
         watched["suppress_recoverable"] = os.environ.get("LLMLIBRARIAN_SUPPRESS_RECOVERABLE_WARNINGS")
-        watched["child_path"] = str(args[0])
-        watched["child_extra_env"] = kwargs.get("extra_env")
-        from types import SimpleNamespace
+        watched["mcp_tool"] = tool
+        watched["mcp_args"] = kwargs
+        watched["child_path"] = kwargs.get("path")
+        return {"status": "ok"}
 
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("pal._run_pull_child", _fake_pull_child)
+    monkeypatch.setattr("pal._mcp_healthcheck", lambda: (True, ""))
+    monkeypatch.setattr("pal._mcp_call_sync", _fake_mcp_call)
     monkeypatch.setattr(
         "pal._read_llmli_registry",
         lambda _db: {"folder-slug": {"path": str(Path('/tmp/folder').resolve())}},
@@ -201,11 +202,26 @@ def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     assert watched["debounce"] == 2
     assert watched["root"] == str(Path("/tmp/folder").resolve())
     assert watched["child_path"] == str(Path("/tmp/folder").resolve())
-    assert watched["child_extra_env"]["LLMLIBRARIAN_INGEST_LOG_LEVEL"] == "FATAL"
+    assert watched["mcp_tool"] == "add_silo"
+    assert watched["mcp_args"]["confirm"] is True
     assert watched["processor_log_level"] == "ERROR"
     assert watched["ingest_log_level"] == "FATAL"
     assert watched["suppress_recoverable"] == "1"
     assert watched["watcher_processor_log_level"] == "ERROR"
+
+
+def test_pull_watch_errors_when_mcp_unreachable(monkeypatch, tmp_path):
+    import pal
+
+    monkeypatch.setattr("pal.Observer", object())
+    monkeypatch.setattr("pal._mcp_healthcheck", lambda: (False, "connection refused"))
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    res = runner.invoke(pal.app, ["pull", str(folder), "--watch"])
+    assert res.exit_code == 2
+    assert "MCP server" in (res.output + (res.stderr if hasattr(res, "stderr") and res.stderr_bytes is not None else ""))
 
 
 def test_temporary_env_restores_previous_values(monkeypatch):

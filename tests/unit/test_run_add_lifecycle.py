@@ -40,8 +40,16 @@ class _FakeClient:
 
 
 def _patch_runtime(monkeypatch, coll):
+    from contextlib import contextmanager
+
     monkeypatch.setattr("ingest.get_embedding_function", lambda **_kw: None)
     monkeypatch.setattr("ingest.get_client", lambda db_path: _FakeClient(coll))
+
+    @contextmanager
+    def _fake_writer_client(db_path):
+        yield _FakeClient(coll)
+
+    monkeypatch.setattr("ingest.writer_client", _fake_writer_client)
     monkeypatch.setattr("ingest.load_config", lambda *a, **k: {"limits": {}})
 
 
@@ -181,7 +189,35 @@ def test_run_add_uses_and_persists_saved_excludes(monkeypatch, tmp_path):
     assert files_indexed == 0
     assert "vendor/" in captured["exclude"]
     assert "*.tmp" in captured["exclude"]
-    assert get_silo_exclude_patterns(db_path, slug) == ["vendor/", "*.tmp"]
+    excludes = get_silo_exclude_patterns(db_path, slug)
+    assert "vendor/" in excludes
+    assert "*.tmp" in excludes
+    assert "/cortex/" in excludes
+
+
+def test_run_add_persists_default_excludes_for_new_silo(monkeypatch, tmp_path):
+    root = tmp_path / "docs"
+    root.mkdir()
+    file_path = root / "keep.txt"
+    file_path.write_text("hello world", encoding="utf-8")
+    db_path = tmp_path / "db"
+    coll = _FakeCollection()
+    _patch_runtime(monkeypatch, coll)
+    monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [(file_path.resolve(), "code")])
+    monkeypatch.setattr("ingest.process_one_file", lambda *a, **k: [])
+
+    files_indexed, failures = run_add(
+        root,
+        db_path=db_path,
+        allow_cloud=True,
+    )
+
+    slug = resolve_silo_by_path(db_path, root)
+    assert slug is not None
+    assert failures == 0
+    assert files_indexed == 0
+    excludes = get_silo_exclude_patterns(db_path, slug)
+    assert "/cortex/" in excludes
 
 
 def test_run_add_writes_status_file(monkeypatch, tmp_path):

@@ -27,7 +27,7 @@ Do **not** keep API keys in a repo-local `.env` (easy to leak via backups, scree
 Preferred order (`pal` / `llmli` / `mcp_server.py` all call the same bootstrap):
 
 1. **Explicit file**: set `LLMLIBRARIAN_ENV_FILE=/path/to/.llmlibrarian.env` (recommended for systemd units).
-   - If this variable is set but the file **does not exist**, bootstrap falls through to (2) and then (3).
+  - If this variable is set but the file **does not exist**, bootstrap falls through to (2) and then (3).
 2. **XDG config file**: create `~/.config/llmLibrarian/.llmlibrarian.env` (or `$XDG_CONFIG_HOME/llmLibrarian/.llmlibrarian.env`) with `chmod 600`.
 3. **Legacy user config**: `~/.config/llmLibrarian/llmlibrarian.env` is still read for compatibility, but new installs use the hidden filename.
 4. **Legacy dev only**: repo-root `.env` is supported **only** when `LLMLIBRARIAN_DOTENV=1`.
@@ -173,9 +173,59 @@ uv run python cli.py --help
 
 ---
 
+## Shared MCP server for `pal pull --watch`
+
+`pal pull --watch` requires the shared HTTP MCP server to be running and routes
+all per-file writes through it. This enforces ChromaDB's one-`PersistentClient`-per-DB
+invariant and prevents HNSW corruption when multiple watchers run alongside other
+write paths.
+
+If the server is not reachable, `pal pull --watch` exits with code 2 and prints a
+clear error. There is no autostart and no fallback.
+
+**Environment** (read by both server and watcher):
+- `LLMLIBRARIAN_MCP_URL` (default `http://127.0.0.1:8765/mcp`)
+- `LLMLIBRARIAN_MCP_BEARER_TOKEN` (optional; required if the server enforces auth)
+
+**Install as a user-level systemd service** (`~/.config/systemd/user/llmlibrarian-mcp.service`):
+
+```ini
+[Unit]
+Description=llmLibrarian shared MCP server
+After=network.target
+
+[Service]
+Environment=LLMLIBRARIAN_MCP_TRANSPORT=streamable-http
+Environment=LLMLIBRARIAN_MCP_HOST=127.0.0.1
+Environment=LLMLIBRARIAN_MCP_PORT=8765
+Environment=LLMLIBRARIAN_MCP_BEARER_TOKEN=<openssl rand -hex 24>
+Environment=LLMLIBRARIAN_DB=%h/Desktop/llmLibrarian/my_brain_db
+ExecStart=%h/Desktop/llmLibrarian/.venv/bin/python %h/Desktop/llmLibrarian/mcp_server.py
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
+```
+
+Then:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now llmlibrarian-mcp.service
+curl http://127.0.0.1:8765/healthz   # should return ok
+```
+
+One-shot writes (`pal pull <path>` without `--watch`, `llmli add`, `llmli repair`)
+keep their direct-write path and serialize via flock — they do not require the
+shared server.
+
+---
+
 ## Further reading
 
 - Runtime and architecture: `[docs/TECH.md](docs/TECH.md)`
 - Security and testing notes: `[SECURITY_AND_TESTING.md](SECURITY_AND_TESTING.md)`
 - MCP over HTTPS via Tailscale Funnel: `[docs/MCP_TAILSCALE_FUNNEL.md](docs/MCP_TAILSCALE_FUNNEL.md)`
 - Agent and contributor contracts: `[AGENTS.md](AGENTS.md)`
+

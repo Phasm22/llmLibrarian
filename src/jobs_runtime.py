@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 SERVICE_DEBOUNCE_DEFAULT = 30.0
-SERVICE_INTERVAL_DEFAULT = 60.0
+SERVICE_INTERVAL_DEFAULT = 600.0
 SERVICE_RESTART_DELAY_DEFAULT = 15
 SERVICE_PREFIX_LAUNCHD = "io.llmlibrarian.watch."
 SERVICE_PREFIX_SYSTEMD = "llmlibrarian-watch-"

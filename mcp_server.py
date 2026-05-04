@@ -698,6 +698,105 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
         _release_chroma()
 
 
+def _resolve_silo_under_path(silo: str, path: str) -> tuple[str | None, str | None, dict | None]:
+    """Resolve silo slug and validate that path is inside the silo's registered source.
+
+    Returns (slug, abs_path, error_dict). If error_dict is non-None, return it as the tool result.
+    """
+    from pathlib import Path as _Path
+    from state import list_silos as _list_silos, resolve_silo_to_slug
+
+    if not _Path(_DB_PATH).is_dir():
+        return (None, None, {"status": "error", **_db_missing_error()})
+    slug = resolve_silo_to_slug(_DB_PATH, silo)
+    if slug is None:
+        return (None, None, {"status": "error", "error": f"silo not found: {silo!r}"})
+    info = next((s for s in _list_silos(_DB_PATH) if s.get("slug") == slug), None)
+    if not info:
+        return (None, None, {"status": "error", "error": f"silo registry entry missing for slug: {slug}"})
+    silo_root = info.get("path") or ""
+    if not silo_root:
+        return (None, None, {"status": "error", "error": "silo has no registered source path"})
+    abs_p = _Path(path).expanduser().resolve()
+    silo_root_p = _Path(silo_root).resolve()
+    try:
+        abs_p.relative_to(silo_root_p)
+    except ValueError:
+        return (None, None, {
+            "status": "error",
+            "error": f"path is not under silo source: path={abs_p} silo_root={silo_root_p}",
+        })
+    return (slug, str(abs_p), None)
+
+
+@mcp.tool()
+def update_file(silo: str, path: str, confirm: bool = False) -> dict:
+    """
+    Re-index a single file in an already-registered silo. Used by `pal pull --watch`
+    to push individual file changes through the shared Chroma client without
+    spawning a separate writer process. Synchronous: blocks until the file is indexed.
+    Path must resolve to a location under the silo's registered source folder.
+    Requires confirm=True (safety guard, mirrors trigger_reindex / repair_silo).
+    """
+    if not confirm:
+        return {
+            "status": "not_started",
+            "message": "Pass confirm=True to update the file.",
+        }
+    slug, abs_path, err = _resolve_silo_under_path(silo, path)
+    if err:
+        return err
+    try:
+        with _mcp_chroma_lock("update_file"):
+            from ingest import update_single_file
+
+            status, resolved = update_single_file(
+                abs_path,
+                db_path=_DB_PATH,
+                silo_slug=slug,
+                allow_cloud=True,  # path was already validated under the registered silo root
+            )
+        return {"status": status, "silo": slug, "path": resolved}
+    except Exception as e:
+        _logger.exception("update_file failed silo=%s path=%s", slug, abs_path)
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    finally:
+        _release_chroma()
+
+
+@mcp.tool()
+def remove_file(silo: str, path: str, confirm: bool = False) -> dict:
+    """
+    Remove a single file's chunks and manifest entry from an already-registered silo.
+    Used by `pal pull --watch` for delete events. Synchronous.
+    Path must resolve to a location under the silo's registered source folder.
+    Requires confirm=True (safety guard).
+    """
+    if not confirm:
+        return {
+            "status": "not_started",
+            "message": "Pass confirm=True to remove the file.",
+        }
+    slug, abs_path, err = _resolve_silo_under_path(silo, path)
+    if err:
+        return err
+    try:
+        with _mcp_chroma_lock("remove_file"):
+            from ingest import remove_single_file
+
+            status, resolved = remove_single_file(
+                abs_path,
+                db_path=_DB_PATH,
+                silo_slug=slug,
+            )
+        return {"status": status, "silo": slug, "path": resolved}
+    except Exception as e:
+        _logger.exception("remove_file failed silo=%s path=%s", slug, abs_path)
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    finally:
+        _release_chroma()
+
+
 @mcp.tool()
 def add_silo(
     path: str,

@@ -13,8 +13,16 @@ class _DummyClient:
 
 
 def _patch_ingest_runtime(monkeypatch, mock_collection):
+    from contextlib import contextmanager
+
     monkeypatch.setattr("ingest.get_embedding_function", lambda **_kw: None)
     monkeypatch.setattr("ingest.get_client", lambda db_path: _DummyClient(mock_collection))
+
+    @contextmanager
+    def _fake_writer_client(db_path):
+        yield _DummyClient(mock_collection)
+
+    monkeypatch.setattr("ingest.writer_client", _fake_writer_client)
 
 
 class _MultiClient:
@@ -131,11 +139,17 @@ def test_update_single_file_reuses_cross_silo_duplicate(monkeypatch, mock_collec
 
 
 def test_update_single_file_image_adds_image_vector(monkeypatch, mock_collection, db_path: Path, tmp_path: Path):
+    from contextlib import contextmanager
+
     image_collection = type(mock_collection)()
-    monkeypatch.setattr(
-        "ingest.get_client",
-        lambda db_path: _MultiClient({"llmli": mock_collection, "llmli_image": image_collection}),
-    )
+    multi = _MultiClient({"llmli": mock_collection, "llmli_image": image_collection})
+    monkeypatch.setattr("ingest.get_client", lambda db_path: multi)
+
+    @contextmanager
+    def _fake_writer_client(db_path):
+        yield multi
+
+    monkeypatch.setattr("ingest.writer_client", _fake_writer_client)
     monkeypatch.setattr("ingest.get_embedding_function", lambda **_kw: None)
     monkeypatch.setattr("ingest.ensure_vision_model_ready", lambda: "llava:test")
 

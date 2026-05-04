@@ -35,15 +35,23 @@ def test_watch_debounce_collapses_updates(monkeypatch, tmp_path: Path):
     logged = []
     watcher._log = lambda message: logged.append(message)
 
-    calls = []
-    watcher._pull_once = lambda: (calls.append("pull") or SimpleNamespace(returncode=0, stdout="", stderr=""))
+    calls: list[tuple] = []
+
+    def _fake_mcp(tool, **kwargs):
+        calls.append((tool, kwargs))
+        return {"status": "updated", "path": kwargs.get("path"), "silo": kwargs.get("silo")}
+
+    monkeypatch.setattr(pal, "_mcp_call_sync", _fake_mcp)
 
     now = pal.time.time()
     watcher.enqueue_update(str(target))
     watcher._drain_due(now=now + 0.5)
     assert calls == []
     watcher._drain_due(now=now + 2.0)
-    assert calls == ["pull"]
+    assert len(calls) == 1
+    assert calls[0][0] == "update_file"
+    assert calls[0][1]["path"] == str(target.resolve())
+    assert calls[0][1]["confirm"] is True
     assert logged == ["this folder: pull complete after +1 queued, -0 queued, 0 skipped"]
 
 
@@ -74,7 +82,12 @@ def test_watch_retries_error_with_backoff(monkeypatch, tmp_path: Path):
     watcher = _make_watcher(monkeypatch, root)
     logged = []
     watcher._log = lambda message: logged.append(message)
-    watcher._pull_once = lambda: SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(
+        pal,
+        "_mcp_call_sync",
+        lambda tool, **kwargs: {"status": "error", "error": "boom"},
+    )
 
     now = pal.time.time()
     watcher.enqueue_update(str(target))
@@ -83,5 +96,4 @@ def test_watch_retries_error_with_backoff(monkeypatch, tmp_path: Path):
     queued = watcher._queue[str(target.resolve())]
     assert queued["action"] == "update"
     assert int(queued["attempts"]) == 1
-    assert any("pull failed: boom" in line for line in logged)
-    assert any("retrying file.py in 30s" in line for line in logged)
+    assert any("failed via MCP" in line and "boom" in line for line in logged)

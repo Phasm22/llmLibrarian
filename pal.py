@@ -1350,6 +1350,54 @@ def _run_pull_child(
     return subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
 
 
+def _mcp_url() -> str:
+    return os.environ.get("LLMLIBRARIAN_MCP_URL", "http://127.0.0.1:8765/mcp")
+
+
+def _mcp_bearer_token() -> str | None:
+    return os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN") or None
+
+
+async def _mcp_call(tool: str, **args) -> dict:
+    from fastmcp import Client
+
+    headers = {}
+    tok = _mcp_bearer_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    async with Client(_mcp_url(), headers=headers) as client:
+        result = await client.call_tool(tool, arguments=args)
+    data = getattr(result, "data", None)
+    if isinstance(data, dict):
+        return data
+    structured = getattr(result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured
+    return {"status": "ok", "raw": str(result)}
+
+
+def _mcp_call_sync(tool: str, **args) -> dict:
+    import asyncio
+
+    return asyncio.run(_mcp_call(tool, **args))
+
+
+def _mcp_healthcheck() -> tuple[bool, str]:
+    import urllib.request
+
+    base = _mcp_url().rsplit("/mcp", 1)[0]
+    healthz = base + "/healthz"
+    try:
+        req = urllib.request.Request(healthz)
+        tok = _mcp_bearer_token()
+        if tok:
+            req.add_header("Authorization", f"Bearer {tok}")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            return (resp.status == 200, "")
+    except Exception as exc:
+        return (False, f"MCP server not reachable at {healthz}: {exc}")
+
+
 class _SiloEventHandler(FileSystemEventHandler):
     def __init__(self, watcher: "SiloWatcher") -> None:
         super().__init__()
@@ -1426,13 +1474,6 @@ class SiloWatcher:
             get_silo_exclude_patterns(self.db_path, self.silo_slug),
             exclude_patterns,
         )
-        self._pull_once = lambda: _run_pull_child(
-            self.root,
-            allow_cloud=self.allow_cloud,
-            exclude_patterns=self._exclude,
-            extra_env=watch_env,
-        )
-
         self._observer = Observer()
         self._handler = _SiloEventHandler(self)
         self._queue: dict[str, dict[str, object]] = {}
@@ -1523,30 +1564,31 @@ class SiloWatcher:
         updated = 0
         removed = 0
         skipped = 0
-        status = "updated"
-        detail = ""
-        try:
-            with self._lock:
-                result = self._pull_once()
-            returncode = getattr(result, "returncode", 1)
-            if returncode != 0:
-                status = "error"
-                detail = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
-        except Exception as exc:
-            status = "error"
-            detail = str(exc)
-        if status == "error":
+        errors: list[tuple[str, str]] = []
+        with self._lock:
             for path, action, attempts in due:
-                next_attempt = attempts + 1
-                delay = self._retry_delay(next_attempt)
-                self._queue_action(path, action, delay=delay, attempts=next_attempt)
-            first_path = Path(due[0][0]).name
-            suffix = f": {detail.splitlines()[-1]}" if detail else ""
-            self._log(f"{self.label}: pull failed{suffix}")
-            self._log(f"{self.label}: retrying {first_path} in {int(self._retry_delay(int(due[0][2]) + 1))}s")
-            return 0
-        updated = sum(1 for _path, action, _attempts in due if action != "delete")
-        removed = sum(1 for _path, action, _attempts in due if action == "delete")
+                tool = "remove_file" if action == "delete" else "update_file"
+                try:
+                    res = _mcp_call_sync(tool, silo=self.silo_slug, path=path, confirm=True)
+                except Exception as exc:
+                    res = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                status = str(res.get("status") or "")
+                if status in ("updated", "removed", "unchanged"):
+                    if action == "delete":
+                        removed += 1
+                    elif status == "unchanged":
+                        skipped += 1
+                    else:
+                        updated += 1
+                else:
+                    next_attempt = attempts + 1
+                    delay = self._retry_delay(next_attempt)
+                    self._queue_action(path, action, delay=delay, attempts=next_attempt)
+                    detail = str(res.get("error") or res.get("message") or status or "unknown")
+                    errors.append((path, detail))
+        if errors:
+            first_path = Path(errors[0][0]).name
+            self._log(f"{self.label}: {len(errors)} file(s) failed via MCP; first={first_path}: {errors[0][1]}")
         processed = updated + removed
         if processed or skipped:
             self._log(f"{self.label}: pull complete after +{updated} queued, -{removed} queued, {skipped} skipped")
@@ -1775,6 +1817,14 @@ def _pull_watch_path_mode(
     if Observer is None:
         print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
         return 1
+    ok, msg = _mcp_healthcheck()
+    if not ok:
+        print(
+            f"Error: --watch requires the shared MCP server to be running. {msg}\n"
+            "Start it (e.g. via the systemd unit in README) and retry.",
+            file=sys.stderr,
+        )
+        return 2
     path = Path(path_input).resolve()
     watch_env = {
         "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
@@ -1784,24 +1834,26 @@ def _pull_watch_path_mode(
     previous_env = {key: os.environ.get(key) for key in watch_env}
     try:
         os.environ.update(watch_env)
-        initial = _run_pull_child(
-            path,
-            allow_cloud=allow_cloud,
-            follow_symlinks=follow_symlinks,
-            full=False,
-            exclude_patterns=exclude_patterns,
-            prompt=prompt,
-            clear_prompt=clear_prompt,
-            image_vision=image_vision,
-            workers=workers,
-            embedding_workers=embedding_workers,
-            extra_env=watch_env,
-        )
-        if initial.returncode != 0:
-            detail = (initial.stderr or initial.stdout or "").strip()
-            if detail:
-                print(detail, file=sys.stderr)
-            return int(initial.returncode)
+        try:
+            res = _mcp_call_sync(
+                "add_silo",
+                path=str(path),
+                allow_cloud=allow_cloud,
+                exclude_patterns=exclude_patterns or [],
+                confirm=True,
+            )
+        except Exception as exc:
+            print(f"Error: initial MCP add_silo failed: {exc}", file=sys.stderr)
+            return 1
+        status = str(res.get("status") or "")
+        if status not in ("ok", "started", "queued", "exists", "updated", "added"):
+            detail = res.get("error") or res.get("message") or status or "unknown"
+            print(f"Error: initial MCP add_silo returned status={status}: {detail}", file=sys.stderr)
+            return 1
+        if prompt is not None or clear_prompt:
+            if not _set_silo_prompt_for_path(path, prompt, clear_prompt=clear_prompt):
+                print("Error: unable to resolve silo for prompt override.", file=sys.stderr)
+                return 1
         db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
         llmli_registry = _read_llmli_registry(db_path)
         slug = _resolve_llmli_silo_by_path(llmli_registry, path)

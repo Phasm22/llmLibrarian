@@ -10,8 +10,9 @@ import os
 import shutil
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import chromadb
 from chromadb.config import Settings
@@ -141,3 +142,33 @@ def get_collection(db_path: str, name: str, embedding_function=None):
         name=name,
         embedding_function=embedding_function,
     )
+
+
+@contextmanager
+def writer_client(db_path: str) -> Iterator["_SafeClient"]:
+    """Acquire exclusive Chroma write access with a fresh, non-singleton client.
+
+    Why fresh: get_client() caches a PersistentClient per process. Two writer
+    processes can each hold a live cached client across overlapping flock windows
+    (since the flock only wraps the call, not the client lifetime). With Chroma
+    running an async compaction thread, two live clients on the same persist dir
+    can corrupt the HNSW segment ("Failed to apply logs to the hnsw segment writer").
+
+    By opening a dedicated client inside the exclusive lock and dropping it before
+    the lock releases, only one writer client is alive on this DB at a time.
+    Read paths continue to use the singleton via get_client() + chroma_shared_lock.
+    """
+    from chroma_lock import chroma_exclusive_lock
+
+    with chroma_exclusive_lock(db_path):
+        _storage_preflight(db_path)
+        raw = chromadb.PersistentClient(
+            path=db_path,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        client = _SafeClient(raw)
+        try:
+            yield client
+        finally:
+            del client
+            del raw
