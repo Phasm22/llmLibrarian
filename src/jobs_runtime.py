@@ -140,6 +140,11 @@ def _env_for_service(env: dict[str, str] | None = None) -> dict[str, str]:
         "HTTPS_PROXY",
         "NO_PROXY",
         "LLMLIBRARIAN_DB",
+        "LLMLIBRARIAN_MCP_URL",
+        "LLMLIBRARIAN_MCP_HOST",
+        "LLMLIBRARIAN_MCP_PORT",
+        "LLMLIBRARIAN_MCP_PATH",
+        "LLMLIBRARIAN_MCP_BEARER_TOKEN",
         "PAL_HOME",
     }
     source = env if env is not None else os.environ

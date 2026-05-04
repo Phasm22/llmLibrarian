@@ -1351,7 +1351,15 @@ def _run_pull_child(
 
 
 def _mcp_url() -> str:
-    return os.environ.get("LLMLIBRARIAN_MCP_URL", "http://127.0.0.1:8765/mcp")
+    explicit = os.environ.get("LLMLIBRARIAN_MCP_URL")
+    if explicit:
+        return explicit
+    host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1")
+    port = os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765")
+    path = os.environ.get("LLMLIBRARIAN_MCP_PATH", "/mcp")
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"http://{host}:{port}{path}"
 
 
 def _mcp_bearer_token() -> str | None:
@@ -1361,11 +1369,11 @@ def _mcp_bearer_token() -> str | None:
 async def _mcp_call(tool: str, **args) -> dict:
     from fastmcp import Client
 
-    headers = {}
     tok = _mcp_bearer_token()
+    client_kwargs: dict = {}
     if tok:
-        headers["Authorization"] = f"Bearer {tok}"
-    async with Client(_mcp_url(), headers=headers) as client:
+        client_kwargs["auth"] = tok
+    async with Client(_mcp_url(), **client_kwargs) as client:
         result = await client.call_tool(tool, arguments=args)
     data = getattr(result, "data", None)
     if isinstance(data, dict):
@@ -1384,9 +1392,10 @@ def _mcp_call_sync(tool: str, **args) -> dict:
 
 def _mcp_healthcheck() -> tuple[bool, str]:
     import urllib.request
+    from urllib.parse import urlparse
 
-    base = _mcp_url().rsplit("/mcp", 1)[0]
-    healthz = base + "/healthz"
+    parsed = urlparse(_mcp_url())
+    healthz = f"{parsed.scheme}://{parsed.netloc}/healthz"
     try:
         req = urllib.request.Request(healthz)
         tok = _mcp_bearer_token()
@@ -1840,7 +1849,6 @@ def _pull_watch_path_mode(
                 path=str(path),
                 allow_cloud=allow_cloud,
                 exclude_patterns=exclude_patterns or [],
-                confirm=True,
             )
         except Exception as exc:
             print(f"Error: initial MCP add_silo failed: {exc}", file=sys.stderr)
