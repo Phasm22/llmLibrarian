@@ -2116,10 +2116,53 @@ def _daemon_is_installed() -> bool:
     return _daemon_metadata() is not None
 
 
+def _parse_env_file(path: Path) -> dict[str, str]:
+    """Parse a simple KEY=VALUE env file, ignoring comments and blank lines."""
+    result: dict[str, str] = {}
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            elif val.startswith("'") and val.endswith("'"):
+                val = val[1:-1]
+            if key:
+                result[key] = val
+    except Exception:
+        pass
+    return result
+
+
+_MCP_CLIENT_ENV_KEYS = {
+    "LLMLIBRARIAN_MCP_URL",
+    "LLMLIBRARIAN_MCP_HOST",
+    "LLMLIBRARIAN_MCP_PORT",
+    "LLMLIBRARIAN_MCP_PATH",
+    "LLMLIBRARIAN_MCP_BEARER_TOKEN",
+}
+
+
 def _daemon_env(db_path: str | Path) -> dict[str, str]:
     env = os.environ.copy()
     env["LLMLIBRARIAN_DB"] = str(Path(db_path).resolve())
     env["PAL_HOME"] = str(PAL_HOME.resolve())
+
+    # If MCP client env vars aren't in the caller's shell, read them from .env.mcp
+    # in the workdir so watch-service unit files always get the correct MCP path.
+    if not any(k in env for k in _MCP_CLIENT_ENV_KEYS):
+        existing = _daemon_metadata()
+        if existing:
+            workdir = Path(str(existing.get("workdir") or ""))
+            env_mcp = workdir / ".env.mcp"
+            for key, val in _parse_env_file(env_mcp).items():
+                if key in _MCP_CLIENT_ENV_KEYS and val:
+                    env[key] = val
+
     return env
 
 
