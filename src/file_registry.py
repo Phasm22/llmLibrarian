@@ -98,6 +98,27 @@ def _update_file_manifest(db_path: str | Path, update_fn: Any) -> None:
         _write_file_manifest(db_path, manifest)
 
 
+def manifest_file_entry(
+    path_str: str,
+    mtime: float,
+    size: int,
+    file_hash: str,
+) -> dict[str, Any]:
+    """Build a manifest entry with parsed filename-date fields.
+
+    Imported lazily to avoid a circular import (query.filename_dates -> formatting
+    -> nothing in file_registry; this is just defensive).
+    """
+    from query.filename_dates import parse_filename_date
+
+    name_date, precision = parse_filename_date(path_str)
+    entry: dict[str, Any] = {"mtime": mtime, "size": size, "hash": file_hash}
+    if name_date:
+        entry["name_date"] = name_date
+        entry["name_date_precision"] = precision
+    return entry
+
+
 # --- File registry (content-hash -> [{silo, path}]) ---
 
 def _file_registry_path(db_path: str | Path) -> Path:

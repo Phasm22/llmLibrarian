@@ -1849,6 +1849,7 @@ def _pull_watch_path_mode(
                 path=str(path),
                 allow_cloud=allow_cloud,
                 exclude_patterns=exclude_patterns or [],
+                confirm=True,
             )
         except Exception as exc:
             print(f"Error: initial MCP add_silo failed: {exc}", file=sys.stderr)
@@ -2683,6 +2684,34 @@ def ask_command(
         llmli_args.append("--force")
     llmli_args.extend(query)
     _exit(_run_llmli(llmli_args))
+
+
+@app.command("find", help="Find files by name/date (manifest-only; no embeddings).")
+def find_command(
+    in_silo: list[str] = typer.Option(None, "--in", help="Restrict to silo (repeatable).", autocompletion=_complete_silo),
+    name: str | None = typer.Option(None, "--name", help="fnmatch-style glob applied to relative path or filename."),
+    date: str | None = typer.Option(None, "--date", help="YYYY-MM-DD or START:END."),
+    field: str = typer.Option("either", "--field", help="Which date signal to filter on (name_date|mtime|either)."),
+    with_chunks: bool = typer.Option(False, "--with-chunks", help="Include chunk_count per file."),
+    limit: int = typer.Option(50, "--limit", help="Cap result count."),
+    json_out: bool = typer.Option(False, "--json", help="Emit raw JSON."),
+) -> None:
+    args: list[str] = ["find"]
+    for s in in_silo or []:
+        args.extend(["--in", s])
+    if name:
+        args.extend(["--name", name])
+    if date:
+        args.extend(["--date", date])
+    if field and field != "either":
+        args.extend(["--field", field])
+    if with_chunks:
+        args.append("--with-chunks")
+    if limit and limit != 50:
+        args.extend(["--limit", str(limit)])
+    if json_out:
+        args.append("--json")
+    _exit(_run_llmli(args))
 
 
 def _ls_status() -> None:

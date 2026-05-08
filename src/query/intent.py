@@ -17,9 +17,54 @@ INTENT_REFLECT = "REFLECT"
 INTENT_CODE_LANGUAGE = "CODE_LANGUAGE"
 INTENT_CAPABILITIES = "CAPABILITIES"
 INTENT_FILE_LIST = "FILE_LIST"
+INTENT_FILENAME_DATE_LOOKUP = "FILENAME_DATE_LOOKUP"
 INTENT_STRUCTURE = "STRUCTURE"
 INTENT_TIMELINE = "TIMELINE"
 INTENT_METADATA_ONLY = "METADATA_ONLY"
+
+# FILENAME_DATE_LOOKUP boundaries:
+#   - INTENT_FILE_LIST owns bare-year asks ("files from 2022"); we require day or
+#     month precision (or relative phrases like today/yesterday/this-week).
+#   - INTENT_STRUCTURE owns generic "recent files" / "what changed recently".
+#   - Content questions that happen to contain a date phrase ("yesterday I was
+#     thinking about taxes") fall through to LOOKUP / EVIDENCE_PROFILE — see the
+#     content-verb negative list in _is_filename_date_query.
+
+_FN_DATE_NEGATIVE_VERBS = re.compile(
+    r"\b(about|regarding|re:|concerning|"
+    r"thinking|thought|thoughts|"
+    r"wrote|writing|write|written|"
+    r"said|saying|"
+    r"mentioned|mention|mentions|"
+    r"feel|felt|feeling|feelings)\b",
+    re.IGNORECASE,
+)
+
+_FN_DATE_FILE_NOUN = re.compile(
+    r"\b(entry|entries|note|notes|journal|journals|log|logs|"
+    r"file|files|doc|docs|document|documents|page|pages)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_filename_date_query(query: str) -> bool:
+    """True iff the query looks like a deterministic filename/date lookup.
+
+    Conjunction of: a parseable date phrase, a file-noun scope signal, no
+    content-verb negatives, and a short (≤12 token) query.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    if len(q.split()) > 12:
+        return False
+    if _FN_DATE_NEGATIVE_VERBS.search(q):
+        return False
+    if not _FN_DATE_FILE_NOUN.search(q):
+        return False
+    # Lazy import to avoid pulling stdlib date code when intent is uncalled.
+    from query.filename_dates import query_has_date_phrase
+    return query_has_date_phrase(q)
 
 # EVIDENCE_PROFILE / AGGREGATE: wider retrieval (cap). n_results from CLI is still the final context size.
 K_PROFILE_MIN = 48
@@ -40,6 +85,10 @@ def route_intent(query: str) -> str:
         q,
     ):
         return INTENT_CAPABILITIES
+    # FILENAME_DATE_LOOKUP: deterministic filename/date file lookup. Runs before
+    # FILE_LIST so day/month-precision asks don't get routed to year-only paths.
+    if _is_filename_date_query(q):
+        return INTENT_FILENAME_DATE_LOOKUP
     # FILE_LIST: explicit file/document listing by year (deterministic catalog query).
     if (
         re.search(r"\b(files?|documents?|docs?)\b", q)

@@ -43,6 +43,7 @@ class IngestResult:
     files_indexed: int
     failures: int
     silo_slug: str | None
+    artifact_result: dict[str, Any] | None = None
 
 
 @contextmanager
@@ -110,7 +111,29 @@ def run_ingest(request: IngestRequest) -> IngestResult:
     except Exception:
         slug = None
 
-    return IngestResult(files_indexed=files_ok, failures=n_failures, silo_slug=slug)
+    artifact_result: dict[str, Any] | None = None
+    if slug:
+        try:
+            from artifacts import compile_artifacts_for_silo
+
+            artifact_result = compile_artifacts_for_silo(
+                db_path=db,
+                parent_slug=slug,
+                source_path=path,
+                display_name=request.display_name or path.name,
+            )
+        except Exception as exc:
+            artifact_result = {
+                "status": "error",
+                "parent_silo": slug,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    return IngestResult(
+        files_indexed=files_ok,
+        failures=n_failures,
+        silo_slug=slug,
+        artifact_result=artifact_result,
+    )
 
 
 def llmli_add_argv(request: IngestRequest) -> list[str]:

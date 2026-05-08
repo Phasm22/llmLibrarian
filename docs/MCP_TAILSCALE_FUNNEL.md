@@ -80,6 +80,7 @@ Smoke-test expected behavior:
 1. Connector lists tools.
 2. `capabilities` returns supported file types.
 3. `health` returns `db_path` and storage info.
+4. write tools (`add_silo`, `trigger_reindex`, `repair_silo`) run only when explicitly intended; keep `confirm=true` in client calls.
 
 ## 6) Key rotation
 

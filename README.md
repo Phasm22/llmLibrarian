@@ -139,6 +139,12 @@ Chroma or registry inconsistency (e.g. `Error finding id`, empty silo after a cr
 
 ```bash
 llmli repair <silo>
+# Read-only L2 diagnostics (sqlite integrity + segment scan + repair ladder)
+llmli repair-ladder
+
+# L3 helper: rehydrate from llmli_registry into the current DB path
+llmli rehydrate --dry-run
+llmli rehydrate
 ```
 
 ---
@@ -187,6 +193,9 @@ clear error. There is no autostart and no fallback.
 - `LLMLIBRARIAN_MCP_URL` (default `http://127.0.0.1:8765/mcp`)
 - `LLMLIBRARIAN_MCP_BEARER_TOKEN` (optional; required if the server enforces auth)
 
+Write-tool note: MCP `add_silo` supports `confirm` and defaults to `true`. Keep
+`confirm=true` when calling write tools from external clients to preserve explicit intent.
+
 **Install as a user-level systemd service** (`~/.config/systemd/user/llmlibrarian-mcp.service`):
 
 ```ini
@@ -219,6 +228,21 @@ curl http://127.0.0.1:8765/healthz   # should return ok
 One-shot writes (`pal pull <path>` without `--watch`, `llmli add`, `llmli repair`)
 keep their direct-write path and serialize via flock — they do not require the
 shared server.
+
+---
+
+## Artifact + context controls
+
+Optional artifact compilation is post-ingest and additive (raw chunks remain):
+
+- `LLMLIBRARIAN_ARTIFACT_SILOS` — comma list of parent silos, or `*` to enable for all
+- `LLMLIBRARIAN_ARTIFACT_MAX_FACTS` — cap extracted artifact rows per compile
+- `LLMLIBRARIAN_ARTIFACT_MAX_INPUT_CHARS` — cap parent chunk text scanned during compile
+
+Ask-time context budget:
+
+- `LLMLIBRARIAN_CONTEXT_BUDGET_TOKENS` — global budget (approx chars/4). On overflow,
+  low-ranked chunks are dropped; if none fit, ask returns a deterministic budget warning.
 
 ---
 

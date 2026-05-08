@@ -18,7 +18,20 @@ def test_llmli_root_help_lists_all_subcommands(monkeypatch, capsys):
         _run_cli(monkeypatch, ["--help"])
     assert ei.value.code == 0
     out = capsys.readouterr().out
-    for cmd in ("add", "ask", "ls", "inspect", "index", "rm", "capabilities", "log", "eval-adversarial"):
+    for cmd in (
+        "add",
+        "ask",
+        "ls",
+        "inspect",
+        "index",
+        "rm",
+        "repair",
+        "repair-ladder",
+        "rehydrate",
+        "capabilities",
+        "log",
+        "eval-adversarial",
+    ):
         assert cmd in out
 
 
@@ -30,6 +43,8 @@ def test_llmli_root_help_lists_all_subcommands(monkeypatch, capsys):
         ("inspect", ["--top", "--filter"]),
         ("index", ["--archetype", "--mode", "--follow-symlinks"]),
         ("log", ["--last"]),
+        ("repair-ladder", ["--json"]),
+        ("rehydrate", ["--dry-run", "--quiet", "--json"]),
         ("eval-adversarial", ["--strict-mode", "--no-strict-mode", "--direct-decisive-mode", "--no-direct-decisive-mode"]),
     ],
 )
@@ -175,6 +190,9 @@ def test_llmli_other_subcommands_parse_and_dispatch(monkeypatch):
     monkeypatch.setattr(cli, "cmd_inspect", _capture("inspect"))
     monkeypatch.setattr(cli, "cmd_index", _capture("index"))
     monkeypatch.setattr(cli, "cmd_rm", _capture("rm"))
+    monkeypatch.setattr(cli, "cmd_repair", _capture("repair"))
+    monkeypatch.setattr(cli, "cmd_repair_ladder", _capture("repair_ladder"))
+    monkeypatch.setattr(cli, "cmd_rehydrate", _capture("rehydrate"))
     monkeypatch.setattr(cli, "cmd_capabilities", _capture("capabilities"))
     monkeypatch.setattr(cli, "cmd_log", _capture("log"))
     monkeypatch.setattr(cli, "cmd_eval_adversarial", _capture("eval"))
@@ -183,6 +201,9 @@ def test_llmli_other_subcommands_parse_and_dispatch(monkeypatch):
     assert _run_cli(monkeypatch, ["inspect", "stuff", "--top", "9", "--filter", "pdf"]) == 0
     assert _run_cli(monkeypatch, ["index", "--archetype", "tax", "--log", "/tmp/log.txt", "--mode", "deep", "--follow-symlinks"]) == 0
     assert _run_cli(monkeypatch, ["rm", "Stuff"]) == 0
+    assert _run_cli(monkeypatch, ["repair", "Stuff"]) == 0
+    assert _run_cli(monkeypatch, ["repair-ladder", "--json"]) == 0
+    assert _run_cli(monkeypatch, ["rehydrate", "--dry-run", "--quiet", "stuff"]) == 0
     assert _run_cli(monkeypatch, ["capabilities"]) == 0
     assert _run_cli(monkeypatch, ["log", "--last"]) == 0
     assert _run_cli(
@@ -207,6 +228,11 @@ def test_llmli_other_subcommands_parse_and_dispatch(monkeypatch):
     assert seen["index"].mode == "deep"
     assert seen["index"].follow_symlinks is True
     assert seen["rm"].silo == ["Stuff"]
+    assert seen["repair"].silo == ["Stuff"]
+    assert seen["repair_ladder"].json is True
+    assert seen["rehydrate"].dry_run is True
+    assert seen["rehydrate"].quiet is True
+    assert seen["rehydrate"].silos == ["stuff"]
     assert seen["log"].last is True
     assert seen["eval"].strict_mode is False
     assert seen["eval"].direct_decisive_mode is True

@@ -6,10 +6,12 @@ Deterministic, locally-hosted context engine for high-stakes personal data.
 Run from project root; uses archetypes.yaml and ./my_brain_db by default.
 """
 import argparse
+import json
 import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 _ROOT = Path(__file__).resolve().parent
 
@@ -304,6 +306,76 @@ def cmd_repair(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_repair_ladder(args: argparse.Namespace) -> int:
+    """Read-only L2 diagnostics for Chroma + suggested L1/L3 next steps."""
+    from operations import op_chroma_diagnostics
+
+    db = _db_path(args)
+    result = op_chroma_diagnostics(str(db))
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+        return 0 if result.get("status") != "error" else 1
+    if result.get("status") == "error":
+        print(f"Error: {result.get('error', 'unknown error')}", file=sys.stderr)
+        return 1
+    print(f"DB path: {result['db_path']}")
+    print(f"Chroma version: {result.get('chromadb_version') or 'unknown'}")
+    print(f"SQLite file: {result['sqlite_path']} (exists={result['sqlite_exists']})")
+    print(f"SQLite integrity_check: {result.get('sqlite_integrity_check') or '?'}")
+    if result.get("sqlite_integrity_error"):
+        print(f"SQLite check error: {result['sqlite_integrity_error']}", file=sys.stderr)
+    print(f"Segment directories: {result.get('segment_dir_count', 0)}")
+    print(f"HNSW indexes: {result.get('hnsw_index_count', 0)}")
+    storage = result.get("storage") or {}
+    if storage.get("chroma_hnsw_bloat"):
+        print("[warn] HNSW bloat detected.", file=sys.stderr)
+        print(storage.get("chroma_hnsw_bloat_note", ""), file=sys.stderr)
+    ladder = result.get("repair_ladder") or {}
+    print("\nRepair ladder:")
+    print(f"  L1: {ladder.get('l1', 'llmli repair <silo>')}")
+    print(f"  L2: {ladder.get('l2', 'diagnostics only')}")
+    print(f"  L3: {ladder.get('l3', 'rehydrate from registry into fresh DB path')}")
+    return 0
+
+
+def cmd_rehydrate(args: argparse.Namespace) -> int:
+    """Rebuild one or more silos from llmli_registry into the current DB path."""
+    from operations import op_rehydrate_registry
+
+    db = _db_path(args)
+    requested = getattr(args, "silos", None)
+    result = op_rehydrate_registry(
+        db,
+        requested_silos=requested,
+        dry_run=bool(getattr(args, "dry_run", False)),
+        verbose=not bool(getattr(args, "quiet", False)),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2))
+    else:
+        mode = "planned" if result.get("dry_run") else "completed"
+        print(
+            f"Rehydrate {mode}: targets={result.get('total_targets', 0)} "
+            f"completed={result.get('completed', 0)} planned={result.get('planned', 0)} "
+            f"skipped={result.get('skipped', 0)} errors={result.get('errors', 0)}"
+        )
+        for row in result.get("results", []):
+            slug = row.get("slug", "?")
+            status = row.get("status", "unknown")
+            if status == "completed":
+                print(
+                    f"  {slug}: files_indexed={row.get('files_indexed', 0)} "
+                    f"failures={row.get('failures', 0)}"
+                )
+            elif status == "planned":
+                print(f"  {slug}: planned ({row.get('path', '?')})")
+            elif status == "skipped":
+                print(f"  {slug}: skipped ({row.get('reason', 'unknown')})")
+            else:
+                print(f"  {slug}: error ({row.get('error', 'unknown')})", file=sys.stderr)
+    return 0 if int(result.get("errors", 0) or 0) == 0 else 1
+
+
 def cmd_capabilities(args: argparse.Namespace) -> int:
     """Print supported file types and extractors (source of truth). No LLM, no retrieval."""
     from ingest import get_capabilities_text
@@ -376,6 +448,152 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         short = src if len(src) <= 72 else "..." + src[-69:]
         dup_note = "  [same content as duplicate file]" if file_info.get("has_duplicate_content") else ""
         print(f"  {count:6d} chunks  {short}{dup_note}")
+    return 0
+
+
+def _parse_find_date(raw: str | None) -> tuple[Any, Any]:
+    """Parse --date as either a single ISO date or a START:END range."""
+    from datetime import date as _date
+
+    if not raw:
+        return None, None
+    sep = ":" if ":" in raw else (".." if ".." in raw else None)
+    if sep is None:
+        try:
+            d = _date.fromisoformat(raw)
+        except ValueError as e:
+            raise ValueError(f"invalid --date value {raw!r}: {e}") from e
+        return d, d
+    parts = raw.split(sep, 1)
+    lo_raw = parts[0].strip()
+    hi_raw = parts[1].strip()
+    try:
+        lo = _date.fromisoformat(lo_raw) if lo_raw else None
+        hi = _date.fromisoformat(hi_raw) if hi_raw else None
+    except ValueError as e:
+        raise ValueError(f"invalid --date range {raw!r}: {e}") from e
+    return lo, hi
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    """Find files by name and/or date against the manifest (no embeddings)."""
+    import json
+
+    from operations_find import op_find_files
+    from state import resolve_silo_to_slug, resolve_silo_prefix
+
+    db = _db_path(args)
+    silo_args = getattr(args, "in_silo", None) or []
+    resolved_silos: list[str] = []
+    for raw in silo_args:
+        slug = resolve_silo_to_slug(db, raw) or resolve_silo_prefix(db, raw) or raw
+        if slug not in resolved_silos:
+            resolved_silos.append(slug)
+
+    try:
+        date_start, date_end = _parse_find_date(getattr(args, "date", None))
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        result = op_find_files(
+            db,
+            silos=resolved_silos or None,
+            name_glob=getattr(args, "name", None),
+            date_start=date_start,
+            date_end=date_end,
+            date_field=getattr(args, "field", "either") or "either",
+            include_chunk_count=bool(getattr(args, "with_chunks", False)),
+            limit=int(getattr(args, "limit", 50) or 50),
+        )
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+
+    from query.find_format import (
+        format_filename_lookup,
+        format_filename_lookup_with_excerpt,
+        render_range_label,
+    )
+
+    hits = result.get("files") or []
+    warnings = result.get("warnings") or []
+    range_label = render_range_label(date_start, date_end)
+    source_label = ", ".join(resolved_silos) if resolved_silos else ""
+
+    if len(hits) == 1 and getattr(args, "with_chunks", False):
+        out = format_filename_lookup_with_excerpt(
+            hits[0],
+            db_path=str(db),
+            source_label=source_label,
+            no_color=args.no_color,
+            range_label=range_label,
+        )
+    else:
+        out = format_filename_lookup(
+            hits,
+            source_label=source_label,
+            no_color=args.no_color,
+            range_label=range_label,
+        )
+    print(out)
+    if result.get("truncated"):
+        print(f"(truncated to {len(hits)} of {result.get('total_matched')} matches)", file=sys.stderr)
+    for warning in warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def cmd_reindex_names(args: argparse.Namespace) -> int:
+    """Walk the manifest and persist name_date / name_date_precision for files missing it."""
+    from file_registry import _read_file_manifest, _update_file_manifest
+    from query.filename_dates import parse_filename_date
+
+    db = _db_path(args)
+    manifest = _read_file_manifest(db)
+    silo_map = manifest.get("silos") or {}
+    if not isinstance(silo_map, dict) or not silo_map:
+        print("No silos in manifest. Nothing to do.")
+        return 0
+
+    target_silos = set(getattr(args, "in_silo", None) or [])
+    updated = 0
+    cleared = 0
+    scanned = 0
+
+    def _update(m: dict[str, Any]) -> None:
+        nonlocal updated, cleared, scanned
+        smap = m.get("silos") or {}
+        for slug, silo_entry in smap.items():
+            if target_silos and slug not in target_silos:
+                continue
+            files_map = silo_entry.get("files") or {}
+            if not isinstance(files_map, dict):
+                continue
+            for path_str, info in files_map.items():
+                if not isinstance(info, dict):
+                    continue
+                scanned += 1
+                fresh_iso, fresh_precision = parse_filename_date(path_str)
+                stored_iso = info.get("name_date")
+                stored_precision = info.get("name_date_precision")
+                if fresh_iso:
+                    if stored_iso != fresh_iso or stored_precision != fresh_precision:
+                        info["name_date"] = fresh_iso
+                        info["name_date_precision"] = fresh_precision
+                        updated += 1
+                elif stored_iso:
+                    info.pop("name_date", None)
+                    info.pop("name_date_precision", None)
+                    cleared += 1
+
+    _update_file_manifest(db, _update)
+    print(f"Scanned {scanned} files. Wrote name_date for {updated}; cleared {cleared} stale entries.")
     return 0
 
 
@@ -478,6 +696,30 @@ def main() -> int:
     repair_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
     p_repair.set_defaults(_run=cmd_repair)
 
+    # repair-ladder (L2 diagnostics)
+    p_repair_ladder = sub.add_parser(
+        "repair-ladder",
+        help="Read-only Chroma diagnostics and L1→L3 repair guidance",
+    )
+    p_repair_ladder.add_argument("--json", action="store_true", help="Emit diagnostics as JSON")
+    p_repair_ladder.set_defaults(_run=cmd_repair_ladder)
+
+    # rehydrate [SILO ...]
+    p_rehydrate = sub.add_parser(
+        "rehydrate",
+        help="Re-index silos from llmli_registry (L3 rebuild helper)",
+    )
+    rehydrate_silo_arg = p_rehydrate.add_argument(
+        "silos",
+        nargs="*",
+        help="Optional silo slug/display/prefix list (default: all registry silos)",
+    )
+    rehydrate_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
+    p_rehydrate.add_argument("--dry-run", action="store_true", help="Show what would run without indexing")
+    p_rehydrate.add_argument("--quiet", action="store_true", help="Suppress per-silo progress output")
+    p_rehydrate.add_argument("--json", action="store_true", help="Emit result as JSON")
+    p_rehydrate.set_defaults(_run=cmd_rehydrate)
+
     # capabilities
     p_capabilities = sub.add_parser("capabilities", help="Supported file types and document extractors (source of truth)")
     p_capabilities.set_defaults(_run=cmd_capabilities)
@@ -486,6 +728,26 @@ def main() -> int:
     p_log = sub.add_parser("log", help="Show last add failures")
     p_log.add_argument("--last", action="store_true", help="Show last add failures (default)")
     p_log.set_defaults(_run=cmd_log)
+
+    # find [--in SILO ...] [--name GLOB] [--date YYYY-MM-DD | START:END]
+    p_find = sub.add_parser("find", help="Find files by name/date (manifest-only; no embeddings)")
+    find_in_arg = p_find.add_argument("--in", dest="in_silo", action="append", metavar="SILO", help="Restrict to silo (repeatable)")
+    find_in_arg.completer = _silo_completer  # type: ignore[attr-defined]
+    p_find.add_argument("--name", metavar="GLOB", help="fnmatch-style glob applied to relative path or filename")
+    p_find.add_argument("--date", metavar="DATE", help="YYYY-MM-DD or START:END (either bound may be empty)")
+    p_find.add_argument("--field", choices=["name_date", "mtime", "either"], default="either", help="Which date signal to filter on (default: either)")
+    p_find.add_argument("--with-chunks", action="store_true", help="Include chunk_count per file (touches Chroma)")
+    p_find.add_argument("--limit", type=int, default=50, help="Cap result count (default: 50)")
+    p_find.add_argument("--json", action="store_true", help="Emit raw JSON instead of formatted text")
+    p_find.set_defaults(_run=cmd_find)
+
+    # reindex --names [--in SILO ...]
+    p_reindex = sub.add_parser("reindex", help="One-shot maintenance commands for the manifest")
+    reindex_sub = p_reindex.add_subparsers(dest="reindex_subcommand", required=True)
+    p_reindex_names = reindex_sub.add_parser("names", help="Backfill name_date / name_date_precision in the manifest")
+    reindex_in_arg = p_reindex_names.add_argument("--in", dest="in_silo", action="append", metavar="SILO", help="Restrict to silo (repeatable)")
+    reindex_in_arg.completer = _silo_completer  # type: ignore[attr-defined]
+    p_reindex_names.set_defaults(_run=cmd_reindex_names)
 
     # eval-adversarial [--model M] [--out report.json] [--limit N]
     p_eval = sub.add_parser("eval-adversarial", help="Run synthetic adversarial trustfulness eval")

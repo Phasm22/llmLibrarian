@@ -161,6 +161,35 @@ def get_silo_exclude_patterns(db_path: str | Path, slug: str) -> list[str]:
         out.append(pattern)
     return out
 
+
+def get_silo_artifact_compile(db_path: str | Path, slug: str) -> dict[str, Any] | None:
+    """Get artifact compile metadata for a silo, if present."""
+    reg = _read_registry(db_path)
+    entry = reg.get(slug)
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("last_artifact_compile")
+    return dict(value) if isinstance(value, dict) else None
+
+
+def set_silo_artifact_compile(
+    db_path: str | Path,
+    slug: str,
+    payload: dict[str, Any] | None,
+) -> bool:
+    """Set or clear artifact compile metadata for a silo."""
+    reg = _read_registry(db_path)
+    entry = reg.get(slug)
+    if not isinstance(entry, dict):
+        return False
+    if payload is None:
+        entry.pop("last_artifact_compile", None)
+    else:
+        entry["last_artifact_compile"] = dict(payload)
+    reg[slug] = entry
+    _write_registry(db_path, reg)
+    return True
+
 def list_silos(db_path: str | Path) -> list[dict[str, Any]]:
     """Return list of silo dicts (slug, display_name, path, files_indexed, chunks_count, updated)."""
     reg = _read_registry(db_path)

@@ -19,7 +19,7 @@ When integrated via MCP, prefer tools over shell so you do not depend on `PYTHON
 1. **`health`** — DB presence, embedding stack, basic sanity (call first if tools misbehave).
 2. **`list_silos`** / **`capabilities`** — discover slugs and supported file types.
 3. **`retrieve`** / **`retrieve_bulk`** — document Q&A from indexed data.
-4. **`add_silo`** — index a **file or directory** (same rules as `llmli add`).
+4. **`add_silo`** — index a **file or directory** (same rules as `llmli add`; keep `confirm=true` for write calls).
 5. **`trigger_reindex`** — incremental refresh for a registered silo; **`repair_silo`** — hard reset when Chroma/registry is inconsistent.
 
 ## Session-start checklist (MCP)
@@ -74,6 +74,8 @@ pal inspect <silo> --top 20
 pal ls --status
 pal ls --jobs
 pal pull --status
+llmli repair-ladder
+llmli rehydrate --dry-run
 ```
 
 ### 5) Test

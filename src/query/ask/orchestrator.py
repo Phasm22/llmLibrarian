@@ -31,6 +31,7 @@ for _sym in (
     "INTENT_CODE_LANGUAGE",
     "INTENT_CAPABILITIES",
     "INTENT_FILE_LIST",
+    "INTENT_FILENAME_DATE_LOOKUP",
     "INTENT_STRUCTURE",
     "INTENT_TIMELINE",
     "INTENT_METADATA_ONLY",
@@ -43,6 +44,42 @@ for _sym in (
     "RERANK_STAGE1_N",
 ):
     globals()[_sym] = getattr(qc, _sym)
+
+
+def _apply_context_budget(
+    docs: list[str],
+    metas: list[dict | None],
+    dists: list[float | None],
+    *,
+    budget_tokens: int,
+    use_unified: bool,
+    silo: str | None,
+) -> tuple[list[str], list[dict | None], list[float | None], bool]:
+    """Keep top-ranked chunks that fit into a global context budget."""
+    if budget_tokens <= 0 or not docs:
+        return docs, metas, dists, False
+    budget_chars = max(0, int(budget_tokens) * 4)
+    if budget_chars <= 0:
+        return [], [], [], True
+    kept_docs: list[str] = []
+    kept_metas: list[dict | None] = []
+    kept_dists: list[float | None] = []
+    used = 0
+    show_silo_for_budget = use_unified and silo is None
+    for i, doc in enumerate(docs):
+        meta = metas[i] if i < len(metas) else None
+        dist = dists[i] if i < len(dists) else None
+        block = qc.context_block(doc, meta, show_silo_for_budget)
+        block_len = len(block) + 8
+        if used + block_len > budget_chars:
+            continue
+        kept_docs.append(doc)
+        kept_metas.append(meta)
+        kept_dists.append(dist)
+        used += block_len
+    if not kept_docs:
+        return [], [], [], True
+    return kept_docs, kept_metas, kept_dists, False
 
 
 def execute_run_ask(
@@ -217,6 +254,88 @@ def execute_run_ask(
             cap_text = "Could not load capabilities."
         out_lines = [cap_text, "", qc.dim(no_color, "---"), qc.label_style(no_color, f"Answered by: {source_label} (capabilities)")]
         return cap_text if quiet else "\n".join(out_lines)
+
+    # FILENAME_DATE_LOOKUP: deterministic filename/date file lookup. No retrieval, no LLM.
+    if intent == INTENT_FILENAME_DATE_LOOKUP and use_unified:
+        from datetime import date as _date
+
+        from operations_find import op_find_files
+        from query.filename_dates import resolve_query_date_range
+        from query.find_format import (
+            format_filename_lookup,
+            format_filename_lookup_with_excerpt,
+            render_range_label,
+        )
+
+        date_range = resolve_query_date_range(query, _date.today())
+        if date_range is None:
+            # Defensive: detector matched but resolver couldn't parse. Fall through
+            # to LOOKUP rather than raising — this should be rare.
+            intent = INTENT_LOOKUP
+        else:
+            lo, hi = date_range
+            silos_arg = [silo] if silo else None
+            if silos_arg is None:
+                ranked = qc.rank_silos_by_catalog_tokens(
+                    query, db, qc.detect_filetype_hints(query)
+                )
+                if ranked:
+                    silos_arg = [c.get("slug") for c in ranked if c.get("slug")][:3] or None
+            result = op_find_files(
+                db,
+                silos=silos_arg,
+                date_start=lo,
+                date_end=hi,
+                date_field="either",
+            )
+            hits = result.get("files") or []
+            range_label = render_range_label(lo, hi)
+            if len(hits) == 1:
+                body = format_filename_lookup_with_excerpt(
+                    hits[0],
+                    db_path=db,
+                    source_label=source_label,
+                    no_color=no_color,
+                    range_label=range_label,
+                )
+            else:
+                body = format_filename_lookup(
+                    hits,
+                    source_label=source_label,
+                    no_color=no_color,
+                    range_label=range_label,
+                )
+            if quiet:
+                return body
+            lines = [
+                body,
+                "",
+                qc.dim(no_color, "---"),
+                qc.label_style(no_color, f"Answered by: {source_label} (filename-date lookup)"),
+            ]
+            time_ms = (time.perf_counter() - t0) * 1000
+            qc.write_trace(
+                intent=intent,
+                n_stage1=0,
+                n_results=0,
+                model=model,
+                silo=silo,
+                source_label=source_label,
+                num_docs=len(hits),
+                time_ms=time_ms,
+                query_len=len(query),
+                hybrid_used=False,
+                guardrail_no_match=(len(hits) == 0),
+                guardrail_reason="filename_date_lookup",
+                requested_year=None,
+                requested_form=None,
+                requested_line=None,
+                receipt_metas=[
+                    {"source": h.get("path"), "silo": h.get("silo")} for h in hits[:5]
+                ],
+                answer_kind="catalog_artifact",
+            )
+            return "\n".join(lines)
 
     # STRUCTURE: deterministic catalog snapshot (outline/recent/inventory). No retrieval.
     if intent == INTENT_STRUCTURE and use_unified:
@@ -1094,6 +1213,91 @@ def execute_run_ask(
             lexical_phrases=_lexical_phrases,
         )
         hybrid_used = (hybrid_method == "hybrid")
+
+        # Scoped dual-stream retrieval: when querying one silo, run a second stream on
+        # "{silo}-artifacts", apply per-stream diversity, then merge via RRF.
+        artifact_stream_enabled = False
+        if use_unified and silo:
+            try:
+                from state import get_silo_artifact_compile
+
+                _artifact_meta = get_silo_artifact_compile(db, silo) or {}
+                artifact_stream_enabled = str(_artifact_meta.get("artifact_silo") or "") == f"{silo}-artifacts"
+            except Exception:
+                artifact_stream_enabled = False
+        if use_unified and silo and artifact_stream_enabled:
+            artifact_slug = f"{silo}-artifacts"
+
+            def _swap_silo_where(where_obj: Any, new_silo: str) -> Any:
+                if not isinstance(where_obj, dict):
+                    return {"silo": new_silo}
+                if "silo" in where_obj:
+                    out = dict(where_obj)
+                    out["silo"] = new_silo
+                    return out
+                if "$and" in where_obj and isinstance(where_obj.get("$and"), list):
+                    out_parts = []
+                    replaced = False
+                    for part in where_obj.get("$and") or []:
+                        if isinstance(part, dict) and "silo" in part:
+                            out_parts.append({"silo": new_silo})
+                            replaced = True
+                        else:
+                            out_parts.append(part)
+                    if not replaced:
+                        out_parts.append({"silo": new_silo})
+                    return {"$and": out_parts}
+                return {"$and": [where_obj, {"silo": new_silo}]}
+
+            artifact_query_kw = dict(query_kw)
+            artifact_query_kw["where"] = _swap_silo_where(query_kw.get("where"), artifact_slug)
+            artifact_results = collection.query(**artifact_query_kw)
+            artifact_docs = (artifact_results.get("documents") or [[]])[0] or []
+            artifact_metas = (artifact_results.get("metadatas") or [[]])[0] or []
+            artifact_dists = (artifact_results.get("distances") or [[]])[0] or []
+            artifact_ids = (artifact_results.get("ids") or [[]])[0] or []
+            if artifact_docs:
+                artifact_hybrid_where = (
+                    artifact_query_kw.get("where") if isinstance(artifact_query_kw.get("where"), dict) else None
+                )
+                artifact_docs, artifact_metas, artifact_dists, _artifact_method = qc.run_hybrid_retrieve(
+                    ids_v=artifact_ids,
+                    docs_v=artifact_docs,
+                    metas_v=artifact_metas,
+                    dists_v=artifact_dists,
+                    query_text=query_for_retrieval,
+                    collection=collection,
+                    where_filter=artifact_hybrid_where,
+                    top_k=n_stage1,
+                    lexical_phrases=_lexical_phrases,
+                )
+                per_intent_cap_dual = qc.max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
+                raw_docs_stream, raw_metas_stream, raw_dists_stream = qc.diversify_by_source(
+                    docs,
+                    metas,
+                    dists,
+                    n_stage1,
+                    max_per_source=per_intent_cap_dual,
+                )
+                artifact_docs_stream, artifact_metas_stream, artifact_dists_stream = qc.diversify_by_source(
+                    artifact_docs,
+                    artifact_metas,
+                    artifact_dists,
+                    n_stage1,
+                    max_per_source=per_intent_cap_dual,
+                )
+                docs, metas, dists = qc.merge_dual_streams_rrf(
+                    raw_docs_stream,
+                    raw_metas_stream,
+                    raw_dists_stream,
+                    artifact_docs_stream,
+                    artifact_metas_stream,
+                    artifact_dists_stream,
+                    top_k=n_stage1,
+                )
+                docs, metas, dists = qc.dedup_by_chunk_hash(docs, metas, dists)
+                hybrid_used = True
+
         # EVIDENCE_PROFILE fallback: if hybrid didn't fire, reorder by trigger regex
         if intent == INTENT_EVIDENCE_PROFILE and docs and not hybrid_used:
             docs, metas, dists = qc.filter_by_triggers(docs, metas, dists)
@@ -1644,6 +1848,42 @@ def execute_run_ask(
                 + " Avoid speculative ownership claims unless explicitly labeled once."
                 + " Do not contradict ownership labels in the same answer."
             )
+
+        if intent == INTENT_AGGREGATE and not strict:
+            system_prompt = (
+                system_prompt.rstrip()
+                + "\n\nFor aggregate/numeric questions, prefer a compact table-like output with stable columns."
+                + " Include units and source grounding for each row."
+            )
+
+        budget_tokens = 0
+        try:
+            budget_tokens = int(os.environ.get("LLMLIBRARIAN_CONTEXT_BUDGET_TOKENS", "0") or "0")
+        except (TypeError, ValueError):
+            budget_tokens = 0
+        if budget_tokens > 0 and docs:
+            docs, metas, dists, budget_exhausted = _apply_context_budget(
+                docs,
+                metas,
+                dists,
+                budget_tokens=budget_tokens,
+                use_unified=use_unified,
+                silo=silo,
+            )
+            if budget_exhausted:
+                budget_msg = (
+                    "I found relevant content, but the configured context budget is too small to include any chunk. "
+                    "Increase LLMLIBRARIAN_CONTEXT_BUDGET_TOKENS and retry."
+                )
+                if quiet:
+                    return budget_msg
+                return (
+                    budget_msg
+                    + "\n\n"
+                    + qc.dim(no_color, "---")
+                    + "\n"
+                    + qc.label_style(no_color, f"Answered by: {source_label}")
+                )
         
         # Standardized context packaging: file, mtime, silo, doc_type, snippet (helps model and debugging)
         show_silo_in_context = use_unified and silo is None

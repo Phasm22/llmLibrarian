@@ -161,6 +161,70 @@ def rrf_merge(
     )
 
 
+def merge_dual_streams_rrf(
+    docs_a: list[str],
+    metas_a: list[dict | None],
+    dists_a: list[float | None],
+    docs_b: list[str],
+    metas_b: list[dict | None],
+    dists_b: list[float | None],
+    *,
+    top_k: int,
+    rrf_k: int = RRF_K,
+) -> tuple[list[str], list[dict | None], list[float | None]]:
+    """
+    Merge two ranked result streams with reciprocal-rank scoring.
+
+    Used for raw-vs-artifact retrieval so each stream keeps its own diversity
+    policy before merge.
+    """
+    if not docs_a:
+        return docs_b[:top_k], (metas_b or [])[:top_k], (dists_b or [])[:top_k]
+    if not docs_b:
+        return docs_a[:top_k], (metas_a or [])[:top_k], (dists_a or [])[:top_k]
+
+    def _key(doc: str, meta: dict | None) -> tuple[str, str, str, str, str]:
+        m = meta or {}
+        return (
+            doc or "",
+            str(m.get("source") or ""),
+            str(m.get("line_start") or ""),
+            str(m.get("page") or ""),
+            str(m.get("region_index") or ""),
+        )
+
+    rows: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for idx, doc in enumerate(docs_a):
+        meta = metas_a[idx] if idx < len(metas_a) else None
+        dist = dists_a[idx] if idx < len(dists_a) else None
+        k = _key(doc, meta)
+        row = rows.setdefault(k, {"doc": doc, "meta": meta, "dist": dist, "score": 0.0})
+        row["score"] += 1.0 / (rrf_k + idx + 1)
+        if row.get("dist") is None and dist is not None:
+            row["dist"] = dist
+    for idx, doc in enumerate(docs_b):
+        meta = metas_b[idx] if idx < len(metas_b) else None
+        dist = dists_b[idx] if idx < len(dists_b) else None
+        k = _key(doc, meta)
+        row = rows.setdefault(k, {"doc": doc, "meta": meta, "dist": dist, "score": 0.0})
+        row["score"] += 1.0 / (rrf_k + idx + 1)
+        if row.get("dist") is None and dist is not None:
+            row["dist"] = dist
+
+    ranked = sorted(
+        rows.values(),
+        key=lambda item: (
+            -float(item.get("score") or 0.0),
+            float(item.get("dist")) if item.get("dist") is not None else 999.0,
+        ),
+    )[:top_k]
+    return (
+        [str(r.get("doc") or "") for r in ranked],
+        [r.get("meta") if isinstance(r.get("meta"), dict) or r.get("meta") is None else None for r in ranked],
+        [r.get("dist") if isinstance(r.get("dist"), (int, float)) or r.get("dist") is None else None for r in ranked],
+    )
+
+
 def run_hybrid_retrieve(
     ids_v: list[str],
     docs_v: list[str],

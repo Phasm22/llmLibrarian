@@ -62,6 +62,54 @@ def test_derive_watch_jobs_prefers_hashed_slug_for_duplicate_registry_path(tmp_p
     assert jobs[0].service_name == "io.llmlibrarian.watch.journallinker-397f11d4"
 
 
+def test_derive_watch_jobs_uses_registry_path_when_bookmark_missing_but_hint_present(tmp_path: Path):
+    pal_home = tmp_path / ".pal"
+    registry_path = tmp_path / "canonical"
+    registry_path.mkdir()
+    stale_path = tmp_path / "old-location"
+    source_registry = {"bookmarks": [{"path": str(stale_path), "silo": "docs-aaaa1111"}]}
+    llmli_registry = {
+        "docs-aaaa1111": {"path": str(registry_path.resolve()), "display_name": "Docs"},
+    }
+
+    jobs, warnings = jobs_runtime.derive_watch_jobs(
+        source_registry,
+        llmli_registry,
+        pal_home=pal_home,
+        db_path=tmp_path / "db",
+        manager="launchd",
+    )
+
+    assert [job.slug for job in jobs] == ["docs-aaaa1111"]
+    assert jobs[0].source_path == str(registry_path.resolve())
+    assert any("using registry path" in w.lower() for w in warnings)
+
+
+def test_derive_watch_jobs_warns_on_path_hint_conflict_and_uses_path_match(tmp_path: Path):
+    pal_home = tmp_path / ".pal"
+    path_alpha = tmp_path / "alpha"
+    path_beta = tmp_path / "beta"
+    path_alpha.mkdir()
+    path_beta.mkdir()
+    source_registry = {"bookmarks": [{"path": str(path_alpha), "silo": "beta-22222222"}]}
+    llmli_registry = {
+        "alpha-11111111": {"path": str(path_alpha.resolve()), "display_name": "Alpha"},
+        "beta-22222222": {"path": str(path_beta.resolve()), "display_name": "Beta"},
+    }
+
+    jobs, warnings = jobs_runtime.derive_watch_jobs(
+        source_registry,
+        llmli_registry,
+        pal_home=pal_home,
+        db_path=tmp_path / "db",
+        manager="launchd",
+    )
+
+    assert [job.slug for job in jobs] == ["alpha-11111111"]
+    assert jobs[0].source_path == str(path_alpha.resolve())
+    assert any("hint/path conflict" in w.lower() for w in warnings)
+
+
 def test_platform_sync_deduplicates_jobs_by_source_path(monkeypatch, tmp_path: Path):
     source = tmp_path / "journalLinker"
     source.mkdir()

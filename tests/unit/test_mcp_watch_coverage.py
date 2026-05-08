@@ -170,3 +170,39 @@ def test_watch_coverage_legacy_sources_key(tmp_path: Path, sample_trees: dict) -
     assert len(out["bookmarks"]) == 1
     assert out["bookmarks"][0]["path"] == str(sample_trees["indexed"])
     assert out["watch_jobs"][0]["slug"] == slug
+
+
+def test_watch_coverage_marks_hint_bookmark_watchable_when_path_missing(tmp_path: Path) -> None:
+    pal_home = tmp_path / ".pal"
+    pal_home.mkdir()
+    db_dir = tmp_path / "my_brain_db"
+    canonical = tmp_path / "canonical_docs"
+    canonical.mkdir()
+    slug = "docs-aaaa1111"
+    _write_llmli_registry(
+        db_dir,
+        {
+            slug: {
+                "slug": slug,
+                "display_name": "Docs",
+                "path": str(canonical.resolve()),
+                "files_indexed": 1,
+                "chunks_count": 1,
+                "updated": "2026-01-01T00:00:00+00:00",
+            },
+        },
+    )
+    stale = tmp_path / "old_docs"
+    (pal_home / "registry.json").write_text(
+        json.dumps({"bookmarks": [{"path": str(stale), "name": "docs", "silo": slug}]}),
+        encoding="utf-8",
+    )
+
+    out = op_watch_coverage(db_dir, pal_home=pal_home)
+    assert len(out["watch_jobs"]) == 1
+    assert out["watch_jobs"][0]["source_path"] == str(canonical.resolve())
+    row = out["bookmarks"][0]
+    assert row["silo_slug"] == slug
+    assert row["path_exists"] is False
+    assert row["would_watch"] is True
+    assert row["effective_source_path"] == str(canonical.resolve())

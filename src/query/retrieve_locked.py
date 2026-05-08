@@ -15,10 +15,22 @@ from query.retrieval import (
     dedup_by_chunk_hash,
     diversify_by_silo,
     diversify_by_source,
+    merge_dual_streams_rrf,
     max_chunks_for_intent,
     max_silo_chunks_for_intent,
     run_hybrid_retrieve,
 )
+
+
+def _artifact_stream_enabled(db: str, silo_slug: str) -> bool:
+    try:
+        from state import get_silo_artifact_compile
+
+        meta = get_silo_artifact_compile(db, silo_slug) or {}
+        artifact_slug = str(meta.get("artifact_silo") or "")
+        return artifact_slug == f"{silo_slug}-artifacts"
+    except Exception:
+        return False
 
 
 def execute_retrieve_chroma_phase(
@@ -40,40 +52,63 @@ def execute_retrieve_chroma_phase(
     client = _gc(str(db))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
 
-    query_kw: dict = {
-        "query_texts": [query_for_retrieval],
-        "n_results": n_stage1,
-        "include": ["documents", "metadatas", "distances"],
-    }
-    where_parts: list[dict] = []
-    if silo_slug:
-        where_parts.append({"silo": silo_slug})
-    if doc_type:
-        where_parts.append({"doc_type": doc_type})
-    if len(where_parts) == 1:
-        query_kw["where"] = where_parts[0]
-    elif len(where_parts) > 1:
-        query_kw["where"] = {"$and": where_parts}
+    def _where_for_silo(target_silo: str | None) -> dict | None:
+        parts: list[dict[str, Any]] = []
+        if target_silo:
+            parts.append({"silo": target_silo})
+        if doc_type:
+            parts.append({"doc_type": doc_type})
+        if len(parts) == 1:
+            return parts[0]
+        if len(parts) > 1:
+            return {"$and": parts}
+        return None
 
-    docs, metas, dists, ids_v, _silo_warning = _safe_query(collection, query_kw, silo_slug, db_path=db_path)
+    def _query_stream(target_silo: str | None) -> tuple[list[str], list[dict | None], list[float | None], str | None]:
+        query_kw: dict[str, Any] = {
+            "query_texts": [query_for_retrieval],
+            "n_results": n_stage1,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        where = _where_for_silo(target_silo)
+        if where:
+            query_kw["where"] = where
+        docs_v, metas_v, dists_v, ids_v, _warn = _safe_query(collection, query_kw, target_silo, db_path=db_path)
+        _hybrid_where = query_kw.get("where") if isinstance(query_kw.get("where"), dict) else None
+        _lexical_phrases = PROFILE_LEXICAL_PHRASES if intent == INTENT_EVIDENCE_PROFILE else None
+        docs_h, metas_h, dists_h, _method = run_hybrid_retrieve(
+            ids_v=ids_v,
+            docs_v=docs_v,
+            metas_v=metas_v,
+            dists_v=dists_v,
+            query_text=query_for_retrieval,
+            collection=collection,
+            where_filter=_hybrid_where,
+            top_k=n_stage1,
+            lexical_phrases=_lexical_phrases,
+        )
+        per_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
+        docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, n_results, max_per_source=per_cap)
+        docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
+        return docs_h, metas_h, dists_h, _warn
 
-    _hybrid_where = query_kw.get("where") if isinstance(query_kw.get("where"), dict) else None
-    _lexical_phrases = PROFILE_LEXICAL_PHRASES if intent == INTENT_EVIDENCE_PROFILE else None
-    docs, metas, dists, retrieval_method = run_hybrid_retrieve(
-        ids_v=ids_v,
-        docs_v=docs,
-        metas_v=metas,
-        dists_v=dists,
-        query_text=query_for_retrieval,
-        collection=collection,
-        where_filter=_hybrid_where,
-        top_k=n_stage1,
-        lexical_phrases=_lexical_phrases,
-    )
-
-    per_intent_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
-    docs, metas, dists = diversify_by_source(docs, metas, dists, n_results, max_per_source=per_intent_cap)
-    docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+    docs, metas, dists, _silo_warning = _query_stream(silo_slug)
+    retrieval_method = "hybrid_or_vector"
+    if silo_slug and (doc_type is None or doc_type == "artifact") and _artifact_stream_enabled(db, silo_slug):
+        artifact_slug = f"{silo_slug}-artifacts"
+        artifact_docs, artifact_metas, artifact_dists, _artifact_warning = _query_stream(artifact_slug)
+        if artifact_docs:
+            docs, metas, dists = merge_dual_streams_rrf(
+                docs,
+                metas,
+                dists,
+                artifact_docs,
+                artifact_metas,
+                artifact_dists,
+                top_k=n_results,
+            )
+            docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+            retrieval_method = "dual_stream_rrf"
 
     if silo_slug is None:
         per_silo_cap = max_silo_chunks_for_intent(intent, 3)

@@ -22,6 +22,8 @@ llmli ls                        # List silos
 llmli inspect <silo>            # Silo details + per-file chunk counts
 llmli rm <silo>                 # Remove silo
 llmli repair <silo>             # Fix ChromaDB index errors (wipe + re-index)
+llmli repair-ladder             # Read-only diagnostics + L1/L2/L3 repair guidance
+llmli rehydrate [silo...]       # Rebuild silos from llmli_registry (L3 helper)
 llmli capabilities              # Supported file types
 
 # pal is the agent layer (delegates to llmli; state in ~/.pal/registry.json)
@@ -83,6 +85,9 @@ pal daemon install|sync|uninstall|logs  # Manage background watchers
 - `LLMLIBRARIAN_TRACE` — JSON-lines trace file for debugging
 - `LLMLIBRARIAN_RERANK=1` — Enable cross-encoder reranker
 - `LLMLIBRARIAN_CHUNK_SIZE` / `LLMLIBRARIAN_CHUNK_OVERLAP` — Tuning (default: 1000/150)
+- `LLMLIBRARIAN_ARTIFACT_SILOS` — Enable post-ingest artifact compilation (`*` or comma-separated slugs)
+- `LLMLIBRARIAN_ARTIFACT_MAX_FACTS` / `LLMLIBRARIAN_ARTIFACT_MAX_INPUT_CHARS` — Artifact compile limits
+- `LLMLIBRARIAN_CONTEXT_BUDGET_TOKENS` — Global ask-time context budget (drops lowest-ranked chunks on overflow)
 
 ## Configuration
 

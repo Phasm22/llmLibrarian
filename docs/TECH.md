@@ -18,6 +18,9 @@ The system is organized around a few stable ideas:
 4. LLM answer fallback
 5. Source footer and optional trace write
 
+Scoped retrieval can run dual streams (`<silo>` + `<silo>-artifacts`) with
+per-stream source diversity and RRF merge when artifact metadata exists.
+
 Deterministic query families:
 - capabilities
 - code language stats
@@ -51,6 +54,11 @@ Watch lifecycle:
 Watcher locks live in `~/.pal/watch_locks/*.pid`.
 
 The broader maintenance and inspection surfaces are intentionally thin wrappers around the same index state: use them when you need to confirm freshness, support, or cleanup, not as separate product modes.
+
+Repair/recovery surfaces:
+- `llmli repair` (L1) for per-silo wipe + full re-index
+- `llmli repair-ladder` (L2 diagnostics) for sqlite integrity + segment scan
+- `llmli rehydrate` (L3 helper) for registry-driven rebuild
 
 ## OCR and Images
 
@@ -105,6 +113,10 @@ If `LLMLIBRARIAN_TRACE` is set, asks append JSON-lines traces.
 - `LLMLIBRARIAN_TRACE`
 - `LLMLIBRARIAN_RERANK`
 - `LLMLIBRARIAN_OCR_BACKEND`
+- `LLMLIBRARIAN_ARTIFACT_SILOS`
+- `LLMLIBRARIAN_ARTIFACT_MAX_FACTS`
+- `LLMLIBRARIAN_ARTIFACT_MAX_INPUT_CHARS`
+- `LLMLIBRARIAN_CONTEXT_BUDGET_TOKENS`
 - `PAL_DEBUG`
 
 ## Source Priority

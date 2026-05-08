@@ -587,6 +587,80 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
 
 
 @mcp.tool()
+def find_files(
+    silos: list[str] | None = None,
+    name_glob: str | None = None,
+    date_start: str | None = None,
+    date_end: str | None = None,
+    date_field: str = "either",
+    include_chunk_count: bool = False,
+    limit: int = 50,
+) -> dict:
+    """
+    Find files by name and/or date against the manifest — no embeddings, no LLM.
+    Use this for filename/date lookups like "today's journal entry" or "files from May 2026"
+    where the user wants the *file*, not content discussion. Returns each hit with both
+    name_date (parsed from filename) and mtime, plus a date_source field showing which
+    one matched the filter ("name_date" | "mtime" | "both"). Filename precedence is the
+    default because mtime is unreliable across syncs/restores. Set include_chunk_count=True
+    to also report chunks per file (touches ChromaDB; otherwise this is metadata-only).
+    Pass date_start / date_end as ISO strings (YYYY-MM-DD); same value for both means
+    a single-day query. date_field accepts "name_date", "mtime", or "either" (default).
+    """
+    from datetime import date as _date
+
+    from operations_find import op_find_files
+
+    if not Path(_DB_PATH).is_dir():
+        return _db_missing_error()
+
+    def _parse(raw: str | None) -> _date | None:
+        if not raw:
+            return None
+        return _date.fromisoformat(raw)
+
+    try:
+        lo = _parse(date_start)
+        hi = _parse(date_end)
+    except ValueError as e:
+        return {"db_path": _DB_PATH, "error": f"invalid date: {e}"}
+
+    if date_field not in ("name_date", "mtime", "either"):
+        return {"db_path": _DB_PATH, "error": f"invalid date_field: {date_field}"}
+
+    try:
+        if include_chunk_count:
+            with _mcp_chroma_lock("find_files"):
+                result = op_find_files(
+                    _DB_PATH,
+                    silos=silos,
+                    name_glob=name_glob,
+                    date_start=lo,
+                    date_end=hi,
+                    date_field=date_field,  # type: ignore[arg-type]
+                    include_chunk_count=True,
+                    limit=int(limit),
+                )
+        else:
+            result = op_find_files(
+                _DB_PATH,
+                silos=silos,
+                name_glob=name_glob,
+                date_start=lo,
+                date_end=hi,
+                date_field=date_field,  # type: ignore[arg-type]
+                include_chunk_count=False,
+                limit=int(limit),
+            )
+        return result
+    except Exception as e:
+        return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        if include_chunk_count:
+            _release_chroma()
+
+
+@mcp.tool()
 def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     """
     Re-index a registered silo from its source path in a background thread.
@@ -805,6 +879,7 @@ def add_silo(
     allow_cloud: bool = False,
     exclude_patterns: list[str] | None = None,
     full: bool = False,
+    confirm: bool = True,
 ) -> dict:
     """
     Index a file or folder as a new silo (or update an existing one). Equivalent to `llmli add <path>`.
@@ -816,6 +891,12 @@ def add_silo(
     Call list_silos() or health() after a minute or two to confirm completion.
     """
     from pathlib import Path as _Path
+
+    if not confirm:
+        return {
+            "status": "not_started",
+            "message": "Pass confirm=True to start add_silo.",
+        }
 
     p = _Path(path).resolve()
     if not p.exists():

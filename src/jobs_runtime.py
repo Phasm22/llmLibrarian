@@ -262,6 +262,56 @@ def _resolve_silo_by_path(llmli_registry: dict[str, Any], path: Path) -> tuple[s
     return max(matches, key=lambda item: len(item[0]))
 
 
+def _resolve_silo_by_hint(llmli_registry: dict[str, Any], hint: str | None) -> tuple[str | None, str | None]:
+    """
+    Resolve bookmark silo hint to a slug in llmli registry.
+
+    Returns (slug, warning). warning is set for ambiguous hints.
+    """
+    raw = str(hint or "").strip()
+    if not raw:
+        return None, None
+    if raw in llmli_registry:
+        return raw, None
+
+    lower = raw.lower()
+    lower_slug = [slug for slug in llmli_registry.keys() if str(slug).lower() == lower]
+    if len(lower_slug) == 1:
+        return str(lower_slug[0]), None
+
+    display_matches = []
+    for slug, data in llmli_registry.items():
+        if not isinstance(data, dict):
+            continue
+        display = str(data.get("display_name") or "")
+        if display.lower() == lower:
+            display_matches.append(str(slug))
+    if len(display_matches) == 1:
+        return display_matches[0], None
+    if len(display_matches) > 1:
+        return None, f"Ambiguous silo_hint '{raw}' matches multiple display names."
+
+    prefix_matches = [str(slug) for slug in llmli_registry.keys() if str(slug).startswith(raw)]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0], None
+    if len(prefix_matches) > 1:
+        return None, f"Ambiguous silo_hint prefix '{raw}' matches multiple slugs."
+    return None, None
+
+
+def _resolve_registry_source_path(llmli_registry: dict[str, Any], slug: str) -> Path | None:
+    data = llmli_registry.get(slug)
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("path")
+    if not raw:
+        return None
+    try:
+        return Path(str(raw)).expanduser().resolve()
+    except Exception:
+        return None
+
+
 def derive_watch_jobs(
     source_registry: dict[str, Any],
     llmli_registry: dict[str, Any],
@@ -278,30 +328,69 @@ def derive_watch_jobs(
         if not isinstance(raw, dict):
             continue
         path_value = raw.get("path")
-        if not path_value:
-            continue
-        try:
-            path = Path(str(path_value)).expanduser().resolve()
-        except Exception:
-            warnings.append(f"Skipping unreadable source path: {path_value}")
-            continue
-        if str(path) in seen:
-            continue
-        seen.add(str(path))
-        if not path.exists() or not path.is_dir():
-            warnings.append(f"Skipping missing source: {path}")
-            continue
-        slug, _entry = _resolve_silo_by_path(llmli_registry, path)
+        hint_value = raw.get("silo")
+
+        path: Path | None = None
+        path_exists = False
+        if path_value:
+            try:
+                path = Path(str(path_value)).expanduser().resolve()
+                path_exists = path.exists() and path.is_dir()
+            except Exception:
+                warnings.append(f"Skipping unreadable source path: {path_value}")
+                continue
+
+        slug_hint, hint_warning = _resolve_silo_by_hint(llmli_registry, str(hint_value) if hint_value else None)
+        if hint_warning:
+            warnings.append(hint_warning)
+        slug_path = None
+        if path is not None and path_exists:
+            slug_path, _entry = _resolve_silo_by_path(llmli_registry, path)
+
+        slug: str | None = None
+        if slug_hint and slug_path and slug_hint != slug_path:
+            warnings.append(
+                f"Bookmark hint/path conflict for {path}: hint={slug_hint} path={slug_path}; using path match."
+            )
+            slug = slug_path
+        else:
+            slug = slug_hint or slug_path
+
         if not slug:
-            warnings.append(f"Skipping unindexed source: {path}")
+            if path is not None and not path_exists:
+                warnings.append(f"Skipping missing source: {path}")
+            elif path is not None:
+                warnings.append(f"Skipping unindexed source: {path}")
+            elif hint_value:
+                warnings.append(f"Skipping bookmark with unresolved silo_hint: {hint_value}")
             continue
+
+        canonical_path = _resolve_registry_source_path(llmli_registry, slug)
+        if canonical_path is None:
+            warnings.append(f"Skipping silo with missing registry path: {slug}")
+            continue
+        if not canonical_path.exists() or not canonical_path.is_dir():
+            warnings.append(f"Skipping missing registry source for silo {slug}: {canonical_path}")
+            continue
+
+        if path is not None and path_exists and path != canonical_path:
+            warnings.append(
+                f"Bookmark path mismatch for silo {slug}: bookmark={path} registry={canonical_path}; using registry path."
+            )
+        if (path is None or not path_exists) and slug_hint:
+            warnings.append(f"Bookmark path missing for silo {slug}; using registry path {canonical_path}.")
+
+        if str(canonical_path) in seen:
+            continue
+        seen.add(str(canonical_path))
+
         service_name = desired_service_name(manager, slug)
         jobs.append(
             JobSpec(
                 id=f"watch_silo:{slug}",
                 kind="watch_silo",
                 slug=slug,
-                source_path=str(path),
+                source_path=str(canonical_path),
                 service_name=service_name,
                 log_path=str(watch_log_path(pal_home, slug)),
                 interval=SERVICE_INTERVAL_DEFAULT,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -77,6 +78,69 @@ def op_db_storage_summary(db_path: str) -> dict[str, Any]:
         "chroma_hnsw_bloat": bloated,
         "chroma_hnsw_bloat_note": note,
         "chroma_lock": lock,
+    }
+
+
+def op_chroma_diagnostics(db_path: str) -> dict[str, Any]:
+    """
+    Read-only Chroma diagnostics used by the L2 repair ladder.
+
+    Does not open a Chroma client. Safe to run even when the DB is unhealthy.
+    """
+    db_root = Path(db_path).expanduser().resolve()
+    storage = op_db_storage_summary(str(db_root))
+    if "error" in storage:
+        return {"status": "error", "error": storage["error"], "db_path": str(db_root)}
+
+    sqlite_path = db_root / "chroma.sqlite3"
+    sqlite_exists = sqlite_path.exists()
+    sqlite_integrity: str | None = None
+    sqlite_error: str | None = None
+    if sqlite_exists:
+        try:
+            with sqlite3.connect(str(sqlite_path)) as conn:
+                row = conn.execute("PRAGMA integrity_check;").fetchone()
+                sqlite_integrity = str((row or [""])[0])
+        except Exception as exc:
+            sqlite_error = f"{type(exc).__name__}: {exc}"
+
+    segment_dirs: list[str] = []
+    hnsw_count = 0
+    for dirpath, _dirnames, filenames in os.walk(db_root):
+        if "link_lists.bin" in filenames:
+            segment_dirs.append(str(Path(dirpath)))
+            hnsw_count += 1
+
+    chromadb_version: str | None = None
+    try:
+        import chromadb
+
+        chromadb_version = str(getattr(chromadb, "__version__", "unknown"))
+    except Exception:
+        chromadb_version = None
+
+    from state import get_query_health
+
+    health = get_query_health(db_root)
+    latest_health = health[-5:] if isinstance(health, list) else []
+    return {
+        "status": "ok",
+        "db_path": str(db_root),
+        "chromadb_version": chromadb_version,
+        "sqlite_path": str(sqlite_path),
+        "sqlite_exists": sqlite_exists,
+        "sqlite_integrity_check": sqlite_integrity,
+        "sqlite_integrity_error": sqlite_error,
+        "segment_dir_count": len(segment_dirs),
+        "segment_dirs": segment_dirs[:20],
+        "hnsw_index_count": hnsw_count,
+        "query_health_recent": latest_health,
+        "storage": storage,
+        "repair_ladder": {
+            "l1": "llmli repair <silo>",
+            "l2": "Run diagnostics only: sqlite integrity check + segment inspection.",
+            "l3": "Run llmli rehydrate to rebuild into a fresh DB path from registry sources.",
+        },
     }
 
 
@@ -197,6 +261,92 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
         "path": source_path,
         "files_indexed": files_ok,
         "failures": n_failures,
+    }
+
+
+def op_rehydrate_registry(
+    db_path: str | Path,
+    *,
+    requested_silos: list[str] | None = None,
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """
+    Rehydrate silos from llmli_registry.json by re-running full non-incremental add.
+
+    Intended for L3 recovery after moving to a fresh DB path.
+    """
+    from ingest import run_add
+    from state import list_silos, resolve_silo_prefix, resolve_silo_to_slug
+
+    db = str(Path(db_path).resolve())
+    silos = list_silos(db)
+    by_slug = {str(s.get("slug") or ""): s for s in silos if s.get("slug")}
+    if requested_silos:
+        selected_slugs: list[str] = []
+        for raw in requested_silos:
+            slug = resolve_silo_to_slug(db, raw) or resolve_silo_prefix(db, raw) or raw
+            if slug in by_slug and slug not in selected_slugs:
+                selected_slugs.append(slug)
+        targets = [by_slug[s] for s in selected_slugs if s in by_slug]
+    else:
+        targets = sorted(by_slug.values(), key=lambda row: str(row.get("slug") or ""))
+
+    rows: list[dict[str, Any]] = []
+    for item in targets:
+        slug = str(item.get("slug") or "")
+        source_path = str(item.get("path") or "")
+        display_name = str(item.get("display_name") or slug)
+        if not source_path:
+            rows.append({"slug": slug, "status": "skipped", "reason": "missing_path"})
+            continue
+        p = Path(source_path)
+        if not p.exists():
+            rows.append({"slug": slug, "status": "skipped", "reason": "path_not_found", "path": source_path})
+            continue
+        if dry_run:
+            rows.append({"slug": slug, "status": "planned", "path": source_path})
+            continue
+        if verbose:
+            print(f"[rehydrate] Re-indexing silo '{slug}' from '{source_path}'...")
+        try:
+            files_ok, failures = run_add(
+                path=source_path,
+                db_path=db,
+                incremental=False,
+                forced_silo_slug=slug,
+                display_name_override=display_name,
+            )
+            rows.append(
+                {
+                    "slug": slug,
+                    "status": "completed",
+                    "path": source_path,
+                    "files_indexed": int(files_ok),
+                    "failures": int(failures),
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "slug": slug,
+                    "status": "error",
+                    "path": source_path,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    return {
+        "status": "ok",
+        "db_path": db,
+        "dry_run": bool(dry_run),
+        "requested_silos": list(requested_silos or []),
+        "total_targets": len(targets),
+        "completed": sum(1 for r in rows if r.get("status") == "completed"),
+        "planned": sum(1 for r in rows if r.get("status") == "planned"),
+        "skipped": sum(1 for r in rows if r.get("status") == "skipped"),
+        "errors": sum(1 for r in rows if r.get("status") == "error"),
+        "results": rows,
     }
 
 
@@ -504,8 +654,21 @@ def op_watch_coverage(db_path: str | Path, pal_home: str | Path | None = None) -
         silo_slug: str | None = None
         if resolved is not None and path_exists:
             silo_slug = resolve_silo_by_path(db_resolved, resolved)
+        if silo_slug is None and hint_str:
+            hint_slug, _hint_warning = jobsrt._resolve_silo_by_hint(llmli_registry, hint_str)
+            silo_slug = hint_slug
         if resolved is not None:
             bookmark_resolved_paths.add(str(resolved))
+
+        effective_source_path: str | None = None
+        if silo_slug:
+            reg_row = llmli_registry.get(silo_slug) or {}
+            raw_effective = str((reg_row or {}).get("path") or "").strip()
+            if raw_effective:
+                try:
+                    effective_source_path = str(Path(raw_effective).expanduser().resolve())
+                except Exception:
+                    effective_source_path = raw_effective
 
         bookmarks_out.append(
             {
@@ -516,7 +679,8 @@ def op_watch_coverage(db_path: str | Path, pal_home: str | Path | None = None) -
                 "silo_slug": silo_slug,
                 "path_exists": path_exists,
                 "indexed": silo_slug is not None,
-                "would_watch": bool(silo_slug) and path_exists,
+                "would_watch": bool(silo_slug) and bool(effective_source_path),
+                "effective_source_path": effective_source_path,
             }
         )
 
