@@ -774,6 +774,11 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     no concurrent-write crash risk). Concurrent calls are serialized via a lock.
     Check list_silos() for updated timestamp after completion.
     This updates indexed chunks from files; it is not `repair_silo` (no wipe) and not `watch_coverage` (not about pal bookmarks/daemons).
+
+    IMPORTANT: Do NOT call immediately after add_silo. add_silo already runs its own
+    full index in a background thread — a redundant trigger_reindex will queue a second
+    reindex that can corrupt the HNSW index and cause lock contention.
+    Only call when list_silos shows a stale timestamp AND source files have changed.
     """
     if not Path(_DB_PATH).is_dir():
         return {"status": "error", **_db_missing_error()}
