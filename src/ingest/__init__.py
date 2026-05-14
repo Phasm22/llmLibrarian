@@ -2639,6 +2639,26 @@ def run_add(
             _file_registry_add(db_path, fhash, silo_slug, path_str)
         if incremental:
             _update_file_manifest(db_path, _update_manifest)
+        else:
+            def _overwrite_manifest(manifest_data: dict) -> None:
+                silos = manifest_data.setdefault("silos", {})
+                files_map: dict = {}
+                for p, _k, h, p_res in regular_with_hash:
+                    if p_res is None:
+                        continue
+                    try:
+                        st = p_res.stat()
+                        files_map[str(p_res)] = {"mtime": st.st_mtime, "size": st.st_size, "hash": h}
+                    except OSError:
+                        continue
+                for zp in zips:
+                    try:
+                        st = zp.stat()
+                        files_map[str(zp)] = {"mtime": st.st_mtime, "size": st.st_size, "hash": ""}
+                    except OSError:
+                        continue
+                silos[silo_slug] = {"path": str(path), "files": files_map}
+            _update_file_manifest(db_path, _overwrite_manifest)
     
         if (not incremental) or ledger_sources_to_replace or tax_rows:
             replace_tax_rows_for_sources(
