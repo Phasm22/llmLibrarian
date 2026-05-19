@@ -26,9 +26,14 @@ def mcp_module(monkeypatch, tmp_path):
 
 
 def _patch_state(monkeypatch, *, slug, silos):
+    import state as real_state
+
     fake_state = SimpleNamespace(
         list_silos=lambda _db: silos,
         resolve_silo_to_slug=lambda _db, _name: slug,
+        append_last_failures=real_state.append_last_failures,
+        get_last_failures=real_state.get_last_failures,
+        failures_path=real_state.failures_path,
     )
     monkeypatch.setitem(sys.modules, "state", fake_state)
 
@@ -130,6 +135,12 @@ def test_update_file_propagates_ingest_error(monkeypatch, mcp_module, tmp_path):
     res = mcp_module.update_file("docs", str(target), confirm=True)
     assert res["status"] == "error"
     assert "RuntimeError: disk full" in res["error"]
+    from state import get_last_failures
+
+    failures = get_last_failures(mcp_module._DB_PATH)
+    assert len(failures) == 1
+    assert failures[0]["path"] == str(target.resolve())
+    assert "disk full" in failures[0]["error"]
 
 
 # ---------- remove_file ----------

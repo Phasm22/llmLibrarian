@@ -2,6 +2,8 @@ import json
 
 from ingest import _file_manifest_path
 from state import (
+    append_last_failures,
+    failures_path,
     get_silo_display_name,
     get_silo_image_vision_enabled,
     get_last_failures,
@@ -115,6 +117,32 @@ def test_get_last_failures_missing_file_returns_empty(tmp_path):
     db = tmp_path / "db"
     db.mkdir()
     assert get_last_failures(db) == []
+
+
+def test_append_last_failures_dedupes_by_path(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    set_last_failures(db, [{"path": "/a", "error": "old"}])
+    append_last_failures(db, [{"path": "/a", "error": "new"}, {"path": "/b", "error": "err"}])
+    got = get_last_failures(db)
+    assert got == [{"path": "/a", "error": "new"}, {"path": "/b", "error": "err"}]
+
+
+def test_append_last_failures_caps_entries(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    initial = [{"path": f"/f{i}", "error": "e"} for i in range(55)]
+    set_last_failures(db, initial)
+    append_last_failures(db, [{"path": "/new", "error": "latest"}], max_entries=50)
+    got = get_last_failures(db)
+    assert len(got) == 50
+    assert got[-1] == {"path": "/new", "error": "latest"}
+
+
+def test_failures_path_under_db_dir(tmp_path):
+    db = tmp_path / "db"
+    db.mkdir()
+    assert failures_path(db) == db / "llmli_last_failures.json"
 
 
 def test_remove_manifest_silo_no_file_is_safe(tmp_path):

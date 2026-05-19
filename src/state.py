@@ -259,12 +259,43 @@ def remove_manifest_silo(db_path: str | Path, slug: str) -> None:
     except Exception:
         return
 
+def failures_path(db_path: str | Path) -> Path:
+    """Absolute path to llmli_last_failures.json for the given DB."""
+    return _failures_path(db_path)
+
+
 def set_last_failures(db_path: str | Path, failures: list[dict[str, str]]) -> None:
     """Save last add failures for 'log --last'."""
     path = _failures_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(failures, f, indent=2)
+
+
+def append_last_failures(
+    db_path: str | Path,
+    entries: list[dict[str, str]],
+    *,
+    max_entries: int = 50,
+) -> None:
+    """Append ingest failures, deduping by path (newest wins) and capping list size."""
+    if not entries:
+        return
+    merged: dict[str, dict[str, str]] = {}
+    for row in get_last_failures(db_path):
+        path = str(row.get("path") or "")
+        if path:
+            merged[path] = {"path": path, "error": str(row.get("error") or "")}
+    for row in entries:
+        path = str(row.get("path") or "")
+        if not path:
+            continue
+        merged[path] = {"path": path, "error": str(row.get("error") or "")}
+    ordered = list(merged.values())
+    if len(ordered) > max_entries:
+        ordered = ordered[-max_entries:]
+    set_last_failures(db_path, ordered)
+
 
 def get_last_failures(db_path: str | Path) -> list[dict[str, str]]:
     """Load last add failures."""

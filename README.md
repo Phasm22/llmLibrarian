@@ -222,7 +222,7 @@ Then:
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now llmlibrarian-mcp.service
-curl http://127.0.0.1:8765/healthz   # should return ok
+curl http://127.0.0.1:8765/healthz   # {"ok":true,"service":"llmLibrarian-mcp","version":"...","db_exists":true,"started_at":"..."}
 ```
 
 One-shot writes (`pal pull <path>` without `--watch`, `llmli add`, `llmli repair`)

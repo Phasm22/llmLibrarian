@@ -1570,6 +1570,7 @@ class SiloWatcher:
                     del self._queue[path]
         if not due:
             return 0
+        started = time.perf_counter()
         updated = 0
         removed = 0
         skipped = 0
@@ -1582,10 +1583,10 @@ class SiloWatcher:
                 except Exception as exc:
                     res = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
                 status = str(res.get("status") or "")
-                if status in ("updated", "removed", "unchanged"):
+                if status in ("updated", "removed", "unchanged", "skipped"):
                     if action == "delete":
                         removed += 1
-                    elif status == "unchanged":
+                    elif status in ("unchanged", "skipped"):
                         skipped += 1
                     else:
                         updated += 1
@@ -1596,11 +1597,35 @@ class SiloWatcher:
                     detail = str(res.get("error") or res.get("message") or status or "unknown")
                     errors.append((path, detail))
         if errors:
+            _ensure_src_on_path()
+            from state import append_last_failures
+
+            append_last_failures(
+                self.db_path,
+                [{"path": p, "error": e} for p, e in errors],
+            )
             first_path = Path(errors[0][0]).name
             self._log(f"{self.label}: {len(errors)} file(s) failed via MCP; first={first_path}: {errors[0][1]}")
         processed = updated + removed
         if processed or skipped:
             self._log(f"{self.label}: pull complete after +{updated} queued, -{removed} queued, {skipped} skipped")
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        _ensure_src_on_path()
+        from state import failures_path, get_last_failures
+        from watch_telemetry import EVENT_BATCH_DRAIN, emit_watch_event
+
+        emit_watch_event(
+            self._logger,
+            EVENT_BATCH_DRAIN,
+            silo=self.silo_slug,
+            updated=updated,
+            removed=removed,
+            skipped=skipped,
+            errors=[{"path": p, "error": e} for p, e in errors[:10]],
+            duration_ms=duration_ms,
+            last_failures_path=str(failures_path(self.db_path)),
+            last_failure_count=len(get_last_failures(self.db_path)),
+        )
         return processed
 
     def _process_loop(self) -> None:
@@ -1609,6 +1634,15 @@ class SiloWatcher:
                 self._drain_due()
             except Exception as exc:
                 self._log(f"{self.label}: queue loop error: {exc}")
+                _ensure_src_on_path()
+                from watch_telemetry import EVENT_QUEUE_LOOP_ERROR, emit_watch_event
+
+                emit_watch_event(
+                    self._logger,
+                    EVENT_QUEUE_LOOP_ERROR,
+                    silo=self.silo_slug,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             time.sleep(0.2)
 
     def _reconcile_once(self) -> tuple[int, int, int]:
@@ -1650,16 +1684,41 @@ class SiloWatcher:
             queued_updates += 1
         return (queued_updates, queued_removes, skipped)
 
+    def _emit_reconcile_event(
+        self,
+        queued_updates: int,
+        queued_removes: int,
+        skipped: int,
+        duration_ms: int,
+    ) -> None:
+        if not (queued_updates or queued_removes):
+            return
+        _ensure_src_on_path()
+        from watch_telemetry import EVENT_RECONCILE, emit_watch_event
+
+        emit_watch_event(
+            self._logger,
+            EVENT_RECONCILE,
+            silo=self.silo_slug,
+            queued_updates=queued_updates,
+            queued_removes=queued_removes,
+            skipped=skipped,
+            duration_ms=duration_ms,
+        )
+
     def _reconcile_loop(self) -> None:
         while not self._stop.is_set():
             time.sleep(self.interval)
             if self._stop.is_set():
                 break
+            started = time.perf_counter()
             queued_updates, queued_removes, skipped = self._reconcile_once()
+            duration_ms = int((time.perf_counter() - started) * 1000)
             if queued_updates or queued_removes or skipped:
                 self._log(
                     f"Check for missed changes: +{queued_updates} queued, -{queued_removes} queued, {skipped} skipped"
                 )
+            self._emit_reconcile_event(queued_updates, queued_removes, skipped, duration_ms)
 
     def run(self) -> None:
         if self.startup_message:
@@ -1668,17 +1727,32 @@ class SiloWatcher:
             self._log(
                 f"Watching {self.label} (check every {int(self.interval)}s, wait {self.debounce}s after edits). Ctrl+C to stop."
             )
+        _ensure_src_on_path()
+        from watch_telemetry import EVENT_WATCH_START, emit_watch_event
+
+        emit_watch_event(
+            self._logger,
+            EVENT_WATCH_START,
+            silo=self.silo_slug,
+            root=str(self.root),
+            interval=self.interval,
+            debounce=self.debounce,
+            db_path=self.db_path,
+        )
         self._observer.schedule(self._handler, str(self.root), recursive=True)
         self._observer.start()
         worker = threading.Thread(target=self._process_loop, daemon=True)
         recon = threading.Thread(target=self._reconcile_loop, daemon=True)
         worker.start()
         recon.start()
+        started = time.perf_counter()
         queued_updates, queued_removes, skipped = self._reconcile_once()
+        duration_ms = int((time.perf_counter() - started) * 1000)
         if queued_updates or queued_removes or skipped:
             self._log(
                 f"Check for missed changes: +{queued_updates} queued, -{queued_removes} queued, {skipped} skipped"
             )
+        self._emit_reconcile_event(queued_updates, queued_removes, skipped, duration_ms)
         try:
             while not self._stop.is_set():
                 time.sleep(1.0)

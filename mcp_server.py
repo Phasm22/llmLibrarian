@@ -1,7 +1,11 @@
+import atexit
+import errno
 import logging
 import os
+import signal
 import sys
 import traceback
+from importlib.metadata import PackageNotFoundError, version as package_version
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,6 +113,101 @@ import threading
 
 # Serializes concurrent trigger_reindex calls in-process (no subprocess races).
 _reindex_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Single-instance enforcement (HTTP transport only)
+# fcntl.LOCK_EX | LOCK_NB on a PID file prevents a second HTTP server from
+# opening the same ChromaDB path and corrupting the HNSW index.
+# Stdio processes are ephemeral and do not acquire this lock.
+# ---------------------------------------------------------------------------
+
+_server_lock_fd: int | None = None
+_server_lock_path: Path | None = None
+_SERVER_STARTED_AT: str | None = None
+
+
+def _package_version() -> str:
+    try:
+        return package_version("llmlibrarian")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _pid_file_path() -> Path:
+    # Use a fixed path that doesn't depend on XDG_RUNTIME_DIR so shell-launched
+    # and service-launched processes always agree on the same lock file.
+    uid = os.getuid() if hasattr(os, "getuid") else "0"
+    return Path(f"/tmp/llmlibrarian-mcp-{uid}.pid")
+
+
+def _release_server_lock() -> None:
+    global _server_lock_fd, _server_lock_path
+    fd, path = _server_lock_fd, _server_lock_path
+    _server_lock_fd = None
+    _server_lock_path = None
+    if fd is not None:
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+    if path is not None:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _sigterm_handler(signum: int, frame: object) -> None:
+    _release_server_lock()
+    sys.exit(0)
+
+
+def _acquire_server_lock() -> None:
+    """Acquire an exclusive PID file lock; exit(0) cleanly if already held."""
+    global _server_lock_fd, _server_lock_path
+    try:
+        import fcntl
+    except ImportError:
+        return  # Windows — skip (fcntl is Unix-only)
+
+    pid_path = _pid_file_path()
+    try:
+        fd = os.open(str(pid_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        print(f"[llmLibrarian] cannot open PID file {pid_path}: {e}", file=sys.stderr)
+        return
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        if e.errno not in (errno.EWOULDBLOCK, errno.EACCES):
+            os.close(fd)
+            raise
+        # Lock held by another process — read its PID and exit cleanly.
+        try:
+            existing = os.pread(fd, 32, 0).decode().strip()
+        except Exception:
+            existing = "unknown"
+        os.close(fd)
+        print(
+            f"[llmLibrarian] another MCP server is already running (pid={existing}), exiting",
+            file=sys.stderr,
+        )
+        sys.exit(0)
+
+    # Lock acquired — record fd and write our PID.
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    _server_lock_fd = fd
+    _server_lock_path = pid_path
+    atexit.register(_release_server_lock)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGINT, _sigterm_handler)
 
 if not Path(_DB_PATH).exists():
     print(
@@ -833,7 +932,11 @@ def update_file(silo: str, path: str, confirm: bool = False) -> dict:
         return {"status": status, "silo": slug, "path": resolved}
     except Exception as e:
         _logger.exception("update_file failed silo=%s path=%s", slug, abs_path)
-        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        err_msg = f"{type(e).__name__}: {e}"
+        from state import append_last_failures
+
+        append_last_failures(_DB_PATH, [{"path": abs_path, "error": err_msg}])
+        return {"status": "error", "error": err_msg}
     finally:
         _release_chroma()
 
@@ -866,7 +969,11 @@ def remove_file(silo: str, path: str, confirm: bool = False) -> dict:
         return {"status": status, "silo": slug, "path": resolved}
     except Exception as e:
         _logger.exception("remove_file failed silo=%s path=%s", slug, abs_path)
-        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        err_msg = f"{type(e).__name__}: {e}"
+        from state import append_last_failures
+
+        append_last_failures(_DB_PATH, [{"path": abs_path, "error": err_msg}])
+        return {"status": "error", "error": err_msg}
     finally:
         _release_chroma()
 
@@ -1073,7 +1180,13 @@ def get_silo(slug: str) -> str:
 @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
 async def healthz(_: Request) -> Response:
     """Simple liveness check for process supervisors and reverse proxies."""
-    return JSONResponse({"ok": True, "service": "llmLibrarian-mcp"})
+    return JSONResponse({
+        "ok": True,
+        "service": "llmLibrarian-mcp",
+        "version": _package_version(),
+        "db_exists": Path(_DB_PATH).exists(),
+        "started_at": _SERVER_STARTED_AT,
+    })
 
 
 if __name__ == "__main__":
@@ -1083,6 +1196,13 @@ if __name__ == "__main__":
             "LLMLIBRARIAN_MCP_TRANSPORT must be one of: "
             "stdio, http, sse, streamable-http"
         )
+
+    # Acquire single-instance lock for persistent HTTP server processes.
+    # Stdio processes are ephemeral (one per Claude Desktop conversation) and
+    # must not acquire this lock — they'd block each other needlessly.
+    if transport != "stdio":
+        _acquire_server_lock()
+        _SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
     auth_provider = _auth_for_transport(transport)
     if auth_provider is not None:

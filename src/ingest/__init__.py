@@ -88,7 +88,8 @@ ADD_DEFAULT_EXCLUDE = [
     ".env", ".env.*", ".aws/", ".ssh/", "*.pem", "*.key", "secrets.json", "credentials.json", "credentials*.json",
     "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "Pipfile.lock", "poetry.lock",
     "composer.lock", "Gemfile.lock", "Cargo.lock", "uv.lock",
-    "my_brain_db/", "*.db", "*.sqlite", "*.sqlite3",
+    "my_brain_db/", "*.db", "*.sqlite", "*.sqlite3", "*.sqlite3-journal",
+    "tmp", "/tmp",
 ]
 
 
@@ -2890,6 +2891,17 @@ def remove_single_file(
     return ("removed" if prev else "skipped", path_str)
 
 
+def _record_single_file_failure(db_path: str | Path, path_str: str, error: str) -> None:
+    from state import append_last_failures
+
+    append_last_failures(db_path, [{"path": path_str, "error": error}])
+
+
+def _fail_single_file(db_path: str | Path, path_str: str, error: str) -> tuple[str, str]:
+    _record_single_file_failure(db_path, path_str, error)
+    return ("error", path_str)
+
+
 def update_single_file(
     path: str | Path,
     db_path: str | Path | None = None,
@@ -2917,7 +2929,7 @@ def update_single_file(
     try:
         p = p.resolve()
     except Exception:
-        return ("error", str(p))
+        return _fail_single_file(db_path, str(p), "path resolution failed")
     path_str = str(p)
     if not p.exists() or not p.is_file():
         return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
@@ -2939,7 +2951,7 @@ def update_single_file(
                 ensure_vision_model_ready()
             ensure_image_embedding_adapter_ready()
         except Exception:
-            return ("error", path_str)
+            return _fail_single_file(db_path, path_str, "image model not ready")
 
     max_file_bytes, _max_depth, max_archive_bytes, max_files_per_zip, max_extracted_per_zip = _load_limits_config()
     try:
@@ -2947,7 +2959,7 @@ def update_single_file(
         mtime = stat.st_mtime
         size = stat.st_size
     except OSError:
-        return ("error", path_str)
+        return _fail_single_file(db_path, path_str, "stat failed")
 
     kind = _detect_kind(p)
     if kind != "zip" and size > max_file_bytes:
@@ -3001,7 +3013,7 @@ def update_single_file(
                     db_path=db_path,
                 )
             except Exception:
-                return ("error", path_str)
+                return _fail_single_file(db_path, path_str, "zip processing failed")
         else:
             clone_from = next(
                 (str(e.get("silo") or "") for e in existing if str(e.get("silo") or "") != silo_slug),
@@ -3038,7 +3050,7 @@ def update_single_file(
                         image_vision_enabled=effective_image_vision_enabled,
                     )
                 except Exception:
-                    return ("error", path_str)
+                    return _fail_single_file(db_path, path_str, "file processing failed")
 
         _delete_source_from_collections(
             collection=collection,
