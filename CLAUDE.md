@@ -67,7 +67,7 @@ pal daemon install|sync|uninstall|logs  # Manage background watchers
 2. `ask` → intent route → retrieve from ChromaDB (with optional silo filter) → diversify (max 4 chunks/file) → optional rerank → build prompt → Ollama → styled output with sources
 
 **Storage:**
-- ChromaDB persistent client in `./my_brain_db` (or `LLMLIBRARIAN_DB`)
+- ChromaDB in `./my_brain_db` (or `LLMLIBRARIAN_DB`): embedded `PersistentClient` by default, or HTTP to `chroma run` when `LLMLIBRARIAN_CHROMA_HOST` is set (`pal chroma start`)
 - Single collection `llmli` for all silos; chunks tagged with `silo` metadata
 - Registry files: `llmli_registry.json`, `llmli_file_registry.json`, `llmli_last_failures.json`
 
@@ -81,6 +81,8 @@ pal daemon install|sync|uninstall|logs  # Manage background watchers
 ## Key Environment Variables
 
 - `LLMLIBRARIAN_DB` — DB path (default: `./my_brain_db`)
+- `LLMLIBRARIAN_CHROMA_HOST` / `LLMLIBRARIAN_CHROMA_PORT` — HTTP client to local `chroma run` (server mode; safe MCP + CLI writes)
+- `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` — embedded long-lived readers exit 99 after external writes
 - `LLMLIBRARIAN_MODEL` — Ollama model (default: `llama3.1:8b`)
 - `LLMLIBRARIAN_TRACE` — JSON-lines trace file for debugging
 - `LLMLIBRARIAN_RERANK=1` — Enable cross-encoder reranker

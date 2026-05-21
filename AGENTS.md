@@ -28,6 +28,7 @@ When integrated via MCP, prefer tools over shell so you do not depend on `PYTHON
 2. If `is_stale: true` and `stale_file_count` is substantial, call `trigger_reindex` before querying.
 3. If `stale_file_count` is small (<= 2-3) **and** `newest_source_mtime_iso` matches the silo's `updated` timestamp, treat the residual as write-during-index race noise; the index is usable, skip reindex.
 4. `db_exists: false` means the `LLMLIBRARIAN_DB` env var is misconfigured for this process. Fix the launch config before proceeding; retrieval results are invalid until resolved.
+5. `health()` reports `chroma_transport` (`embedded` vs `http`). If `embedded` and you need CLI ingest while MCP is up, enable server mode (`LLMLIBRARIAN_CHROMA_HOST`, `pal chroma start`) — see [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).
 
 `check_staleness` does a filesystem mtime walk; cheap for repo-sized silos (< 200ms observed on 175 files).
 

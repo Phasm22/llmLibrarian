@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.llmlibrarian.chroma</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{INSTALL_DIR}}/scripts/run_chroma_server.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{INSTALL_DIR}}</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>{{LOG_DIR}}/llmlibrarian-chroma.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{LOG_DIR}}/llmlibrarian-chroma.stderr.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

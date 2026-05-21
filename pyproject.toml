@@ -81,8 +81,11 @@ packages = ["src"]
 "archetypes.yaml" = "archetypes.yaml"
 "src/vision_ocr.swift" = "src/vision_ocr.swift"
 "deploy/systemd/llmlibrarian-mcp@.service" = "deploy/systemd/llmlibrarian-mcp@.service"
+"deploy/systemd/llmlibrarian-chroma@.service" = "deploy/systemd/llmlibrarian-chroma@.service"
 "deploy/launchd/com.tjm4.llmlibrarian-mcp.plist" = "deploy/launchd/com.tjm4.llmlibrarian-mcp.plist"
+"deploy/launchd/com.llmlibrarian.chroma.plist" = "deploy/launchd/com.llmlibrarian.chroma.plist"
 "scripts/run_mcp_http.sh" = "scripts/run_mcp_http.sh"
+"scripts/run_chroma_server.sh" = "scripts/run_chroma_server.sh"
 
 [dependency-groups]
 dev = [

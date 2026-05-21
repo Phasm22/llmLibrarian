@@ -1844,6 +1844,17 @@ def _pull_path_mode(
         return 1
 
     _ensure_src_on_path()
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
+    try:
+        from chroma_client import preflight_embedded_write
+
+        preflight_err = preflight_embedded_write(str(db_path))
+        if preflight_err:
+            print(preflight_err, file=sys.stderr)
+            return 1
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
     # Apply suppression env vars before calling run_add directly so log noise is
     # controlled the same way the subprocess approach did.
     suppress_env = {
@@ -1854,7 +1865,6 @@ def _pull_path_mode(
     try:
         from orchestration.ingest import IngestRequest, run_ingest
 
-        db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
         result = run_ingest(
             IngestRequest(
                 path=path,
@@ -2221,6 +2231,12 @@ _MCP_CLIENT_ENV_KEYS = {
     "LLMLIBRARIAN_MCP_BEARER_TOKEN",
 }
 
+_CHROMA_ENV_KEYS = {
+    "LLMLIBRARIAN_CHROMA_HOST",
+    "LLMLIBRARIAN_CHROMA_PORT",
+    "LLMLIBRARIAN_CHROMA_SSL",
+}
+
 
 def _daemon_env(db_path: str | Path) -> dict[str, str]:
     env = os.environ.copy()
@@ -2229,13 +2245,15 @@ def _daemon_env(db_path: str | Path) -> dict[str, str]:
 
     # If MCP client env vars aren't in the caller's shell, read them from .env.mcp
     # in the workdir so watch-service unit files always get the correct MCP path.
-    if not any(k in env for k in _MCP_CLIENT_ENV_KEYS):
+    if not any(k in env for k in _MCP_CLIENT_ENV_KEYS) or not any(k in env for k in _CHROMA_ENV_KEYS):
         existing = _daemon_metadata()
         if existing:
             workdir = Path(str(existing.get("workdir") or ""))
             env_mcp = workdir / ".env.mcp"
             for key, val in _parse_env_file(env_mcp).items():
-                if key in _MCP_CLIENT_ENV_KEYS and val:
+                if key in _MCP_CLIENT_ENV_KEYS and val and key not in env:
+                    env[key] = val
+                if key in _CHROMA_ENV_KEYS and val and key not in env:
                     env[key] = val
 
     return env
@@ -2345,6 +2363,66 @@ def _install_mcp_service(install_dir: Path, manager: str) -> tuple[bool, str]:
     return True, str(dest)
 
 
+def _chroma_service_paths(manager: str, install_dir: Path | None = None) -> tuple[Path, Path, list[str], list[str]]:
+    root = install_dir or _default_project_root()
+    deploy_dir = root / "deploy"
+    log_dir = PAL_HOME / "logs"
+    if manager == "systemd":
+        template = deploy_dir / "systemd" / "llmlibrarian-chroma@.service"
+        dest = jobsrt.systemd_user_dir() / "llmlibrarian-chroma.service"
+        enable_cmd = ["systemctl", "--user", "daemon-reload"]
+        start_cmd = ["systemctl", "--user", "enable", "--now", "llmlibrarian-chroma.service"]
+        stop_cmd = ["systemctl", "--user", "disable", "--now", "llmlibrarian-chroma.service"]
+        status_cmd = ["systemctl", "--user", "is-active", "llmlibrarian-chroma.service"]
+    elif manager == "launchd":
+        template = deploy_dir / "launchd" / "com.llmlibrarian.chroma.plist"
+        label = "com.llmlibrarian.chroma"
+        dest = jobsrt.launchd_agents_dir() / f"{label}.plist"
+        enable_cmd = ["launchctl", "unload", str(dest)]
+        start_cmd = ["launchctl", "load", str(dest)]
+        stop_cmd = ["launchctl", "unload", str(dest)]
+        status_cmd = ["launchctl", "print", f"gui/{os.getuid()}/{label}"]
+    else:
+        raise ValueError(f"unsupported platform: {manager}")
+    return template, dest, enable_cmd, start_cmd, stop_cmd, status_cmd
+
+
+def _install_chroma_service(install_dir: Path, manager: str) -> tuple[bool, str]:
+    try:
+        template, dest, enable_cmd, start_cmd, _, _ = _chroma_service_paths(manager, install_dir)
+    except ValueError as exc:
+        return False, str(exc)
+    log_dir = PAL_HOME / "logs"
+    if not template.exists():
+        return False, f"template not found: {template}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(_render_mcp_template(template, install_dir, log_dir), encoding="utf-8")
+    subprocess.run(enable_cmd, capture_output=True)
+    result = subprocess.run(start_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return False, result.stderr.strip() or f"command failed: {' '.join(start_cmd)}"
+    return True, str(dest)
+
+
+def _chroma_service_installed(manager: str) -> bool:
+    try:
+        _, dest, _, _, _, _ = _chroma_service_paths(manager)
+    except ValueError:
+        return False
+    return dest.exists()
+
+
+def _chroma_service_active(manager: str) -> tuple[bool, str]:
+    try:
+        _, _, _, _, _, status_cmd = _chroma_service_paths(manager)
+    except ValueError as exc:
+        return False, str(exc)
+    rc, out = jobsrt._run_command(status_cmd)
+    if manager == "systemd":
+        return rc == 0 and out.strip() == "active", out or "inactive"
+    return rc == 0, out or "not loaded"
+
+
 def _resolve_job_target(target: str, jobs: list[jobsrt.JobSpec]) -> tuple[jobsrt.JobSpec | None, str | None]:
     raw = (target or "").strip()
     if not raw:
@@ -2439,8 +2517,10 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 daemon_app = typer.Typer(help="Install and manage background silo watchers.", add_completion=False, invoke_without_command=True)
+chroma_app = typer.Typer(help="Manage local ChromaDB server (chroma run) for safe multi-process access.", add_completion=False)
 extension_app = typer.Typer(help="Claude Desktop MCP packaging (records mcp_server.py hash).", add_completion=False)
 app.add_typer(daemon_app, name="daemon")
+app.add_typer(chroma_app, name="chroma")
 app.add_typer(extension_app, name="extension")
 
 
@@ -2584,7 +2664,7 @@ def install_command(
         if not manager_name:
             print("mcp:       unsupported platform, skipping", file=sys.stderr)
         else:
-            install_dir = Path(__file__).resolve().parent
+            install_dir = _default_project_root()
             ok, detail = _install_mcp_service(install_dir, manager_name)
             if ok:
                 print(f"mcp:       service installed → {detail}")
@@ -2922,6 +3002,89 @@ def remove_command(
     else:
         _remove_source_path(name)
     _sync_daemon_if_installed()
+
+
+@chroma_app.command("install", help="Install user-space ChromaDB server (chroma run) service.")
+def chroma_install_command() -> None:
+    manager = jobsrt.supported_service_manager()
+    if not manager:
+        print(f"Unsupported platform for chroma service: {sys.platform}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    PAL_HOME.mkdir(parents=True, exist_ok=True)
+    jobsrt.watch_log_dir(PAL_HOME).mkdir(parents=True, exist_ok=True)
+    install_dir = _default_project_root()
+    ok, detail = _install_chroma_service(install_dir, manager)
+    if not ok:
+        print(f"Chroma install failed: {detail}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    print(f"Chroma server installed ({manager}): {detail}")
+    print("Set LLMLIBRARIAN_CHROMA_HOST=127.0.0.1 in .env.mcp (and restart MCP) to use HTTP mode.")
+
+
+@chroma_app.command("start", help="Start the ChromaDB server service.")
+def chroma_start_command() -> None:
+    manager = jobsrt.supported_service_manager()
+    if not manager or not _chroma_service_installed(manager):
+        print("Chroma service is not installed. Use: pal chroma install", file=sys.stderr)
+        raise typer.Exit(code=1)
+    _, _, enable_cmd, start_cmd, _, _ = _chroma_service_paths(manager)
+    subprocess.run(enable_cmd, capture_output=True)
+    result = subprocess.run(start_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stderr.strip() or "chroma start failed", file=sys.stderr)
+        raise typer.Exit(code=result.returncode)
+    print("Chroma server started.")
+
+
+@chroma_app.command("stop", help="Stop the ChromaDB server service.")
+def chroma_stop_command() -> None:
+    manager = jobsrt.supported_service_manager()
+    if not manager or not _chroma_service_installed(manager):
+        print("Chroma service is not installed.", file=sys.stderr)
+        raise typer.Exit(code=1)
+    _, _, _, _, stop_cmd, _ = _chroma_service_paths(manager)
+    subprocess.run(stop_cmd, capture_output=True)
+    print("Chroma server stopped.")
+
+
+@chroma_app.command("status", help="Show Chroma transport mode and server health.")
+def chroma_status_command() -> None:
+    _ensure_src_on_path()
+    from chroma_client import chroma_mode_info, check_chroma_server_reachable, chroma_http_settings, chroma_transport_mode
+
+    info = chroma_mode_info()
+    manager = jobsrt.supported_service_manager()
+    if manager:
+        installed = _chroma_service_installed(manager)
+        active, active_detail = _chroma_service_active(manager) if installed else (False, "not installed")
+        info["chroma_service_installed"] = installed
+        info["chroma_service_active"] = active
+        if active_detail:
+            info["chroma_service_detail"] = active_detail
+    print(json.dumps(info, indent=2))
+    if chroma_transport_mode() == "http":
+        host, port, ssl = chroma_http_settings()
+        ok, detail = check_chroma_server_reachable(host, port, ssl=ssl)
+        if not ok:
+            print(f"Warning: configured HTTP server not reachable: {detail}", file=sys.stderr)
+            raise typer.Exit(code=1)
+
+
+@chroma_app.command("logs", help="Show recent Chroma server logs.")
+def chroma_logs_command(lines: int = typer.Option(50, "--lines", min=1)) -> None:
+    stdout_log = PAL_HOME / "logs" / "llmlibrarian-chroma.stdout.log"
+    stderr_log = PAL_HOME / "logs" / "llmlibrarian-chroma.stderr.log"
+    if stdout_log.exists():
+        print("# stdout")
+        for line in _tail_file(stdout_log, lines=lines):
+            print(line)
+    if stderr_log.exists():
+        print("# stderr")
+        for line in _tail_file(stderr_log, lines=lines):
+            print(line)
+    if not stdout_log.exists() and not stderr_log.exists():
+        print("No chroma logs found. Install with: pal chroma install", file=sys.stderr)
+        raise typer.Exit(code=1)
 
 
 @daemon_app.command("install", help="Install user-space watch services for registered silos.")

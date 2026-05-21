@@ -1114,9 +1114,12 @@ def health() -> dict:
     duplicate_hashes = find_duplicate_hashes(file_registry)
     path_overlaps = find_path_overlaps(registry)
     orphaned_sources = find_orphaned_sources(registry)
+    from chroma_client import chroma_mode_info
+
     out: dict = {
         "db_path": _DB_PATH,
         "db_exists": Path(_DB_PATH).exists(),
+        **chroma_mode_info(),
         "embedding_model": embedding_model,
         "embedding_kind": embedding_kind,
         "python_version": sys.version,
@@ -1217,6 +1220,7 @@ async def healthz(_: Request) -> Response:
         "ok": True,
         "service": "llmLibrarian-mcp",
         "version": _package_version(),
+        "db_path": _DB_PATH,
         "db_exists": Path(_DB_PATH).exists(),
         "started_at": _SERVER_STARTED_AT,
     })

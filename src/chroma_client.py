@@ -4,12 +4,21 @@ Singleton ChromaDB client factory.
 All modules import get_client() instead of constructing PersistentClient
 directly. A single shared client per db_path eliminates the concurrent-write
 SIGSEGV caused by multiple Rust HNSW handles on the same files.
+
+When LLMLIBRARIAN_CHROMA_HOST is set, clients use chromadb.HttpClient against a
+local ``chroma run`` server (single on-disk writer). Otherwise embedded
+PersistentClient mode applies (not safe for concurrent processes on one path).
 """
 
+from __future__ import annotations
+
+import json
 import os
 import shutil
 import sys
 import threading
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -21,7 +30,7 @@ _lock = threading.Lock()
 _clients: dict[str, "_SafeClient"] = {}
 _fallback_warned: set[str] = set()
 
-# Cross-process write-generation tracking.
+# Cross-process write-generation tracking (embedded mode only).
 #
 # Background: ChromaDB 1.4+ keeps a process-global Rust/tokio runtime cache.
 # Calling clear_system_cache() to flush it crashes (see release() docstring).
@@ -37,6 +46,202 @@ _fallback_warned: set[str] = set()
 # wrapper restarts itself via os.execv).
 _GEN_FILE_NAME = ".llmli_chroma_generation"
 _client_open_generation: dict[str, float] = {}
+
+
+def chroma_transport_mode() -> str:
+    """Return ``http`` when LLMLIBRARIAN_CHROMA_HOST is set, else ``embedded``."""
+    if os.environ.get("LLMLIBRARIAN_CHROMA_HOST", "").strip():
+        return "http"
+    return "embedded"
+
+
+def is_http_mode() -> bool:
+    return chroma_transport_mode() == "http"
+
+
+def chroma_http_settings() -> tuple[str, int, bool]:
+    host = os.environ.get("LLMLIBRARIAN_CHROMA_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port_raw = os.environ.get("LLMLIBRARIAN_CHROMA_PORT", "8000").strip() or "8000"
+    try:
+        port = int(port_raw)
+    except ValueError:
+        port = 8000
+    ssl_flag = os.environ.get("LLMLIBRARIAN_CHROMA_SSL", "").strip().lower() in ("1", "true", "yes")
+    return host, port, ssl_flag
+
+
+def chroma_mode_info() -> dict[str, Any]:
+    """Summary for MCP health() and operator tooling."""
+    mode = chroma_transport_mode()
+    out: dict[str, Any] = {
+        "chroma_transport": mode,
+        "embedded_write_unsafe_with_cli": mode == "embedded",
+    }
+    if mode == "http":
+        host, port, ssl = chroma_http_settings()
+        ok, detail = check_chroma_server_reachable(host, port, ssl=ssl)
+        out["chroma_server_host"] = host
+        out["chroma_server_port"] = port
+        out["chroma_server_ok"] = ok
+        if detail:
+            out["chroma_server_detail"] = detail
+    return out
+
+
+def check_chroma_server_reachable(
+    host: str | None = None,
+    port: int | None = None,
+    *,
+    ssl: bool | None = None,
+    timeout: float = 2.0,
+) -> tuple[bool, str | None]:
+    """Probe Chroma HTTP heartbeat. Returns (ok, error_detail)."""
+    h, p, use_ssl = chroma_http_settings()
+    if host is not None:
+        h = host
+    if port is not None:
+        p = port
+    if ssl is not None:
+        use_ssl = ssl
+    scheme = "https" if use_ssl else "http"
+    # Chroma 1.x serves heartbeat on v2; v1 returns 410 Gone.
+    for path in ("/api/v2/heartbeat", "/api/v1/heartbeat"):
+        url = f"{scheme}://{h}:{p}{path}"
+        try:
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return True, None
+        except urllib.error.HTTPError as exc:
+            if exc.code == 410 and path == "/api/v1/heartbeat":
+                continue
+            return False, f"heartbeat {path} returned HTTP {exc.code}"
+        except Exception as exc:
+            return False, str(exc)
+    return False, "heartbeat unreachable"
+
+
+def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
+    """Return (reachable, db_path) for the llmLibrarian MCP HTTP /healthz probe."""
+    host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765").strip() or "8765"
+    url = f"http://{host}:{port}/healthz"
+    try:
+        req = urllib.request.Request(url)
+        tok = os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN", "").strip()
+        if tok:
+            req.add_header("Authorization", f"Bearer {tok}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            if resp.status != 200:
+                return False, None
+            raw = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return False, None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return True, None
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return False, None
+    db_raw = payload.get("db_path")
+    if isinstance(db_raw, str) and db_raw.strip():
+        return True, str(Path(db_raw).expanduser().resolve())
+    return True, None
+
+
+def _mcp_blocks_embedded_write(db_path: str) -> bool:
+    """True when a live MCP server holds PersistentClient on this db_path."""
+    up, mcp_db = _mcp_healthz_info()
+    if not up:
+        return False
+    target = str(Path(db_path).expanduser().resolve())
+    if mcp_db is None:
+        # Cannot confirm MCP is on this DB (upgrade MCP /healthz includes db_path).
+        return False
+    return mcp_db == target
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _active_watch_processes_for_db(db_path: str) -> list[str]:
+    """Return human-readable labels for running pal pull --watch processes on db_path."""
+    db_resolved = str(Path(db_path).expanduser().resolve())
+    pal_home = Path(os.environ.get("PAL_HOME", str(Path.home() / ".pal"))).expanduser()
+    locks_dir = pal_home / "watch_locks"
+    if not locks_dir.is_dir():
+        return []
+    active: list[str] = []
+    for lock_path in sorted(locks_dir.glob("*.pid")):
+        try:
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        lock_db = str(data.get("db_path") or "").strip()
+        if lock_db and lock_db != db_resolved:
+            continue
+        pid_val = data.get("pid")
+        try:
+            pid = int(pid_val) if pid_val is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        if pid is None or not _pid_is_running(pid):
+            continue
+        silo = str(data.get("silo") or lock_path.stem)
+        active.append(f"pal pull --watch (silo={silo}, pid={pid})")
+    return active
+
+
+def preflight_embedded_write(db_path: str) -> str | None:
+    """Return an error message if an embedded write is likely to SIGSEGV, else None.
+
+    Skipped in HTTP mode (Chroma server is the single on-disk writer).
+    Skipped when LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT=1 (tests).
+    """
+    if is_http_mode():
+        return None
+    if os.environ.get("LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return None
+
+    reasons: list[str] = []
+    if _mcp_blocks_embedded_write(db_path):
+        reasons.append("llmLibrarian MCP HTTP server is running on this DB (holds a cached PersistentClient)")
+    watchers = _active_watch_processes_for_db(db_path)
+    reasons.extend(watchers)
+
+    if not reasons:
+        return None
+
+    host, port, _ = chroma_http_settings()
+    lines = [
+        "Refusing embedded ChromaDB write: another long-lived process may have the index open.",
+        "Opening a second PersistentClient on the same path can SIGSEGV (ChromaDB 1.x is not process-safe).",
+        "",
+        "Detected:",
+    ]
+    lines.extend(f"  - {r}" for r in reasons)
+    lines.extend(
+        [
+            "",
+            "Options:",
+            "  - Route writes through MCP: add_silo / trigger_reindex / repair_silo",
+            "  - Stop MCP and watchers, run pal pull / llmli add, then restart",
+            f"  - Enable server mode: LLMLIBRARIAN_CHROMA_HOST=127.0.0.1 LLMLIBRARIAN_CHROMA_PORT={port}",
+            "    then: pal chroma install && pal chroma start",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _generation_path(db_path: str) -> Path:
@@ -57,14 +262,14 @@ def bump_generation(db_path: str) -> None:
     Idempotent. Safe across processes (uses filesystem mtime). Readers that
     opened their PersistentClient before this call will see
     check_for_writer_changes() == True on their next check.
+    No-op in HTTP mode.
     """
+    if is_http_mode():
+        return
     p = _generation_path(db_path)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        # `touch` updates mtime; create if missing.
         p.touch(exist_ok=True)
-        # Bump mtime explicitly to ensure monotonic forward progress even if
-        # two writers finish in the same second on coarse filesystems.
         os.utime(p, None)
     except OSError:
         pass
@@ -74,6 +279,8 @@ def check_for_writer_changes(db_path: str) -> bool:
     """Return True if a writer has bumped the generation since this process
     opened the cached PersistentClient for db_path. Returns False if no
     client is cached for this db_path (nothing to invalidate yet)."""
+    if is_http_mode():
+        return False
     key = str(Path(db_path).expanduser().resolve())
     with _lock:
         opened_at = _client_open_generation.get(key)
@@ -95,6 +302,7 @@ def exit_if_stale(db_path: str, *, exit_code: int = 99) -> None:
             flush=True,
         )
         sys.exit(exit_code)
+
 
 _HNSW_BLOAT_BYTES = 1 << 30
 _MIN_FREE_BYTES = 512 * 1024 * 1024
@@ -134,6 +342,27 @@ def _storage_preflight(db_path: str) -> None:
             )
 
 
+def _open_raw_client(db_path: str) -> Any:
+    if is_http_mode():
+        host, port, ssl = chroma_http_settings()
+        ok, detail = check_chroma_server_reachable(host, port, ssl=ssl)
+        if not ok:
+            raise RuntimeError(
+                f"Chroma HTTP server not reachable at {host}:{port} ({detail}). "
+                "Start it with: pal chroma start"
+            )
+        return chromadb.HttpClient(
+            host=host,
+            port=port,
+            ssl=ssl,
+            settings=Settings(anonymized_telemetry=False),
+        )
+    return chromadb.PersistentClient(
+        path=db_path,
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+
 class _SafeClient:
     """Thin wrapper that retries get_or_create_collection with DefaultEmbeddingFunction
     when an embedding-function conflict is detected against an existing collection.
@@ -145,7 +374,7 @@ class _SafeClient:
     one for explicit embedding (avoiding dimension mismatches in parallel ingest).
     """
 
-    def __init__(self, client: chromadb.PersistentClient) -> None:
+    def __init__(self, client: Any) -> None:
         self._client = client
         self._effective_efs: dict[str, Any] = {}
 
@@ -186,15 +415,10 @@ class _SafeClient:
 
 
 def get_client(db_path: str) -> "_SafeClient":
-    """Return (or create) the shared PersistentClient for db_path.
+    """Return (or create) the shared Chroma client for db_path.
 
-    If a cached client exists but the write-generation file has advanced
-    since it was opened, and LLMLIBRARIAN_EXIT_ON_STALE_GENERATION is set
-    (default off in CLI use, opt-in for long-lived readers like MCP and
-    watchers), exit the process so a supervisor restarts it with fresh
-    ChromaDB state. Without that env, the cached client is returned as-is
-    — queries against on-disk segments mutated by another process may
-    return stale results or SIGSEGV in the Rust _query path.
+    Embedded mode: PersistentClient with optional exit-on-stale generation.
+    HTTP mode: HttpClient to a local ``chroma run`` server.
     """
     key = str(Path(db_path).expanduser().resolve())
     with _lock:
@@ -213,16 +437,16 @@ def get_client(db_path: str) -> "_SafeClient":
                     sys.exit(99)
             return _clients[db_path]
         _storage_preflight(db_path)
-        raw = chromadb.PersistentClient(
-            path=db_path,
-            settings=Settings(anonymized_telemetry=False),
-        )
+        raw = _open_raw_client(db_path)
         _clients[db_path] = _SafeClient(raw)
-        _client_open_generation[key] = _read_generation(key)
+        if not is_http_mode():
+            _client_open_generation[key] = _read_generation(key)
         return _clients[db_path]
 
 
 def _exit_on_stale_enabled() -> bool:
+    if is_http_mode():
+        return False
     flag = os.environ.get("LLMLIBRARIAN_EXIT_ON_STALE_GENERATION", "").strip().lower()
     return flag in ("1", "true", "yes")
 
@@ -251,32 +475,34 @@ def get_collection(db_path: str, name: str, embedding_function=None):
 
 @contextmanager
 def writer_client(db_path: str) -> Iterator["_SafeClient"]:
-    """Acquire exclusive Chroma write access with a fresh, non-singleton client.
+    """Acquire exclusive Chroma write access.
 
-    Why fresh: get_client() caches a PersistentClient per process. Two writer
-    processes can each hold a live cached client across overlapping flock windows
-    (since the flock only wraps the call, not the client lifetime). With Chroma
-    running an async compaction thread, two live clients on the same persist dir
-    can corrupt the HNSW segment ("Failed to apply logs to the hnsw segment writer").
-
-    By opening a dedicated client inside the exclusive lock and dropping it before
-    the lock releases, only one writer client is alive on this DB at a time.
-    Read paths continue to use the singleton via get_client() + chroma_shared_lock.
+    Embedded mode: fresh non-singleton PersistentClient inside flock; bumps generation.
+    HTTP mode: shared HttpClient inside flock (server is single on-disk writer).
     """
     from chroma_lock import chroma_exclusive_lock
 
+    err = preflight_embedded_write(db_path)
+    if err:
+        raise RuntimeError(err)
+
     with chroma_exclusive_lock(db_path):
         _storage_preflight(db_path)
-        raw = chromadb.PersistentClient(
-            path=db_path,
-            settings=Settings(anonymized_telemetry=False),
-        )
-        client = _SafeClient(raw)
-        try:
-            yield client
-        finally:
-            del client
-            del raw
-            # Notify other-process readers that on-disk segments have moved
-            # so they can self-restart with fresh ChromaDB state.
-            bump_generation(db_path)
+        if is_http_mode():
+            client = get_client(db_path)
+            try:
+                yield client
+            finally:
+                pass
+        else:
+            raw = chromadb.PersistentClient(
+                path=db_path,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            client = _SafeClient(raw)
+            try:
+                yield client
+            finally:
+                del client
+                del raw
+                bump_generation(db_path)

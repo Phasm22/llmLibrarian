@@ -20,9 +20,10 @@ def mcp_module(monkeypatch, tmp_path):
     return mcp_server
 
 
-def test_healthz_returns_probe_fields(mcp_module):
+def test_healthz_returns_probe_fields(mcp_module, tmp_path):
     scope = {"type": "http", "method": "GET", "path": "/healthz", "headers": []}
     request = Request(scope)
+    expected_db = str(tmp_path / "db")
 
     async def _run():
         response = await mcp_module.healthz(request)
@@ -32,6 +33,7 @@ def test_healthz_returns_probe_fields(mcp_module):
             "ok": True,
             "service": "llmLibrarian-mcp",
             "version": "0.1.0-test",
+            "db_path": expected_db,
             "db_exists": True,
             "started_at": "2026-05-19T12:00:00+00:00",
         }

@@ -226,8 +226,28 @@ curl http://127.0.0.1:8765/healthz   # {"ok":true,"service":"llmLibrarian-mcp","
 ```
 
 One-shot writes (`pal pull <path>` without `--watch`, `llmli add`, `llmli repair`)
-keep their direct-write path and serialize via flock — they do not require the
-shared server.
+use embedded Chroma unless server mode is enabled (below). **Do not run them while
+MCP HTTP is up** in embedded mode — llmLibrarian refuses the write with a clear
+error (Chroma 1.x is not process-safe; concurrent `PersistentClient` instances can SIGSEGV).
+Use MCP `add_silo` / `trigger_reindex` instead, or enable server mode.
+
+### Chroma server mode (MCP + `pal pull` together)
+
+When you need MCP and CLI ingest at the same time, run Chroma as a single local server:
+
+```bash
+pal chroma install && pal chroma start
+```
+
+Add to `.env.mcp` (and re-run `pal daemon sync` if using watchers):
+
+```bash
+LLMLIBRARIAN_CHROMA_HOST=127.0.0.1
+LLMLIBRARIAN_CHROMA_PORT=8000
+```
+
+All processes then use `HttpClient` against `chroma run --path $LLMLIBRARIAN_DB`.
+See [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).
 
 ---
 

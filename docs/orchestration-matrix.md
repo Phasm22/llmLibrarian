@@ -9,7 +9,7 @@ Single reference for how ingest and recovery behave across entry points. Core im
 | **Entry point** | `llmli add`, `pal pull <path>`, `pal pull` (all bookmarks), `pal sync` / `ensure_self_silo` (`__self__`), MCP `add_silo` / `trigger_reindex` / `repair_silo` |
 | **Path kind** | Directory (default include/exclude rules) vs **single file** (bypasses include/exclude; e.g. `places.sqlite`) |
 | **Cloud roots** | Blocked unless `allow_cloud` / `--allow-cloud` |
-| **Concurrency** | Cross-process: [`chroma_lock`](../src/chroma_lock.py) (flock). MCP: in-process `_chroma_lock` around writes. Only one heavy indexer should run per DB. |
+| **Concurrency** | Embedded: Chroma 1.x is not process-safe — do not run `pal pull` / `llmli add` while MCP holds `PersistentClient` (preflight blocks). Server mode: `LLMLIBRARIAN_CHROMA_HOST` + `pal chroma start` → single `chroma run` writer, all clients HTTP. Cross-process: [`chroma_lock`](../src/chroma_lock.py) (flock). MCP: in-process `_chroma_lock`. |
 | **Observability** | `pal pull` (all): streams child `llmli add` stderr/stdout; sets no `LLMLIBRARIAN_QUIET` for the child. Single-path `pal pull`: in-process logs. Optional `LLMLIBRARIAN_STATUS_FILE` JSON at end of `run_add`. |
 | **Performance** | `workers`, `embedding_workers`; Apple Silicon MPS forces single embedding thread unless large-ingest CPU policy applies ([`embeddings.py`](../src/embeddings.py)). |
 | **Recovery** | `llmli repair` / MCP `repair_silo`: hard reset silo chunks + re-index. `trigger_reindex` / incremental `add`: crawl changed files. Killing mid-run can leave partial chunks; re-run add or repair. |
