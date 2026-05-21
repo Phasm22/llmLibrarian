@@ -188,6 +188,10 @@ import os, sys, time, signal
 sys.path.insert(0, os.environ["_LLMLI_REPO_ROOT"])
 sys.path.insert(0, os.path.join(os.environ["_LLMLI_REPO_ROOT"], "src"))
 
+# Mirror MCP's long-lived-reader behavior: exit when another process bumps
+# the Chroma write generation, so a supervisor can restart with fresh state.
+os.environ["LLMLIBRARIAN_EXIT_ON_STALE_GENERATION"] = "1"
+
 from chroma_client import get_client
 from chroma_lock import chroma_shared_lock
 from constants import LLMLI_COLLECTION
@@ -197,7 +201,6 @@ db_path = os.environ["LLMLIBRARIAN_DB"]
 client = get_client(db_path)
 ef = get_embedding_function(batch_size=8)
 coll = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
-# Warm both paths once so HNSW handle is materialised, like MCP after a first query.
 coll.peek(1)
 coll.query(query_texts=["warmup"], n_results=1)
 
@@ -211,11 +214,16 @@ signal.signal(signal.SIGINT, _stop)
 i = 0
 while _running:
     try:
+        # Refresh client handle each iter — get_client() does the
+        # generation check and sys.exit(99)s if the writer has moved on.
+        client = get_client(db_path)
+        coll = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
         with chroma_shared_lock(db_path):
             coll.query(query_texts=[f"probe {i}"], n_results=5)
             coll.get(limit=5, include=["metadatas"])
+    except SystemExit:
+        raise
     except Exception as exc:
-        # Print but don't die — the writer may transiently rebuild the silo.
         print(f"reader iter {i}: {type(exc).__name__}: {exc}", flush=True)
     i += 1
     time.sleep(0.05)
@@ -309,22 +317,19 @@ def test_t1_two_concurrent_llmli_add_subprocesses(scratch_dir: Path) -> None:
 @pytest.mark.integration
 @pytest.mark.skipif(
     not _RACE_OPT_IN,
-    reason=(
-        "Skipped by default. Reproduces a separate cross-process race: a reader "
-        "subprocess holding a live PersistentClient + chroma_shared_lock while a "
-        "concurrent `llmli repair` rebuilds segments leaves the reader's Rust "
-        "HNSW handle invalid, and the post-teardown probe in this process can "
-        "SIGSEGV (cannot be caught by xfail since it kills pytest). Tracked "
-        "separately from the in-process singleton-coexistence bug fixed in Step "
-        "2. Set LLMLI_RACE_TEST=1 to opt in."
-    ),
+    reason="t2 spawns subprocesses; set LLMLI_RACE_TEST=1 to enable",
 )
 def test_t2_reader_subprocess_vs_repair(scratch_dir: Path) -> None:
+    """
+    Cross-process race coverage. With LLMLIBRARIAN_EXIT_ON_STALE_GENERATION=1
+    in the reader, `llmli repair` bumps the write generation file, and the
+    reader self-exits (rc=99) on its next get_client() rather than SIGSEGV'ing
+    against ChromaDB's stale process-global Rust state.
+    """
     db_path = scratch_dir / "db"
     folder = _make_fixture(scratch_dir / "silo_t2", n_files=30)
     logs = scratch_dir / "logs"
 
-    # Baseline ingest (synchronous subprocess so the silo exists before reader/repair race).
     env = _subprocess_env(db_path)
     rc = _wait(_spawn(_llmli_cmd("add", str(folder)), env, logs / "t2_seed.log"), timeout=600)
     assert rc == 0, f"baseline ingest failed:\n{_read_log_tail(logs / 't2_seed.log')}"
@@ -334,7 +339,6 @@ def test_t2_reader_subprocess_vs_repair(scratch_dir: Path) -> None:
     repair: subprocess.Popen | None = None
     try:
         reader = _spawn_reader(db_path, logs / "t2_reader.log")
-        # Give reader a moment to fully open the persistent client + HNSW handle.
         time.sleep(1.0)
         if reader.poll() is not None:
             pytest.fail(
@@ -342,21 +346,72 @@ def test_t2_reader_subprocess_vs_repair(scratch_dir: Path) -> None:
                 f"{_read_log_tail(logs / 't2_reader.log')}"
             )
 
-        # Repair while the reader is actively hitting the collection.
         repair = _spawn(_llmli_cmd("repair", slug), env, logs / "t2_repair.log")
         rc_repair = _wait(repair, timeout=600)
         assert rc_repair == 0, (
             f"repair failed (rc={rc_repair}):\n{_read_log_tail(logs / 't2_repair.log')}"
         )
 
-        # Let the reader exercise the post-repair state a bit before we tear down.
-        time.sleep(1.0)
+        # Reader should detect the generation bump and exit on its own with 99.
+        try:
+            rc_reader = reader.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _terminate(reader)
+            pytest.fail(
+                f"reader did not exit after writer activity:\n"
+                f"{_read_log_tail(logs / 't2_reader.log')}"
+            )
+        reader = None  # already exited
+        assert rc_reader == 99, (
+            f"reader expected to exit 99 on stale generation; got rc={rc_reader}\n"
+            f"{_read_log_tail(logs / 't2_reader.log')}"
+        )
     finally:
         _terminate(reader)
         _terminate(repair)
 
-    coll = _fresh_collection(db_path)
-    assert_silo_hnsw_consistent(coll, slug, db_path)
+    # Final consistency check runs in a fresh subprocess: the pytest process's
+    # ChromaDB global runtime has cached state from prior test_t1, and the
+    # on-disk segments have been rebuilt by `llmli repair` since then.
+    # Opening a "fresh" PersistentClient in this process still reuses that
+    # tainted runtime and SIGSEGVs. A subprocess starts cold.
+    _subprocess_assert_consistent(db_path, slug)
+
+
+def _subprocess_assert_consistent(db_path: Path, slug: str) -> None:
+    script = r"""
+import os, sys
+sys.path.insert(0, os.environ["_LLMLI_REPO_ROOT"])
+sys.path.insert(0, os.path.join(os.environ["_LLMLI_REPO_ROOT"], "src"))
+from chroma_client import get_client
+from constants import LLMLI_COLLECTION
+from embeddings import get_embedding_function
+from silo_audit import verify_silo_hnsw_consistency
+
+db_path = os.environ["LLMLIBRARIAN_DB"]
+slug = os.environ["_LLMLI_SLUG"]
+client = get_client(db_path)
+ef = get_embedding_function(batch_size=8)
+coll = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
+report = verify_silo_hnsw_consistency(coll, slug, db_path)
+print(f"REPORT: {report}", flush=True)
+if not report.get("consistent"):
+    sys.exit(2)
+"""
+    env = _subprocess_env(db_path)
+    env["_LLMLI_REPO_ROOT"] = str(_REPO_ROOT)
+    env["_LLMLI_SLUG"] = slug
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert proc.returncode == 0, (
+        f"subprocess verify failed (rc={proc.returncode}):\n"
+        f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    )
 
 
 # ---------------------------------------------------------------------------

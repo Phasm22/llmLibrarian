@@ -21,6 +21,81 @@ _lock = threading.Lock()
 _clients: dict[str, "_SafeClient"] = {}
 _fallback_warned: set[str] = set()
 
+# Cross-process write-generation tracking.
+#
+# Background: ChromaDB 1.4+ keeps a process-global Rust/tokio runtime cache.
+# Calling clear_system_cache() to flush it crashes (see release() docstring).
+# So once a PersistentClient is opened in this process, the on-disk segments
+# it cached can be silently invalidated by another process's writer
+# (op_repair_silo, run_add via writer_client). The next query then either
+# returns garbage or SIGSEGVs in the Rust _query path.
+#
+# Mitigation: writer_client touches `.llmli_chroma_generation` after each
+# successful write. Readers stash the file mtime at client-open time, and
+# check_for_writer_changes() reports True when the file has moved. Callers
+# that detect this should exit (systemd will restart watchers; the MCP
+# wrapper restarts itself via os.execv).
+_GEN_FILE_NAME = ".llmli_chroma_generation"
+_client_open_generation: dict[str, float] = {}
+
+
+def _generation_path(db_path: str) -> Path:
+    return Path(db_path).expanduser().resolve() / _GEN_FILE_NAME
+
+
+def _read_generation(db_path: str) -> float:
+    p = _generation_path(db_path)
+    try:
+        return p.stat().st_mtime_ns / 1e9
+    except OSError:
+        return 0.0
+
+
+def bump_generation(db_path: str) -> None:
+    """Mark this DB as freshly mutated. Call AFTER a successful write commit.
+
+    Idempotent. Safe across processes (uses filesystem mtime). Readers that
+    opened their PersistentClient before this call will see
+    check_for_writer_changes() == True on their next check.
+    """
+    p = _generation_path(db_path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # `touch` updates mtime; create if missing.
+        p.touch(exist_ok=True)
+        # Bump mtime explicitly to ensure monotonic forward progress even if
+        # two writers finish in the same second on coarse filesystems.
+        os.utime(p, None)
+    except OSError:
+        pass
+
+
+def check_for_writer_changes(db_path: str) -> bool:
+    """Return True if a writer has bumped the generation since this process
+    opened the cached PersistentClient for db_path. Returns False if no
+    client is cached for this db_path (nothing to invalidate yet)."""
+    key = str(Path(db_path).expanduser().resolve())
+    with _lock:
+        opened_at = _client_open_generation.get(key)
+    if opened_at is None:
+        return False
+    return _read_generation(key) > opened_at
+
+
+def exit_if_stale(db_path: str, *, exit_code: int = 99) -> None:
+    """Sys.exit(exit_code) if check_for_writer_changes(db_path). Designed for
+    long-lived reader processes (watcher daemons) under systemd, which will
+    restart them automatically. For in-process MCP use, prefer the MCP wrapper
+    that re-execs the process."""
+    if check_for_writer_changes(db_path):
+        print(
+            f"[llmli][chroma_client] writer activity detected on {db_path}; "
+            f"exiting ({exit_code}) so supervisor restarts with fresh state.",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(exit_code)
+
 _HNSW_BLOAT_BYTES = 1 << 30
 _MIN_FREE_BYTES = 512 * 1024 * 1024
 
@@ -111,16 +186,45 @@ class _SafeClient:
 
 
 def get_client(db_path: str) -> "_SafeClient":
-    """Return (or create) the shared PersistentClient for db_path."""
+    """Return (or create) the shared PersistentClient for db_path.
+
+    If a cached client exists but the write-generation file has advanced
+    since it was opened, and LLMLIBRARIAN_EXIT_ON_STALE_GENERATION is set
+    (default off in CLI use, opt-in for long-lived readers like MCP and
+    watchers), exit the process so a supervisor restarts it with fresh
+    ChromaDB state. Without that env, the cached client is returned as-is
+    — queries against on-disk segments mutated by another process may
+    return stale results or SIGSEGV in the Rust _query path.
+    """
+    key = str(Path(db_path).expanduser().resolve())
     with _lock:
-        if db_path not in _clients:
-            _storage_preflight(db_path)
-            raw = chromadb.PersistentClient(
-                path=db_path,
-                settings=Settings(anonymized_telemetry=False),
-            )
-            _clients[db_path] = _SafeClient(raw)
+        if db_path in _clients:
+            opened_at = _client_open_generation.get(key, 0.0)
+            current = _read_generation(key)
+            if current > opened_at:
+                if _exit_on_stale_enabled():
+                    print(
+                        f"[llmli][chroma_client] writer activity detected on "
+                        f"{db_path} (gen {opened_at:.6f} → {current:.6f}); "
+                        f"exiting (99) so supervisor restarts with fresh state.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sys.exit(99)
+            return _clients[db_path]
+        _storage_preflight(db_path)
+        raw = chromadb.PersistentClient(
+            path=db_path,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        _clients[db_path] = _SafeClient(raw)
+        _client_open_generation[key] = _read_generation(key)
         return _clients[db_path]
+
+
+def _exit_on_stale_enabled() -> bool:
+    flag = os.environ.get("LLMLIBRARIAN_EXIT_ON_STALE_GENERATION", "").strip().lower()
+    return flag in ("1", "true", "yes")
 
 
 def release() -> None:
@@ -134,6 +238,7 @@ def release() -> None:
     """
     with _lock:
         _clients.clear()
+        _client_open_generation.clear()
 
 
 def get_collection(db_path: str, name: str, embedding_function=None):
@@ -172,3 +277,6 @@ def writer_client(db_path: str) -> Iterator["_SafeClient"]:
         finally:
             del client
             del raw
+            # Notify other-process readers that on-disk segments have moved
+            # so they can self-restart with fresh ChromaDB state.
+            bump_generation(db_path)

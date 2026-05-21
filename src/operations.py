@@ -233,6 +233,8 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
         with chroma_exclusive_lock(db_path):
             coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
             coll.delete(where={"silo": slug_to_clean})
+        from chroma_client import bump_generation
+        bump_generation(db_path)
     except Exception as e:
         chroma_error = str(e)
     finally:
@@ -293,6 +295,8 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
             try:
                 coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
                 coll.delete(where={"silo": slug})
+                from chroma_client import bump_generation
+                bump_generation(db_path)
             except Exception as e:
                 msg = f"could not wipe Chroma chunks for {slug}: {e}"
                 if verbose:

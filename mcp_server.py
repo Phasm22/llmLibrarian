@@ -21,6 +21,11 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("TQDM_DISABLE", "1")
+# Long-lived MCP process: when another process bumps the Chroma write
+# generation, exit so the MCP client restarts us with fresh ChromaDB state.
+# Avoids the cross-process Rust HNSW SIGSEGV when on-disk segments are
+# mutated under a cached PersistentClient.
+os.environ.setdefault("LLMLIBRARIAN_EXIT_ON_STALE_GENERATION", "1")
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ROOT = Path(__file__).resolve().parent
