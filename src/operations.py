@@ -123,6 +123,26 @@ def op_chroma_diagnostics(db_path: str) -> dict[str, Any]:
 
     health = get_query_health(db_root)
     latest_health = health[-5:] if isinstance(health, list) else []
+
+    # SQLite-only global consistency probe: compare distinct embedding_id in
+    # `embeddings` vs id_to_label in HNSW segments, minus embeddings_queue lag.
+    # Per-silo breakdown is in mcp_server.health() / op_silo_hnsw_consistency.
+    hnsw_global_truly_missing: int | None = None
+    hnsw_global_queued: int | None = None
+    if sqlite_exists:
+        try:
+            from silo_audit import _hnsw_id_set, _embeddings_queue_id_set
+            with sqlite3.connect(str(sqlite_path)) as conn:
+                rows = conn.execute("SELECT DISTINCT embedding_id FROM embeddings").fetchall()
+            sqlite_emb_ids = {r[0] for r in rows if r and r[0]}
+            hnsw_ids = _hnsw_id_set(db_root)
+            queued = _embeddings_queue_id_set(db_root)
+            missing = sqlite_emb_ids - hnsw_ids
+            hnsw_global_truly_missing = len(missing - queued)
+            hnsw_global_queued = len(missing & queued)
+        except Exception:
+            pass
+
     return {
         "status": "ok",
         "db_path": str(db_root),
@@ -134,6 +154,8 @@ def op_chroma_diagnostics(db_path: str) -> dict[str, Any]:
         "segment_dir_count": len(segment_dirs),
         "segment_dirs": segment_dirs[:20],
         "hnsw_index_count": hnsw_count,
+        "hnsw_global_truly_missing": hnsw_global_truly_missing,
+        "hnsw_global_queued": hnsw_global_queued,
         "query_health_recent": latest_health,
         "storage": storage,
         "repair_ladder": {
@@ -142,6 +164,44 @@ def op_chroma_diagnostics(db_path: str) -> dict[str, Any]:
             "l3": "Run llmli rehydrate to rebuild into a fresh DB path from registry sources.",
         },
     }
+
+
+def op_silo_hnsw_consistency(db_path: str) -> dict[str, Any]:
+    """
+    Per-silo SQLite ↔ HNSW consistency report. Opens a Chroma client.
+    Returns {"status": "ok", "silos": [verify_silo_hnsw_consistency(...) per silo]}.
+    """
+    from chroma_client import get_client, release as _release
+    from constants import LLMLI_COLLECTION
+    from state import list_silos
+    from silo_audit import verify_silo_hnsw_consistency
+
+    db_root = Path(db_path).expanduser().resolve()
+    try:
+        silos = list_silos(str(db_root))
+        client = get_client(str(db_root))
+        coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
+        reports = []
+        for s in silos:
+            slug = s.get("slug")
+            if not slug:
+                continue
+            reports.append(verify_silo_hnsw_consistency(coll, slug, db_root))
+        bad = [r for r in reports if not r.get("consistent")]
+        return {
+            "status": "ok",
+            "db_path": str(db_root),
+            "silo_count": len(reports),
+            "desynced_count": len(bad),
+            "silos": reports,
+        }
+    except Exception as e:
+        return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            _release()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -234,14 +294,25 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
                 coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
                 coll.delete(where={"silo": slug})
             except Exception as e:
-                msg = f"could not wipe Chroma chunks: {e}"
+                msg = f"could not wipe Chroma chunks for {slug}: {e}"
                 if verbose:
                     print(f"[repair] Warning: {msg}", file=sys.stderr)
+                try:
+                    from state import record_index_error
+                    record_index_error(db_path, slug, e)
+                except Exception:
+                    pass
 
             if verbose:
                 print(f"[repair] Clearing file registry for silo '{slug}'...")
             _file_registry_remove_silo(db_path, slug)
             remove_manifest_silo(db_path, slug)
+
+            # Drop the singleton PersistentClient before run_add opens its own
+            # writer_client. Two live PersistentClients on the same persist dir
+            # corrupt the HNSW segment writer (chroma_client.py:148).
+            coll = None
+            release()
 
             if verbose:
                 print(f"[repair] Re-indexing '{source_path}' (full, non-incremental)...")

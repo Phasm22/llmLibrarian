@@ -804,6 +804,11 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
                 with _mcp_chroma_lock("trigger_reindex"):
                     from ingest import run_add
 
+                    # Drop the cached singleton PersistentClient before run_add
+                    # opens its own writer_client. Two live PersistentClients on
+                    # the same persist dir corrupt the HNSW segment writer
+                    # (chroma_client.py:148).
+                    _release_chroma()
                     run_add(path=source_path, db_path=_DB_PATH, incremental=True)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -1130,6 +1135,29 @@ def health() -> dict:
     }
     if Path(_DB_PATH).is_dir():
         out["storage"] = op_db_storage_summary(_DB_PATH)
+        try:
+            from operations import op_silo_hnsw_consistency
+            hnsw = op_silo_hnsw_consistency(_DB_PATH)
+            if hnsw.get("status") == "ok":
+                bad = [r for r in hnsw.get("silos") or [] if not r.get("consistent")]
+                out["hnsw_consistency"] = {
+                    "silo_count": hnsw.get("silo_count", 0),
+                    "desynced_count": hnsw.get("desynced_count", 0),
+                    "desynced": [
+                        {
+                            "slug": r["slug"],
+                            "sqlite_ids": r["sqlite_ids"],
+                            "missing_count": r["missing_count"],
+                            "queued": r["queued"],
+                            "missing_ids_sample": r["missing_ids"][:5],
+                        }
+                        for r in bad
+                    ],
+                }
+            else:
+                out["hnsw_consistency"] = {"error": hnsw.get("error")}
+        except Exception as e:
+            out["hnsw_consistency"] = {"error": f"{type(e).__name__}: {e}"}
     with _reindex_outcome_lock:
         out["active_background_jobs"] = dict(_active_background_jobs)
         out["last_background_reindex"] = dict(_last_reindex_outcome)

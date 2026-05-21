@@ -180,3 +180,96 @@ def format_report(
         lines.append("All clean.")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# SQLite ↔ HNSW consistency probe.
+#
+# Reads `index_metadata.pickle` from every HNSW segment dir under the persist
+# root and `embeddings_queue` from chroma.sqlite3, then compares against the
+# canonical "this silo owns these IDs" view (collection.get(where={silo})).
+# A truly missing ID is one in SQLite but neither in HNSW's id_to_label nor
+# pending in the compaction queue.
+# ---------------------------------------------------------------------------
+
+
+def _hnsw_id_set(db_root: Path) -> set[str]:
+    import pickle
+    ids: set[str] = set()
+    if not db_root.is_dir():
+        return ids
+    for p in db_root.iterdir():
+        meta = p / "index_metadata.pickle"
+        if not meta.exists():
+            continue
+        try:
+            data = pickle.loads(meta.read_bytes())
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            m = data.get("id_to_label")
+            if isinstance(m, dict):
+                ids.update(str(k) for k in m.keys())
+    return ids
+
+
+def _embeddings_queue_id_set(db_root: Path) -> set[str]:
+    import sqlite3
+    sqlite_path = db_root / "chroma.sqlite3"
+    if not sqlite_path.exists():
+        return set()
+    try:
+        con = sqlite3.connect(str(sqlite_path))
+        try:
+            rows = con.execute("SELECT id FROM embeddings_queue").fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return set()
+    return {r[0] for r in rows if r and r[0]}
+
+
+def verify_silo_hnsw_consistency(collection: Any, silo_slug: str, db_path: str | Path) -> dict[str, Any]:
+    """
+    Compare a silo's SQLite-owned chunk IDs against the HNSW id_to_label set,
+    after accounting for embeddings_queue compaction lag.
+
+    Returns: {
+        "slug": str,
+        "sqlite_ids": int,
+        "hnsw_reachable": int,        # |sqlite_ids ∩ hnsw_id_to_label|
+        "queued": int,                # |missing_from_hnsw ∩ embeddings_queue|
+        "missing_ids": list[str],     # truly missing (≤ 50 samples)
+        "missing_count": int,         # full count of truly missing
+        "consistent": bool,
+    }
+    """
+    db_root = Path(db_path).resolve()
+    try:
+        res = collection.get(where={"silo": silo_slug}, include=["metadatas"])
+        owned = set(res.get("ids") or [])
+    except Exception as e:
+        return {
+            "slug": silo_slug,
+            "sqlite_ids": 0,
+            "hnsw_reachable": 0,
+            "queued": 0,
+            "missing_ids": [],
+            "missing_count": 0,
+            "consistent": False,
+            "error": f"{type(e).__name__}: {e}",
+        }
+    hnsw_ids = _hnsw_id_set(db_root)
+    queued_ids = _embeddings_queue_id_set(db_root)
+    missing = owned - hnsw_ids
+    truly = missing - queued_ids
+    sample = sorted(truly)[:50]
+    return {
+        "slug": silo_slug,
+        "sqlite_ids": len(owned),
+        "hnsw_reachable": len(owned & hnsw_ids),
+        "queued": len(missing & queued_ids),
+        "missing_ids": sample,
+        "missing_count": len(truly),
+        "consistent": not truly,
+    }

@@ -1292,6 +1292,33 @@ def _should_use_tqdm() -> bool:
     return sys.stderr.isatty()
 
 
+class HnswWriteVerificationError(RuntimeError):
+    """Raised when a post-add collection.get(ids=...) returns fewer IDs than added."""
+
+
+def _verify_batch_write(collection: Any, ids_b: list[str]) -> None:
+    """If LLMLIBRARIAN_VERIFY_HNSW_WRITES is unset/truthy, sanity-check that
+    SQLite acknowledges every ID we just added. Cheap protection against
+    silent drops in Chroma's add path."""
+    flag = os.environ.get("LLMLIBRARIAN_VERIFY_HNSW_WRITES", "1").strip().lower()
+    if flag in ("0", "false", "no", ""):
+        return
+    try:
+        res = collection.get(ids=ids_b)
+    except Exception as e:
+        raise HnswWriteVerificationError(
+            f"post-add verification get(ids=...) failed: {type(e).__name__}: {e}"
+        ) from e
+    got = set(res.get("ids") or [])
+    expected = set(ids_b)
+    missing = expected - got
+    if missing:
+        sample = sorted(missing)[:5]
+        raise HnswWriteVerificationError(
+            f"post-add verification: {len(missing)}/{len(expected)} IDs not in SQLite after add(). Sample: {sample}"
+        )
+
+
 def _batch_add(
     collection: Any,
     chunks: list[ChunkTuple],
@@ -1335,6 +1362,7 @@ def _batch_add(
                 docs_b = [docs_b[i] for i in dedup]
                 metas_b = [metas_b[i] for i in dedup]
             collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b)
+            _verify_batch_write(collection, ids_b)
         return
 
     # Experimental: parallelize embedding computation, then add in main thread.
@@ -1373,6 +1401,7 @@ def _batch_add(
                 metas_b = [metas_b[i] for i in dedup]
                 embeddings = [embeddings[i] for i in dedup]
             collection.add(ids=ids_b, documents=docs_b, metadatas=metas_b, embeddings=embeddings)
+            _verify_batch_write(collection, ids_b)
             completed += 1
             if pbar is not None:
                 pbar.update(1)
@@ -2268,12 +2297,28 @@ def run_add(
         if not incremental:
             try:
                 collection.delete(where={"silo": silo_slug})
-            except Exception:
-                pass  # no chunks for this silo yet
+            except Exception as e:
+                try:
+                    from state import record_index_error
+                    record_index_error(db_path, silo_slug, e)
+                except Exception:
+                    pass
+                print(
+                    f"[ingest] warn: rebuild delete (chunks) failed for {silo_slug}: {e}",
+                    file=sys.stderr,
+                )
             try:
                 image_collection.delete(where={"silo": silo_slug})
-            except Exception:
-                pass
+            except Exception as e:
+                try:
+                    from state import record_index_error
+                    record_index_error(db_path, silo_slug, e)
+                except Exception:
+                    pass
+                print(
+                    f"[ingest] warn: rebuild delete (images) failed for {silo_slug}: {e}",
+                    file=sys.stderr,
+                )
             _file_registry_remove_silo(db_path, silo_slug)
     
         # Pre-pass: resolve paths, hash, skip duplicates (same file already indexed in any silo)
