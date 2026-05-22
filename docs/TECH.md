@@ -1,6 +1,6 @@
 # Technical Reference
 
-Current runtime contracts only.
+Current runtime contracts only. Narrative guide: [GUIDE.md](./GUIDE.md).
 
 ## Product Shape
 

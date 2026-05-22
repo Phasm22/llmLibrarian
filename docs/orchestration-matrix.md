@@ -1,6 +1,6 @@
 # CLI / MCP orchestration matrix
 
-Single reference for how ingest and recovery behave across entry points. Core implementation: [`run_add`](../src/ingest/__init__.py). Shared orchestration wrapper: [`run_ingest`](../src/orchestration/ingest.py) (`orchestration.ingest`).
+Single reference for how ingest and recovery behave across entry points. For *why* and day-to-day usage, see [GUIDE.md](./GUIDE.md). Core implementation: [`run_add`](../src/ingest/__init__.py). Shared orchestration wrapper: [`run_ingest`](../src/orchestration/ingest.py) (`orchestration.ingest`).
 
 ## Dimensions
 

@@ -1,102 +1,80 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code working in this repository.
 
-## Project Overview
+## What this is
 
-llmLibrarian (llmli) is a deterministic, locally-hosted RAG context engine for personal data. It indexes folders into "silos" (ChromaDB collections), then answers questions using retrieved chunks + Ollama LLM. The design is intentionally stateless—no chat memory, no evolving agent persona. Every answer derives entirely from indexed data + current query.
+llmLibrarian indexes **folders you choose** into a local vector store and answers questions from **that index only** — via MCP tools (chunks for the host model) or `pal ask` (retrieve + local Ollama). No built-in chat memory; each query is grounded in indexed files + current question.
 
-## Development Commands
+**Why it exists (user-facing):** [README.md](README.md), [docs/GUIDE.md](docs/GUIDE.md).  
+**Agent operations:** [AGENTS.md](AGENTS.md).  
+**Technical contracts:** [docs/TECH.md](docs/TECH.md).
+
+## Development commands
 
 ```bash
-# Setup
-uv venv && source .venv/bin/activate
-uv sync
+uv venv && source .venv/bin/activate && uv sync
 ollama pull llama3.1:8b
-
-# Run CLI commands
-llmli add <folder>              # Index folder (silo = folder basename)
-llmli ask "question"            # Query all silos
-llmli ask --in <silo> "query"   # Query specific silo
-llmli ls                        # List silos
-llmli inspect <silo>            # Silo details + per-file chunk counts
-llmli rm <silo>                 # Remove silo
-llmli repair <silo>             # Fix ChromaDB index errors (wipe + re-index)
-llmli repair-ladder             # Read-only diagnostics + L1/L2/L3 repair guidance
-llmli rehydrate [silo...]       # Rebuild silos from llmli_registry (L3 helper)
-llmli capabilities              # Supported file types
-
-# pal is the agent layer (delegates to llmli; state in ~/.pal/registry.json)
-pal pull <folder>                # Index folder (watches if --watch appended)
-pal ask "question"               # Query all silos
-pal ask --in <silo> "query"      # Query specific silo
-pal ls                           # List all indexed silos
-pal ls --status                  # Show silo and daemon health with actions
-pal ls --jobs                    # Show daemon job status and log paths
-pal remove <silo>                # Delete a silo
-pal daemon install|sync|uninstall|logs  # Manage background watchers
 ```
 
-## Architecture
+```bash
+# Engine
+llmli add <folder>
+llmli ask --in <silo> "query"
+llmli ls
+llmli inspect <silo>
+llmli repair <silo>
+llmli repair-ladder
+llmli rehydrate [--dry-run]
+llmli capabilities
 
-**Two CLIs:**
-- `cli.py` → `llmli` — Full control CLI (add, ask, ls, inspect, index, rm, repair, capabilities, log)
-- `pal.py` → `pal` — Agent CLI that orchestrates llmli; maintains state in `~/.pal/registry.json`
+# Operator
+pal pull <folder>              # --watch for daemon
+pal ask --in <silo> "query"
+pal ls --status
+pal chroma start               # when LLMLIBRARIAN_CHROMA_HOST is set
+pal daemon install|sync|logs
+```
 
-**Core pipeline (src/):**
-- `constants.py` — Centralized shared constants (DB_PATH, LLMLI_COLLECTION, chunk/query defaults)
-- `processors.py` — Document processor abstraction (Protocol + PDFProcessor, DOCXProcessor, XLSXProcessor, PPTXProcessor, TextProcessor)
-- `ingest.py` — Indexing core: file collection, chunking, batch add to ChromaDB (uses processors for extraction)
-- `query/` — Query pipeline package (split from former query_engine.py):
-  - `intent.py` — Intent routing constants and `route_intent()`
-  - `retrieval.py` — Vector + hybrid search (RRF), diversity, dedup, sub-scope resolution
-  - `context.py` — Recency scoring, timing detection, context block formatting for LLM prompt
-  - `formatting.py` — Answer styling, source linkification, path shortening
-  - `code_language.py` — Deterministic language detection by file extension count
-  - `trace.py` — JSON-lines trace logging
-  - `core.py` — `run_ask()` orchestration (ties all modules together)
-- `state.py` — Silo registry and failure tracking (JSON files in DB path)
-- `embeddings.py` — ChromaDB embedding function (default: ONNX + all-MiniLM-L6-v2)
-- `reranker.py` — Optional cross-encoder reranker (env: LLMLIBRARIAN_RERANK=1)
+## Architecture (map)
 
-**Testing:**
-- `tests/fixtures/sample_silo/` — Sample files (md, txt, py, json) for quick add/ask testing
+**CLIs:** `cli.py` → `llmli`; `pal.py` → `pal` (+ `~/.pal/registry.json` for bookmarks/daemons).
+
+**Pipeline (`src/`):**
+
+- `ingest/` — collect, chunk, extract, Chroma batch add
+- `query/` — `intent.py`, `retrieval.py` (hybrid/RRF), `core.py` (`run_ask`, `run_retrieve`)
+- `chroma_client.py` — singleton client; HTTP vs embedded; `writer_client` for writes
+- `chroma_lock.py` — cross-process flock
+- `state.py` — registry, manifest, query health
+- `mcp_server.py` — FastMCP tools + HTTP `/healthz`
+
+**Storage:** `LLMLIBRARIAN_DB` (default `./my_brain_db`); collection `llmli`; silo in metadata. Server mode: `chroma run` + `LLMLIBRARIAN_CHROMA_HOST`.
+
+**MCP tools:** `query_personal_knowledge`, `multi_query_knowledge`, `list_silos`, `add_silo`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md).
 
 **Data flow:**
-1. `add` → collect files → chunk (line-aware, 1000 chars, 150 overlap) → extract text (pymupdf/python-docx/openpyxl/python-pptx) → embed → ChromaDB
-2. `ask` → intent route → retrieve from ChromaDB (with optional silo filter) → diversify (max 4 chunks/file) → optional rerank → build prompt → Ollama → styled output with sources
 
-**Storage:**
-- ChromaDB in `./my_brain_db` (or `LLMLIBRARIAN_DB`): embedded `PersistentClient` by default, or HTTP to `chroma run` when `LLMLIBRARIAN_CHROMA_HOST` is set (`pal chroma start`)
-- Single collection `llmli` for all silos; chunks tagged with `silo` metadata
-- Registry files: `llmli_registry.json`, `llmli_file_registry.json`, `llmli_last_failures.json`
+1. Ingest → chunk → embed → Chroma (+ registry/manifest)
+2. Ask → intent route → retrieve → diversify/dedup → optional rerank → Ollama (CLI only)
+3. MCP retrieve → chunks JSON only
 
-**Intent routing (silent, no CLI flags):**
-- `LOOKUP` — Default factual queries
-- `EVIDENCE_PROFILE` — "What do I like", preferences (triggers hybrid search with RRF)
-- `AGGREGATE` — "All my income", totals across docs
-- `CODE_LANGUAGE` — "Most common language" (deterministic count by extension)
-- `CAPABILITIES` — "What file types" (returns static report, no RAG)
+## Key environment variables
 
-## Key Environment Variables
+| Variable | Role |
+|----------|------|
+| `LLMLIBRARIAN_DB` | Persist path |
+| `LLMLIBRARIAN_CHROMA_HOST` / `PORT` | HTTP to `chroma run` |
+| `LLMLIBRARIAN_MODEL` | Ollama model for ask |
+| `LLMLIBRARIAN_RERANK=1` | Cross-encoder rerank (CLI ask) |
+| `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` | MCP embedded reader restart (default on in mcp_server) |
 
-- `LLMLIBRARIAN_DB` — DB path (default: `./my_brain_db`)
-- `LLMLIBRARIAN_CHROMA_HOST` / `LLMLIBRARIAN_CHROMA_PORT` — HTTP client to local `chroma run` (server mode; safe MCP + CLI writes)
-- `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` — embedded long-lived readers exit 99 after external writes
-- `LLMLIBRARIAN_MODEL` — Ollama model (default: `llama3.1:8b`)
-- `LLMLIBRARIAN_TRACE` — JSON-lines trace file for debugging
-- `LLMLIBRARIAN_RERANK=1` — Enable cross-encoder reranker
-- `LLMLIBRARIAN_CHUNK_SIZE` / `LLMLIBRARIAN_CHUNK_OVERLAP` — Tuning (default: 1000/150)
-- `LLMLIBRARIAN_ARTIFACT_SILOS` — Enable post-ingest artifact compilation (`*` or comma-separated slugs)
-- `LLMLIBRARIAN_ARTIFACT_MAX_FACTS` / `LLMLIBRARIAN_ARTIFACT_MAX_INPUT_CHARS` — Artifact compile limits
-- `LLMLIBRARIAN_CONTEXT_BUDGET_TOKENS` — Global ask-time context budget (drops lowest-ranked chunks on overflow)
+Full list: README “Further reading”, [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).
 
-## Configuration
+## Intent routing (silent)
 
-`archetypes.yaml` defines prompts and optional index configs:
-- **Prompt-only archetypes:** Add silo with matching slug, then `ask --in <silo>` uses that prompt
-- **Full archetypes:** Include `folders`, `include`/`exclude`, `collection` for `llmli index --archetype X`
+`LOOKUP`, `EVIDENCE_PROFILE`, `AGGREGATE`, `TAX_QUERY`, `CODE_LANGUAGE`, `CAPABILITIES`, `FILE_LIST`, `STRUCTURE`, `TIMELINE`, … — see `src/query/intent.py` and [docs/TECH.md](docs/TECH.md).
 
-## File Type Support
+## Chroma safety
 
-First-class extraction: PDF (pymupdf), DOCX (python-docx), XLSX (openpyxl), PPTX (python-pptx), plus text/code files. ZIP archives are processed for embedded documents. Cloud-sync paths (OneDrive, iCloud, Dropbox) blocked by default—use `--allow-cloud` to override.
+Chroma 1.x: **not process-safe** for multiple embedded `PersistentClient` on one path. Production setup: **one** `chroma run`, all clients HTTP. MCP HTTP uses PID file lock (stdio MCP does not). See [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).

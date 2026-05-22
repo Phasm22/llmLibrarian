@@ -4,102 +4,111 @@ Primary source of truth for coding agents in this repo.
 
 If any other document conflicts with this file, follow `AGENTS.md`.
 
-## Purpose
+## What this project is (read first)
 
-This repository is a local-first CLI tool.
+llmLibrarian is a **local personal knowledge index**: folders → chunks in Chroma → retrieval tools for assistants or CLI. It is **not** a chat product; it is a **context engine** with deterministic ingest, registry/manifest state, and observable repair paths.
+
+**Human story:** [README.md](../README.md) and [docs/GUIDE.md](docs/GUIDE.md).  
+**Contracts:** [docs/TECH.md](docs/TECH.md), [docs/orchestration-matrix.md](docs/orchestration-matrix.md).
+
 Agent priorities:
-1. Keep behavior deterministic and observable.
-2. Prefer **MCP tools** when the llmLibrarian MCP server is available; otherwise minimal-friction CLI (`pal` first, `llmli` direct when needed).
-3. Keep docs and tests aligned with current command behavior.
 
-## Agent operations (MCP-first)
+1. Keep behavior **deterministic and observable** (no hidden memory, no prompt-only routing flags).
+2. Prefer **MCP tools** when the HTTP MCP server is available; otherwise `pal` then `llmli`.
+3. Keep docs and tests aligned with **current** tool names and command behavior.
 
-When integrated via MCP, prefer tools over shell so you do not depend on `PYTHONPATH` or CLI flag drift:
+## MCP tools (actual names)
 
-1. **`health`** — DB presence, embedding stack, basic sanity (call first if tools misbehave).
-2. **`list_silos`** / **`capabilities`** — discover slugs and supported file types.
-3. **`retrieve`** / **`retrieve_bulk`** — document Q&A from indexed data.
-4. **`add_silo`** — index a **file or directory** (same rules as `llmli add`; keep `confirm=true` for write calls).
-5. **`trigger_reindex`** — incremental refresh for a registered silo; **`repair_silo`** — hard reset when Chroma/registry is inconsistent.
+Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
+
+| Tool | Use |
+|------|-----|
+| `health` | DB, chroma transport, query health, HNSW audit |
+| `list_silos` | Slugs, chunk counts, staleness (`check_staleness=True`) |
+| `capabilities` | Supported file types |
+| `query_personal_knowledge` | Primary retrieval → chunks (no LLM in MCP) |
+| `multi_query_knowledge` | Parallel queries, merged chunks |
+| `explain_retrieval` | Debug hybrid/vector signals |
+| `find_files` | Manifest-only path/date search |
+| `add_silo` | Index path (`confirm=True`) |
+| `trigger_reindex` | Incremental reindex (`confirm=True`; **not** right after `add_silo`) |
+| `repair_silo` | Hard wipe + re-index silo |
+| `update_file` / `remove_file` | Single-file maintenance |
+| `watch_coverage` | Read-only daemon/bookmark diagnostics |
+| `inspect_silo` | Per-file chunk counts |
+
+MCP returns **chunks**; the host model answers. Local synthesis: `pal ask` / `llmli ask` (Ollama).
 
 ## Session-start checklist (MCP)
 
-1. Call `list_silos(check_staleness=True)` before any retrieval.
-2. If `is_stale: true` and `stale_file_count` is substantial, call `trigger_reindex` before querying.
-3. If `stale_file_count` is small (<= 2-3) **and** `newest_source_mtime_iso` matches the silo's `updated` timestamp, treat the residual as write-during-index race noise; the index is usable, skip reindex.
-4. `db_exists: false` means the `LLMLIBRARIAN_DB` env var is misconfigured for this process. Fix the launch config before proceeding; retrieval results are invalid until resolved.
-5. `health()` reports `chroma_transport` (`embedded` vs `http`). If `embedded` and you need CLI ingest while MCP is up, enable server mode (`LLMLIBRARIAN_CHROMA_HOST`, `pal chroma start`) — see [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).
+1. `list_silos(check_staleness=True)` before retrieval.
+2. If `is_stale: true` and `stale_file_count` is substantial → `trigger_reindex` before querying.
+3. If `stale_file_count` is small (≤2–3) **and** `newest_source_mtime_iso` matches the silo `updated` timestamp → treat as index race noise; skip reindex.
+4. `db_exists: false` → fix `LLMLIBRARIAN_DB` in the MCP launch env before any retrieval.
+5. `health()` → `chroma_transport`: if `embedded` and MCP is up, CLI ingest may be blocked; use server mode (`LLMLIBRARIAN_CHROMA_HOST`, `pal chroma start`) — [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).
 
-`check_staleness` does a filesystem mtime walk; cheap for repo-sized silos (< 200ms observed on 175 files).
+If retrieval returns **zero chunks** with no `error`, do **not** assume the KB is empty. Cross-check `list_silos` (`chunks_count`, `has_index_errors`, `has_ingest_failures`) and call `health`.
 
-If retrieval returns zero chunks with no `error`, do not assume the knowledge base is empty. Cross-check `list_silos`: if the target silo has `chunks_count > 0`, or `has_index_errors` / `has_ingest_failures` is true, treat the empty retrieval as a diagnostic signal and call `health` before answering from absence.
+Use **`pal`** / **`llmli`** when MCP is unavailable or for flags not on tools (repair-ladder, rehydrate, trace, etc.).
 
-Use **`pal`** / **`llmli`** only when MCP is unavailable or you need flags not exposed on tools (e.g. niche `llmli` options).
+**Orchestration:** [docs/orchestration-matrix.md](docs/orchestration-matrix.md). Ingest: `orchestration.ingest.run_ingest` → `ingest.run_add`.
 
-**Entry-point behavior** (CLI vs MCP vs `pal pull` all vs `ensure_self_silo`): [docs/orchestration-matrix.md](docs/orchestration-matrix.md). Shared implementation: `orchestration.ingest.run_ingest` → `ingest.run_add`.
+## Canonical workflows
 
-## Canonical Workflows
+### Setup
 
-### 1) Setup
 ```bash
-uv venv
-source .venv/bin/activate
-uv sync
+uv venv && source .venv/bin/activate && uv sync
 ```
 
-### 2) Ingest / Pull
+### Ingest
+
 ```bash
-# Day-to-day (recommended)
 pal pull /path/to/folder
-
-# Direct tool usage
-llmli add /path/to/folder
+# llmli add /path/to/folder
 ```
 
-### 3) Query
+With MCP + watchers: prefer server mode; writes via `add_silo` / `trigger_reindex` when MCP holds the DB.
+
+### Query
+
 ```bash
-# Scoped ask
 pal ask --in <silo> "question"
-
-# Unified ask
 pal ask --unified "question"
-
-# Direct tool usage
-llmli ask --in <silo> "question"
 ```
 
-### 4) Inspect / Diagnose
+### Diagnose
+
 ```bash
-pal ls
-pal inspect <silo> --top 20
 pal ls --status
-pal ls --jobs
-pal pull --status
+pal inspect <silo> --top 20
 llmli repair-ladder
 llmli rehydrate --dry-run
 ```
 
-### 5) Test
+### Test
+
 ```bash
 uv run pytest -q tests/unit
 ```
 
-## Command Notes
+## Command notes
 
-- `pal` is the operator-facing CLI.
-- `llmli` is the direct engine CLI.
-- `pal sync` refreshes the dev self-silo (`__self__`) when needed.
-- **Claude Desktop MCP (.mcpb):** after editing `mcp_server.py`, run `pal extension pack` (requires `LLMLIBRARIAN_MCP_PACK_CMD`) so the packaged extension matches the repo; stdio via `.mcp.json` does not update the Desktop binary. `pal ls --status` / `pal sync` warn if the recorded hash is missing or stale.
-- Natural shorthand `pal ask in <silo> "..."` is supported and normalized to `--in`.
+- `pal` — operator CLI (pull, ask, ls, daemon, chroma service).
+- `llmli` — engine CLI (scripting, repair, rehydrate, log).
+- `pal sync` — refresh dev self-silo `__self__` when needed.
+- **Claude Desktop MCP (.mcpb):** after `mcp_server.py` changes, `pal extension pack` when `LLMLIBRARIAN_MCP_PACK_CMD` is set; stdio via `.mcp.json` does not update the Desktop binary. `pal ls --status` / `pal sync` warn on stale pack hash.
+- `pal ask in <silo> "..."` → normalized to `--in`.
 
-## Documentation Policy
+## Documentation policy
 
-- Keep docs short and current.
-- Remove stale implementation diaries and one-off planning details.
-- Prefer behavior contracts over speculative design notes.
+- User-facing narrative: README + [docs/GUIDE.md](docs/GUIDE.md).
+- Behavior contracts: TECH, orchestration-matrix, CHROMA_AND_STACK.
+- Remove stale implementation diaries from active guidance; do not resurrect one-off handoffs in AGENTS.
 
-## Agent Guardrails
+## Agent guardrails
 
 - Run unit tests for touched behavior before finishing.
 - Do not add broad config surfaces unless required.
 - Keep changes focused and reversible.
+- Do not call `trigger_reindex` immediately after `add_silo` (documented race / lock hazard).

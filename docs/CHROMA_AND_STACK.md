@@ -1,10 +1,12 @@
 # Chroma and Stack Notes (Current)
 
+Operator-focused notes for **one Chroma process on disk** and many HTTP clients (MCP, `pal`, watchers). User-facing “why” and workflows: [GUIDE.md](./GUIDE.md).
+
 ## Current Stack
 
 - Vector store: ChromaDB (persistent local collection, or HTTP to `chroma run`)
 - Ingest: local file processors + chunking + metadata registry/manifest
-- Query: intent routing + deterministic guardrails + retrieval + optional LLM fallback
+- Query: intent routing + deterministic guardrails + retrieval + optional LLM fallback (CLI `ask` only; MCP returns chunks)
 - CLI: `pal` (operator), `llmli` (direct)
 
 ## Chroma concurrency (important)

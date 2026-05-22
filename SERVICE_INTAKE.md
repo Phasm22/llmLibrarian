@@ -19,7 +19,7 @@ This intake process determines whether a service is ready to be monitored. The g
 | One-shot ingest (`pal pull`, `llmli add`, MCP `add_silo`) | **Deferred** | On-demand unless you add a schedule                             |
 | MCP stdio (`mcp_server.py`, Claude Desktop)               | **Deferred** | Ephemeral per IDE session; no silence window                    |
 | `ensure_self_silo` / dev `__self__` index                 | **Deferred** | Triggered by `pal ask` in dev checkouts, not a daemon           |
-| Query / ask (`pal ask`, MCP `retrieve`)                   | **Deferred** | Request/response; not a background job                          |
+| Query / ask (`pal ask`, MCP `query_personal_knowledge`) | **Deferred** | Request/response; not a background job                          |
 
 
 ---
@@ -78,7 +78,7 @@ This intake process determines whether a service is ready to be monitored. The g
 
 #### Identity
 
-- **One sentence:** Exposes llmLibrarian MCP tools over HTTP/SSE so `pal pull --watch` and remote agents can call `add_silo`, `retrieve`, `health`, etc., without spawning a new Python process per request.
+- **One sentence:** Exposes llmLibrarian MCP tools over HTTP/SSE so `pal pull --watch` and remote agents can call `add_silo`, `query_personal_knowledge`, `health`, etc., without spawning a new Python process per request.
 - **Triggers:** systemd user unit `llmlibrarian-mcp@<user>.service` or launchd `com.llmlibrarian.mcp`; `ExecStart` → `scripts/run_mcp_http.sh` → `mcp_server.py` with `LLMLIBRARIAN_MCP_TRANSPORT=streamable-http` (from `.env.mcp`).
 
 #### Execution
@@ -132,7 +132,7 @@ This intake process determines whether a service is ready to be monitored. The g
 
 - **Consecutive failures:** **2** consecutive reconcile cycles with MCP/queue errors before page (noise from transient locks).
 - **Missed window:** **Warning** at 1× interval without activity if silo is low-churn; **alert** at 2× interval if high-churn or `is_stale` from `list_silos(check_staleness=True)`.
-- **Downstream impact:** **Yes** — stale index; `pal ask` and MCP `retrieve` return outdated or empty context for that silo.
+- **Downstream impact:** **Yes** — stale index; `pal ask` and MCP retrieval tools return outdated or empty context for that silo.
 
 #### Logging current state
 

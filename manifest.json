@@ -3,8 +3,8 @@
   "name": "llmlibrarian",
   "display_name": "llmLibrarian",
   "version": "0.1.0",
-  "description": "Query your indexed personal documents using natural language. Retrieves raw chunks or Ollama-synthesized answers from your locally-indexed silos.",
-  "long_description": "llmLibrarian is a deterministic, locally-hosted RAG engine for personal data. It indexes folders into silos (ChromaDB collections) and answers questions using retrieved chunks. Use `retrieve` to get raw evidence for Claude to reason over, or `ask` to get an Ollama-synthesized answer. Supports PDF, DOCX, XLSX, PPTX, and text/code files.",
+  "description": "Search your own indexed folders by meaning. Returns cited chunks from local silos for the host model to answer from.",
+  "long_description": "llmLibrarian is a local-first index over folders you choose (silos). MCP tools expose semantic retrieval (`query_personal_knowledge`, `multi_query_knowledge`), ingest (`add_silo`, `trigger_reindex`), and health checks. The host assistant synthesizes answers from returned chunks; use the `pal ask` CLI with Ollama for fully local Q&A. Supports PDF, DOCX, XLSX, PPTX, and text/code.",
   "author": {
     "name": "tjm4"
   },
