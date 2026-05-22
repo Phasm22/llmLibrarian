@@ -4,7 +4,7 @@
   "display_name": "llmLibrarian",
   "version": "0.1.0",
   "description": "Search your own indexed folders by meaning. Returns cited chunks from local silos for the host model to answer from.",
-  "long_description": "llmLibrarian is a local-first index over folders you choose (silos). MCP tools expose semantic retrieval (`query_personal_knowledge`, `multi_query_knowledge`), ingest (`add_silo`, `trigger_reindex`), and health checks. The host assistant synthesizes answers from returned chunks; use the `pal ask` CLI with Ollama for fully local Q&A. Supports PDF, DOCX, XLSX, PPTX, and text/code.",
+  "long_description": "llmLibrarian is a local-first index over folders you choose (silos). MCP tools expose bootstrap/diagnostics (`session_context`, `health`), semantic retrieval (`query_personal_knowledge`, `multi_query_knowledge`), and ingest (`add_silo`, `trigger_reindex`). The host assistant synthesizes answers from returned chunks; use the `pal ask` CLI with Ollama for fully local Q&A. Supports PDF, DOCX, XLSX, PPTX, and text/code.",
   "author": {
     "name": "tjm4"
   },

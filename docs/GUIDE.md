@@ -38,14 +38,28 @@ Classic search matches strings. **Vector search** encodes meaning: “API redesi
 
 Typical agent flow:
 
-1. `list_silos` (optionally `check_staleness=True`)
+1. `session_context(check_staleness=True)` for roster + health summary + recommended actions
 2. `query_personal_knowledge` or `multi_query_knowledge` with a scoped silo when possible
-3. `health` if results are empty but the silo should have data
+3. `health` when you need full diagnostics (HNSW/storage/audit details)
 4. `add_silo` / `trigger_reindex` / `repair_silo` for ingest and recovery (`confirm=True` on writes)
 
 The **host model** (Claude, etc.) reads chunk text and writes the answer. llmLibrarian does **not** run Ollama inside MCP — that keeps MCP fast and lets you choose the brain in the IDE.
 
 **What crosses the network:** only what the tool returns (top chunks), plus normal chat context — not your entire disk. Provider training/memory policies are up to **Cursor/your API settings**, not this repo.
+
+### MCP cheat sheet (use / avoid)
+
+| Tool | Use for | Avoid for |
+|------|---------|-----------|
+| `session_context` | Start-of-session bootstrap | Deep storage audit (`health`) |
+| `mcp_runtime_status` | Lock/process/runtime troubleshooting | Content retrieval |
+| `query_personal_knowledge` | Content/meaning Q&A | Filename/date lookup (`find_files`) |
+| `multi_query_knowledge` | Multi-angle retrieval in one call | Basic single-query retrieval |
+| `find_files` | Path/date discovery | “What does this document say?” |
+| `add_silo` | Index new/updated path | Calling `trigger_reindex` immediately after |
+| `trigger_reindex` | Stale content refresh | Corruption repair (`repair_silo`) |
+| `repair_silo` | Index corruption / zero-chunk inconsistencies | Routine freshness updates |
+| `health` | Full diagnostics | Everyday bootstrap (`session_context`) |
 
 ---
 

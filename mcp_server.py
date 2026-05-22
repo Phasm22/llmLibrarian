@@ -270,13 +270,13 @@ mcp = FastMCP(
     name="llmLibrarian",
     instructions=(
         "Use these tools when a task requires context from the user's personal knowledge base. "
-        "Call list_silos first to get current silo state, domains, paths, chunk counts, "
-        "and diagnostic flags. Do not assume a silo's topic from its slug alone; names "
+        "At session start, call session_context(check_staleness=True) for roster + health summary + actions. "
+        "If you only need a quick roster, call list_silos. Do not assume a silo's topic from its slug alone; names "
         "can drift or be reused, so verify with list_silos metadata and retrieved sources. "
         ""
         "If retrieval returns zero chunks with no error, cross-check list_silos before treating "
         "that as evidence of absence: chunks_count > 0, has_index_errors, or has_ingest_failures "
-        "means the empty result may be an index/tool problem. Call health for diagnostics. "
+        "means the empty result may be an index/tool problem. Call session_context or health for diagnostics. "
         ""
         "For any task involving the user's past thinking, decisions, habits, or writing, "
         "call query_personal_knowledge before responding. Use multi_query_knowledge when "
@@ -292,6 +292,7 @@ mcp = FastMCP(
         ""
         "Use inspect_silo to diagnose coverage gaps. Use watch_coverage to check whether "
         "registered sources have watcher jobs, but do not assume watchers are active. "
+        "Use mcp_runtime_status when lock/process/runtime visibility is unclear (multiple MCP PIDs, stale pid lock, or transport confusion). "
         "Use trigger_reindex after file changes or when list_silos shows an old updated "
         "timestamp for a silo with active source changes. Use repair_silo for Chroma "
         "corruption. Use health for server diagnostics. Use capabilities for supported "
@@ -399,6 +400,269 @@ def _compute_answer_confidence(chunks: list[dict]) -> tuple[str, float, str]:
     return level, round(mean, 4), note
 
 
+def _collect_health_summary(*, include_audit: bool = False) -> dict:
+    """Collect health signals used by health() and session_context().
+
+    include_audit=False keeps payload small for routine session bootstrap.
+    include_audit=True includes deeper audit/storage details used by health().
+    """
+    from chroma_client import chroma_mode_info
+    from operations import op_db_storage_summary, op_silo_hnsw_consistency
+    from silo_audit import (
+        find_count_mismatches,
+        find_duplicate_hashes,
+        find_orphaned_sources,
+        find_path_overlaps,
+        load_file_registry,
+        load_manifest,
+        load_registry,
+    )
+    from state import get_last_failures, get_query_health
+
+    query_errors = get_query_health(_DB_PATH)
+    last_failures = get_last_failures(_DB_PATH)
+
+    out: dict = {
+        "db_path": _DB_PATH,
+        "db_exists": Path(_DB_PATH).exists(),
+        **chroma_mode_info(),
+        "embedding_model": os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2"),
+        "embedding_kind": os.environ.get("LLMLIBRARIAN_EMBEDDING", "") or "sentence_transformer",
+        "python_version": sys.version,
+        "query_health": {
+            "recent_error_count": len(query_errors),
+            **({"recent_errors": query_errors[-10:]} if include_audit else {}),
+        },
+        "ingest_failures": {
+            "last_failure_count": len(last_failures),
+            **({"last_failures": last_failures[:20]} if include_audit else {}),
+        },
+    }
+
+    if Path(_DB_PATH).is_dir():
+        try:
+            hnsw = op_silo_hnsw_consistency(_DB_PATH)
+            if hnsw.get("status") == "ok":
+                bad = [r for r in hnsw.get("silos") or [] if not r.get("consistent")]
+                if include_audit:
+                    out["hnsw_consistency"] = {
+                        "silo_count": hnsw.get("silo_count", 0),
+                        "desynced_count": hnsw.get("desynced_count", 0),
+                        "desynced": [
+                            {
+                                "slug": r["slug"],
+                                "sqlite_ids": r["sqlite_ids"],
+                                "missing_count": r["missing_count"],
+                                "queued": r["queued"],
+                                "missing_ids_sample": r["missing_ids"][:5],
+                            }
+                            for r in bad
+                        ],
+                    }
+                else:
+                    out["hnsw_consistency"] = {
+                        "silo_count": hnsw.get("silo_count", 0),
+                        "desynced_count": hnsw.get("desynced_count", 0),
+                    }
+            else:
+                out["hnsw_consistency"] = {"error": hnsw.get("error")}
+        except Exception as e:
+            out["hnsw_consistency"] = {"error": f"{type(e).__name__}: {e}"}
+
+    if include_audit:
+        registry = load_registry(_DB_PATH)
+        manifest = load_manifest(_DB_PATH)
+        file_registry = load_file_registry(_DB_PATH)
+        out["silo_audit"] = {
+            "silo_count": len(registry),
+            "count_mismatch_count": len(find_count_mismatches(registry, manifest)),
+            "count_mismatches": find_count_mismatches(registry, manifest)[:20],
+            "duplicate_hash_group_count": len(find_duplicate_hashes(file_registry)),
+            "path_overlap_count": len(find_path_overlaps(registry)),
+            "orphaned_source_count": len(find_orphaned_sources(registry)),
+            "orphaned_sources": find_orphaned_sources(registry)[:20],
+        }
+        if Path(_DB_PATH).is_dir():
+            out["storage"] = op_db_storage_summary(_DB_PATH)
+
+    with _reindex_outcome_lock:
+        out["active_background_jobs"] = dict(_active_background_jobs)
+        out["last_background_reindex"] = dict(_last_reindex_outcome)
+
+    return out
+
+
+def _derive_recommended_actions(silos: list[dict], summary: dict) -> list[str]:
+    """Generate concise operational guidance for session bootstrap."""
+    actions: list[str] = []
+
+    if not summary.get("db_exists"):
+        actions.append("Fix LLMLIBRARIAN_DB for this MCP process before retrieval.")
+        return actions
+
+    if summary.get("chroma_transport") == "http" and not summary.get("chroma_server_ok", True):
+        host = summary.get("chroma_server_host", "127.0.0.1")
+        port = summary.get("chroma_server_port", 8000)
+        actions.append(f"Chroma HTTP appears down at {host}:{port}; start/restart it (for example: pal chroma start).")
+
+    hnsw = summary.get("hnsw_consistency") or {}
+    if isinstance(hnsw, dict):
+        if int(hnsw.get("desynced_count", 0) or 0) > 0:
+            actions.append("One or more silos are HNSW-desynced; run repair_silo on affected silos.")
+        elif hnsw.get("error"):
+            actions.append("HNSW consistency check returned an error; call health() for full diagnostics.")
+
+    if int(((summary.get("query_health") or {}).get("recent_error_count", 0) or 0)) > 0:
+        actions.append("Recent query index errors were recorded; check health() details and repair affected silos if needed.")
+    if int(((summary.get("ingest_failures") or {}).get("last_failure_count", 0) or 0)) > 0:
+        actions.append("Recent ingest failures exist; inspect failures and reindex/repair affected silos.")
+
+    for s in silos:
+        slug = str(s.get("slug") or "")
+        if not slug:
+            continue
+        if bool(s.get("has_index_errors")):
+            actions.append(f"Silo {slug} reports index errors; run repair_silo for a clean rebuild.")
+        if bool(s.get("has_ingest_failures")):
+            actions.append(f"Silo {slug} has ingest failures; inspect and reindex or repair.")
+        if bool(s.get("is_stale")):
+            stale_count = int(s.get("stale_file_count") or 0)
+            newest = str(s.get("newest_source_mtime_iso") or "")
+            updated = str(s.get("updated") or "")
+            if stale_count <= 3 and newest and updated and newest == updated:
+                actions.append(f"Silo {slug} shows minor stale noise (<=3 files) with matching timestamps; index is likely usable.")
+            else:
+                actions.append(f"Silo {slug} appears stale ({stale_count} files); run trigger_reindex once source changes settle.")
+
+    active = summary.get("active_background_jobs") or {}
+    if isinstance(active, dict) and active:
+        actions.append("Background ingest/reindex jobs are active; wait for completion or check health() before heavy querying.")
+
+    return actions
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Best-effort liveness check for local PIDs."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _read_mcp_pid_lock_snapshot() -> dict:
+    """Return MCP PID lock visibility without raising."""
+    path = _pid_file_path()
+    out: dict = {
+        "pid_lock_path": str(path),
+        "lock_file_exists": path.exists(),
+        "lock_holder_pid": None,
+        "lock_holder_alive": None,
+    }
+    if not path.exists():
+        return out
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        pid = int(raw) if raw else None
+        out["lock_holder_pid"] = pid
+        if pid is not None:
+            out["lock_holder_alive"] = _pid_is_alive(pid)
+        return out
+    except Exception as e:
+        out["introspection_error"] = f"{type(e).__name__}: {e}"
+        return out
+
+
+def _mcp_process_snapshot(*, verbose: bool = False) -> dict:
+    """Count mcp_server.py processes via /proc scanning (Linux) with graceful fallback."""
+    out: dict = {"mcp_process_count": 0, "multiple_mcp_processes": False}
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        out["introspection_error"] = "procfs unavailable"
+        return out
+
+    rows: list[dict] = []
+    try:
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            cmdline_path = entry / "cmdline"
+            try:
+                raw = cmdline_path.read_bytes()
+            except Exception:
+                continue
+            if not raw:
+                continue
+            parts = [p.decode("utf-8", errors="replace") for p in raw.split(b"\x00") if p]
+            joined = " ".join(parts)
+            if "mcp_server.py" in joined and "llmLibrarian" in joined:
+                row = {"pid": int(entry.name)}
+                if verbose:
+                    row["cmdline"] = joined
+                rows.append(row)
+    except Exception as e:
+        out["introspection_error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    out["mcp_process_count"] = len(rows)
+    out["multiple_mcp_processes"] = len(rows) > 1
+    if verbose:
+        out["processes"] = rows
+    return out
+
+
+def _dedupe_lines(lines: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
+    return out
+
+
+def _compact_runtime_jobs(summary: dict, *, verbose: bool = False, limit: int = 5) -> dict:
+    """Keep runtime jobs compact by default; expose full records in verbose mode."""
+    active = summary.get("active_background_jobs") or {}
+    last = summary.get("last_background_reindex") or {}
+    if not isinstance(active, dict):
+        active = {}
+    if not isinstance(last, dict):
+        last = {}
+
+    if verbose:
+        return {"active_background_jobs": active, "last_background_reindex": last}
+
+    active_compact: dict[str, dict] = {}
+    for key in list(active.keys())[:limit]:
+        row = active.get(key) or {}
+        if not isinstance(row, dict):
+            continue
+        active_compact[key] = {
+            "kind": row.get("kind"),
+            "silo": row.get("silo"),
+            "started_at": row.get("started_at"),
+        }
+
+    last_compact: dict[str, dict] = {}
+    for key in list(last.keys())[:limit]:
+        row = last.get(key) or {}
+        if not isinstance(row, dict):
+            continue
+        last_compact[key] = {
+            "ok": row.get("ok"),
+            "finished_at": row.get("finished_at"),
+            **({"error": row.get("error")} if row.get("error") else {}),
+        }
+
+    return {
+        "active_background_jobs": active_compact,
+        "last_background_reindex": last_compact,
+        "active_count": len(active),
+        "last_outcome_count": len(last),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Helper: doc-type breakdown (delegated to operations module)
 # ---------------------------------------------------------------------------
@@ -419,6 +683,10 @@ def query_personal_knowledge(
     doc_type: str | None = None,
 ) -> dict:
     """
+    Use when: answering a content/meaning question from indexed files.
+    Do not use when: the user wants filenames/date filtering only (`find_files`) or ranking diagnostics only (`explain_retrieval`).
+    Pairs with: `session_context`/`list_silos` first, then optional `inspect_silo`/`health` if coverage looks weak.
+
     Call this when a task requires the user's personal context — past writing,
     decisions, reflections, or domain knowledge. Returns semantically ranked
     chunks from indexed silos.
@@ -486,6 +754,10 @@ def multi_query_knowledge(
     max_total_chunks: int = 50,
 ) -> dict:
     """
+    Use when: one task needs multiple retrieval angles merged in one response.
+    Do not use when: a single focused query is enough (`query_personal_knowledge`) or when you need silo discovery (`session_context`/`list_silos`).
+    Pairs with: `session_context` first; follow up with `query_personal_knowledge` if truncation hides details.
+
     Call this when a task needs multiple angles of context from personal knowledge.
     Fire multiple semantic queries and return merged, deduplicated chunks ranked
     by best score. Use when a topic requires several retrieval angles — for example,
@@ -552,6 +824,10 @@ def explain_retrieval(
     n_results: int = 20,
 ) -> dict:
     """
+    Use when: debugging retrieval quality (hybrid/vector signal breakdown).
+    Do not use when: generating user-facing answers; use `query_personal_knowledge`.
+    Pairs with: `query_personal_knowledge`, `inspect_silo`, `health`.
+
     Return a structured breakdown of how retrieval results were ranked for a query.
     Useful for diagnosing missed results, unexpected rankings, or low confidence answers
     before deciding to re-query with different parameters.
@@ -641,6 +917,10 @@ def explain_retrieval(
 @mcp.tool()
 def watch_coverage() -> dict:
     """
+    Use when: checking whether pal bookmarks map to daemon watch jobs/services.
+    Do not use when: diagnosing index corruption/staleness (`session_context`, `health`, `trigger_reindex`, `repair_silo`).
+    Pairs with: `list_silos` for source-to-silo sanity checks.
+
     Read-only: pal bookmarks (~/.pal/registry.json) vs indexed silos vs derived watch jobs.
     Returns bookmark rows (path, resolved_path, silo_slug, path_exists, indexed, would_watch),
     watch_jobs (what `pal daemon` would sync), service unit file presence when daemon is installed,
@@ -655,6 +935,10 @@ def watch_coverage() -> dict:
 @mcp.tool()
 def list_silos(check_staleness: bool = False) -> dict:
     """
+    Use when: you need a live roster of registered silos before retrieval.
+    Do not use when: you also need health diagnostics/action guidance — use `session_context`.
+    Pairs with: `query_personal_knowledge`, `multi_query_knowledge`, `trigger_reindex`.
+
     List all indexed silos. Returns db_path (the database this server is using),
     db_exists (false means LLMLIBRARIAN_DB is misconfigured), silo_count, and
     a silos array with slug, display name, path, file count, chunk count, last-indexed
@@ -670,8 +954,56 @@ def list_silos(check_staleness: bool = False) -> dict:
 
 
 @mcp.tool()
+def session_context(check_staleness: bool = True, include_audit: bool = False) -> dict:
+    """
+    Use when: starting a personal-knowledge task and you need one bootstrap call.
+    Do not use when: you only need a quick silo roster (`list_silos`) or deep diagnostics (`health`).
+    Pairs with: `query_personal_knowledge` / `multi_query_knowledge` after reviewing actions.
+
+    Returns:
+    - silo roster (same shape as list_silos)
+    - compact health summary (or richer summary when include_audit=True)
+    - recommended_actions derived from stale/index/error signals
+    - ready_for_retrieval boolean to help agents gate first query
+    """
+    if not Path(_DB_PATH).is_dir():
+        return {
+            **_db_missing_error(),
+            "silo_count": 0,
+            "silos": [],
+            "recommended_actions": ["Fix LLMLIBRARIAN_DB for this MCP process before retrieval."],
+            "ready_for_retrieval": False,
+        }
+
+    from operations import op_list_silos
+
+    silos_result = op_list_silos(_DB_PATH, check_staleness=check_staleness)
+    silos = silos_result.get("silos", []) if isinstance(silos_result, dict) else []
+    summary = _collect_health_summary(include_audit=include_audit)
+    actions = _derive_recommended_actions(silos, summary)
+    hnsw = summary.get("hnsw_consistency") or {}
+    hnsw_desynced = int(hnsw.get("desynced_count", 0) or 0) if isinstance(hnsw, dict) else 0
+    ready_for_retrieval = bool(
+        summary.get("db_exists")
+        and (summary.get("chroma_transport") != "http" or summary.get("chroma_server_ok", True))
+        and hnsw_desynced == 0
+    )
+
+    return {
+        **silos_result,
+        "health_summary": summary,
+        "recommended_actions": actions,
+        "ready_for_retrieval": ready_for_retrieval,
+    }
+
+
+@mcp.tool()
 def inspect_silo(silo: str, top: int = 50) -> dict:
     """
+    Use when: diagnosing coverage inside one silo (file-level chunk distribution).
+    Do not use when: you need content retrieval (`query_personal_knowledge`) or stale diagnostics (`session_context`/`health`).
+    Pairs with: `query_personal_knowledge` and `repair_silo`.
+
     Show per-file chunk counts for a silo. Returns total chunks (registry vs ChromaDB),
     a registry_match flag, and a files list sorted by chunk count descending.
     Useful to diagnose zero-chunk files (likely failed to parse), detect duplicate content,
@@ -701,6 +1033,10 @@ def find_files(
     limit: int = 50,
 ) -> dict:
     """
+    Use when: the user asks for files by filename/date rather than document meaning.
+    Do not use when: you need content-based answers (`query_personal_knowledge`/`multi_query_knowledge`).
+    Pairs with: `query_personal_knowledge` after selecting a target file/silo.
+
     Find files by name and/or date against the manifest — no embeddings, no LLM.
     Use this for filename/date lookups like "today's journal entry" or "files from May 2026"
     where the user wants the *file*, not content discussion. Returns each hit with both
@@ -767,6 +1103,10 @@ def find_files(
 @mcp.tool()
 def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     """
+    Use when: a registered silo is stale after source-file edits.
+    Do not use when: immediately after `add_silo` or when fixing corruption (`repair_silo`).
+    Pairs with: `session_context`/`list_silos` to validate staleness first.
+
     Re-index a registered silo from its source path in a background thread.
     Only works on already-registered silos — cannot add new paths.
     Requires confirm=True to proceed (safety guard against accidental calls).
@@ -871,6 +1211,10 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
 @mcp.tool()
 def repair_silo(silo: str, confirm: bool = False) -> dict:
     """
+    Use when: index corruption/zero-chunk inconsistencies are suspected.
+    Do not use when: routine freshness updates are needed (`trigger_reindex`).
+    Pairs with: `session_context`/`health` before and after repair.
+
     Hard-wipe and fully re-index a silo to fix ChromaDB index corruption or 0-chunk inconsistencies.
     Runs inside this process (safe even when the MCP server has the DB open).
     Equivalent to `llmli repair <silo>` but avoids the concurrent-write crash that happens
@@ -937,6 +1281,10 @@ def _resolve_silo_under_path(silo: str, path: str) -> tuple[str | None, str | No
 @mcp.tool()
 def update_file(silo: str, path: str, confirm: bool = False) -> dict:
     """
+    Use when: applying a single-file change inside an existing silo (watcher-style delta).
+    Do not use when: onboarding/updating a full folder (`add_silo`) or fixing corruption (`repair_silo`).
+    Pairs with: `remove_file` and `watch_coverage`.
+
     Re-index a single file in an already-registered silo. Used by `pal pull --watch`
     to push individual file changes through the shared Chroma client without
     spawning a separate writer process. Synchronous: blocks until the file is indexed.
@@ -976,6 +1324,10 @@ def update_file(silo: str, path: str, confirm: bool = False) -> dict:
 @mcp.tool()
 def remove_file(silo: str, path: str, confirm: bool = False) -> dict:
     """
+    Use when: deleting one file from an already-registered silo.
+    Do not use when: deleting/rebuilding an entire silo (`repair_silo` / remove+add flow).
+    Pairs with: `update_file` and `watch_coverage`.
+
     Remove a single file's chunks and manifest entry from an already-registered silo.
     Used by `pal pull --watch` for delete events. Synchronous.
     Path must resolve to a location under the silo's registered source folder.
@@ -1021,6 +1373,10 @@ def add_silo(
     confirm: bool = True,
 ) -> dict:
     """
+    Use when: indexing a new file/folder or refreshing a silo from its source path.
+    Do not use when: you only need stale refresh after edits (`trigger_reindex`) or corruption repair (`repair_silo`).
+    Pairs with: `session_context`/`list_silos` before and after indexing.
+
     Index a file or folder as a new silo (or update an existing one). Equivalent to `llmli add <path>`.
     silo: optional slug override (default: basename, slugified).
     display_name: optional human-readable name override.
@@ -1028,6 +1384,10 @@ def add_silo(
     full: set True to force a full non-incremental reindex (default: incremental).
     Returns immediately; indexing runs in a background thread (same process, serialized via lock).
     Call list_silos() or health() after a minute or two to confirm completion.
+
+    IMPORTANT: Do NOT call trigger_reindex immediately after add_silo.
+    add_silo already runs background indexing; a second immediate reindex can
+    create lock contention and increase corruption risk.
     """
     from pathlib import Path as _Path
 
@@ -1121,96 +1481,80 @@ def add_silo(
 
 
 @mcp.tool()
+def mcp_runtime_status(verbose: bool = False) -> dict:
+    """
+    Use when: lock/process/runtime visibility is unclear for MCP or Chroma.
+    Do not use when: you need content retrieval (`query_personal_knowledge`) or per-file coverage (`inspect_silo`).
+    Pairs with: `session_context` for bootstrap and `health` for deep diagnostics.
+
+    Returns a compact operator snapshot for agents:
+    - mcp_http: pid lock visibility + mcp_server process multiplicity
+    - chroma: transport and server reachability
+    - jobs: active background jobs and last reindex outcomes
+    - health_counts: query/ingest/HNSW counts
+    - recommended_actions: short operational guidance
+    """
+    summary = _collect_health_summary(include_audit=False)
+    mcp_lock = _read_mcp_pid_lock_snapshot()
+    proc = _mcp_process_snapshot(verbose=verbose)
+
+    mcp_http: dict = {**mcp_lock, **proc}
+    chroma = {
+        "transport": summary.get("chroma_transport"),
+        "server_ok": summary.get("chroma_server_ok"),
+        "host": summary.get("chroma_server_host"),
+        "port": summary.get("chroma_server_port"),
+    }
+    jobs = _compact_runtime_jobs(summary, verbose=verbose)
+    hnsw = summary.get("hnsw_consistency") or {}
+    health_counts = {
+        "query_error_count": int(((summary.get("query_health") or {}).get("recent_error_count", 0) or 0)),
+        "ingest_failure_count": int(((summary.get("ingest_failures") or {}).get("last_failure_count", 0) or 0)),
+        "hnsw_desynced_count": int((hnsw.get("desynced_count", 0) if isinstance(hnsw, dict) else 0) or 0),
+    }
+
+    actions = _derive_recommended_actions([], summary)
+    if bool(mcp_http.get("multiple_mcp_processes")):
+        actions.append("Multiple mcp_server.py processes detected; stop orphan MCP processes and keep one service instance.")
+    if bool(mcp_http.get("lock_file_exists")) and mcp_http.get("lock_holder_pid") and not bool(mcp_http.get("lock_holder_alive")):
+        actions.append("MCP PID lock file points to a dead process; restart MCP service to refresh lock state.")
+    actions = _dedupe_lines(actions)
+
+    out: dict = {
+        "db_path": _DB_PATH,
+        "db_exists": bool(summary.get("db_exists")),
+        "mcp_http": mcp_http,
+        "chroma": chroma,
+        "jobs": jobs,
+        "health_counts": health_counts,
+        "recommended_actions": actions,
+    }
+    if verbose:
+        out["summary_raw"] = summary
+    return out
+
+
+@mcp.tool()
 def health() -> dict:
     """
+    Use when: you need deep diagnostics (transport, query errors, ingest failures, HNSW, storage).
+    Do not use when: you only need a routine session bootstrap (`session_context`).
+    Pairs with: `session_context`, `repair_silo`, `trigger_reindex`.
+
     Diagnostic check. Returns db_path, db_exists, embedding model, Python version,
     and on-disk Chroma layout stats (including HNSW link_lists.bin bloat detection).
     Call this first if tools are failing, the disk is filling, or Python keeps spawning.
     """
-    from operations import op_db_storage_summary
-    from state import get_last_failures, get_query_health
-    from silo_audit import (
-        find_count_mismatches,
-        find_duplicate_hashes,
-        find_orphaned_sources,
-        find_path_overlaps,
-        load_file_registry,
-        load_manifest,
-        load_registry,
-    )
-
-    embedding_model = os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2")
-    embedding_kind = os.environ.get("LLMLIBRARIAN_EMBEDDING", "") or "sentence_transformer"
-    query_errors = get_query_health(_DB_PATH)
-    last_failures = get_last_failures(_DB_PATH)
-    registry = load_registry(_DB_PATH)
-    manifest = load_manifest(_DB_PATH)
-    file_registry = load_file_registry(_DB_PATH)
-    count_mismatches = find_count_mismatches(registry, manifest)
-    duplicate_hashes = find_duplicate_hashes(file_registry)
-    path_overlaps = find_path_overlaps(registry)
-    orphaned_sources = find_orphaned_sources(registry)
-    from chroma_client import chroma_mode_info
-
-    out: dict = {
-        "db_path": _DB_PATH,
-        "db_exists": Path(_DB_PATH).exists(),
-        **chroma_mode_info(),
-        "embedding_model": embedding_model,
-        "embedding_kind": embedding_kind,
-        "python_version": sys.version,
-        "query_health": {
-            "recent_error_count": len(query_errors),
-            "recent_errors": query_errors[-10:],
-        },
-        "ingest_failures": {
-            "last_failure_count": len(last_failures),
-            "last_failures": last_failures[:20],
-        },
-        "silo_audit": {
-            "silo_count": len(registry),
-            "count_mismatch_count": len(count_mismatches),
-            "count_mismatches": count_mismatches[:20],
-            "duplicate_hash_group_count": len(duplicate_hashes),
-            "path_overlap_count": len(path_overlaps),
-            "orphaned_source_count": len(orphaned_sources),
-            "orphaned_sources": orphaned_sources[:20],
-        },
-    }
-    if Path(_DB_PATH).is_dir():
-        out["storage"] = op_db_storage_summary(_DB_PATH)
-        try:
-            from operations import op_silo_hnsw_consistency
-            hnsw = op_silo_hnsw_consistency(_DB_PATH)
-            if hnsw.get("status") == "ok":
-                bad = [r for r in hnsw.get("silos") or [] if not r.get("consistent")]
-                out["hnsw_consistency"] = {
-                    "silo_count": hnsw.get("silo_count", 0),
-                    "desynced_count": hnsw.get("desynced_count", 0),
-                    "desynced": [
-                        {
-                            "slug": r["slug"],
-                            "sqlite_ids": r["sqlite_ids"],
-                            "missing_count": r["missing_count"],
-                            "queued": r["queued"],
-                            "missing_ids_sample": r["missing_ids"][:5],
-                        }
-                        for r in bad
-                    ],
-                }
-            else:
-                out["hnsw_consistency"] = {"error": hnsw.get("error")}
-        except Exception as e:
-            out["hnsw_consistency"] = {"error": f"{type(e).__name__}: {e}"}
-    with _reindex_outcome_lock:
-        out["active_background_jobs"] = dict(_active_background_jobs)
-        out["last_background_reindex"] = dict(_last_reindex_outcome)
-    return out
+    return _collect_health_summary(include_audit=True)
 
 
 @mcp.tool()
 def capabilities() -> str:
     """
+    Use when: checking supported file types/extractors or smoke-testing MCP connectivity.
+    Do not use when: diagnosing runtime/index health (`session_context`/`health`).
+    Pairs with: `add_silo`.
+
     Return a plain-text report of all supported file types and extractors.
     No Ollama call required. Useful as a connectivity smoke test.
     """

@@ -51,7 +51,7 @@ pal daemon install|sync|logs
 
 **Storage:** `LLMLIBRARIAN_DB` (default `./my_brain_db`); collection `llmli`; silo in metadata. Server mode: `chroma run` + `LLMLIBRARIAN_CHROMA_HOST`.
 
-**MCP tools:** `query_personal_knowledge`, `multi_query_knowledge`, `list_silos`, `add_silo`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md).
+**MCP tools:** `session_context`, `mcp_runtime_status`, `query_personal_knowledge`, `multi_query_knowledge`, `list_silos`, `add_silo`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md).
 
 **Data flow:**
 

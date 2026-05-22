@@ -36,18 +36,21 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 | `update_file` / `remove_file` | Single-file maintenance |
 | `watch_coverage` | Read-only daemon/bookmark diagnostics |
 | `inspect_silo` | Per-file chunk counts |
+| `session_context` | One-call bootstrap: roster + compact health + recommended actions |
+| `mcp_runtime_status` | MCP/chroma runtime visibility (pid lock, process count, transport) |
 
 MCP returns **chunks**; the host model answers. Local synthesis: `pal ask` / `llmli ask` (Ollama).
+MCP tool docstrings follow: **Use when / Do not use when / Pairs with**.
 
 ## Session-start checklist (MCP)
 
-1. `list_silos(check_staleness=True)` before retrieval.
+1. Prefer `session_context(check_staleness=True)` before retrieval.
 2. If `is_stale: true` and `stale_file_count` is substantial → `trigger_reindex` before querying.
 3. If `stale_file_count` is small (≤2–3) **and** `newest_source_mtime_iso` matches the silo `updated` timestamp → treat as index race noise; skip reindex.
 4. `db_exists: false` → fix `LLMLIBRARIAN_DB` in the MCP launch env before any retrieval.
 5. `health()` → `chroma_transport`: if `embedded` and MCP is up, CLI ingest may be blocked; use server mode (`LLMLIBRARIAN_CHROMA_HOST`, `pal chroma start`) — [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).
 
-If retrieval returns **zero chunks** with no `error`, do **not** assume the KB is empty. Cross-check `list_silos` (`chunks_count`, `has_index_errors`, `has_ingest_failures`) and call `health`.
+If retrieval returns **zero chunks** with no `error`, do **not** assume the KB is empty. Cross-check `session_context`/`list_silos` (`chunks_count`, `has_index_errors`, `has_ingest_failures`) and call `health`.
 
 Use **`pal`** / **`llmli`** when MCP is unavailable or for flags not on tools (repair-ladder, rehydrate, trace, etc.).
 
