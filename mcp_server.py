@@ -808,23 +808,40 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
 
     def _run_reindex() -> None:
         err: str | None = None
+        _write_lock_held = False
         _mark_background_job_started(slug, kind="trigger_reindex", silo=slug, path=source_path)
         try:
-            with _reindex_lock:
-                with _mcp_chroma_lock("trigger_reindex"):
-                    from ingest import run_add
+            def _acquire_for_write() -> None:
+                nonlocal _write_lock_held
+                timeout = _mcp_lock_timeout_seconds()
+                if not _chroma_lock.acquire(timeout=timeout):
+                    raise TimeoutError(
+                        f"Timed out after {timeout:g}s waiting for MCP Chroma lock during trigger_reindex. "
+                        "A background reindex or another tool call is still using Chroma; retry or restart."
+                    )
+                _write_lock_held = True
 
-                    # Drop the cached singleton PersistentClient before run_add
-                    # opens its own writer_client. Two live PersistentClients on
-                    # the same persist dir corrupt the HNSW segment writer
-                    # (chroma_client.py:148).
-                    _release_chroma()
-                    run_add(path=source_path, db_path=_DB_PATH, incremental=True)
+            with _reindex_lock:
+                from ingest import run_add
+
+                # Drop the cached singleton PersistentClient before run_add
+                # opens its own writer_client. Two live PersistentClients on
+                # the same persist dir corrupt the HNSW segment writer
+                # (chroma_client.py:148).
+                _release_chroma()
+                run_add(
+                    path=source_path,
+                    db_path=_DB_PATH,
+                    incremental=True,
+                    _pre_write_hook=_acquire_for_write,
+                )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             _logger.exception("trigger_reindex failed silo=%s path=%s", slug, source_path)
             traceback.print_exc(file=sys.stderr)
         finally:
+            if _write_lock_held:
+                _chroma_lock.release()
             finished = datetime.now(timezone.utc).isoformat()
             rec = {
                 "silo": slug,
@@ -1034,35 +1051,49 @@ def add_silo(
         files_ok = 0
         n_failures = 0
         final_slug: str | None = None
+        _write_lock_held = False
         _mark_background_job_started(outcome_key, kind="add_silo", path=str(p), silo=silo)
         try:
-            with _reindex_lock:
-                with _mcp_chroma_lock("add_silo"):
-                    from orchestration.ingest import IngestRequest, run_ingest
-                    from state import resolve_silo_by_path, resolve_silo_to_slug
+            def _acquire_for_write() -> None:
+                nonlocal _write_lock_held
+                timeout = _mcp_lock_timeout_seconds()
+                if not _chroma_lock.acquire(timeout=timeout):
+                    raise TimeoutError(
+                        f"Timed out after {timeout:g}s waiting for MCP Chroma lock during add_silo. "
+                        "A background reindex or another tool call is still using Chroma; retry or restart."
+                    )
+                _write_lock_held = True
 
-                    result = run_ingest(
-                        IngestRequest(
-                            path=str(p),
-                            db_path=_DB_PATH,
-                            forced_silo_slug=silo,
-                            display_name=display_name,
-                            allow_cloud=allow_cloud,
-                            incremental=not full,
-                            exclude_patterns=exclude_patterns,
-                        )
+            with _reindex_lock:
+                from orchestration.ingest import IngestRequest, run_ingest
+                from state import resolve_silo_by_path, resolve_silo_to_slug
+
+                _release_chroma()
+                result = run_ingest(
+                    IngestRequest(
+                        path=str(p),
+                        db_path=_DB_PATH,
+                        forced_silo_slug=silo,
+                        display_name=display_name,
+                        allow_cloud=allow_cloud,
+                        incremental=not full,
+                        exclude_patterns=exclude_patterns,
+                        pre_write_hook=_acquire_for_write,
                     )
-                    files_ok = result.files_indexed
-                    n_failures = result.failures
-                    final_slug = (
-                        resolve_silo_to_slug(_DB_PATH, silo) if silo
-                        else resolve_silo_by_path(_DB_PATH, p)
-                    )
+                )
+                files_ok = result.files_indexed
+                n_failures = result.failures
+                final_slug = (
+                    resolve_silo_to_slug(_DB_PATH, silo) if silo
+                    else resolve_silo_by_path(_DB_PATH, p)
+                )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             _logger.exception("add_silo failed path=%s", p)
             traceback.print_exc(file=sys.stderr)
         finally:
+            if _write_lock_held:
+                _chroma_lock.release()
             finished = datetime.now(timezone.utc).isoformat()
             rec: dict = {
                 "silo": final_slug or outcome_key,

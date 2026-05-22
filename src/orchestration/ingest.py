@@ -30,6 +30,7 @@ class IngestRequest:
     workers: int | None = None
     embedding_workers: int | None = None
     get_chroma_client: Callable[[str], Any] | None = None
+    pre_write_hook: Callable[[], None] | None = None
     quiet: bool = False
     """If True, set LLMLIBRARIAN_QUIET=1 for the duration of run_add (subprocess callers)."""
     status_file: str | Path | None = None
@@ -101,6 +102,7 @@ def run_ingest(request: IngestRequest) -> IngestResult:
             workers=request.workers,
             embedding_workers=request.embedding_workers,
             get_chroma_client=request.get_chroma_client,
+            _pre_write_hook=request.pre_write_hook,
         )
 
     slug: str | None = None

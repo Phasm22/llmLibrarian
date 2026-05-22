@@ -2136,6 +2136,7 @@ def run_add(
     workers: int | None = None,
     embedding_workers: int | None = None,
     get_chroma_client: Callable[[str], Any] | None = None,
+    _pre_write_hook: Callable[[], None] | None = None,
 ) -> tuple[int, int]:
     """
     Index a folder or a single file into the unified collection (llmli). Silo name = basename(path) unless forced.
@@ -2638,6 +2639,11 @@ def run_add(
                     except OSError:
                         continue
     
+        # Acquire any external lock before Chroma writes begin (e.g. MCP in-process lock).
+        # File crawl / chunking above is lock-free; only the write phase needs serialization.
+        if _pre_write_hook is not None:
+            _pre_write_hook()
+
         # Write-ahead marker: if we crash between here and clear_pending, the next
         # run will detect this silo as interrupted and force a full non-incremental re-index.
         from ingest_journal import write_pending, clear_pending
