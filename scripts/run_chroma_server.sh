@@ -33,6 +33,11 @@ fi
 
 mkdir -p "$DB_PATH"
 
+# Chroma server loads sentence-transformers from collection schema; pin CPU when
+# the host has no GPU (indexed configs may still say cuda from another machine).
+export LLMLIBRARIAN_EMBEDDING_DEVICE="${LLMLIBRARIAN_EMBEDDING_DEVICE:-cpu}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
+
 exec "$CHROMA_BIN" run \
   --path "$DB_PATH" \
   --host "$HOST" \
