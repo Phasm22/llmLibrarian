@@ -30,7 +30,7 @@
     "model": {
       "type": "string",
       "title": "Ollama model",
-      "description": "Ollama model used by the `ask` tool (e.g. llama3.1:8b, phi4:14b)",
+      "description": "Ollama model for local `pal ask` / llmli (not used by MCP retrieval tools)",
       "default": "llama3.1:8b",
       "required": false
     }
