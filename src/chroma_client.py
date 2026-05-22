@@ -12,13 +12,12 @@ PersistentClient mode applies (not safe for concurrent processes on one path).
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
 import sys
 import threading
-import urllib.error
-import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -103,40 +102,55 @@ def check_chroma_server_reachable(
         p = port
     if ssl is not None:
         use_ssl = ssl
-    scheme = "https" if use_ssl else "http"
     # Chroma 1.x serves heartbeat on v2; v1 returns 410 Gone.
     for path in ("/api/v2/heartbeat", "/api/v1/heartbeat"):
-        url = f"{scheme}://{h}:{p}{path}"
+        if use_ssl:
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(h, p, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(h, p, timeout=timeout)
         try:
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if resp.status == 200:
-                    return True, None
-        except urllib.error.HTTPError as exc:
-            if exc.code == 410 and path == "/api/v1/heartbeat":
+            try:
+                conn.request("GET", path)
+                resp = conn.getresponse()
+                status = resp.status
+                resp.read()
+            except Exception as exc:
+                return False, str(exc)
+            if status == 200:
+                return True, None
+            if status == 410 and path == "/api/v1/heartbeat":
                 continue
-            return False, f"heartbeat {path} returned HTTP {exc.code}"
-        except Exception as exc:
-            return False, str(exc)
+            return False, f"heartbeat {path} returned HTTP {status}"
+        finally:
+            conn.close()
     return False, "heartbeat unreachable"
 
 
 def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
     """Return (reachable, db_path) for the llmLibrarian MCP HTTP /healthz probe."""
     host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
-    port = os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765").strip() or "8765"
-    url = f"http://{host}:{port}/healthz"
+    port_raw = os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765").strip() or "8765"
     try:
-        req = urllib.request.Request(url)
-        tok = os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN", "").strip()
-        if tok:
-            req.add_header("Authorization", f"Bearer {tok}")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        port = int(port_raw)
+    except ValueError:
+        port = 8765
+    headers: dict[str, str] = {}
+    tok = os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN", "").strip()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        try:
+            conn.request("GET", "/healthz", headers=headers)
+            resp = conn.getresponse()
             if resp.status != 200:
+                resp.read()
                 return False, None
             raw = resp.read().decode("utf-8", errors="replace")
-    except Exception:
-        return False, None
+        except Exception:
+            return False, None
+    finally:
+        conn.close()
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -418,24 +432,36 @@ def get_client(db_path: str) -> "_SafeClient":
     """Return (or create) the shared Chroma client for db_path.
 
     Embedded mode: PersistentClient with optional exit-on-stale generation.
-    HTTP mode: HttpClient to a local ``chroma run`` server.
+    HTTP mode: HttpClient to a local ``chroma run`` server. In HTTP mode the
+    cached client is re-validated with a cheap heartbeat probe so callers
+    don't get ConnectError after the chroma server is restarted out from
+    under us.
     """
     key = str(Path(db_path).expanduser().resolve())
     with _lock:
         if db_path in _clients:
-            opened_at = _client_open_generation.get(key, 0.0)
-            current = _read_generation(key)
-            if current > opened_at:
-                if _exit_on_stale_enabled():
-                    print(
-                        f"[llmli][chroma_client] writer activity detected on "
-                        f"{db_path} (gen {opened_at:.6f} → {current:.6f}); "
-                        f"exiting (99) so supervisor restarts with fresh state.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    sys.exit(99)
-            return _clients[db_path]
+            if is_http_mode():
+                cached = _clients[db_path]
+                try:
+                    cached._client.heartbeat()
+                    return cached
+                except Exception:
+                    # Stale connection (chroma server restarted). Drop and rebuild.
+                    _clients.pop(db_path, None)
+            else:
+                opened_at = _client_open_generation.get(key, 0.0)
+                current = _read_generation(key)
+                if current > opened_at:
+                    if _exit_on_stale_enabled():
+                        print(
+                            f"[llmli][chroma_client] writer activity detected on "
+                            f"{db_path} (gen {opened_at:.6f} → {current:.6f}); "
+                            f"exiting (99) so supervisor restarts with fresh state.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                        sys.exit(99)
+                return _clients[db_path]
         _storage_preflight(db_path)
         raw = _open_raw_client(db_path)
         _clients[db_path] = _SafeClient(raw)

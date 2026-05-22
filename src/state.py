@@ -4,6 +4,7 @@ Display name = original folder name; slug = canonical key (lowercase, hyphens).
 """
 import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -45,16 +46,26 @@ def _read_registry(db_path: str | Path) -> dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        print(f"[llmli] registry read failed: {path}: {e}; using empty registry.", file=sys.stderr)
+    except OSError as e:
+        # File exists but cannot be opened (e.g. EMFILE / EACCES). Treating this
+        # as an empty registry causes silent "silo not found" errors that mask
+        # the real problem. Surface it so callers (and the watcher retry loop)
+        # stop hammering.
+        raise RuntimeError(f"registry read failed: {path}: {e}") from e
+    except json.JSONDecodeError as e:
+        print(f"[llmli] registry corrupt: {path}: {e}; using empty registry.", file=sys.stderr)
         return {}
 
 def _write_registry(db_path: str | Path, data: dict[str, Any]) -> None:
     path = _registry_path(db_path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
     except Exception as e:
         print(f"[llmli] registry write failed: {path}: {e}", file=sys.stderr)
         raise
