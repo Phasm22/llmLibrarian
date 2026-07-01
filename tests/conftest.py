@@ -40,6 +40,17 @@ if _mcp_spec is not None and _mcp_spec.loader is not None:
 os.environ.setdefault("LLMLIBRARIAN_EDITOR_SCHEME", "file")
 
 
+@pytest.fixture(autouse=True)
+def _reset_embedding_function_cache() -> Any:
+    """Clear the process-wide embedding-function cache between tests so cases
+    that swap chromadb fakes or env vars see a fresh EF."""
+    from embeddings import _reset_ef_cache_for_tests
+
+    _reset_ef_cache_for_tests()
+    yield
+    _reset_ef_cache_for_tests()
+
+
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     """Consistent temp DB path fixture for tests that need a Chroma path."""

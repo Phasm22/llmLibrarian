@@ -20,10 +20,18 @@ Other env vars:
     are safe. Set to 0 to disable. Default: 400.
 """
 import os
+import threading
 from typing import Any
 
 # Empirically measured crossover on Apple M-series: MPS beats CPU at ~24+ texts per batch.
 _DEFAULT_MPS_THRESHOLD = 24
+
+# Cache sentence-transformer embedding functions across calls. Without this,
+# every ingest / update_file / remove_file call in a long-lived MCP server
+# instantiates a fresh SentenceTransformer (~500 MB of torch tensors), fragments
+# the glibc heap, and drives anon RSS into the tens of GB over hours.
+_ef_cache: dict[tuple, Any] = {}
+_ef_cache_lock = threading.Lock()
 
 
 def _mps_threshold() -> int:
@@ -98,27 +106,43 @@ def get_embedding_function(batch_size: int | None = None, device: str | None = N
     """
     from chromadb.utils import embedding_functions
     kind = os.environ.get("LLMLIBRARIAN_EMBEDDING", "").lower()
-    if kind == "default":
-        # Explicit opt-in to ONNX MiniLM path; onnxruntime will automatically
-        # use CoreMLExecutionProvider on macOS when available.
-        return embedding_functions.DefaultEmbeddingFunction()
     model = os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2")
     resolved = device if device is not None else _best_device(batch_size)
     encode_batch_size = _embedding_batch_size()
-    if encode_batch_size is not None:
-        base_cls = embedding_functions.SentenceTransformerEmbeddingFunction
+    cache_key = (kind, model, resolved, encode_batch_size)
+    with _ef_cache_lock:
+        cached = _ef_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        class BatchedSentenceTransformerEmbeddingFunction(base_cls):  # type: ignore[misc, valid-type]
-            def __call__(self, input: Any) -> Any:
-                import numpy as np
+        if kind == "default":
+            # Explicit opt-in to ONNX MiniLM path; onnxruntime will automatically
+            # use CoreMLExecutionProvider on macOS when available.
+            ef: Any = embedding_functions.DefaultEmbeddingFunction()
+        elif encode_batch_size is not None:
+            base_cls = embedding_functions.SentenceTransformerEmbeddingFunction
 
-                embeddings = self._model.encode(
-                    list(input),
-                    batch_size=encode_batch_size,
-                    convert_to_numpy=True,
-                    normalize_embeddings=self.normalize_embeddings,
-                )
-                return [np.array(embedding, dtype=np.float32) for embedding in embeddings]
+            class BatchedSentenceTransformerEmbeddingFunction(base_cls):  # type: ignore[misc, valid-type]
+                def __call__(self, input: Any) -> Any:
+                    import numpy as np
 
-        return BatchedSentenceTransformerEmbeddingFunction(model_name=model, device=resolved)
-    return embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model, device=resolved)
+                    embeddings = self._model.encode(
+                        list(input),
+                        batch_size=encode_batch_size,
+                        convert_to_numpy=True,
+                        normalize_embeddings=self.normalize_embeddings,
+                    )
+                    return [np.array(embedding, dtype=np.float32) for embedding in embeddings]
+
+            ef = BatchedSentenceTransformerEmbeddingFunction(model_name=model, device=resolved)
+        else:
+            ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model, device=resolved)
+
+        _ef_cache[cache_key] = ef
+        return ef
+
+
+def _reset_ef_cache_for_tests() -> None:
+    """Drop the cached embedding functions. Test-only helper."""
+    with _ef_cache_lock:
+        _ef_cache.clear()

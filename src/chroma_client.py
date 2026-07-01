@@ -18,6 +18,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -28,6 +29,99 @@ from chromadb.config import Settings
 _lock = threading.Lock()
 _clients: dict[str, "_SafeClient"] = {}
 _fallback_warned: set[str] = set()
+
+# Rate-limit the heartbeat probe fired from get_client() in HTTP mode. Without
+# this every get_client() call (many per query/ingest) round-trips to the
+# chroma server, and repeated open-then-close on the underlying httpx pool
+# starves the ephemeral-port range under load.
+_heartbeat_ok_at: dict[str, float] = {}
+
+
+def _heartbeat_min_interval() -> float:
+    raw = os.environ.get("LLMLIBRARIAN_CHROMA_HEARTBEAT_INTERVAL_SEC", "").strip()
+    if not raw:
+        return 5.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 5.0
+
+
+# Persistent keep-alive HTTP connections used for the cheap reachability probes
+# (Chroma /heartbeat, MCP /healthz). http.client opens a fresh socket per
+# request, and each closed socket sits in TIME_WAIT ~60s -- issued from a hot
+# code path this exhausts the ephemeral port range. We keep one HTTPConnection
+# per (host, port, ssl) target under a lock, retry once on stale sockets.
+_probe_lock = threading.Lock()
+_probe_conns: dict[tuple[str, int, bool], http.client.HTTPConnection] = {}
+
+
+def _make_probe_conn(host: str, port: int, ssl: bool, timeout: float) -> http.client.HTTPConnection:
+    if ssl:
+        return http.client.HTTPSConnection(host, port, timeout=timeout)
+    return http.client.HTTPConnection(host, port, timeout=timeout)
+
+
+def _drop_probe_conn(key: tuple[str, int, bool]) -> None:
+    conn = _probe_conns.pop(key, None)
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _probe_http(
+    host: str,
+    port: int,
+    ssl: bool,
+    path: str,
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: float = 2.0,
+) -> tuple[int, bytes, str | None]:
+    """Send GET ``path`` on a pooled keep-alive HTTP connection.
+
+    Returns ``(status, body, error)``. ``status == 0`` indicates a transport
+    error (see ``error`` for the reason). Retries once on a stale socket so
+    long-idle pooled connections don't surface transient failures to callers.
+    """
+    key = (host, port, ssl)
+    hdrs = dict(headers or {})
+    hdrs.setdefault("Connection", "keep-alive")
+    with _probe_lock:
+        last_err: str | None = None
+        for attempt in (0, 1):
+            conn = _probe_conns.get(key)
+            if conn is None:
+                conn = _make_probe_conn(host, port, ssl, timeout)
+                _probe_conns[key] = conn
+            else:
+                conn.timeout = timeout
+            try:
+                conn.request("GET", path, headers=hdrs)
+                resp = conn.getresponse()
+                status = resp.status
+                body = resp.read()
+                if resp.will_close:
+                    _drop_probe_conn(key)
+                return status, body, None
+            except (http.client.HTTPException, ConnectionError, OSError, TimeoutError) as exc:
+                last_err = str(exc)
+                _drop_probe_conn(key)
+                if attempt == 0:
+                    continue
+                return 0, b"", last_err
+        return 0, b"", last_err or "probe failed"
+
+
+def _close_probe_pool() -> None:
+    """Drop all pooled probe connections. Test/reset helper."""
+    with _probe_lock:
+        keys = list(_probe_conns.keys())
+        for key in keys:
+            _drop_probe_conn(key)
 
 # Cross-process write-generation tracking (embedded mode only).
 #
@@ -94,7 +188,11 @@ def check_chroma_server_reachable(
     ssl: bool | None = None,
     timeout: float = 2.0,
 ) -> tuple[bool, str | None]:
-    """Probe Chroma HTTP heartbeat. Returns (ok, error_detail)."""
+    """Probe Chroma HTTP heartbeat. Returns (ok, error_detail).
+
+    Uses the pooled keep-alive probe connection so repeated status checks
+    don't churn ephemeral ports.
+    """
     h, p, use_ssl = chroma_http_settings()
     if host is not None:
         h = host
@@ -104,30 +202,22 @@ def check_chroma_server_reachable(
         use_ssl = ssl
     # Chroma 1.x serves heartbeat on v2; v1 returns 410 Gone.
     for path in ("/api/v2/heartbeat", "/api/v1/heartbeat"):
-        if use_ssl:
-            conn: http.client.HTTPConnection = http.client.HTTPSConnection(h, p, timeout=timeout)
-        else:
-            conn = http.client.HTTPConnection(h, p, timeout=timeout)
-        try:
-            try:
-                conn.request("GET", path)
-                resp = conn.getresponse()
-                status = resp.status
-                resp.read()
-            except Exception as exc:
-                return False, str(exc)
-            if status == 200:
-                return True, None
-            if status == 410 and path == "/api/v1/heartbeat":
-                continue
-            return False, f"heartbeat {path} returned HTTP {status}"
-        finally:
-            conn.close()
+        status, _, err = _probe_http(h, p, use_ssl, path, timeout=timeout)
+        if err is not None:
+            return False, err
+        if status == 200:
+            return True, None
+        if status == 410 and path == "/api/v1/heartbeat":
+            continue
+        return False, f"heartbeat {path} returned HTTP {status}"
     return False, "heartbeat unreachable"
 
 
 def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
-    """Return (reachable, db_path) for the llmLibrarian MCP HTTP /healthz probe."""
+    """Return (reachable, db_path) for the llmLibrarian MCP HTTP /healthz probe.
+
+    Uses the pooled keep-alive probe connection.
+    """
     host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
     port_raw = os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765").strip() or "8765"
     try:
@@ -138,19 +228,10 @@ def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
     tok = os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN", "").strip()
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
-    conn = http.client.HTTPConnection(host, port, timeout=timeout)
-    try:
-        try:
-            conn.request("GET", "/healthz", headers=headers)
-            resp = conn.getresponse()
-            if resp.status != 200:
-                resp.read()
-                return False, None
-            raw = resp.read().decode("utf-8", errors="replace")
-        except Exception:
-            return False, None
-    finally:
-        conn.close()
+    status, body, err = _probe_http(host, port, False, "/healthz", headers=headers, timeout=timeout)
+    if err is not None or status != 200:
+        return False, None
+    raw = body.decode("utf-8", errors="replace")
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -442,12 +523,18 @@ def get_client(db_path: str) -> "_SafeClient":
         if db_path in _clients:
             if is_http_mode():
                 cached = _clients[db_path]
+                now = time.monotonic()
+                last_ok = _heartbeat_ok_at.get(db_path, 0.0)
+                if now - last_ok < _heartbeat_min_interval():
+                    return cached
                 try:
                     cached._client.heartbeat()
+                    _heartbeat_ok_at[db_path] = now
                     return cached
                 except Exception:
                     # Stale connection (chroma server restarted). Drop and rebuild.
                     _clients.pop(db_path, None)
+                    _heartbeat_ok_at.pop(db_path, None)
             else:
                 opened_at = _client_open_generation.get(key, 0.0)
                 current = _read_generation(key)
@@ -465,7 +552,9 @@ def get_client(db_path: str) -> "_SafeClient":
         _storage_preflight(db_path)
         raw = _open_raw_client(db_path)
         _clients[db_path] = _SafeClient(raw)
-        if not is_http_mode():
+        if is_http_mode():
+            _heartbeat_ok_at[db_path] = time.monotonic()
+        else:
             _client_open_generation[key] = _read_generation(key)
         return _clients[db_path]
 
@@ -489,6 +578,8 @@ def release() -> None:
     with _lock:
         _clients.clear()
         _client_open_generation.clear()
+        _heartbeat_ok_at.clear()
+    _close_probe_pool()
 
 
 def get_collection(db_path: str, name: str, embedding_function=None):
