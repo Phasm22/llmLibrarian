@@ -37,6 +37,15 @@ for _key in (
 # needs the sentence-transformer path.
 os.environ.setdefault("LLMLIBRARIAN_EMBEDDING", "default")
 
+# Deterministic terminal rendering: rich/typer help output and answer
+# wrapping (_answer_wrap_width) depend on detected terminal width and TTY
+# color support, which differ on CI runners. Pin width 88 (the suite's
+# phrasing asserts expect the resulting 86-column answer wrap) and disable
+# color so substring asserts see plain text.
+os.environ["COLUMNS"] = "88"
+os.environ["NO_COLOR"] = "1"
+os.environ.pop("FORCE_COLOR", None)
+
 # Ensure tests target the workspace module, not an installed site-packages copy.
 _pal_path = (ROOT / "pal.py").resolve()
 _pal_spec = importlib.util.spec_from_file_location("pal", _pal_path)
