@@ -6,8 +6,11 @@ After=network.target
 Type=simple
 WorkingDirectory={{INSTALL_DIR}}
 ExecStart={{INSTALL_DIR}}/scripts/run_mcp_http.sh
-Restart=always
-RestartSec=2
+Restart=on-failure
+RestartSec=5
+CPUQuota=80%
+MemoryMax=4G
+Nice=5
 # Default soft limit is 1024; chromadb HTTP client + watcher retries can blow
 # through that during a re-index storm. Raise so transient socket/fd churn
 # doesn't cascade into EMFILE -> empty-registry reads -> false "silo not found".

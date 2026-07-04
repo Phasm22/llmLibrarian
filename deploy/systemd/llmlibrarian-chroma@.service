@@ -7,8 +7,11 @@ Before=llmlibrarian-mcp.service
 Type=simple
 WorkingDirectory={{INSTALL_DIR}}
 ExecStart={{INSTALL_DIR}}/scripts/run_chroma_server.sh
-Restart=always
-RestartSec=2
+Restart=on-failure
+RestartSec=5
+CPUQuota=80%
+MemoryMax=6G
+Nice=5
 LimitNOFILE=65536
 Environment=LLMLIBRARIAN_INSTALL_DIR={{INSTALL_DIR}}
 Environment=LLMLI_CHROMA_ENV_FILE={{INSTALL_DIR}}/.env.mcp
