@@ -17,7 +17,13 @@ import chroma_client
 
 @pytest.fixture(autouse=True)
 def _reset_module_state(monkeypatch):
-    """Each test starts with a clean client cache."""
+    """Each test starts with a clean client cache in embedded mode.
+
+    LLMLIBRARIAN_CHROMA_HOST may leak in from the host's user env file
+    (pal bootstraps it at import); these tests assert the embedded
+    PersistentClient contract, so force embedded transport.
+    """
+    monkeypatch.delenv("LLMLIBRARIAN_CHROMA_HOST", raising=False)
     monkeypatch.setattr(chroma_client, "_clients", {})
     monkeypatch.setattr(chroma_client, "_fallback_warned", set())
     yield

@@ -15,6 +15,7 @@ class _FakeCollection:
         self.delete_calls = []
         self.add_calls = []
         self._metadatas = []
+        self._added_ids = set()
 
     def count(self) -> int:
         """Non-zero so ingest's consistency check does not force full re-index with a fake client."""
@@ -23,11 +24,16 @@ class _FakeCollection:
     def add(self, **kwargs):
         self.add_calls.append(kwargs)
         self._metadatas.extend(kwargs.get("metadatas") or [])
+        self._added_ids.update(kwargs.get("ids") or [])
 
     def delete(self, where):
         self.delete_calls.append(where)
 
-    def get(self, **_kwargs):
+    def get(self, **kwargs):
+        ids = kwargs.get("ids")
+        if ids is not None:
+            # Post-add write verification path: acknowledge ids we've seen added.
+            return {"ids": [i for i in ids if i in self._added_ids]}
         return {"metadatas": list(self._metadatas)}
 
 

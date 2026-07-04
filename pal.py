@@ -1350,11 +1350,60 @@ def _run_pull_child(
     return subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
 
 
+def _mcp_env_file_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    explicit = (os.environ.get("LLMLI_MCP_ENV_FILE") or "").strip()
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    meta = _daemon_metadata() or {}
+    workdir = str(meta.get("workdir") or "").strip()
+    if workdir:
+        candidates.append(Path(workdir) / ".env.mcp")
+    candidates.append(_default_project_root() / ".env.mcp")
+    candidates.append(Path.cwd() / ".env.mcp")
+    return candidates
+
+
+def _ensure_mcp_client_env() -> None:
+    """Populate MCP client env vars from the server's .env.mcp when unset.
+
+    The MCP HTTP server may be mounted on a non-default URL path (e.g. a
+    secret path for funnel exposure) configured in .env.mcp. Without this
+    fallback a pal client in a fresh shell posts to the default /mcp, the
+    server responds 404 before reaching the tool layer, and the MCP client
+    surfaces the opaque error "Session terminated".
+    """
+    if os.environ.get("LLMLIBRARIAN_MCP_URL") or os.environ.get("LLMLIBRARIAN_MCP_PATH"):
+        return
+    for candidate in _mcp_env_file_candidates():
+        try:
+            if not candidate.is_file():
+                continue
+        except OSError:
+            continue
+        parsed = _parse_env_file(candidate)
+        found = {k: v for k, v in parsed.items() if k in _MCP_CLIENT_ENV_KEYS and v}
+        if not found:
+            continue
+        for key, val in found.items():
+            os.environ.setdefault(key, val)
+        require_auth = (parsed.get("LLMLIBRARIAN_MCP_REQUIRE_AUTH") or "").strip().lower() in {"1", "true", "yes", "on"}
+        auth_token = (parsed.get("LLMLIBRARIAN_MCP_AUTH_TOKEN") or "").strip()
+        if require_auth and auth_token:
+            os.environ.setdefault("LLMLIBRARIAN_MCP_BEARER_TOKEN", auth_token)
+        return
+
+
 def _mcp_url() -> str:
+    _ensure_mcp_client_env()
     explicit = os.environ.get("LLMLIBRARIAN_MCP_URL")
     if explicit:
         return explicit
     host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1")
+    # .env.mcp holds the server *bind* address; a wildcard bind is not a
+    # usable client target, so connect via loopback instead.
+    if host in {"0.0.0.0", "::", "*"}:
+        host = "127.0.0.1"
     port = os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765")
     path = os.environ.get("LLMLIBRARIAN_MCP_PATH", "/mcp")
     if not path.startswith("/"):
@@ -1363,6 +1412,7 @@ def _mcp_url() -> str:
 
 
 def _mcp_bearer_token() -> str | None:
+    _ensure_mcp_client_env()
     return os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN") or None
 
 
@@ -1384,10 +1434,43 @@ async def _mcp_call(tool: str, **args) -> dict:
     return {"status": "ok", "raw": str(result)}
 
 
+def _mcp_endpoint_http_status() -> int | None:
+    """Status code of a bare GET on the MCP endpoint (404 = path mismatch)."""
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(_mcp_url())
+    tok = _mcp_bearer_token()
+    if tok:
+        req.add_header("Authorization", f"Bearer {tok}")
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except Exception:
+        return None
+
+
+def _mcp_path_mismatch_hint() -> str:
+    return (
+        f"MCP endpoint returned 404 at {_mcp_url()} — the server is up but mounted on a "
+        "different URL path. Set LLMLIBRARIAN_MCP_PATH (or LLMLIBRARIAN_MCP_URL) to match "
+        "the server's .env.mcp, or run pal from the install directory."
+    )
+
+
 def _mcp_call_sync(tool: str, **args) -> dict:
     import asyncio
 
-    return asyncio.run(_mcp_call(tool, **args))
+    try:
+        return asyncio.run(_mcp_call(tool, **args))
+    except Exception as exc:
+        # A 404 from a path mismatch dies at the transport layer and surfaces
+        # as an opaque "Session terminated"; diagnose it explicitly.
+        if "session terminated" in str(exc).lower() and _mcp_endpoint_http_status() == 404:
+            raise RuntimeError(_mcp_path_mismatch_hint()) from exc
+        raise
 
 
 def _mcp_healthcheck() -> tuple[bool, str]:
@@ -1402,9 +1485,13 @@ def _mcp_healthcheck() -> tuple[bool, str]:
         if tok:
             req.add_header("Authorization", f"Bearer {tok}")
         with urllib.request.urlopen(req, timeout=2.0) as resp:
-            return (resp.status == 200, "")
+            if resp.status != 200:
+                return (False, f"MCP healthz returned {resp.status} at {healthz}")
     except Exception as exc:
         return (False, f"MCP server not reachable at {healthz}: {exc}")
+    if _mcp_endpoint_http_status() == 404:
+        return (False, _mcp_path_mismatch_hint())
+    return (True, "")
 
 
 class _SiloEventHandler(FileSystemEventHandler):
@@ -2244,17 +2331,25 @@ def _daemon_env(db_path: str | Path) -> dict[str, str]:
     env["PAL_HOME"] = str(PAL_HOME.resolve())
 
     # If MCP client env vars aren't in the caller's shell, read them from .env.mcp
-    # in the workdir so watch-service unit files always get the correct MCP path.
+    # so watch-service unit files always get the correct MCP path. Check every
+    # known location: the daemon workdir is site-packages for package installs,
+    # while .env.mcp lives in the install/checkout directory.
     if not any(k in env for k in _MCP_CLIENT_ENV_KEYS) or not any(k in env for k in _CHROMA_ENV_KEYS):
-        existing = _daemon_metadata()
-        if existing:
-            workdir = Path(str(existing.get("workdir") or ""))
-            env_mcp = workdir / ".env.mcp"
-            for key, val in _parse_env_file(env_mcp).items():
+        for env_mcp in _mcp_env_file_candidates():
+            try:
+                if not env_mcp.is_file():
+                    continue
+            except OSError:
+                continue
+            parsed = _parse_env_file(env_mcp)
+            if not any(k in parsed for k in (_MCP_CLIENT_ENV_KEYS | _CHROMA_ENV_KEYS)):
+                continue
+            for key, val in parsed.items():
                 if key in _MCP_CLIENT_ENV_KEYS and val and key not in env:
                     env[key] = val
                 if key in _CHROMA_ENV_KEYS and val and key not in env:
                     env[key] = val
+            break
 
     return env
 

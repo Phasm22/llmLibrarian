@@ -89,7 +89,6 @@ ADD_DEFAULT_EXCLUDE = [
     "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "Pipfile.lock", "poetry.lock",
     "composer.lock", "Gemfile.lock", "Cargo.lock", "uv.lock",
     "my_brain_db/", "*.db", "*.sqlite", "*.sqlite3", "*.sqlite3-journal",
-    "tmp", "/tmp",
 ]
 
 

@@ -39,6 +39,10 @@ if _mcp_spec is not None and _mcp_spec.loader is not None:
 # Avoid color/style differences in test output formatting.
 os.environ.setdefault("LLMLIBRARIAN_EDITOR_SCHEME", "file")
 
+# Never let tests rewrite or restart the operator's real watch daemon units
+# (pal._sync_daemon_if_installed runs after successful pulls).
+os.environ["PAL_SUPPRESS_DAEMON_SYNC"] = "1"
+
 
 @pytest.fixture(autouse=True)
 def _reset_embedding_function_cache() -> Any:
@@ -67,6 +71,7 @@ class _MockCollection:
         }
         self.get_result: dict[str, Any] = {"ids": [], "documents": [], "metadatas": []}
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._added_ids: set[str] = set()
 
     def query(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("query", kwargs))
@@ -74,10 +79,16 @@ class _MockCollection:
 
     def get(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("get", kwargs))
+        ids = kwargs.get("ids")
+        if ids is not None:
+            # Post-add write verification path: acknowledge ids we've seen added.
+            found = [i for i in ids if i in self._added_ids]
+            return {"ids": found, "documents": [None] * len(found), "metadatas": [None] * len(found)}
         return self.get_result
 
     def add(self, **kwargs: Any) -> None:
         self.calls.append(("add", kwargs))
+        self._added_ids.update(kwargs.get("ids") or [])
 
     def delete(self, **kwargs: Any) -> None:
         self.calls.append(("delete", kwargs))

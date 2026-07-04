@@ -12,6 +12,7 @@ runner = CliRunner()
 
 def test_pull_path_mode_syncs_daemon_when_installed(monkeypatch):
     seen = {"sync": 0}
+    monkeypatch.delenv("PAL_SUPPRESS_DAEMON_SYNC", raising=False)
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
     monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
@@ -25,6 +26,7 @@ def test_pull_path_mode_syncs_daemon_when_installed(monkeypatch):
 
 def test_remove_command_prunes_source_registry_and_syncs_daemon(monkeypatch):
     seen: dict[str, object] = {}
+    monkeypatch.delenv("PAL_SUPPRESS_DAEMON_SYNC", raising=False)
     monkeypatch.setattr("operations.op_remove_silo", lambda _db, _name: {"removed_slug": "docs", "cleaned_slug": "docs", "not_found": False})
     monkeypatch.setattr("pal._resolve_registry_source_for_remove", lambda _name, _db: "/tmp/source")
     monkeypatch.setattr("pal._remove_source_path", lambda path: seen.setdefault("removed_path", path) or True)
