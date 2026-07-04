@@ -1537,7 +1537,7 @@ class SiloWatcher:
         if Observer is None:
             raise RuntimeError("watchdog is not installed. Install `watchdog` to use watch mode.")
         _ensure_src_on_path()
-        from ingest import (
+        from ingest.watch_scan import (
             _read_file_manifest,
             _load_limits_config,
             collect_files,
@@ -1730,7 +1730,7 @@ class SiloWatcher:
                     silo=self.silo_slug,
                     error=f"{type(exc).__name__}: {exc}",
                 )
-            time.sleep(0.2)
+            self._stop.wait(0.2)
 
     def _reconcile_once(self) -> tuple[int, int, int]:
         max_file_bytes, max_depth, _max_archive_bytes, _max_files_per_zip, _max_extracted = self._load_limits_config()
