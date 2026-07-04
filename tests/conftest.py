@@ -45,6 +45,11 @@ os.environ.setdefault("LLMLIBRARIAN_EMBEDDING", "default")
 os.environ["COLUMNS"] = "88"
 os.environ["NO_COLOR"] = "1"
 os.environ.pop("FORCE_COLOR", None)
+# rich force-enables ANSI when it sees GitHub Actions env, ignoring the lack
+# of a TTY; a dumb terminal keeps help output plain everywhere.
+os.environ["TERM"] = "dumb"
+os.environ.pop("GITHUB_ACTIONS", None)
+os.environ.pop("CI", None)
 
 # Ensure tests target the workspace module, not an installed site-packages copy.
 _pal_path = (ROOT / "pal.py").resolve()
