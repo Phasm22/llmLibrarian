@@ -83,7 +83,10 @@ def test_pull_all_subprocess_does_not_capture_output(monkeypatch):
 
 
 def test_mcp_add_silo_file_reaches_run_ingest(monkeypatch, tmp_path):
-    """MCP add_silo allows a single file and delegates to run_ingest."""
+    """MCP add_silo allows a single file, returns immediately, and the
+    background indexing thread delegates to run_ingest."""
+    import time
+
     from orchestration.ingest import IngestResult
 
     import mcp_server
@@ -106,6 +109,9 @@ def test_mcp_add_silo_file_reaches_run_ingest(monkeypatch, tmp_path):
     f.write_text("ok", encoding="utf-8")
 
     out = mcp_server.add_silo(str(f))
+    assert out.get("status") == "started"
+
+    deadline = time.monotonic() + 10.0
+    while "path" not in called and time.monotonic() < deadline:
+        time.sleep(0.05)
     assert Path(called["path"]).resolve() == f.resolve()
-    assert out.get("status") == "ok"
-    assert out.get("files_indexed") == 1

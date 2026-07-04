@@ -366,7 +366,8 @@ def test_pull_with_path_passes_clear_prompt_option(monkeypatch):
     assert called["clear_prompt"] is True
 
 
-def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
+def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLMLIBRARIAN_DB", str(tmp_path / "db"))
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
     monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
@@ -384,7 +385,8 @@ def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
     assert calls["args"][2] is False
 
 
-def test_pull_path_mode_errors_when_prompt_override_target_missing(monkeypatch):
+def test_pull_path_mode_errors_when_prompt_override_target_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLMLIBRARIAN_DB", str(tmp_path / "db"))
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
     monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)

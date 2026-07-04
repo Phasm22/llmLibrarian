@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit + contract (torch-free)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # ONNX MiniLM embeddings only; the torch / sentence-transformers stack
+      # (and its ~5 GB of CUDA wheels) is deliberately not installed in CI.
+      LLMLIBRARIAN_EMBEDDING: default
+      TOKENIZERS_PARALLELISM: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies (skip torch/CUDA wheels)
+        run: |
+          SKIP_PKGS="torch triton open-clip-torch $(grep -oP '(?<=^name = ")nvidia-[a-z0-9-]+(?=")' uv.lock | sort -u | tr '\n' ' ')"
+          FLAGS=""
+          for pkg in $SKIP_PKGS; do FLAGS="$FLAGS --no-install-package $pkg"; done
+          echo "Skipping: $SKIP_PKGS"
+          uv sync --frozen --python 3.12 $FLAGS
+
+      - name: Cache ONNX embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/chroma
+          key: chroma-onnx-${{ hashFiles('uv.lock') }}
+          restore-keys: chroma-onnx-
+
+      - name: Run unit and contract tests
+        run: uv run --no-sync pytest -q tests/unit tests/contract
