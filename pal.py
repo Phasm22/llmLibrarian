@@ -1641,6 +1641,11 @@ class SiloWatcher:
                 return
         except Exception:
             return
+        # Excluded paths (e.g. .git/ churn like index.lock) were never indexed,
+        # so a delete event for them would loop on remove_file failures. Gate on
+        # the same exclude/include rules as enqueue_update.
+        if not self._should_index(str(p), self._include, self._exclude):
+            return
         self._queue_action(str(p), "delete")
 
     def _drain_due(self, now: float | None = None) -> int:
