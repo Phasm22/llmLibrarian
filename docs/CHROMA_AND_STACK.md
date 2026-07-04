@@ -38,6 +38,19 @@ LLMLIBRARIAN_CHROMA_PORT=8000
 
 Same `LLMLIBRARIAN_DB` path is passed to `chroma run --path`. No DB migration.
 
+## Local runtime (on-demand / `pc-stacks`)
+
+On TJ's Linux desktop, Chroma + MCP + watch daemons are **cold by default** at login.
+
+```bash
+pc-stacks up llmlibrarian   # start chroma → mcp → watchers
+pc-stacks status            # verify warm before MCP session
+```
+
+Do **not** assume `:8000` / `:8765` are up because systemd units are installed — they are disabled at boot. Agents: see [AGENTS.md](../AGENTS.md#host-runtime-pc-stacks) and [`/home/tj/bin/README.md`](/home/tj/bin/README.md).
+
+Traceability: **PC Idle Quietdown** plan (Cursor plans, Jul 2025).
+
 ## Environment
 
 | Variable | Role |

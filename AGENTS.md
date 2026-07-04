@@ -42,8 +42,20 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 MCP returns **chunks**; the host model answers. Local synthesis: `pal ask` / `llmli ask` (Ollama).
 MCP tool docstrings follow: **Use when / Do not use when / Pairs with**.
 
+## Host runtime (`pc-stacks`)
+
+On TJ's Linux desktop, Chroma + MCP + watchers are **cold at login**. Before MCP tools or `:8765` health checks:
+
+```bash
+pc-stacks status
+pc-stacks up llmlibrarian   # if cold
+```
+
+Canonical index: [`/home/tj/bin/README.md`](/home/tj/bin/README.md). Traceability: **PC Idle Quietdown** plan (Cursor plans, Jul 2025).
+
 ## Session-start checklist (MCP)
 
+0. Confirm stack is warm (`pc-stacks status` or `curl -fsS http://127.0.0.1:8765/healthz`); if not, `pc-stacks up llmlibrarian`.
 1. Prefer `session_context(check_staleness=True)` before retrieval.
 2. If `is_stale: true` and `stale_file_count` is substantial → `trigger_reindex` before querying.
 3. If `stale_file_count` is small (≤2–3) **and** `newest_source_mtime_iso` matches the silo `updated` timestamp → treat as index race noise; skip reindex.

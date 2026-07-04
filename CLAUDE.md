@@ -7,8 +7,10 @@ Guidance for Claude Code working in this repository.
 llmLibrarian indexes **folders you choose** into a local vector store and answers questions from **that index only** — via MCP tools (chunks for the host model) or `pal ask` (retrieve + local Ollama). No built-in chat memory; each query is grounded in indexed files + current question.
 
 **Why it exists (user-facing):** [README.md](README.md), [docs/GUIDE.md](docs/GUIDE.md).  
-**Agent operations:** [AGENTS.md](AGENTS.md).  
+**Agent operations:** [AGENTS.md](AGENTS.md) (includes `pc-stacks` host runtime).  
 **Technical contracts:** [docs/TECH.md](docs/TECH.md).
+
+**Linux desktop:** stack is cold at login — `pc-stacks up llmlibrarian` before MCP. See [`/home/tj/bin/README.md`](/home/tj/bin/README.md).
 
 ## Development commands
 

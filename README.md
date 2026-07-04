@@ -125,6 +125,27 @@ Watchers (`pal pull --watch`) keep silos fresh; `trigger_reindex` via MCP after 
 
 ---
 
+## Local runtime (on-demand / `pc-stacks`)
+
+On TJ's Linux desktop this stack is **not** auto-started at login (~18 GB RAM when always-on). Use the host orchestrator:
+
+```bash
+pc-stacks up llmlibrarian    # chroma :8000 → MCP :8765/healthz → watch daemons
+pc-stacks down llmlibrarian
+pc-stacks status
+pc-stacks pin llmlibrarian   # keep warm through idle periods
+```
+
+- **Orchestrator:** [`/home/tj/bin/pc-stacks`](/home/tj/bin/pc-stacks) — see [`/home/tj/bin/README.md`](/home/tj/bin/README.md) for all stacks.
+- **Systemd units** (`llmlibrarian-chroma`, `llmlibrarian-mcp`, `llmlibrarian-watch-*`) exist but are **disabled** at boot; `pc-stacks` starts them in order.
+- **Agents / MCP:** call `pc-stacks up llmlibrarian` before expecting MCP tools or `:8765` to respond.
+- **Idle shutdown:** `pc-stacks-idle.timer` stops warm stacks after 30 min session idle (unless pinned).
+- **Traceability:** PC Idle Quietdown plan (Cursor plans, Jul 2025).
+
+Details: [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md#local-runtime-on-demand--pc-stacks).
+
+---
+
 ## When something looks wrong
 
 | Symptom | Try |
@@ -151,8 +172,8 @@ Watchers (`pal pull --watch`) keep silos fresh; `trigger_reindex` via MCP after 
 | Doc | For |
 |-----|-----|
 | [docs/GUIDE.md](docs/GUIDE.md) | Narrative guide: why, workflows, MCP vs terminal, privacy |
-| [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md) | Chroma server mode, concurrency, systemd |
-| [AGENTS.md](AGENTS.md) | Coding agents: MCP checklist, tool names, guardrails |
+| [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md) | Chroma server mode, concurrency, systemd, **pc-stacks** |
+| [AGENTS.md](AGENTS.md) | Coding agents: MCP checklist, **pc-stacks**, tool names |
 | [CLAUDE.md](CLAUDE.md) | Claude Code: dev commands + architecture map |
 | [docs/TECH.md](docs/TECH.md) | Behavior contracts (intent, pull, ask) |
 | [docs/orchestration-matrix.md](docs/orchestration-matrix.md) | CLI vs MCP entry points |
