@@ -671,6 +671,38 @@ from operations import _doc_type_breakdown, _inject_staleness
 
 
 # ---------------------------------------------------------------------------
+# Usage telemetry (Argus usage-dashboard rollout — see argus/docs/
+# usage-dashboard-rollout.md). Dedicated log file, separate from anything
+# Argus's llmlibrarian.mcp liveness binding tails, so a quiet query week
+# can't be misread as a liveness gap and vice versa. Best-effort: never let
+# telemetry failures affect a query response.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def _usage_log_path() -> Path:
+    import jobs_runtime as _jobsrt
+    pal_home = Path(os.environ.get("PAL_HOME", str(Path.home() / ".pal"))).expanduser()
+    return _jobsrt.watch_log_dir(pal_home) / "usage.log"
+
+
+def _emit_usage_event(event: str, metrics: dict) -> None:
+    try:
+        path = _usage_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = _json.dumps({
+            "event": event,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "metrics": metrics,
+        })
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        _logger.debug("usage event emit failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -717,6 +749,8 @@ def query_personal_knowledge(
                 config_path=_CONFIG_PATH,
             )
             chunks = result.get("chunks", [])
+
+            _emit_usage_event("usage.llmlibrarian.query", {"silo": silo or "unscoped"})
 
             # Answer-level confidence signal
             conf_level, conf_score, coverage_note = _compute_answer_confidence(chunks)
@@ -802,6 +836,11 @@ def multi_query_knowledge(
 
     # Feature 6: answer-level confidence on merged results
     conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
+
+    _emit_usage_event(
+        "usage.llmlibrarian.query",
+        {"silo": silo or "unscoped", "query_count": len(queries)},
+    )
 
     _release_chroma()
     return {
