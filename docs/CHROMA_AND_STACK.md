@@ -38,6 +38,17 @@ LLMLIBRARIAN_CHROMA_PORT=8000
 
 Same `LLMLIBRARIAN_DB` path is passed to `chroma run --path`. No DB migration.
 
+#### Lock contention & query availability
+
+Cross-process access is coordinated by an advisory `flock` (`src/chroma_lock.py`): reads take a **shared** lock, writes an **exclusive** one. In embedded mode this is required — it prevents the concurrent-`PersistentClient` SIGSEGV — but it means an in-progress index write blocks all queries until it finishes, and a query that waits longer than `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` (default 10s) fails with a lock-timeout.
+
+Two mitigations keep contention from surfacing as unavailability:
+
+- **Shared read lock is skipped in server mode.** The single `chroma run` process is the only on-disk reader/writer and serializes safely, so the redundant read `flock` is dropped — queries no longer block behind an in-progress index write. Force the old behavior with `LLMLIBRARIAN_CHROMA_SHARED_LOCK=1`. (Exclusive write locks are always taken.)
+- **Read tools degrade to `busy`, not error.** On a lock timeout, `query_personal_knowledge` / `multi_query_knowledge` / `explain_retrieval` / `find_files` / `inspect_silo` return `{"busy": true, "retryable": true, "retry_after_seconds": N}` instead of a hard error — the caller should retry rather than treat the index as broken or empty.
+
+The transient "DB lock — startup contention" you may see right after starting a server or a test run is a writer briefly holding the exclusive lock; it clears on its own.
+
 ## Local runtime (on-demand / `pc-stacks`)
 
 On TJ's Linux desktop, Chroma + MCP + watch daemons are **cold by default** at login.
@@ -58,6 +69,8 @@ Traceability: **PC Idle Quietdown** plan (Cursor plans, Jul 2025).
 | `LLMLIBRARIAN_DB` | Persist directory (embedded path and `chroma run --path`) |
 | `LLMLIBRARIAN_CHROMA_HOST` | If set, use HTTP client instead of embedded |
 | `LLMLIBRARIAN_CHROMA_PORT` | Chroma server port (default `8000`) |
+| `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` | Max wait for the Chroma flock before a busy/timeout (default `10`; `0`/`off` = block forever) |
+| `LLMLIBRARIAN_CHROMA_SHARED_LOCK` | Force the shared read flock even in server mode (default off — read lock skipped in HTTP mode) |
 | `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` | Embedded readers exit 99 after external write |
 | `LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT` | Tests only; disable embedded write guard |
 

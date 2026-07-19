@@ -366,6 +366,33 @@ def _release_chroma() -> None:
         pass
 
 
+def _is_lock_timeout(exc: BaseException) -> bool:
+    """True when an exception is a transient Chroma/MCP lock timeout.
+
+    Covers both the cross-process flock (``ChromaLockTimeoutError``, a
+    ``TimeoutError`` subclass) and the in-process ``_mcp_chroma_lock``
+    (``TimeoutError``). These mean "busy, retry", not "index broken"."""
+    return isinstance(exc, TimeoutError)
+
+
+def _busy_error(exc: BaseException, operation: str) -> dict:
+    """Soft, retryable payload for lock contention. Distinct from a hard error
+    so the caller retries instead of treating the DB as down or the index as
+    empty."""
+    retry_after = max(1, round(_mcp_lock_timeout_seconds() / 2))
+    return {
+        "db_path": _DB_PATH,
+        "busy": True,
+        "retryable": True,
+        "retry_after_seconds": retry_after,
+        "error": (
+            f"ChromaDB is busy ({type(exc).__name__} during {operation}); another "
+            "index/query is holding the lock. This is transient — retry shortly. "
+            "If it persists, call health() / mcp_runtime_status to find the holder."
+        ),
+    }
+
+
 def _db_missing_error() -> dict:
     return {
         "db_path": _DB_PATH,
@@ -773,6 +800,8 @@ def query_personal_knowledge(
 
             return {"db_path": _DB_PATH, **result}
     except Exception as e:
+        if _is_lock_timeout(e):
+            return {**_busy_error(e, "query_personal_knowledge"), "chunks": []}
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}
     finally:
         _release_chroma()
@@ -809,6 +838,7 @@ def multi_query_knowledge(
     seen: set[str] = set()
     all_chunks: list[dict] = []
     errors: list[str] = []
+    busy = False
     for q in queries:
         try:
             with _mcp_chroma_lock("multi_query_knowledge"):
@@ -828,6 +858,8 @@ def multi_query_knowledge(
                     chunk["query"] = q
                     all_chunks.append(chunk)
         except Exception as e:
+            if _is_lock_timeout(e):
+                busy = True
             errors.append(f"{q!r}: {type(e).__name__}: {e}")
     all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
     truncated = len(all_chunks) > max_total_chunks
@@ -853,6 +885,11 @@ def multi_query_knowledge(
         "coverage_note": coverage_note,
         "chunks": all_chunks,
         **({"errors": errors} if errors else {}),
+        **(
+            {"busy": True, "retryable": True, "retry_after_seconds": max(1, round(_mcp_lock_timeout_seconds() / 2))}
+            if busy and not all_chunks
+            else {}
+        ),
     }
 
 
@@ -948,6 +985,8 @@ def explain_retrieval(
                 "ranked_chunks": ranked_chunks,
             }
     except Exception as e:
+        if _is_lock_timeout(e):
+            return {**_busy_error(e, "explain_retrieval"), "ranked_chunks": []}
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "ranked_chunks": []}
     finally:
         _release_chroma()
@@ -1056,6 +1095,8 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
             result = op_inspect_silo(_DB_PATH, silo, top=top)
         return result
     except Exception as e:
+        if _is_lock_timeout(e):
+            return _busy_error(e, "inspect_silo")
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}"}
     finally:
         _release_chroma()
@@ -1133,6 +1174,8 @@ def find_files(
             )
         return result
     except Exception as e:
+        if _is_lock_timeout(e):
+            return _busy_error(e, "find_files")
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}"}
     finally:
         if include_chunk_count:
