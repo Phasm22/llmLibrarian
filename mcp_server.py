@@ -314,11 +314,11 @@ def _mcp_lock_timeout_seconds() -> float:
     if not raw:
         raw = os.environ.get("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS", "").strip()
     if not raw:
-        return 10.0
+        return 5.0
     try:
         return max(0.0, float(raw))
     except ValueError:
-        return 10.0
+        return 5.0
 
 
 @contextmanager

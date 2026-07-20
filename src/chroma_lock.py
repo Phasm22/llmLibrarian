@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover — Windows
 _T = TypeVar("_T")
 
 _LOCK_BASENAME = ".llmli_chroma.flock"
-_DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
+_DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_POLL_SECONDS = 0.1
 _warned_no_fcntl = False
 

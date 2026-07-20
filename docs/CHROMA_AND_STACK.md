@@ -38,9 +38,11 @@ LLMLIBRARIAN_CHROMA_PORT=8000
 
 Same `LLMLIBRARIAN_DB` path is passed to `chroma run --path`. No DB migration.
 
+**Every client on that path must be HTTP.** This includes the MCP server Claude Code spawns from `.mcp.json` — its `env` block needs `LLMLIBRARIAN_CHROMA_HOST` / `LLMLIBRARIAN_CHROMA_PORT`, not just `.env.mcp`. Without them a session's MCP opens an embedded `PersistentClient` on the same path the server owns — the exact concurrent-client hazard server mode is meant to remove. Restart the MCP server (new session / reconnect) after changing `.mcp.json`.
+
 #### Lock contention & query availability
 
-Cross-process access is coordinated by an advisory `flock` (`src/chroma_lock.py`): reads take a **shared** lock, writes an **exclusive** one. In embedded mode this is required — it prevents the concurrent-`PersistentClient` SIGSEGV — but it means an in-progress index write blocks all queries until it finishes, and a query that waits longer than `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` (default 10s) fails with a lock-timeout.
+Cross-process access is coordinated by an advisory `flock` (`src/chroma_lock.py`): reads take a **shared** lock, writes an **exclusive** one. In embedded mode this is required — it prevents the concurrent-`PersistentClient` SIGSEGV — but it means an in-progress index write blocks all queries until it finishes, and a query that waits longer than `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` (default 5s) fails with a lock-timeout.
 
 Two mitigations keep contention from surfacing as unavailability:
 
@@ -69,7 +71,8 @@ Traceability: **PC Idle Quietdown** plan (Cursor plans, Jul 2025).
 | `LLMLIBRARIAN_DB` | Persist directory (embedded path and `chroma run --path`) |
 | `LLMLIBRARIAN_CHROMA_HOST` | If set, use HTTP client instead of embedded |
 | `LLMLIBRARIAN_CHROMA_PORT` | Chroma server port (default `8000`) |
-| `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` | Max wait for the Chroma flock before a busy/timeout (default `10`; `0`/`off` = block forever) |
+| `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` | Max wait for the Chroma flock before a busy/timeout (default `5`; `0`/`off` = block forever) |
+| `LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS` | Max wait for the in-process MCP Chroma lock before a busy/timeout (default `5`; falls back to the flock timeout var) |
 | `LLMLIBRARIAN_CHROMA_SHARED_LOCK` | Force the shared read flock even in server mode (default off — read lock skipped in HTTP mode) |
 | `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` | Embedded readers exit 99 after external write |
 | `LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT` | Tests only; disable embedded write guard |
