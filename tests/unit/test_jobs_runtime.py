@@ -215,6 +215,9 @@ def test_render_systemd_unit_contains_restart_and_logs(tmp_path: Path):
     )
 
     assert "Restart=on-failure" in unit
+    # Ordered after / wanting the shared MCP server so watchers don't race it at boot.
+    assert "After=default.target llmlibrarian-mcp.service" in unit
+    assert "Wants=llmlibrarian-mcp.service" in unit
     assert "StartLimitBurst=3" in unit
     assert "RestartSec=15" in unit
     assert "StandardOutput=append:" in unit

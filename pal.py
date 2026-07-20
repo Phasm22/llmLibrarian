@@ -1494,6 +1494,35 @@ def _mcp_healthcheck() -> tuple[bool, str]:
     return (True, "")
 
 
+def _watch_mcp_wait_seconds() -> float:
+    """How long a watch-mode preflight waits for the MCP server before giving up.
+
+    Watchers are long-running services usually started at boot alongside the
+    shared MCP server (and the Chroma backend it depends on), which can take
+    several seconds to become reachable. Configurable via
+    LLMLIBRARIAN_WATCH_MCP_WAIT (seconds); defaults to 120.
+    """
+    raw = os.environ.get("LLMLIBRARIAN_WATCH_MCP_WAIT")
+    if raw is None:
+        return 120.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 120.0
+
+
+def _mcp_healthcheck_wait(timeout: float, poll: float = 3.0) -> tuple[bool, str]:
+    """Poll _mcp_healthcheck until it succeeds or `timeout` seconds elapse."""
+    ok, msg = _mcp_healthcheck()
+    if ok or timeout <= 0:
+        return ok, msg
+    deadline = time.monotonic() + timeout
+    while not ok and time.monotonic() < deadline:
+        time.sleep(poll)
+        ok, msg = _mcp_healthcheck()
+    return ok, msg
+
+
 class _SiloEventHandler(FileSystemEventHandler):
     def __init__(self, watcher: "SiloWatcher") -> None:
         super().__init__()
@@ -2002,14 +2031,20 @@ def _pull_watch_path_mode(
     if Observer is None:
         print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
         return 1
-    ok, msg = _mcp_healthcheck()
+    # A watcher is a long-running service, typically started at boot alongside
+    # the shared MCP server, which can take several seconds (plus its Chroma
+    # backend) to become reachable. Treat an initial healthcheck failure as a
+    # transient boot race and wait with bounded backoff rather than exiting
+    # immediately: a hard failure here makes systemd burn through StartLimitBurst
+    # and give up permanently, leaving the watcher dead until manually restarted.
+    ok, msg = _mcp_healthcheck_wait(_watch_mcp_wait_seconds())
     if not ok:
         print(
             f"Error: --watch requires the shared MCP server to be running. {msg}\n"
             "Start it (e.g. via the systemd unit in README) and retry.",
             file=sys.stderr,
         )
-        return 2
+        return 1
     path = Path(path_input).resolve()
     watch_env = {
         "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
