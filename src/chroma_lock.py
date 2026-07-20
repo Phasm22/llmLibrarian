@@ -15,6 +15,11 @@ Non-POSIX: locking is a no-op (see chroma_lock_available()).
 ``run_retrieve`` and ``run_ask`` (CLI / pal) take a shared lock around Chroma access so
 reads coordinate with exclusive writers; writers block until shared readers finish.
 
+The shared (read) lock is skipped in HTTP server mode: the single ``chroma run`` server
+serializes concurrent read/write safely, so holding it only blocks reads behind an
+in-progress writer for no benefit. Exclusive (write) locks are always taken.
+See ``_shared_read_lock_disabled`` (override with ``LLMLIBRARIAN_CHROMA_SHARED_LOCK=1``).
+
 Policy layers (do not mix up which one you are holding):
 
 +------------------+------------------------------------------+-----------------------------+
@@ -55,7 +60,7 @@ except ImportError:  # pragma: no cover — Windows
 _T = TypeVar("_T")
 
 _LOCK_BASENAME = ".llmli_chroma.flock"
-_DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
+_DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
 _LOCK_POLL_SECONDS = 0.1
 _warned_no_fcntl = False
 
@@ -78,6 +83,29 @@ _excl_gates: dict[str, _ExclusiveGate] = defaultdict(_ExclusiveGate)
 
 def chroma_lock_available() -> bool:
     return fcntl is not None
+
+
+def _shared_read_lock_disabled() -> bool:
+    """True when the cross-process shared (read) flock should be skipped.
+
+    In HTTP server mode a single ``chroma run`` process is the only on-disk
+    reader/writer, and it serializes concurrent access safely. Holding the
+    shared flock around reads there is redundant and, worse, blocks all reads
+    for the full duration of any writer's exclusive lock — the main way lock
+    contention interferes with query availability. Skipping it lets reads flow
+    concurrently with an in-progress index write.
+
+    Escape hatch: set ``LLMLIBRARIAN_CHROMA_SHARED_LOCK=1`` (or force) to keep
+    the shared flock even in HTTP mode.
+    """
+    force = os.environ.get("LLMLIBRARIAN_CHROMA_SHARED_LOCK", "").strip().lower()
+    if force in {"1", "true", "yes", "force"}:
+        return False
+    try:
+        from chroma_client import is_http_mode
+    except Exception:
+        return False
+    return is_http_mode()
 
 
 def _resolve_db(db_path: str | Path) -> str:
@@ -176,9 +204,16 @@ def _acquire_flock(f: Any, operation: int, *, mode: str, db_path: str, path: Pat
 
 @contextmanager
 def chroma_shared_lock(db_path: str | Path) -> Iterator[None]:
-    """Advisory shared lock for Chroma reads (query/get)."""
+    """Advisory shared lock for Chroma reads (query/get).
+
+    No-op in HTTP server mode (the ``chroma run`` server is the single on-disk
+    reader/writer and serializes safely); see ``_shared_read_lock_disabled``.
+    """
     if fcntl is None:
         _warn_no_fcntl_once()
+        yield
+        return
+    if _shared_read_lock_disabled():
         yield
         return
     key = _resolve_db(db_path)
