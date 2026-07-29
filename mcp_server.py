@@ -1607,6 +1607,14 @@ async def healthz(_: Request) -> Response:
 
 
 if __name__ == "__main__":
+    try:
+        import setproctitle
+
+        _transport_for_title = os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower()
+        setproctitle.setproctitle(f"llmLibrarian-mcp-{_transport_for_title}")
+    except ImportError:
+        pass
+
     transport = os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower()
     if transport not in {"stdio", "http", "sse", "streamable-http"}:
         raise RuntimeError(

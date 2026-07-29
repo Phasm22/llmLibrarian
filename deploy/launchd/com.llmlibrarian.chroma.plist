@@ -18,6 +18,20 @@
   <key>KeepAlive</key>
   <true/>
 
+  <!-- launchd's default soft limit (256) is too low for a Chroma server that
+       fields concurrent connections from MCP + N watch daemons + interactive
+       clients; each is a socket fd plus the server's own SQLite/HNSW handles. -->
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+
   <key>StandardOutPath</key>
   <string>{{LOG_DIR}}/llmlibrarian-chroma.stdout.log</string>
   <key>StandardErrorPath</key>

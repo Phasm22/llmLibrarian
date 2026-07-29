@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -1394,6 +1395,41 @@ def _ensure_mcp_client_env() -> None:
         return
 
 
+def _ensure_chroma_client_env() -> None:
+    """Populate Chroma server-mode env vars from .env.mcp when unset.
+
+    Mirrors _ensure_mcp_client_env: pal subcommands run in a fresh shell won't
+    have LLMLIBRARIAN_CHROMA_HOST/PORT unless the caller exported them, but
+    .env.mcp (read by the installed services themselves) usually has them.
+    """
+    if os.environ.get("LLMLIBRARIAN_CHROMA_HOST"):
+        return
+    for candidate in _mcp_env_file_candidates():
+        try:
+            if not candidate.is_file():
+                continue
+        except OSError:
+            continue
+        parsed = _parse_env_file(candidate)
+        found = {k: v for k, v in parsed.items() if k in _CHROMA_ENV_KEYS and v}
+        if not found:
+            continue
+        for key, val in found.items():
+            os.environ.setdefault(key, val)
+        return
+
+
+def _port_probe(host: str, port: int, timeout: float = 0.5) -> bool:
+    """True if something is already listening on host:port."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _mcp_url() -> str:
     _ensure_mcp_client_env()
     explicit = os.environ.get("LLMLIBRARIAN_MCP_URL")
@@ -2006,6 +2042,12 @@ def _pull_watch_path_mode(
         )
         return 2
     path = Path(path_input).resolve()
+    try:
+        import setproctitle
+
+        setproctitle.setproctitle(f"llmLibrarian-watch-{path.name}")
+    except ImportError:
+        pass
     watch_env = {
         "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
         "LLMLIBRARIAN_INGEST_LOG_LEVEL": "FATAL",
@@ -2263,6 +2305,17 @@ def _daemon_workdir() -> str:
     return str(Path(__file__).resolve().parent)
 
 
+def _resolve_daemon_python_executable() -> str:
+    """Prefer a renamed copy of the interpreter (shows as "llmLibrarian" instead
+    of "Python" in Activity Monitor/top/ps) over the raw interpreter, if present
+    alongside it. See scripts/run_mcp_http.sh and run_chroma_server.sh for the
+    same convention on the other two services."""
+    renamed = Path(sys.executable).parent / "llmLibrarian"
+    if renamed.is_file() and os.access(renamed, os.X_OK):
+        return str(renamed)
+    return sys.executable
+
+
 def _daemon_runtime_metadata(manager: str | None = None) -> dict[str, object]:
     detected_manager = manager or jobsrt.supported_service_manager()
     if not detected_manager:
@@ -2271,7 +2324,7 @@ def _daemon_runtime_metadata(manager: str | None = None) -> dict[str, object]:
     return {
         "version": 1,
         "manager": detected_manager,
-        "python_executable": sys.executable,
+        "python_executable": _resolve_daemon_python_executable(),
         "pal_path": str(Path(__file__).resolve()),
         "workdir": _daemon_workdir(),
         "db_path": str(db_path),
@@ -2424,38 +2477,91 @@ def _render_mcp_template(template_path: Path, install_dir: Path, log_dir: Path) 
     return text.replace("{{INSTALL_DIR}}", str(install_dir)).replace("{{LOG_DIR}}", str(log_dir))
 
 
-def _install_mcp_service(install_dir: Path, manager: str) -> tuple[bool, str]:
-    deploy_dir = install_dir / "deploy"
-    log_dir = PAL_HOME / "logs"
-
+def _mcp_service_paths(manager: str, install_dir: Path | None = None) -> tuple[Path, Path, list[str], list[str], list[str], list[str]]:
+    root = install_dir or _default_project_root()
+    deploy_dir = root / "deploy"
     if manager == "systemd":
         template = deploy_dir / "systemd" / "llmlibrarian-mcp@.service"
-        dest_dir = jobsrt.systemd_user_dir()
-        dest = dest_dir / "llmlibrarian-mcp.service"
+        dest = jobsrt.systemd_user_dir() / "llmlibrarian-mcp.service"
         enable_cmd = ["systemctl", "--user", "daemon-reload"]
         start_cmd = ["systemctl", "--user", "enable", "--now", "llmlibrarian-mcp.service"]
+        stop_cmd = ["systemctl", "--user", "disable", "--now", "llmlibrarian-mcp.service"]
+        status_cmd = ["systemctl", "--user", "is-active", "llmlibrarian-mcp.service"]
     elif manager == "launchd":
         template = deploy_dir / "launchd" / "com.tjm4.llmlibrarian-mcp.plist"
         label = "com.llmlibrarian.mcp"
-        dest_dir = jobsrt.launchd_agents_dir()
-        dest = dest_dir / f"{label}.plist"
+        dest = jobsrt.launchd_agents_dir() / f"{label}.plist"
         enable_cmd = ["launchctl", "unload", str(dest)]
         start_cmd = ["launchctl", "load", str(dest)]
+        stop_cmd = ["launchctl", "unload", str(dest)]
+        status_cmd = ["launchctl", "print", f"gui/{os.getuid()}/{label}"]
     else:
-        return False, f"unsupported platform: {manager}"
+        raise ValueError(f"unsupported platform: {manager}")
+    return template, dest, enable_cmd, start_cmd, stop_cmd, status_cmd
 
+
+def _mcp_port_preflight() -> str | None:
+    """Return an error string if the configured MCP port is already occupied."""
+    _ensure_mcp_client_env()
+    host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1")
+    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", "*"} else host
+    try:
+        port = int(os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765") or 8765)
+    except ValueError:
+        port = 8765
+    if _port_probe(probe_host, port):
+        return (
+            f"port {port} on {probe_host} is already in use by another process (not this "
+            f"service — nothing was started). Run `lsof -nP -iTCP:{port} -sTCP:LISTEN` to see "
+            "what, or set LLMLIBRARIAN_MCP_PORT in .env.mcp to a free port and retry."
+        )
+    return None
+
+
+def _install_mcp_service(install_dir: Path, manager: str) -> tuple[bool, str]:
+    try:
+        template, dest, enable_cmd, start_cmd, _, _ = _mcp_service_paths(manager, install_dir)
+    except ValueError as exc:
+        return False, str(exc)
     if not template.exists():
         return False, f"template not found: {template}"
 
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    preflight_error = _mcp_port_preflight()
+    if preflight_error:
+        return False, preflight_error
+
+    log_dir = PAL_HOME / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    jobsrt.rotate_log_if_large(log_dir / "llmlibrarian-mcp.stdout.log")
+    jobsrt.rotate_log_if_large(log_dir / "llmlibrarian-mcp.stderr.log")
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(_render_mcp_template(template, install_dir, log_dir), encoding="utf-8")
 
-    import subprocess
     subprocess.run(enable_cmd, capture_output=True)
     result = subprocess.run(start_cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return False, result.stderr.strip() or f"command failed: {' '.join(start_cmd)}"
     return True, str(dest)
+
+
+def _mcp_service_installed(manager: str) -> bool:
+    try:
+        _, dest, _, _, _, _ = _mcp_service_paths(manager)
+    except ValueError:
+        return False
+    return dest.exists()
+
+
+def _mcp_service_active(manager: str) -> tuple[bool, str]:
+    try:
+        _, _, _, _, _, status_cmd = _mcp_service_paths(manager)
+    except ValueError as exc:
+        return False, str(exc)
+    rc, out = jobsrt._run_command(status_cmd)
+    if manager == "systemd":
+        return rc == 0 and out.strip() == "active", out or "inactive"
+    return rc == 0, out or "not loaded"
 
 
 def _chroma_service_paths(manager: str, install_dir: Path | None = None) -> tuple[Path, Path, list[str], list[str]]:
@@ -2482,6 +2588,23 @@ def _chroma_service_paths(manager: str, install_dir: Path | None = None) -> tupl
     return template, dest, enable_cmd, start_cmd, stop_cmd, status_cmd
 
 
+def _chroma_port_preflight() -> str | None:
+    """Return an error string if the configured Chroma port is already occupied."""
+    _ensure_chroma_client_env()
+    _ensure_src_on_path()
+    from chroma_client import chroma_http_settings
+
+    host, port, _ssl = chroma_http_settings()
+    probe_host = "127.0.0.1" if host in {"0.0.0.0", "::", "*"} else host
+    if _port_probe(probe_host, port):
+        return (
+            f"port {port} on {probe_host} is already in use by another process (not this "
+            f"service — nothing was started). Run `lsof -nP -iTCP:{port} -sTCP:LISTEN` to see "
+            "what, or set LLMLIBRARIAN_CHROMA_PORT in .env.mcp to a free port and retry."
+        )
+    return None
+
+
 def _install_chroma_service(install_dir: Path, manager: str) -> tuple[bool, str]:
     try:
         template, dest, enable_cmd, start_cmd, _, _ = _chroma_service_paths(manager, install_dir)
@@ -2490,6 +2613,15 @@ def _install_chroma_service(install_dir: Path, manager: str) -> tuple[bool, str]
     log_dir = PAL_HOME / "logs"
     if not template.exists():
         return False, f"template not found: {template}"
+
+    preflight_error = _chroma_port_preflight()
+    if preflight_error:
+        return False, preflight_error
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    jobsrt.rotate_log_if_large(log_dir / "llmlibrarian-chroma.stdout.log")
+    jobsrt.rotate_log_if_large(log_dir / "llmlibrarian-chroma.stderr.log")
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(_render_mcp_template(template, install_dir, log_dir), encoding="utf-8")
     subprocess.run(enable_cmd, capture_output=True)
@@ -2613,9 +2745,11 @@ app = typer.Typer(
 )
 daemon_app = typer.Typer(help="Install and manage background silo watchers.", add_completion=False, invoke_without_command=True)
 chroma_app = typer.Typer(help="Manage local ChromaDB server (chroma run) for safe multi-process access.", add_completion=False)
+mcp_app = typer.Typer(help="Manage the shared MCP HTTP server (required by watch daemons).", add_completion=False)
 extension_app = typer.Typer(help="Claude Desktop MCP packaging (records mcp_server.py hash).", add_completion=False)
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(chroma_app, name="chroma")
+app.add_typer(mcp_app, name="mcp")
 app.add_typer(extension_app, name="extension")
 
 
@@ -3122,6 +3256,13 @@ def chroma_start_command() -> None:
     if not manager or not _chroma_service_installed(manager):
         print("Chroma service is not installed. Use: pal chroma install", file=sys.stderr)
         raise typer.Exit(code=1)
+    preflight_error = _chroma_port_preflight()
+    if preflight_error:
+        print(preflight_error, file=sys.stderr)
+        raise typer.Exit(code=1)
+    log_dir = PAL_HOME / "logs"
+    jobsrt.rotate_log_if_large(log_dir / "llmlibrarian-chroma.stdout.log")
+    jobsrt.rotate_log_if_large(log_dir / "llmlibrarian-chroma.stderr.log")
     _, _, enable_cmd, start_cmd, _, _ = _chroma_service_paths(manager)
     subprocess.run(enable_cmd, capture_output=True)
     result = subprocess.run(start_cmd, capture_output=True, text=True)
@@ -3144,6 +3285,7 @@ def chroma_stop_command() -> None:
 
 @chroma_app.command("status", help="Show Chroma transport mode and server health.")
 def chroma_status_command() -> None:
+    _ensure_chroma_client_env()
     _ensure_src_on_path()
     from chroma_client import chroma_mode_info, check_chroma_server_reachable, chroma_http_settings, chroma_transport_mode
 
@@ -3180,6 +3322,127 @@ def chroma_logs_command(lines: int = typer.Option(50, "--lines", min=1)) -> None
     if not stdout_log.exists() and not stderr_log.exists():
         print("No chroma logs found. Install with: pal chroma install", file=sys.stderr)
         raise typer.Exit(code=1)
+
+
+@chroma_app.command("uninstall", help="Stop and remove the ChromaDB server service.")
+def chroma_uninstall_command() -> None:
+    manager = jobsrt.supported_service_manager()
+    if not manager or not _chroma_service_installed(manager):
+        print("Chroma service is not installed.")
+        return
+    _, dest, _, _, stop_cmd, _ = _chroma_service_paths(manager)
+    subprocess.run(stop_cmd, capture_output=True)
+    try:
+        dest.unlink()
+    except FileNotFoundError:
+        pass
+    if manager == "systemd":
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    print(f"Chroma service removed: {dest}")
+
+
+@mcp_app.command("install", help="Install the MCP HTTP server as a user service.")
+def mcp_install_command() -> None:
+    manager = jobsrt.supported_service_manager()
+    if not manager:
+        print(f"Unsupported platform for MCP service: {sys.platform}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    PAL_HOME.mkdir(parents=True, exist_ok=True)
+    jobsrt.watch_log_dir(PAL_HOME).mkdir(parents=True, exist_ok=True)
+    install_dir = _default_project_root()
+    ok, detail = _install_mcp_service(install_dir, manager)
+    if not ok:
+        print(f"MCP install failed: {detail}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    print(f"MCP service installed ({manager}): {detail}")
+
+
+@mcp_app.command("start", help="Start the MCP HTTP server service.")
+def mcp_start_command() -> None:
+    manager = jobsrt.supported_service_manager()
+    if not manager or not _mcp_service_installed(manager):
+        print("MCP service is not installed. Use: pal mcp install", file=sys.stderr)
+        raise typer.Exit(code=1)
+    preflight_error = _mcp_port_preflight()
+    if preflight_error:
+        print(preflight_error, file=sys.stderr)
+        raise typer.Exit(code=1)
+    log_dir = PAL_HOME / "logs"
+    jobsrt.rotate_log_if_large(log_dir / "llmlibrarian-mcp.stdout.log")
+    jobsrt.rotate_log_if_large(log_dir / "llmlibrarian-mcp.stderr.log")
+    _, _, enable_cmd, start_cmd, _, _ = _mcp_service_paths(manager)
+    subprocess.run(enable_cmd, capture_output=True)
+    result = subprocess.run(start_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(result.stderr.strip() or "mcp start failed", file=sys.stderr)
+        raise typer.Exit(code=result.returncode)
+    print("MCP server started.")
+
+
+@mcp_app.command("stop", help="Stop the MCP HTTP server service.")
+def mcp_stop_command() -> None:
+    manager = jobsrt.supported_service_manager()
+    if not manager or not _mcp_service_installed(manager):
+        print("MCP service is not installed.", file=sys.stderr)
+        raise typer.Exit(code=1)
+    _, _, _, _, stop_cmd, _ = _mcp_service_paths(manager)
+    subprocess.run(stop_cmd, capture_output=True)
+    print("MCP server stopped.")
+
+
+@mcp_app.command("status", help="Show MCP HTTP server health.")
+def mcp_status_command() -> None:
+    manager = jobsrt.supported_service_manager()
+    info: dict = {}
+    if manager:
+        installed = _mcp_service_installed(manager)
+        active, active_detail = _mcp_service_active(manager) if installed else (False, "not installed")
+        info["mcp_service_installed"] = installed
+        info["mcp_service_active"] = active
+        if active_detail:
+            info["mcp_service_detail"] = active_detail
+    info["mcp_url"] = _mcp_url()
+    ok, detail = _mcp_healthcheck()
+    info["healthz_ok"] = ok
+    if detail:
+        info["healthz_detail"] = detail
+    print(json.dumps(info, indent=2))
+    if not ok:
+        raise typer.Exit(code=1)
+
+
+@mcp_app.command("logs", help="Show recent MCP server logs.")
+def mcp_logs_command(lines: int = typer.Option(50, "--lines", min=1)) -> None:
+    stdout_log = PAL_HOME / "logs" / "llmlibrarian-mcp.stdout.log"
+    stderr_log = PAL_HOME / "logs" / "llmlibrarian-mcp.stderr.log"
+    if stdout_log.exists():
+        print("# stdout")
+        for line in _tail_file(stdout_log, lines=lines):
+            print(line)
+    if stderr_log.exists():
+        print("# stderr")
+        for line in _tail_file(stderr_log, lines=lines):
+            print(line)
+    if not stdout_log.exists() and not stderr_log.exists():
+        print("No MCP logs found. Install with: pal mcp install", file=sys.stderr)
+        raise typer.Exit(code=1)
+
+
+@mcp_app.command("uninstall", help="Stop and remove the MCP HTTP server service.")
+def mcp_uninstall_command() -> None:
+    manager = jobsrt.supported_service_manager()
+    if not manager or not _mcp_service_installed(manager):
+        print("MCP service is not installed.")
+        return
+    _, dest, _, _, stop_cmd, _ = _mcp_service_paths(manager)
+    subprocess.run(stop_cmd, capture_output=True)
+    try:
+        dest.unlink()
+    except FileNotFoundError:
+        pass
+    if manager == "systemd":
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    print(f"MCP service removed: {dest}")
 
 
 @daemon_app.command("install", help="Install user-space watch services for registered silos.")
@@ -3237,6 +3500,70 @@ def daemon_logs_command(
             print(line)
 
 
+@daemon_app.command("prune-logs", help="Rotate oversized daemon log files, including stale ones from removed silos.")
+def daemon_prune_logs_command(
+    max_mb: float = typer.Option(10.0, "--max-mb", min=0.1, help="Act on logs larger than this size."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    log_dir = jobsrt.watch_log_dir(PAL_HOME)
+    if not log_dir.exists():
+        print("No log directory.")
+        return
+
+    # A log matching a currently-registered job gets rotated (one .1 backup
+    # kept, since the job is still active and the history has value). A log
+    # with no matching job — the silo/watcher was removed — gets deleted
+    # outright: nothing will ever write to it again, so a "backup" is just
+    # dead weight.
+    active_names: set[str] = set()
+    metadata = _daemon_metadata()
+    if metadata:
+        manager_name = str(metadata.get("manager") or "")
+        jobs, _warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or _DEFAULT_DB))
+        for job in jobs:
+            active_names.add(Path(job.log_path).name)
+            active_names.add(jobsrt.watch_stderr_log_path(PAL_HOME, job.slug).name)
+
+    threshold = int(max_mb * 1_000_000)
+    to_rotate: list[tuple[Path, int]] = []
+    to_delete: list[tuple[Path, int]] = []
+    for path in sorted(log_dir.glob("*.log")):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if size <= threshold:
+            continue
+        if path.name in active_names:
+            to_rotate.append((path, size))
+        else:
+            to_delete.append((path, size))
+
+    if not to_rotate and not to_delete:
+        print(f"No log files over {max_mb:.0f}MB.")
+        return
+
+    total = sum(size for _, size in to_rotate) + sum(size for _, size in to_delete)
+    print(f"{len(to_rotate) + len(to_delete)} log file(s) over {max_mb:.0f}MB, {total / 1_000_000:.0f}MB total:")
+    for path, size in to_rotate:
+        print(f"  rotate  {path.name}  {size / 1_000_000:.0f}MB  (active job)")
+    for path, size in to_delete:
+        print(f"  delete  {path.name}  {size / 1_000_000:.0f}MB  (no matching job — stale)")
+
+    if not yes:
+        typer.confirm("Proceed?", abort=True)
+
+    for path, _size in to_rotate:
+        jobsrt.rotate_log_if_large(path, max_bytes=0)
+        print(f"Rotated: {path.name}")
+    for path, _size in to_delete:
+        try:
+            path.unlink()
+            print(f"Deleted: {path.name}")
+        except FileNotFoundError:
+            pass
+
+
 @daemon_app.command("uninstall", help="Remove all daemon-managed services.")
 def daemon_uninstall_command() -> None:
     metadata = _daemon_metadata()
@@ -3279,6 +3606,109 @@ def _jobs_ls_impl() -> None:
         log_name = Path(job.log_path).name
         log_cell = link_style(no_color, f"file://{job.log_path}", log_name)
         print(f"{job.kind:10} {job.slug:24} {state:10} {job.service_name:28} {log_cell}")
+
+
+@app.command("uninstall", help="Stop and remove installed llmLibrarian services (MCP, watch daemons, Chroma).")
+def uninstall_command(
+    purge: bool = typer.Option(False, "--purge", help="Also remove ~/.pal (logs, registry, daemon metadata)."),
+    purge_data: bool = typer.Option(False, "--purge-data", help="Also delete the indexed ChromaDB directory. Implies --purge."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    manager = jobsrt.supported_service_manager()
+    if not manager:
+        print(f"Unsupported platform: {sys.platform}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    if purge_data:
+        purge = True
+
+    mcp_installed = _mcp_service_installed(manager)
+    chroma_installed = _chroma_service_installed(manager)
+    daemon_meta = _daemon_metadata()
+    daemon_jobs: list = []
+    if daemon_meta:
+        daemon_jobs, _warnings = _derive_watch_jobs_for_daemon(manager, db_path=str(daemon_meta.get("db_path") or _DEFAULT_DB))
+
+    if not mcp_installed and not chroma_installed and not daemon_meta:
+        print("Nothing installed.")
+        return
+
+    print("Will remove:")
+    if mcp_installed:
+        print("  - MCP HTTP service")
+    if daemon_meta:
+        print(f"  - {len(daemon_jobs)} watch daemon service(s)")
+    if chroma_installed:
+        print("  - Chroma server service")
+    if purge:
+        extra = " and the ChromaDB data directory" if purge_data else ""
+        print(f"  - ~/.pal (logs, registry, daemon metadata){extra}")
+
+    if not yes:
+        typer.confirm("Proceed?", abort=True)
+
+    removed_summary: list[str] = []
+
+    if mcp_installed:
+        _, dest, _, _, stop_cmd, _ = _mcp_service_paths(manager)
+        subprocess.run(stop_cmd, capture_output=True)
+        try:
+            dest.unlink()
+        except FileNotFoundError:
+            pass
+        removed_summary.append(f"mcp: {dest}")
+
+    if daemon_meta:
+        result = jobsrt.PlatformManager(manager).uninstall_all()
+        jobsrt.remove_daemon_metadata(PAL_HOME)
+        removed_summary.append(f"daemon: {len(result.get('removed') or [])} service(s)")
+        for err in result.get("errors") or []:
+            print(err, file=sys.stderr)
+
+    if chroma_installed:
+        _, dest, _, _, stop_cmd, _ = _chroma_service_paths(manager)
+        subprocess.run(stop_cmd, capture_output=True)
+        try:
+            dest.unlink()
+        except FileNotFoundError:
+            pass
+        removed_summary.append(f"chroma: {dest}")
+
+    if manager == "systemd":
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+
+    for line in removed_summary:
+        print(f"Removed {line}")
+
+    if purge_data:
+        db_path = str((daemon_meta or {}).get("db_path") or os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB))
+        try:
+            shutil.rmtree(db_path)
+            print(f"Purged data: {db_path}")
+        except FileNotFoundError:
+            pass
+
+    if purge:
+        # Only known service-state paths, never the whole PAL_HOME tree:
+        # ~/.pal/exports (and possibly other subdirs) can hold real bookmarked
+        # source content a silo was built from, not just logs/registry/cache.
+        purge_targets = [
+            jobsrt.watch_log_dir(PAL_HOME),
+            jobsrt.daemon_metadata_path(PAL_HOME),
+            PAL_HOME / "registry.json",
+        ]
+        for target in purge_targets:
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+                print(f"Purged: {target}")
+            except FileNotFoundError:
+                pass
+    else:
+        print("")
+        print(f"Kept: {PAL_HOME} (logs, registry) and the indexed database.")
+        print("Run with --purge to also remove logs/registry/daemon metadata, or --purge-data to also delete the index.")
 
 
 @app.command("tool", help="Pass-through to llmli.")

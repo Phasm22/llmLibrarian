@@ -614,7 +614,12 @@ def op_list_silos(db_path: str, check_staleness: bool = False) -> dict:
         s["doc_type_breakdown"] = _doc_type_breakdown(by_ext)
 
         slug = s.get("slug") or ""
-        if slug in silo_errors:
+        # An error recorded before the silo's most recent successful update
+        # (e.g. a full repair_silo/llmli repair rebuild) has been superseded —
+        # without this check, one historical error flags a silo as broken
+        # forever, since the query-health log is append-only and never pruned.
+        last_updated = s.get("updated") or ""
+        if slug in silo_errors and silo_errors[slug] > last_updated:
             s["has_index_errors"] = True
             s["last_index_error_time"] = silo_errors[slug]
         else:

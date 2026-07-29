@@ -142,6 +142,56 @@ def get_embedding_function(batch_size: int | None = None, device: str | None = N
         return ef
 
 
+def validate_embedding_dimension(collection: Any, ef: Any) -> None:
+    """Raise a clear error if `ef` would produce vectors of a different
+    dimension than what's already stored in `collection`.
+
+    Chroma itself only catches this deep inside collection.add(), after
+    chunking/embedding work has already happened, with an opaque
+    "Collection expecting embedding with dimension of X, got Y" error and a
+    partially-completed ingest. Checking here — once, before any of that
+    work starts — fails fast with an actionable message instead.
+
+    No-op (not an error) for a fresh/empty collection: there's nothing to
+    conflict with yet, so any dimension is valid.
+    """
+    try:
+        existing_count = collection.count()
+    except Exception:
+        return
+    if not existing_count:
+        return
+
+    try:
+        peek = collection.get(limit=1, include=["embeddings"])
+        existing_embeddings = peek.get("embeddings")
+        if existing_embeddings is None or len(existing_embeddings) == 0:
+            return
+        existing_dim = len(existing_embeddings[0])
+    except Exception:
+        return
+
+    try:
+        probe = ef(["dimension probe"])
+        new_dim = len(probe[0])
+    except Exception:
+        return
+
+    if existing_dim and new_dim and existing_dim != new_dim:
+        raise RuntimeError(
+            "Embedding dimension mismatch: this collection already holds "
+            f"{existing_dim}-dimensional vectors, but the configured embedding "
+            f"function produces {new_dim}-dimensional vectors.\n"
+            "This means LLMLIBRARIAN_EMBEDDING or LLMLIBRARIAN_EMBEDDING_MODEL "
+            "doesn't match whatever model this collection was originally built with.\n"
+            "Options:\n"
+            "  - Unset LLMLIBRARIAN_EMBEDDING / LLMLIBRARIAN_EMBEDDING_MODEL (or set them "
+            "back) to match the original model\n"
+            "  - If you intend to switch models, every silo needs a full reindex — there is "
+            "no partial-reindex path for a dimension change"
+        )
+
+
 def _reset_ef_cache_for_tests() -> None:
     """Drop the cached embedding functions. Test-only helper."""
     with _ef_cache_lock:

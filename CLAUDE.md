@@ -32,8 +32,10 @@ llmli capabilities
 pal pull <folder>              # --watch for daemon
 pal ask --in <silo> "query"
 pal ls --status
-pal chroma start               # when LLMLIBRARIAN_CHROMA_HOST is set
-pal daemon install|sync|logs
+pal chroma install|start|stop|status|logs|uninstall
+pal mcp install|start|stop|status|logs|uninstall
+pal daemon install|sync|logs|prune-logs|uninstall
+pal uninstall [--purge|--purge-data] [--yes]   # tears down mcp+daemon+chroma; keeps DB/env unless --purge*
 ```
 
 ## Architecture (map)

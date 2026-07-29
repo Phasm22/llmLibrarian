@@ -44,7 +44,7 @@ try:
 except Exception:
     tqdm = None  # type: ignore[assignment]
 
-from embeddings import get_embedding_function
+from embeddings import get_embedding_function, validate_embedding_dimension
 from image_embeddings import (
     ensure_image_embedding_adapter_ready,
     image_collection_name,
@@ -2275,6 +2275,7 @@ def run_add(
         collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
         if hasattr(client, "get_effective_ef"):
             ef = client.get_effective_ef(LLMLI_COLLECTION) or ef
+        validate_embedding_dimension(collection, ef)
         image_collection = _get_image_collection(client)
 
         # Cheap consistency check: if manifest says files are indexed but ChromaDB has 0
@@ -3046,6 +3047,7 @@ def update_single_file(
         collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
         if hasattr(client, "get_effective_ef"):
             ef = client.get_effective_ef(LLMLI_COLLECTION) or ef
+        validate_embedding_dimension(collection, ef)
         image_collection = _get_image_collection(client)
 
         chunks: list[ChunkTuple] = []

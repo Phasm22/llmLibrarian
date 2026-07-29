@@ -18,6 +18,19 @@
   <key>KeepAlive</key>
   <true/>
 
+  <!-- launchd's default soft limit (256) is too low for a long-lived MCP
+       process fielding concurrent tool calls and Chroma HTTP connections. -->
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+
   <key>StandardOutPath</key>
   <string>{{LOG_DIR}}/llmlibrarian-mcp.stdout.log</string>
   <key>StandardErrorPath</key>

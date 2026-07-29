@@ -141,11 +141,49 @@ _GEN_FILE_NAME = ".llmli_chroma_generation"
 _client_open_generation: dict[str, float] = {}
 
 
+_auto_transport: str | None = None
+
+
+def _managed_chroma_service_installed() -> bool:
+    """True when this machine has the pal-managed Chroma service installed."""
+    candidates = (
+        Path.home() / "Library" / "LaunchAgents" / "com.llmlibrarian.chroma.plist",
+        Path.home() / ".config" / "systemd" / "user" / "llmlibrarian-chroma.service",
+    )
+    return any(p.exists() for p in candidates)
+
+
 def chroma_transport_mode() -> str:
-    """Return ``http`` when LLMLIBRARIAN_CHROMA_HOST is set, else ``embedded``."""
+    """Return ``http`` when LLMLIBRARIAN_CHROMA_HOST is set, else ``embedded``.
+
+    When the env var is unset but the pal-managed Chroma service is installed
+    and answering its heartbeat, adopt HTTP automatically (resolved once per
+    process, then pinned via os.environ so child processes inherit it). An
+    embedded client opened alongside the running server is a second writer on
+    the same on-disk segment files — the multi-writer scenario that corrupts
+    the HNSW index. Processes spawned without the service env (stdio MCP
+    servers launched by MCP clients, bare CLI invocations) hit exactly that
+    unless caught here. Set LLMLIBRARIAN_CHROMA_AUTODETECT=0 to opt out.
+    """
     if os.environ.get("LLMLIBRARIAN_CHROMA_HOST", "").strip():
         return "http"
-    return "embedded"
+    global _auto_transport
+    if _auto_transport is None:
+        _auto_transport = "embedded"
+        flag = os.environ.get("LLMLIBRARIAN_CHROMA_AUTODETECT", "1").strip().lower()
+        if flag in ("1", "true", "yes", "on") and _managed_chroma_service_installed():
+            ok, _detail = check_chroma_server_reachable(timeout=1.0)
+            if ok:
+                host, port, _ssl = chroma_http_settings()
+                os.environ["LLMLIBRARIAN_CHROMA_HOST"] = host
+                os.environ["LLMLIBRARIAN_CHROMA_PORT"] = str(port)
+                _auto_transport = "http"
+                print(
+                    f"[llmLibrarian] Managed Chroma server detected at {host}:{port}; "
+                    "using HTTP transport (LLMLIBRARIAN_CHROMA_AUTODETECT=0 to disable).",
+                    file=sys.stderr,
+                )
+    return _auto_transport
 
 
 def is_http_mode() -> bool:

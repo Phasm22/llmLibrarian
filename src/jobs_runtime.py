@@ -5,6 +5,7 @@ import plistlib
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,12 @@ SERVICE_RESTART_DELAY_DEFAULT = 15
 SERVICE_PREFIX_LAUNCHD = "io.llmlibrarian.watch."
 SERVICE_PREFIX_SYSTEMD = "llmlibrarian-watch-"
 LOG_DIRNAME = "logs"
+# Activating N watch daemons back-to-back means N processes all connect to
+# Chroma within the same instant. Reproduced empirically: loading 8 daemons
+# simultaneously against a freshly-started Chroma server reliably crashed it
+# (SIGSEGV inside chromadb_rust_bindings.abi3.so); loading them one at a time
+# never did. A small stagger between activations avoids the connection burst.
+SERVICE_ACTIVATION_STAGGER_SECONDS = 0.75
 
 
 @dataclass
@@ -92,6 +99,27 @@ def watch_log_path(pal_home: Path, slug: str) -> Path:
 
 def watch_stderr_log_path(pal_home: Path, slug: str) -> Path:
     return watch_log_dir(pal_home) / f"watch-{safe_service_suffix(slug)}.stderr.log"
+
+
+def rotate_log_if_large(path: Path, max_bytes: int = 10_000_000) -> bool:
+    """Rotate ``path`` to ``path`` + ``.1`` (single backup) if it exceeds max_bytes.
+
+    A crash-looping service under KeepAlive/Restart can otherwise append to the
+    same log file forever. Called before a service (re)starts, not on a timer,
+    so a healthy service never pays for it.
+    """
+    try:
+        if not path.exists() or path.stat().st_size <= max_bytes:
+            return False
+        backup = Path(str(path) + ".1")
+        try:
+            backup.unlink()
+        except FileNotFoundError:
+            pass
+        path.rename(backup)
+        return True
+    except OSError:
+        return False
 
 
 def launchd_agents_dir(home: Path | None = None) -> Path:
@@ -184,6 +212,11 @@ def render_launchd_plist(
         "KeepAlive": True,
         "WorkingDirectory": workdir,
         "EnvironmentVariables": _env_for_service(env),
+        # launchd's default soft limit (256) is shared across every launchd
+        # process a user runs; N watch daemons each holding a Chroma HTTP
+        # connection can exhaust it. Match the systemd units' LimitNOFILE.
+        "SoftResourceLimits": {"NumberOfFiles": 8192},
+        "HardResourceLimits": {"NumberOfFiles": 8192},
         "StandardOutPath": job.log_path,
         "StandardErrorPath": stderr_path or job.log_path,
     }
@@ -235,6 +268,7 @@ def render_systemd_unit(
         f"ExecStart={exec_start}",
         "Restart=on-failure",
         f"RestartSec={int(restart_sec)}",
+        "LimitNOFILE=8192",
         f"StandardOutput=append:{job.log_path}",
         f"StandardError=append:{stderr_path or job.log_path}",
         "",
@@ -452,6 +486,8 @@ class PlatformManager:
             parents=True, exist_ok=True
         )
         stderr_path = str(watch_stderr_log_path(Path(env.get("PAL_HOME")) if env and env.get("PAL_HOME") else Path.home() / ".pal", job.slug))
+        rotate_log_if_large(Path(job.log_path))
+        rotate_log_if_large(Path(stderr_path))
         if self.manager == "launchd":
             payload = render_launchd_plist(
                 job,
@@ -540,6 +576,7 @@ class PlatformManager:
                 activated.append(job.service_name)
             elif detail:
                 errors.append(f"{job.service_name}: {detail}")
+            time.sleep(SERVICE_ACTIVATION_STAGGER_SECONDS)
         desired_paths = {self.desired_path(slug) for slug in desired.keys()}
         for path in self.existing_service_paths():
             if path in desired_paths:
