@@ -1606,16 +1606,54 @@ async def healthz(_: Request) -> Response:
     })
 
 
-if __name__ == "__main__":
-    try:
-        import setproctitle
+def _client_app_name() -> str | None:
+    """Best-effort name of the MCP client that spawned this stdio server.
 
-        _transport_for_title = os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower()
-        setproctitle.setproctitle(f"llmLibrarian-mcp-{_transport_for_title}")
-    except ImportError:
+    Walks up the parent chain past wrapper processes (uv, Claude's
+    disclaimer helper, shells) to the first real application, so multiple
+    stdio instances are distinguishable in ps (e.g. Claude vs Cursor).
+    """
+    import subprocess
+
+    wrappers = {
+        "disclaimer", "uv", "sh", "bash", "zsh", "fish", "login", "env",
+        "python", "python3", "Python", "node",
+    }
+    pid = os.getppid()
+    for _ in range(6):
+        if pid <= 1:
+            return None
+        try:
+            out = subprocess.run(
+                ["/bin/ps", "-o", "ppid=", "-o", "comm=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+            ppid_str, _, comm = out.partition(" ")
+            name = Path(comm.strip()).name
+            pid = int(ppid_str)
+        except Exception:
+            return None
+        if name and name not in wrappers:
+            return name
+    return None
+
+
+if __name__ == "__main__":
+    transport = os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower()
+    try:
+        from proctitle import set_process_title
+
+        if transport == "stdio":
+            set_process_title("mcp", "stdio", _client_app_name())
+        else:
+            set_process_title(
+                "mcp",
+                "http" if transport in {"http", "streamable-http"} else transport,
+                os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765"),
+            )
+    except Exception:
         pass
 
-    transport = os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower()
     if transport not in {"stdio", "http", "sse", "streamable-http"}:
         raise RuntimeError(
             "LLMLIBRARIAN_MCP_TRANSPORT must be one of: "

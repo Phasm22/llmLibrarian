@@ -766,6 +766,22 @@ def main() -> int:
     except ImportError:
         pass
     args = parser.parse_args()
+    try:
+        src = _ROOT / "src"
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
+        from proctitle import set_process_title
+
+        target = (
+            getattr(args, "silo", None)
+            or getattr(args, "in_silo", None)
+            or getattr(args, "path", None)
+        )
+        if isinstance(target, str) and "/" in target:
+            target = Path(target).name
+        set_process_title("cli", args.command, target)
+    except Exception:
+        pass
     return args._run(args)
 
 if __name__ == "__main__":

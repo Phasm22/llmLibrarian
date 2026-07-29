@@ -1372,7 +1372,7 @@ def _batch_add(
         embeddings = embedding_fn(docs_b)
         return (ids_b, docs_b, metas_b, embeddings)
 
-    with ThreadPoolExecutor(max_workers=embedding_workers) as executor:
+    with ThreadPoolExecutor(max_workers=embedding_workers, thread_name_prefix="llmli-embed") as executor:
         futures = {}
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i : i + batch_size]
@@ -1988,7 +1988,7 @@ def run_index(
     
         # 3. Process regular files in parallel
         log("Processing files (parallel)...")
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="llmli-file") as executor:
             future_to_item = {}
             for path, kind in regular:
                 try:
@@ -2479,7 +2479,7 @@ def run_add(
                     to_register.append((fhash, path_str))
     
         total_to_process = len(regular_with_hash) + len(zips)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="llmli-file") as executor:
             future_to_item = {
                 executor.submit(
                     process_one_file,

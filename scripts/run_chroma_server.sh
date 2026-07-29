@@ -29,23 +29,34 @@ mkdir -p "$DB_PATH"
 export LLMLIBRARIAN_EMBEDDING_DEVICE="${LLMLIBRARIAN_EMBEDDING_DEVICE:-cpu}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-}"
 
-# NOTE: deliberately NOT using the renamed-interpreter trick here (see
-# run_mcp_http.sh / pal.py's watch daemons for that). Running Chroma's server
-# through the manually-copied .venv/bin/llmLibrarian + .venv/lib/libpython
-# combo SIGSEGV'd under launchd (crash-looped) even though it worked fine
-# interactively — not worth the risk on the single process that owns the
-# on-disk index. This process shows as "Python" in Activity Monitor; that's
-# an acceptable tradeoff for the most critical service in the stack.
-if [[ -x "$ROOT_DIR/.venv/bin/chroma" ]]; then
-  CHROMA_BIN="$ROOT_DIR/.venv/bin/chroma"
-elif command -v chroma >/dev/null 2>&1; then
-  CHROMA_BIN="$(command -v chroma)"
-else
-  echo "chroma CLI not found. Install deps: uv sync (provides chromadb CLI)." >&2
-  exit 127
+# Process title: run Chroma's CLI in-interpreter with setproctitle so ps/
+# pgrep/lsof show "llmLibrarian-chroma:<port>" instead of a bare python path.
+# This only rewrites argv — same interpreter, same chromadb package, no
+# relocated binaries. (The 2026-07-28 crash-loop that made an earlier rename
+# attempt look dangerous was later root-caused to on-disk HNSW corruption;
+# the renamed-binary/copied-dylib experiment stays retired regardless —
+# kernel p_comm reads "Python" and that's fine.)
+PY_BIN="$ROOT_DIR/.venv/bin/python"
+if [[ -x "$PY_BIN" ]]; then
+  exec "$PY_BIN" -c '
+import sys
+try:
+    import setproctitle
+    port = sys.argv[sys.argv.index("--port") + 1]
+    setproctitle.setproctitle(f"llmLibrarian-chroma:{port}")
+except (ImportError, ValueError, IndexError):
+    pass
+from chromadb.cli.cli import app
+app()
+' run --path "$DB_PATH" --host "$HOST" --port "$PORT"
 fi
 
-exec "$CHROMA_BIN" run \
-  --path "$DB_PATH" \
-  --host "$HOST" \
-  --port "$PORT"
+# Fallback without the venv: plain console script, unnamed process.
+if command -v chroma >/dev/null 2>&1; then
+  exec "$(command -v chroma)" run \
+    --path "$DB_PATH" \
+    --host "$HOST" \
+    --port "$PORT"
+fi
+echo "chroma CLI not found. Install deps: uv sync (provides chromadb CLI)." >&2
+exit 127

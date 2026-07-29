@@ -2042,12 +2042,9 @@ def _pull_watch_path_mode(
         )
         return 2
     path = Path(path_input).resolve()
-    try:
-        import setproctitle
-
-        setproctitle.setproctitle(f"llmLibrarian-watch-{path.name}")
-    except ImportError:
-        pass
+    # Provisional title from the folder name; upgraded to the silo slug once
+    # add_silo resolves it (matches launchd label io.llmlibrarian.watch.<slug>).
+    _set_process_title("watch", path.name)
     watch_env = {
         "LLMLIBRARIAN_PROCESSOR_LOG_LEVEL": "ERROR",
         "LLMLIBRARIAN_INGEST_LOG_LEVEL": "FATAL",
@@ -2082,6 +2079,7 @@ def _pull_watch_path_mode(
         if slug is None:
             print("Error: unable to resolve silo slug for watched folder.", file=sys.stderr)
             return 1
+        _set_process_title("watch", slug)
         watcher = SiloWatcher(
             path,
             db_path,
@@ -3724,6 +3722,25 @@ def tool_command(
     raise typer.Exit(code=1)
 
 
+def _set_process_title(*parts: object) -> None:
+    """Title as ``llmLibrarian-part[:part...]``; no-op without setproctitle.
+
+    Local copy of src/proctitle.py's helper — pal.py stays import-free of
+    the engine's src/ package by design (it drives llmli as a subprocess).
+    """
+    try:
+        import setproctitle
+    except ImportError:
+        return
+    clean = [
+        re.sub(r"[\s/:]+", "-", str(p).strip())
+        for p in parts
+        if p is not None and str(p).strip()
+    ]
+    if clean:
+        setproctitle.setproctitle("llmLibrarian-" + ":".join(clean))
+
+
 def main() -> int:
     if _argv_requests_watch_pull(sys.argv[1:]) and os.environ.get("LLMLIBRARIAN_WATCH_ENV_APPLIED") != "1":
         env = os.environ.copy()
@@ -3734,6 +3751,9 @@ def main() -> int:
         os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
     if _argv_requests_watch_pull(sys.argv[1:]):
         _apply_watch_process_env()
+    # e.g. `pal chroma start` -> llmLibrarian-pal:chroma:start (watch pulls
+    # re-title themselves to llmLibrarian-watch:<slug> once the silo resolves).
+    _set_process_title("pal", *[a for a in sys.argv[1:3] if not a.startswith("-")])
     app()
     return 0
 
