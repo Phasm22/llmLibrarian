@@ -53,6 +53,12 @@ Mitigations that keep contention from surfacing as unavailability:
 - **Waiters back off.** Lock polling grows 20ms → 500ms instead of a fixed 100ms tick, so contending processes stop retrying in lockstep. The final sleep is clamped to the remaining budget.
 - **MCP reads skip the in-process mutex in server mode.** `mcp_server._chroma_lock` exists because two threads driving one *embedded* `PersistentClient` into the Rust HNSW writer once grew `link_lists.bin` to 680 GB. Under `chroma run` no thread touches HNSW, so the mutex only made every MCP read return `busy` for the full duration of a watcher-triggered background reindex. Reads now skip it in HTTP mode; writes (`repair_silo`, `update_file`, `remove_file`, and the background reindex write phase) still take it. Restore with `LLMLIBRARIAN_MCP_READ_LOCK=1`.
 
+#### Transport retry (HTTP mode)
+
+`chroma run` is unavailable for roughly **0.5s** during a restart (`pc-stacks redeploy`, an OOM kill against `MemoryMax=6G`, a systemd restart). `src/chroma_client.py` retries connection-level failures — 3 attempts, ~0.7s of backoff total, never application errors, and a no-op in embedded mode. Writes replay only when the request provably never reached the server (`ConnectError`/`ECONNREFUSED`); a read timeout may mean the write landed and is still applying. Tune with `LLMLIBRARIAN_CHROMA_HTTP_RETRIES` (0 disables).
+
+The point is the MCP caller: an unretried blip reaches Claude as a tool error, and a model may read "tool failed" as "the knowledge base has nothing" and answer from training data instead — the same class of silent-wrong-answer as an unflagged rebuild window. Note this is defensive: no end-to-end reproduction of a failure it prevents has been captured, partly because chromadb retains its system/transport cache across `HttpClient()` construction within a process.
+
 #### Rebuild visibility
 
 A `--full` rebuild deletes a silo's rows before writing replacements, so a query landing in that window gets zero chunks and no error — indistinguishable from "the source doesn't say that." Three things close it: the delete is deferred until the replacements are embedded and in hand; the write-ahead marker (`src/ingest_journal.py`) records `kind` and `pid` and is held until a vector probe against the silo succeeds (Chroma keeps building HNSW after the write returns); and `run_retrieve` samples that marker either side of retrieval and tags the response with `write_in_progress` + `retryable` + a coverage note. Read tools surface it, so a remote session can tell "rebuilding" from "absent."

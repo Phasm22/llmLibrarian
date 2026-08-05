@@ -12,6 +12,7 @@ PersistentClient mode applies (not safe for concurrent processes on one path).
 
 from __future__ import annotations
 
+import errno
 import http.client
 import json
 import os
@@ -437,21 +438,131 @@ def _storage_preflight(db_path: str) -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# Transport retry (HTTP mode)
+#
+# A `chroma run` restart — pc-stacks redeploy, an OOM kill against MemoryMax, a
+# systemd restart — makes in-flight calls fail for a second or two. Without a
+# retry here that reaches the MCP caller as a tool error, and the caller is a
+# model: it may not retry, and can read "the tool failed" as "the knowledge base
+# has nothing", answering from training data instead. Worst on a phone, where
+# the tool error is invisible and there is no prompt to re-ask. An in-process
+# retry costs ~200ms and the model never learns it happened.
+#
+# Deliberately narrow: connection-level failures only, never application errors
+# (a bad filter or missing collection will not fix itself by sleeping). The
+# budget stays under a second so a genuinely down server still fails fast — a
+# slow error is worse than a quick one.
+# ---------------------------------------------------------------------------
+
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 0.1
+_RETRY_MAX_DELAY = 0.4
+
+
+def _retry_attempts() -> int:
+    raw = os.environ.get("LLMLIBRARIAN_CHROMA_HTTP_RETRIES", "").strip()
+    if not raw:
+        return _RETRY_ATTEMPTS
+    try:
+        return max(1, int(raw) + 1)
+    except ValueError:
+        return _RETRY_ATTEMPTS
+
+
+def _transport_error_types() -> tuple[type, ...]:
+    types: list[type] = [ConnectionError, TimeoutError]
+    try:
+        import httpx
+
+        types.append(httpx.TransportError)
+    except Exception:
+        pass
+    return tuple(types)
+
+
+def _is_transient_transport_error(exc: BaseException) -> bool:
+    """Connection-level failure that a moment's wait might clear."""
+    if isinstance(exc, _transport_error_types()):
+        return True
+    # EMFILE during a reindex storm: the MCP unit raises LimitNOFILE for exactly
+    # this, and fd exhaustion has previously cascaded into false "silo not found".
+    return isinstance(exc, OSError) and exc.errno in {
+        errno.EMFILE,
+        errno.ENFILE,
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EPIPE,
+    }
+
+
+def _never_reached_server(exc: BaseException) -> bool:
+    """True when the request certainly did not arrive, so replaying it is safe."""
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    if isinstance(exc, OSError) and exc.errno == errno.ECONNREFUSED:
+        return True
+    try:
+        import httpx
+
+        return isinstance(exc, httpx.ConnectError)
+    except Exception:
+        return False
+
+
+def _retry_transport(fn: Any, *, label: str, replayable: bool = True) -> Any:
+    """Run fn, retrying connection-level failures.
+
+    replayable=False (writes) retries only when the request provably never
+    reached the server. Chunk ids are deterministic, so a replayed add is
+    idempotent — but a read timeout may mean the write landed and is still being
+    applied, and replaying that races the server rather than helping.
+    """
+    attempts = _retry_attempts()
+    delay = _RETRY_BASE_DELAY
+    last: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last = exc
+            if attempt >= attempts or not _is_transient_transport_error(exc):
+                raise
+            if not replayable and not _never_reached_server(exc):
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, _RETRY_MAX_DELAY)
+    raise last  # unreachable; loop either returns or raises
+
+
 def _open_raw_client(db_path: str) -> Any:
     if is_http_mode():
         host, port, ssl = chroma_http_settings()
-        ok, detail = check_chroma_server_reachable(host, port, ssl=ssl)
-        if not ok:
-            raise RuntimeError(
-                f"Chroma HTTP server not reachable at {host}:{port} ({detail}). "
-                "Start it with: pal chroma start"
+
+        def _connect() -> Any:
+            ok, detail = check_chroma_server_reachable(host, port, ssl=ssl)
+            if not ok:
+                # Raised as a transport error so the retry loop treats a
+                # restarting server the same as a refused connection.
+                raise ConnectionError(
+                    f"Chroma HTTP server not reachable at {host}:{port} ({detail})"
+                )
+            return chromadb.HttpClient(
+                host=host,
+                port=port,
+                ssl=ssl,
+                settings=Settings(anonymized_telemetry=False),
             )
-        return chromadb.HttpClient(
-            host=host,
-            port=port,
-            ssl=ssl,
-            settings=Settings(anonymized_telemetry=False),
-        )
+
+        try:
+            return _retry_transport(_connect, label="open_client")
+        except Exception as exc:
+            if _is_transient_transport_error(exc):
+                raise RuntimeError(
+                    f"Chroma HTTP server not reachable at {host}:{port} ({exc}). "
+                    "Start it with: pal chroma start"
+                ) from exc
+            raise
     return chromadb.PersistentClient(
         path=db_path,
         settings=Settings(anonymized_telemetry=False),
@@ -479,7 +590,7 @@ class _SafeClient:
                 name=name, embedding_function=embedding_function, **kwargs
             )
             self._effective_efs[name] = embedding_function
-            return coll
+            return self._wrap(coll)
         except Exception as exc:
             msg = str(exc).lower()
             if embedding_function is not None and "conflict" in msg and "default" in msg:
@@ -498,8 +609,19 @@ class _SafeClient:
                         "this DB to sentence-transformers/CUDA embeddings.",
                         file=sys.stderr,
                     )
-                return coll
+                return self._wrap(coll)
             raise
+
+    @staticmethod
+    def _wrap(collection: Any) -> Any:
+        """Add transport retry to a collection in HTTP mode only.
+
+        Embedded mode has no transport to fail, so the proxy would be pure
+        indirection there.
+        """
+        if not is_http_mode():
+            return collection
+        return _RetryingCollection(collection)
 
     def get_effective_ef(self, name: str):
         """Return the EF that was actually used when opening the named collection."""
@@ -507,6 +629,46 @@ class _SafeClient:
 
     def __getattr__(self, name: str):
         return getattr(self._client, name)
+
+
+# Read methods are freely replayable; write methods only when the request
+# provably never reached the server (see _retry_transport).
+_COLLECTION_READ_METHODS = frozenset({"query", "get", "count", "peek"})
+_COLLECTION_WRITE_METHODS = frozenset({"add", "update", "upsert", "delete", "modify"})
+
+
+class _RetryingCollection:
+    """Wraps a Chroma collection so a server restart mid-call is not fatal.
+
+    Only the data-plane methods are wrapped; everything else (``name``, ``id``,
+    private attrs) passes straight through.
+    """
+
+    __slots__ = ("_collection",)
+
+    def __init__(self, collection: Any) -> None:
+        object.__setattr__(self, "_collection", collection)
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._collection, name)
+        if name in _COLLECTION_READ_METHODS or name in _COLLECTION_WRITE_METHODS:
+            replayable = name in _COLLECTION_READ_METHODS
+
+            def _wrapped(*args, **kwargs):
+                return _retry_transport(
+                    lambda: attr(*args, **kwargs),
+                    label=f"collection.{name}",
+                    replayable=replayable,
+                )
+
+            return _wrapped
+        return attr
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._collection, name, value)
+
+    def __repr__(self) -> str:
+        return f"_RetryingCollection({self._collection!r})"
 
 
 def get_client(db_path: str) -> "_SafeClient":
