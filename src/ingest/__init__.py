@@ -2121,6 +2121,86 @@ def run_index(
         _run_index_chroma_phase(client)
 
 
+# Observed HNSW settle lag after a batch write is sub-second; this is headroom,
+# not an expected wait. Only index-build errors are retried (see below), so a
+# genuinely broken collection returns immediately rather than burning the budget.
+_QUERYABLE_TIMEOUT_SECONDS = 10.0
+_QUERYABLE_POLL_SECONDS = 0.1
+
+
+def _wait_until_queryable(collection: Any, silo_slug: str, timeout: float | None = None) -> bool:
+    """Block until a *vector* query against the silo stops erroring.
+
+    Probes with a stored embedding rather than fresh text so this costs no model
+    inference and needs no knowledge of the embedding dimension. It must be a
+    query, not a get: `get` answers from metadata and succeeds while HNSW is
+    still building, which is exactly the window that raises "Error finding id"
+    on the read path.
+
+    Returns True once the silo answers, False if it never settled within the
+    budget — best-effort quiesce, not a correctness gate, so the caller proceeds
+    either way.
+    """
+    budget = _QUERYABLE_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + budget
+    probe: Any = None
+    while True:
+        try:
+            if probe is None:
+                sample = collection.get(
+                    where={"silo": silo_slug}, limit=1, include=["embeddings"]
+                )
+                embeddings = (sample or {}).get("embeddings") or []
+                if len(embeddings) == 0:
+                    return True  # nothing stored for this silo; nothing to settle
+                probe = embeddings[0]
+            collection.query(
+                query_embeddings=[probe],
+                n_results=1,
+                where={"silo": silo_slug},
+                include=[],
+            )
+            return True
+        except Exception as e:
+            # Only the HNSW build-lag error is worth waiting on. Anything else
+            # (missing collection, transport failure, a stub in tests) will not
+            # resolve by sleeping, so return instead of burning the budget.
+            from query.core_support import _is_chroma_index_error
+
+            if not _is_chroma_index_error(e) or time.monotonic() >= deadline:
+                return False
+            probe = None  # re-fetch: the earlier get may itself have been mid-build
+            time.sleep(_QUERYABLE_POLL_SECONDS)
+
+
+def _delete_silo_rows_for_rebuild(
+    db_path: str | Path,
+    silo_slug: str,
+    collection: Any,
+    image_collection: Any,
+    no_color: bool = False,
+) -> None:
+    """Drop a silo's existing rows as the first step of a full rebuild.
+
+    Called immediately before the replacement batch is written, not at the top of
+    ``run_add``: the delete is what makes the silo queryable-but-empty, so the
+    window between it and the re-add should be as short as possible.
+    """
+    for label, coll in (("chunks", collection), ("images", image_collection)):
+        try:
+            coll.delete(where={"silo": silo_slug})
+        except Exception as e:
+            try:
+                from state import record_index_error
+                record_index_error(db_path, silo_slug, e)
+            except Exception:
+                pass
+            print(
+                f"[ingest] warn: rebuild delete ({label}) failed for {silo_slug}: {e}",
+                file=sys.stderr,
+            )
+
+
 def run_add(
     path: str | Path,
     db_path: str | Path | None = None,
@@ -2295,32 +2375,12 @@ def run_add(
                 pass
     
         if not incremental:
-            try:
-                collection.delete(where={"silo": silo_slug})
-            except Exception as e:
-                try:
-                    from state import record_index_error
-                    record_index_error(db_path, silo_slug, e)
-                except Exception:
-                    pass
-                print(
-                    f"[ingest] warn: rebuild delete (chunks) failed for {silo_slug}: {e}",
-                    file=sys.stderr,
-                )
-            try:
-                image_collection.delete(where={"silo": silo_slug})
-            except Exception as e:
-                try:
-                    from state import record_index_error
-                    record_index_error(db_path, silo_slug, e)
-                except Exception:
-                    pass
-                print(
-                    f"[ingest] warn: rebuild delete (images) failed for {silo_slug}: {e}",
-                    file=sys.stderr,
-                )
+            # NOTE: the Chroma row delete for a rebuild is deliberately NOT here.
+            # It is deferred to just before _batch_add (see _delete_silo_rows_for_rebuild)
+            # so the silo is not left empty for the whole crawl/extract/embed phase.
+            # The file registry is cleared now because the crawl below rebuilds it.
             _file_registry_remove_silo(db_path, silo_slug)
-    
+
         # Pre-pass: resolve paths, hash, skip duplicates (same file already indexed in any silo)
         regular_with_hash: list[tuple[Path, str, str, Path | None]] = []
         manifest = _read_file_manifest(db_path) if incremental else {"silos": {}}
@@ -2644,9 +2704,18 @@ def run_add(
             _pre_write_hook()
 
         # Write-ahead marker: if we crash between here and clear_pending, the next
-        # run will detect this silo as interrupted and force a full non-incremental re-index.
+        # run will detect this silo as interrupted and force a full non-incremental
+        # re-index. It also makes the write visible to concurrent readers while it
+        # runs — see ingest_journal.write_in_progress.
         from ingest_journal import write_pending, clear_pending
-        write_pending(str(db_path), silo_slug)
+        write_pending(str(db_path), silo_slug, kind="incremental" if incremental else "full")
+
+        # Deferred rebuild delete: replacements are embedded and in hand, so the
+        # empty window is now the batch write rather than the whole extract phase.
+        if not incremental:
+            _delete_silo_rows_for_rebuild(
+                db_path, silo_slug, collection, image_collection, no_color=no_color
+            )
     
         if all_chunks:
             batch_size = ADD_BATCH_SIZE
@@ -2766,6 +2835,13 @@ def run_add(
             exclude_patterns=effective_excludes if effective_excludes else None,
         )
         set_last_failures(db_path, failures)
+        # Hold the in-progress marker until the silo is actually queryable. Chroma
+        # keeps building HNSW for a beat after the batch write returns, and queries
+        # landing in that gap raise "Error finding id" and fall back to a global
+        # scan — which can yield zero chunks for a silo that is in fact complete.
+        # Clearing the marker on write-completion alone left that window unflagged.
+        if all_chunks:
+            _wait_until_queryable(collection, silo_slug)
         clear_pending(str(db_path), silo_slug)
         elapsed_seconds = time.perf_counter() - run_started_at
         elapsed_label = f"{elapsed_seconds:.1f}s"

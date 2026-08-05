@@ -34,6 +34,7 @@ llmli capabilities
 pal pull <folder>              # --watch for daemon
 pal ask --in <silo> "query"
 pal ls --status
+pal queries                    # audit past MCP queries (--grep/--silo/--since/--summary)
 pal chroma start               # when LLMLIBRARIAN_CHROMA_HOST is set
 pal daemon install|sync|logs
 ```
@@ -53,7 +54,9 @@ pal daemon install|sync|logs
 
 **Storage:** `LLMLIBRARIAN_DB` (default `./my_brain_db`); collection `llmli`; silo in metadata. Server mode: `chroma run` + `LLMLIBRARIAN_CHROMA_HOST`.
 
-**MCP tools:** `session_context`, `mcp_runtime_status`, `query_personal_knowledge`, `multi_query_knowledge`, `list_silos`, `add_silo`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md).
+**MCP tools:** `session_context`, `mcp_runtime_status`, `query_personal_knowledge`, `multi_query_knowledge`, `recent_queries`, `list_silos`, `add_silo`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md).
+
+**Query audit:** every MCP query appends query text + params + per-source-file chunk breakdown to `~/.pal/logs/query-audit.jsonl` (`src/query_audit.py`; disable with `LLMLIBRARIAN_QUERY_AUDIT=0`). Read it via `pal queries` or the `recent_queries` MCP tool. Separate from `usage.log`, which stays a text-free metrics feed for the Argus dashboard.
 
 **Data flow:**
 

@@ -38,15 +38,24 @@ LLMLIBRARIAN_CHROMA_PORT=8000
 
 Same `LLMLIBRARIAN_DB` path is passed to `chroma run --path`. No DB migration.
 
-**Every client on that path must be HTTP.** This includes the MCP server Claude Code spawns from `.mcp.json` — its `env` block needs `LLMLIBRARIAN_CHROMA_HOST` / `LLMLIBRARIAN_CHROMA_PORT`, not just `.env.mcp`. Without them a session's MCP opens an embedded `PersistentClient` on the same path the server owns — the exact concurrent-client hazard server mode is meant to remove. Restart the MCP server (new session / reconnect) after changing `.mcp.json`.
+**Every client on that path must be HTTP.** Any client missing `LLMLIBRARIAN_CHROMA_HOST` / `LLMLIBRARIAN_CHROMA_PORT` opens an embedded `PersistentClient` on the path the server owns — the exact concurrent-client hazard server mode exists to remove.
+
+**One MCP process, reached over HTTP.** The plugin no longer ships a stdio `.mcp.json`: a stdio entry spawns a *new* `mcp_server.py` per client, so a desktop session, a phone session, and a local checkout each got their own process against one Chroma path — and a bug reproduced in one told you nothing about the others. The supported topology is a single `llmlibrarian-mcp.service` on `LLMLIBRARIAN_MCP_PORT` that every client connects to. Point Claude Code at it with an `http` MCP entry in your **local** config (the URL embeds `LLMLIBRARIAN_MCP_PATH`, so it must not be committed). After changing `mcp_server.py`, run `pc-stacks redeploy llmlibrarian`.
 
 #### Lock contention & query availability
 
 Cross-process access is coordinated by an advisory `flock` (`src/chroma_lock.py`): reads take a **shared** lock, writes an **exclusive** one. In embedded mode this is required — it prevents the concurrent-`PersistentClient` SIGSEGV — but it means an in-progress index write blocks all queries until it finishes, and a query that waits longer than `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` (default 5s) fails with a lock-timeout.
 
-Two mitigations keep contention from surfacing as unavailability:
+Mitigations that keep contention from surfacing as unavailability:
 
-- **Shared read lock is skipped in server mode.** The single `chroma run` process is the only on-disk reader/writer and serializes safely, so the redundant read `flock` is dropped — queries no longer block behind an in-progress index write. Force the old behavior with `LLMLIBRARIAN_CHROMA_SHARED_LOCK=1`. (Exclusive write locks are always taken.)
+- **Both locks are skipped in server mode.** `chroma run` is the only process touching the persist directory and orders access itself, so the `flock` protects nothing there — it only serializes llmLibrarian's own clients against each other. Skipping the shared lock stops queries blocking behind an index write; skipping the exclusive lock stops a `llmli add` failing outright because a peer index was mid-flight. Force either back with `LLMLIBRARIAN_CHROMA_SHARED_LOCK=1` / `LLMLIBRARIAN_CHROMA_EXCLUSIVE_LOCK=1`. In embedded mode both are always taken.
+- **Writers wait longer than readers.** A reader blocked 5s looks hung to its caller; a queued `llmli add` has nothing better to do than wait. Writers default to 120s (`LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS`), readers stay at 5s.
+- **Waiters back off.** Lock polling grows 20ms → 500ms instead of a fixed 100ms tick, so contending processes stop retrying in lockstep. The final sleep is clamped to the remaining budget.
+- **MCP reads skip the in-process mutex in server mode.** `mcp_server._chroma_lock` exists because two threads driving one *embedded* `PersistentClient` into the Rust HNSW writer once grew `link_lists.bin` to 680 GB. Under `chroma run` no thread touches HNSW, so the mutex only made every MCP read return `busy` for the full duration of a watcher-triggered background reindex. Reads now skip it in HTTP mode; writes (`repair_silo`, `update_file`, `remove_file`, and the background reindex write phase) still take it. Restore with `LLMLIBRARIAN_MCP_READ_LOCK=1`.
+
+#### Rebuild visibility
+
+A `--full` rebuild deletes a silo's rows before writing replacements, so a query landing in that window gets zero chunks and no error — indistinguishable from "the source doesn't say that." Three things close it: the delete is deferred until the replacements are embedded and in hand; the write-ahead marker (`src/ingest_journal.py`) records `kind` and `pid` and is held until a vector probe against the silo succeeds (Chroma keeps building HNSW after the write returns); and `run_retrieve` samples that marker either side of retrieval and tags the response with `write_in_progress` + `retryable` + a coverage note. Read tools surface it, so a remote session can tell "rebuilding" from "absent."
 - **Read tools degrade to `busy`, not error.** On a lock timeout, `query_personal_knowledge` / `multi_query_knowledge` / `explain_retrieval` / `find_files` / `inspect_silo` return `{"busy": true, "retryable": true, "retry_after_seconds": N}` instead of a hard error — the caller should retry rather than treat the index as broken or empty.
 
 The transient "DB lock — startup contention" you may see right after starting a server or a test run is a writer briefly holding the exclusive lock; it clears on its own.

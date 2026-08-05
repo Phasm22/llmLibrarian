@@ -102,7 +102,7 @@ tailscale funnel reset
   - Linux: `sudo systemctl stop llmlibrarian-mcp`
 
 - Full rollback to local-only MCP integration:
-  - Keep using `.mcp.json` stdio entry (`python mcp_server.py`).
+  - Stop the Funnel and keep `llmlibrarian-mcp.service` bound to localhost; point local clients at `http://127.0.0.1:$LLMLIBRARIAN_MCP_PORT$LLMLIBRARIAN_MCP_PATH`. Do **not** reintroduce a stdio entry — it spawns a second MCP process per client against the same Chroma path.
 
 ## 8) Hardening notes
 

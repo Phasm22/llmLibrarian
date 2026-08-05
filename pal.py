@@ -3116,6 +3116,83 @@ def ls_command(
 
 
 
+@app.command("queries", help="Audit past MCP queries: what was asked, of which silo, and which files answered.")
+def queries_command(
+    limit: int = typer.Option(20, "--limit", "-n", min=1, help="Most recent records to show."),
+    silo: str | None = typer.Option(None, "--silo", help="Only this silo slug.", autocompletion=_complete_silo),
+    contains: str | None = typer.Option(None, "--grep", help="Substring over query text, source filenames, or silo."),
+    since: str | None = typer.Option(None, "--since", help="Window: 30m, 24h, 7d, or an ISO timestamp."),
+    tool: str | None = typer.Option(None, "--tool", help="query_personal_knowledge or multi_query_knowledge."),
+    summary: bool = typer.Option(False, "--summary", help="Roll-up only, no individual records."),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSONL records."),
+) -> None:
+    _ensure_src_on_path()
+    import query_audit
+
+    log_path = query_audit.audit_log_path()
+    records = query_audit.read_records(
+        limit=limit, silo=silo, contains=contains, since=since, tool=tool
+    )
+
+    if as_json:
+        for entry in records:
+            print(json.dumps(entry))
+        return
+
+    if not records:
+        if not log_path.exists():
+            print(f"No query audit log yet ({log_path}).")
+            print("It is written on the first MCP query after the current build is running.")
+        else:
+            print("No matching queries.")
+        if not query_audit.audit_enabled():
+            print("Note: auditing is disabled (LLMLIBRARIAN_QUERY_AUDIT).", file=sys.stderr)
+        raise typer.Exit(code=0 if log_path.exists() else 1)
+
+    roll = query_audit.summarize_records(records)
+    if not summary:
+        for entry in records:
+            result = entry.get("result") or {}
+            ts = str(entry.get("ts") or "").replace("T", " ").replace("+00:00", "Z")
+            head = f"{ts}  {entry.get('tool')}  silo={entry.get('silo') or 'unscoped'}"
+            flags = []
+            if result.get("truncated"):
+                flags.append("TRUNCATED")
+            if result.get("errors"):
+                flags.append("ERRORS")
+            if not result.get("chunks"):
+                flags.append("EMPTY")
+            if flags:
+                head += "  [" + " ".join(flags) + "]"
+            print(head)
+            for q in entry.get("queries") or []:
+                print(f"    ? {q}")
+            srcs = result.get("sources") or []
+            if srcs:
+                shown = ", ".join(f"{s.get('file')}×{s.get('chunks')}" for s in srcs[:5])
+                extra = f" (+{result.get('sources_total', len(srcs)) - min(5, len(srcs))} more)" if result.get("sources_total", 0) > 5 else ""
+                print(f"    → {result.get('chunks')} chunks from {shown}{extra}")
+            else:
+                print(f"    → {result.get('chunks')} chunks")
+            print()
+
+    print(f"# {roll['calls']} call(s)  {roll.get('first_ts')} → {roll.get('last_ts')}")
+    if roll["by_silo"]:
+        print("  silos: " + ", ".join(f"{k}×{v}" for k, v in roll["by_silo"].items()))
+    if roll["top_sources"]:
+        print("  top sources: " + ", ".join(f"{s['file']}×{s['chunks']}" for s in roll["top_sources"][:5]))
+    notes = []
+    if roll["empty_results"]:
+        notes.append(f"{roll['empty_results']} empty")
+    if roll["truncated_results"]:
+        notes.append(f"{roll['truncated_results']} truncated")
+    if roll["errored_calls"]:
+        notes.append(f"{roll['errored_calls']} errored")
+    if notes:
+        print("  flags: " + ", ".join(notes))
+    print(f"  log: {log_path}")
+
+
 @app.command("remove", help="Remove a silo.")
 def remove_command(
     silo: list[str] = typer.Argument(..., help="Silo slug, display name, or path.", autocompletion=_complete_silo),

@@ -29,6 +29,7 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 | `query_personal_knowledge` | Primary retrieval → chunks (no LLM in MCP) |
 | `multi_query_knowledge` | Parallel queries, merged chunks |
 | `explain_retrieval` | Debug hybrid/vector signals |
+| `recent_queries` | Audit past queries: text, silo scope, per-source-file chunk breakdown |
 | `find_files` | Manifest-only path/date search |
 | `add_silo` | Index path (`confirm=True`) |
 | `trigger_reindex` | Incremental reindex (`confirm=True`; **not** right after `add_silo`) |
@@ -112,7 +113,9 @@ uv run pytest -q tests/unit
 - `pal` — operator CLI (pull, ask, ls, daemon, chroma service).
 - `llmli` — engine CLI (scripting, repair, rehydrate, log).
 - `pal sync` — refresh dev self-silo `__self__` when needed.
-- **Claude Desktop MCP (.mcpb):** after `mcp_server.py` changes, `pal extension pack` when `LLMLIBRARIAN_MCP_PACK_CMD` is set; stdio via `.mcp.json` does not update the Desktop binary. `pal ls --status` / `pal sync` warn on stale pack hash.
+- **After `mcp_server.py` / `src/` changes: `pc-stacks redeploy llmlibrarian`.** systemd services keep serving the code they imported at startup — a process from last week outlives every fix since. `redeploy` restarts MCP + watchers (leaving `chroma run` up) and prints each unit's start time so you can confirm the running process is the one you just changed.
+- **Claude Desktop MCP (.mcpb):** after `mcp_server.py` changes, `pal extension pack` when `LLMLIBRARIAN_MCP_PACK_CMD` is set. `pal ls --status` / `pal sync` warn on stale pack hash.
+- **No stdio MCP.** The plugin ships no `.mcp.json`; every client (Claude Code, Desktop, phone via Funnel) connects to the one `llmlibrarian-mcp.service` over HTTP. A stdio entry would spawn a second server per client and make bugs unreproducible across sessions.
 - `pal ask in <silo> "..."` → normalized to `--in`.
 
 ## Documentation policy

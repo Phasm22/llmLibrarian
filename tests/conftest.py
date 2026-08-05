@@ -21,6 +21,10 @@ if str(SRC) not in sys.path:
 # write into the production Chroma server. Block the bootstrap and scrub any
 # host-specific vars so tests only ever touch per-test tmp paths.
 os.environ["LLMLIBRARIAN_ENV_BOOTSTRAPPED"] = "1"
+# Query auditing appends to $PAL_HOME/logs (default ~/.pal) on every MCP query
+# tool call. Off by default here so tests can't write into the operator's real
+# audit trail; test_query_audit.py re-enables it against tmp paths.
+os.environ["LLMLIBRARIAN_QUERY_AUDIT"] = "0"
 for _key in (
     "LLMLIBRARIAN_DB",
     "LLMLIBRARIAN_CHROMA_HOST",
