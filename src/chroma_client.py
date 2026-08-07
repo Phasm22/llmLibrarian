@@ -26,6 +26,9 @@ from typing import Any, Iterator
 import chromadb
 from chromadb.config import Settings
 
+from constants import env_flag, mcp_auth_token
+from watch_locks import active_watchers_for_db
+
 _lock = threading.Lock()
 _clients: dict[str, "_SafeClient"] = {}
 _fallback_warned: set[str] = set()
@@ -133,10 +136,15 @@ def _close_probe_pool() -> None:
 # returns garbage or SIGSEGVs in the Rust _query path.
 #
 # Mitigation: writer_client touches `.llmli_chroma_generation` after each
-# successful write. Readers stash the file mtime at client-open time, and
-# check_for_writer_changes() reports True when the file has moved. Callers
-# that detect this should exit (systemd will restart watchers; the MCP
-# wrapper restarts itself via os.execv).
+# successful write. Readers stash the file mtime at client-open time; when
+# get_client() sees the file has moved it takes one of two corrective actions:
+#
+#   - LLMLIBRARIAN_EXIT_ON_STALE_GENERATION set (the MCP server defaults it on):
+#     exit 99 so the supervisor restarts the process with fresh state.
+#   - otherwise (CLI, pal, watchers): drop the cached client and reopen, the
+#     same recovery the HTTP heartbeat path performs on a dropped connection.
+#
+# Either way the stale client is never handed back to a caller.
 _GEN_FILE_NAME = ".llmli_chroma_generation"
 _client_open_generation: dict[str, float] = {}
 
@@ -159,8 +167,7 @@ def chroma_http_settings() -> tuple[str, int, bool]:
         port = int(port_raw)
     except ValueError:
         port = 8000
-    ssl_flag = os.environ.get("LLMLIBRARIAN_CHROMA_SSL", "").strip().lower() in ("1", "true", "yes")
-    return host, port, ssl_flag
+    return host, port, env_flag("LLMLIBRARIAN_CHROMA_SSL")
 
 
 def chroma_mode_info() -> dict[str, Any]:
@@ -213,8 +220,12 @@ def check_chroma_server_reachable(
     return False, "heartbeat unreachable"
 
 
-def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
-    """Return (reachable, db_path) for the llmLibrarian MCP HTTP /healthz probe.
+def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None, bool]:
+    """Probe the llmLibrarian MCP HTTP /healthz endpoint.
+
+    Returns ``(reachable, db_path, auth_blocked)``. ``auth_blocked`` is True when
+    the server answered but rejected our credentials -- a live MCP process we
+    cannot identify, which is very different from nothing listening at all.
 
     Uses the pooled keep-alive probe connection.
     """
@@ -225,73 +236,56 @@ def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
     except ValueError:
         port = 8765
     headers: dict[str, str] = {}
-    tok = os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN", "").strip()
+    tok = mcp_auth_token()
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
     status, body, err = _probe_http(host, port, False, "/healthz", headers=headers, timeout=timeout)
-    if err is not None or status != 200:
-        return False, None
+    if err is not None:
+        return False, None, False
+    if status in (401, 403):
+        return True, None, True
+    if status != 200:
+        return False, None, False
     raw = body.decode("utf-8", errors="replace")
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return True, None
+        return True, None, False
     if not isinstance(payload, dict) or not payload.get("ok"):
-        return False, None
+        return False, None, False
     db_raw = payload.get("db_path")
     if isinstance(db_raw, str) and db_raw.strip():
-        return True, str(Path(db_raw).expanduser().resolve())
-    return True, None
+        return True, str(Path(db_raw).expanduser().resolve()), False
+    return True, None, False
 
 
-def _mcp_blocks_embedded_write(db_path: str) -> bool:
-    """True when a live MCP server holds PersistentClient on this db_path."""
-    up, mcp_db = _mcp_healthz_info()
+def _mcp_blocks_embedded_write(db_path: str) -> str | None:
+    """Reason to refuse an embedded write because of a live MCP server, else None.
+
+    An authenticated probe that names this db_path is a definite block. A probe
+    rejected for bad credentials is also a block: a live MCP process is holding
+    *some* DB open and we have no way to rule out this one. Guessing wrong
+    SIGSEGVs, so the ambiguous case fails closed and says how to fix it.
+
+    A 200 response without a db_path field is genuine version skew against an
+    older server; that stays permissive.
+    """
+    up, mcp_db, auth_blocked = _mcp_healthz_info()
     if not up:
-        return False
-    target = str(Path(db_path).expanduser().resolve())
+        return None
+    if auth_blocked:
+        return (
+            "llmLibrarian MCP HTTP server is running but rejected our /healthz credentials, "
+            "so it cannot be confirmed to be on a different DB. Set LLMLIBRARIAN_MCP_AUTH_TOKEN "
+            "to the server's token, or set LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT=1 if you "
+            "know the MCP server holds a different database"
+        )
     if mcp_db is None:
-        # Cannot confirm MCP is on this DB (upgrade MCP /healthz includes db_path).
-        return False
-    return mcp_db == target
-
-
-def _pid_is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
-
-def _active_watch_processes_for_db(db_path: str) -> list[str]:
-    """Return human-readable labels for running pal pull --watch processes on db_path."""
-    db_resolved = str(Path(db_path).expanduser().resolve())
-    pal_home = Path(os.environ.get("PAL_HOME", str(Path.home() / ".pal"))).expanduser()
-    locks_dir = pal_home / "watch_locks"
-    if not locks_dir.is_dir():
-        return []
-    active: list[str] = []
-    for lock_path in sorted(locks_dir.glob("*.pid")):
-        try:
-            data = json.loads(lock_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        lock_db = str(data.get("db_path") or "").strip()
-        if lock_db and lock_db != db_resolved:
-            continue
-        pid_val = data.get("pid")
-        try:
-            pid = int(pid_val) if pid_val is not None else None
-        except (TypeError, ValueError):
-            pid = None
-        if pid is None or not _pid_is_running(pid):
-            continue
-        silo = str(data.get("silo") or lock_path.stem)
-        active.append(f"pal pull --watch (silo={silo}, pid={pid})")
-    return active
+        # Older MCP whose /healthz omits db_path — cannot confirm, stay permissive.
+        return None
+    if mcp_db == str(Path(db_path).expanduser().resolve()):
+        return "llmLibrarian MCP HTTP server is running on this DB (holds a cached PersistentClient)"
+    return None
 
 
 def preflight_embedded_write(db_path: str) -> str | None:
@@ -302,18 +296,14 @@ def preflight_embedded_write(db_path: str) -> str | None:
     """
     if is_http_mode():
         return None
-    if os.environ.get("LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    ):
+    if env_flag("LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT"):
         return None
 
     reasons: list[str] = []
-    if _mcp_blocks_embedded_write(db_path):
-        reasons.append("llmLibrarian MCP HTTP server is running on this DB (holds a cached PersistentClient)")
-    watchers = _active_watch_processes_for_db(db_path)
-    reasons.extend(watchers)
+    mcp_reason = _mcp_blocks_embedded_write(db_path)
+    if mcp_reason:
+        reasons.append(mcp_reason)
+    reasons.extend(active_watchers_for_db(db_path))
 
     if not reasons:
         return None
@@ -354,10 +344,10 @@ def _read_generation(db_path: str) -> float:
 def bump_generation(db_path: str) -> None:
     """Mark this DB as freshly mutated. Call AFTER a successful write commit.
 
-    Idempotent. Safe across processes (uses filesystem mtime). Readers that
-    opened their PersistentClient before this call will see
-    check_for_writer_changes() == True on their next check.
-    No-op in HTTP mode.
+    Idempotent. Safe across processes (uses filesystem mtime). A reader that
+    opened its PersistentClient before this call will, on its next
+    get_client(), either exit for a supervisor restart or drop and reopen —
+    see the write-generation comment above. No-op in HTTP mode.
     """
     if is_http_mode():
         return
@@ -370,42 +360,42 @@ def bump_generation(db_path: str) -> None:
         pass
 
 
-def check_for_writer_changes(db_path: str) -> bool:
-    """Return True if a writer has bumped the generation since this process
-    opened the cached PersistentClient for db_path. Returns False if no
-    client is cached for this db_path (nothing to invalidate yet)."""
-    if is_http_mode():
-        return False
-    key = str(Path(db_path).expanduser().resolve())
-    with _lock:
-        opened_at = _client_open_generation.get(key)
-    if opened_at is None:
-        return False
-    return _read_generation(key) > opened_at
-
-
-def exit_if_stale(db_path: str, *, exit_code: int = 99) -> None:
-    """Sys.exit(exit_code) if check_for_writer_changes(db_path). Designed for
-    long-lived reader processes (watcher daemons) under systemd, which will
-    restart them automatically. For in-process MCP use, prefer the MCP wrapper
-    that re-execs the process."""
-    if check_for_writer_changes(db_path):
-        print(
-            f"[llmli][chroma_client] writer activity detected on {db_path}; "
-            f"exiting ({exit_code}) so supervisor restarts with fresh state.",
-            file=sys.stderr,
-            flush=True,
-        )
-        sys.exit(exit_code)
-
-
-_HNSW_BLOAT_BYTES = 1 << 30
+HNSW_BLOAT_BYTES = 1 << 30
 _MIN_FREE_BYTES = 512 * 1024 * 1024
+
+# Persist dirs whose storage preflight already passed in this process. The scan
+# walks the whole persist directory, and get_client() plus writer_client() both
+# want it on the same path within one operation.
+_storage_preflight_ok: set[str] = set()
+
+
+def find_bloated_hnsw(root: Path | str) -> tuple[Path, int] | None:
+    """First ``link_lists.bin`` under ``root`` exceeding HNSW_BLOAT_BYTES.
+
+    A multi-gigabyte link_lists.bin means the HNSW writer ran concurrently from
+    two processes; the index is unusable and must be rebuilt.
+    """
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        return None
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if "link_lists.bin" not in filenames:
+            continue
+        fp = Path(dirpath) / "link_lists.bin"
+        try:
+            size = fp.stat().st_size
+        except OSError:
+            continue
+        if size > HNSW_BLOAT_BYTES:
+            return fp, size
+    return None
 
 
 def _storage_preflight(db_path: str) -> None:
     """Fail before opening Chroma when the persist directory is visibly unsafe."""
     root = Path(db_path).expanduser().resolve()
+    if str(root) in _storage_preflight_ok:
+        return
     usage_root = root if root.exists() else next((p for p in [root.parent, *root.parents] if p.exists()), root)
     try:
         min_free = int(os.environ.get("LLMLIBRARIAN_MIN_FREE_BYTES", _MIN_FREE_BYTES))
@@ -420,21 +410,14 @@ def _storage_preflight(db_path: str) -> None:
             f"ChromaDB storage preflight failed: only {free} bytes free under {usage_root}. "
             "Free disk space before opening the index."
         )
-    if not root.is_dir():
-        return
-    for dirpath, _dirnames, filenames in os.walk(root):
-        if "link_lists.bin" not in filenames:
-            continue
-        fp = Path(dirpath) / "link_lists.bin"
-        try:
-            size = fp.stat().st_size
-        except OSError:
-            continue
-        if size > _HNSW_BLOAT_BYTES:
-            raise RuntimeError(
-                f"ChromaDB storage preflight failed: bloated HNSW index {fp} is {size} bytes. "
-                "Stop llmLibrarian writers and rebuild my_brain_db before querying or indexing."
-            )
+    bloated = find_bloated_hnsw(root)
+    if bloated is not None:
+        fp, size = bloated
+        raise RuntimeError(
+            f"ChromaDB storage preflight failed: bloated HNSW index {fp} is {size} bytes. "
+            "Stop llmLibrarian writers and rebuild my_brain_db before querying or indexing."
+        )
+    _storage_preflight_ok.add(str(root))
 
 
 def _open_raw_client(db_path: str) -> Any:
@@ -490,7 +473,7 @@ class _SafeClient:
                 )
                 self._effective_efs[name] = fallback_ef
                 key = f"{id(self._client)}:{name}"
-                if key not in _fallback_warned and os.environ.get("LLMLIBRARIAN_QUIET", "").strip().lower() not in {"1", "true", "yes"}:
+                if key not in _fallback_warned and not env_flag("LLMLIBRARIAN_QUIET"):
                     _fallback_warned.add(key)
                     print(
                         "[llmli][WARN] Existing Chroma collection uses the default ONNX embedding "
@@ -518,52 +501,59 @@ def get_client(db_path: str) -> "_SafeClient":
     don't get ConnectError after the chroma server is restarted out from
     under us.
     """
+    # One cache key for every map in this module. Callers spell the same
+    # directory several ways ("./my_brain_db" vs the absolute path); keying on
+    # the raw string would hand out two PersistentClients for one persist dir,
+    # which is exactly the concurrent-handle SIGSEGV this module prevents.
     key = str(Path(db_path).expanduser().resolve())
     with _lock:
-        if db_path in _clients:
+        if key in _clients:
             if is_http_mode():
-                cached = _clients[db_path]
+                cached = _clients[key]
                 now = time.monotonic()
-                last_ok = _heartbeat_ok_at.get(db_path, 0.0)
+                last_ok = _heartbeat_ok_at.get(key, 0.0)
                 if now - last_ok < _heartbeat_min_interval():
                     return cached
                 try:
                     cached._client.heartbeat()
-                    _heartbeat_ok_at[db_path] = now
+                    _heartbeat_ok_at[key] = now
                     return cached
                 except Exception:
                     # Stale connection (chroma server restarted). Drop and rebuild.
-                    _clients.pop(db_path, None)
-                    _heartbeat_ok_at.pop(db_path, None)
+                    _clients.pop(key, None)
+                    _heartbeat_ok_at.pop(key, None)
             else:
                 opened_at = _client_open_generation.get(key, 0.0)
                 current = _read_generation(key)
-                if current > opened_at:
-                    if _exit_on_stale_enabled():
-                        print(
-                            f"[llmli][chroma_client] writer activity detected on "
-                            f"{db_path} (gen {opened_at:.6f} → {current:.6f}); "
-                            f"exiting (99) so supervisor restarts with fresh state.",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        sys.exit(99)
-                return _clients[db_path]
-        _storage_preflight(db_path)
-        raw = _open_raw_client(db_path)
-        _clients[db_path] = _SafeClient(raw)
+                if current <= opened_at:
+                    return _clients[key]
+                # Another process wrote since we opened. The cached client's
+                # segments are stale either way; never return it.
+                if _exit_on_stale_enabled():
+                    print(
+                        f"[llmli][chroma_client] writer activity detected on "
+                        f"{db_path} (gen {opened_at:.6f} → {current:.6f}); "
+                        f"exiting (99) so supervisor restarts with fresh state.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sys.exit(99)
+                _clients.pop(key, None)
+                _client_open_generation.pop(key, None)
+        _storage_preflight(key)
+        raw = _open_raw_client(key)
+        _clients[key] = _SafeClient(raw)
         if is_http_mode():
-            _heartbeat_ok_at[db_path] = time.monotonic()
+            _heartbeat_ok_at[key] = time.monotonic()
         else:
             _client_open_generation[key] = _read_generation(key)
-        return _clients[db_path]
+        return _clients[key]
 
 
 def _exit_on_stale_enabled() -> bool:
     if is_http_mode():
         return False
-    flag = os.environ.get("LLMLIBRARIAN_EXIT_ON_STALE_GENERATION", "").strip().lower()
-    return flag in ("1", "true", "yes")
+    return env_flag("LLMLIBRARIAN_EXIT_ON_STALE_GENERATION")
 
 
 def release() -> None:
@@ -579,15 +569,8 @@ def release() -> None:
         _clients.clear()
         _client_open_generation.clear()
         _heartbeat_ok_at.clear()
+        _storage_preflight_ok.clear()
     _close_probe_pool()
-
-
-def get_collection(db_path: str, name: str, embedding_function=None):
-    """Convenience wrapper: get-or-create a collection on the shared client."""
-    return get_client(db_path).get_or_create_collection(
-        name=name,
-        embedding_function=embedding_function,
-    )
 
 
 @contextmanager
@@ -606,16 +589,14 @@ def writer_client(db_path: str) -> Iterator["_SafeClient"]:
     with chroma_exclusive_lock(db_path):
         _storage_preflight(db_path)
         if is_http_mode():
-            client = get_client(db_path)
-            try:
-                yield client
-            finally:
-                pass
+            # Reuse the singleton: a second HttpClient would open a second
+            # connection pool to the one server that already serializes writes.
+            yield get_client(db_path)
         else:
-            raw = chromadb.PersistentClient(
-                path=db_path,
-                settings=Settings(anonymized_telemetry=False),
-            )
+            # _open_raw_client does not cache — get_client() owns that — so this
+            # is a fresh handle the caller exclusively owns, built by the same
+            # code path as every other client in this module.
+            raw = _open_raw_client(db_path)
             client = _SafeClient(raw)
             try:
                 yield client

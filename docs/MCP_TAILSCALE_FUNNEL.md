@@ -41,19 +41,19 @@ curl -i -X POST http://127.0.0.1:8765/mcp
 
 ### macOS (launchd)
 
-1. Copy `deploy/launchd/com.tjm4.llmlibrarian-mcp.plist` to `~/Library/LaunchAgents/`.
+1. Copy `deploy/launchd/com.llmlibrarian.mcp.plist` to `~/Library/LaunchAgents/`.
 2. Update any hardcoded paths/usernames.
 3. Load service:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.tjm4.llmlibrarian-mcp.plist 2>/dev/null || true
-launchctl load ~/Library/LaunchAgents/com.tjm4.llmlibrarian-mcp.plist
-launchctl kickstart -k gui/$(id -u)/com.tjm4.llmlibrarian-mcp
+launchctl unload ~/Library/LaunchAgents/com.llmlibrarian.mcp.plist 2>/dev/null || true
+launchctl load ~/Library/LaunchAgents/com.llmlibrarian.mcp.plist
+launchctl kickstart -k gui/$(id -u)/com.llmlibrarian.mcp
 ```
 
 ### Linux (systemd)
 
-Use `deploy/systemd/llmlibrarian-mcp.service` as a template unit.
+Use `deploy/systemd/llmlibrarian-mcp@.service` as a template unit; `pal install --mcp` renders it to `~/.config/systemd/user/llmlibrarian-mcp.service`.
 
 ## 4) Publish via Tailscale Funnel
 
@@ -80,7 +80,7 @@ Smoke-test expected behavior:
 1. Connector lists tools.
 2. `capabilities` returns supported file types.
 3. `health` returns `db_path` and storage info.
-4. write tools (`add_silo`, `trigger_reindex`, `repair_silo`) run only when explicitly intended; keep `confirm=true` in client calls.
+4. write tools (`add_silo`, `trigger_reindex`, `repair_silo`, `update_file`, `remove_file`) all require `confirm=true`. This makes a destructive call deliberate; it is **not** an authorization boundary, since any caller can pass it. The bearer token is the boundary.
 
 ## 6) Key rotation
 
@@ -98,7 +98,7 @@ tailscale funnel reset
 ```
 
 - Stop service:
-  - macOS: `launchctl unload ~/Library/LaunchAgents/com.tjm4.llmlibrarian-mcp.plist`
+  - macOS: `launchctl unload ~/Library/LaunchAgents/com.llmlibrarian.mcp.plist`
   - Linux: `sudo systemctl stop llmlibrarian-mcp`
 
 - Full rollback to local-only MCP integration:

@@ -46,8 +46,10 @@ pal daemon install|sync|logs
 - `query/` — `intent.py`, `retrieval.py` (hybrid/RRF), `core.py` (`run_ask`, `run_retrieve`)
 - `chroma_client.py` — singleton client; HTTP vs embedded; `writer_client` for writes
 - `chroma_lock.py` — cross-process flock
-- `state.py` — registry, manifest, query health
-- `mcp_server.py` — FastMCP tools + HTTP `/healthz`
+- `state.py` — silo registry, ingest failures, query health
+- `file_registry.py` — file manifest + content-hash registry
+- `mcp_server.py` — FastMCP tool surface only
+- `mcp_runtime/` — startup, PID lock, auth, Chroma mutex, background jobs, health roll-ups
 
 **Storage:** `LLMLIBRARIAN_DB` (default `./my_brain_db`); collection `llmli`; silo in metadata. Server mode: `chroma run` + `LLMLIBRARIAN_CHROMA_HOST`.
 

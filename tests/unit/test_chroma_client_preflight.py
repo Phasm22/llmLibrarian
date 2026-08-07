@@ -20,15 +20,16 @@ def _embedded_mode():
 def test_preflight_skipped_in_http_mode(monkeypatch, tmp_path):
     monkeypatch.setenv("LLMLIBRARIAN_CHROMA_HOST", "127.0.0.1")
     monkeypatch.setenv("LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT", "")
-    with patch.object(chroma_client, "_mcp_blocks_embedded_write", return_value=False):
+    with patch.object(chroma_client, "_mcp_blocks_embedded_write", return_value=None):
         assert chroma_client.preflight_embedded_write(str(tmp_path)) is None
 
 
 def test_preflight_blocks_when_mcp_healthz(monkeypatch, tmp_path):
     monkeypatch.delenv("LLMLIBRARIAN_CHROMA_HOST", raising=False)
     monkeypatch.setenv("LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT", "")
-    with patch.object(chroma_client, "_mcp_blocks_embedded_write", return_value=True):
-        with patch.object(chroma_client, "_active_watch_processes_for_db", return_value=[]):
+    reason = "llmLibrarian MCP HTTP server is running on this DB"
+    with patch.object(chroma_client, "_mcp_blocks_embedded_write", return_value=reason):
+        with patch.object(chroma_client, "active_watchers_for_db", return_value=[]):
             err = chroma_client.preflight_embedded_write(str(tmp_path))
     assert err is not None
     assert "MCP HTTP" in err
@@ -48,5 +49,5 @@ def test_writer_client_raises_before_persistent_open(monkeypatch, tmp_path):
 def test_preflight_skipped_when_env_set(monkeypatch, tmp_path):
     monkeypatch.delenv("LLMLIBRARIAN_CHROMA_HOST", raising=False)
     monkeypatch.setenv("LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT", "1")
-    with patch.object(chroma_client, "_mcp_blocks_embedded_write", return_value=False):
+    with patch.object(chroma_client, "_mcp_blocks_embedded_write", return_value=None):
         assert chroma_client.preflight_embedded_write(str(tmp_path)) is None

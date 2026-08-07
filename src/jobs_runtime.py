@@ -144,6 +144,7 @@ def _env_for_service(env: dict[str, str] | None = None) -> dict[str, str]:
         "LLMLIBRARIAN_MCP_HOST",
         "LLMLIBRARIAN_MCP_PORT",
         "LLMLIBRARIAN_MCP_PATH",
+        "LLMLIBRARIAN_MCP_AUTH_TOKEN",
         "LLMLIBRARIAN_MCP_BEARER_TOKEN",
         "LLMLIBRARIAN_CHROMA_HOST",
         "LLMLIBRARIAN_CHROMA_PORT",

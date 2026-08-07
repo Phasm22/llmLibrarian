@@ -10,7 +10,7 @@ Hypothesis: `mcp_server.trigger_reindex` and `operations.op_repair_silo` both
 keep the cached `chroma_client.get_client(...)` singleton alive while calling
 `run_add(...)`, which opens a SECOND `PersistentClient` inside `writer_client(...)`.
 Two live `PersistentClient` instances on the same persist dir corrupt the HNSW
-segment writer (see comment in src/chroma_client.py:148-159).
+segment writer (see the write-generation comment in src/chroma_client.py).
 
 These tests reproduce that pattern on a synthetic fixture and assert the
 invariant: every chunk ID returned by SQLite (`collection.get(where=...)`)

@@ -23,9 +23,7 @@ build/
 tests/
 docs/
 jobs/
-gemini_summary.md
 adversarial_eval_smoke.json
-SETUP_REMOTE.md
 SECURITY_AND_TESTING.md
 AGENTS.md
 

@@ -104,9 +104,25 @@ Requirements for standalone images:
 
 If `LLMLIBRARIAN_TRACE` is set, asks append JSON-lines traces.
 
+## Deployment Modes
+
+| Axis | Values | Source of truth at runtime |
+|------|--------|----------------------------|
+| Chroma transport | `embedded` (default) / `http` when `LLMLIBRARIAN_CHROMA_HOST` is set | `GET /healthz` → `chroma_transport` |
+| MCP transport | `stdio` (default) / `streamable-http` | `GET /healthz` → `transport` |
+
+Supported deployment: MCP `streamable-http` + Chroma `http`. Embedded Chroma is
+safe only when no other process holds the index. Full rationale:
+[CHROMA_AND_STACK.md](./CHROMA_AND_STACK.md).
+
 ## Common Environment Variables
 
 - `LLMLIBRARIAN_DB`
+- `LLMLIBRARIAN_CHROMA_HOST` / `_PORT` / `_SSL`
+- `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS`
+- `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION`
+- `LLMLIBRARIAN_MCP_TRANSPORT` / `_HOST` / `_PORT` / `_PATH`
+- `LLMLIBRARIAN_MCP_REQUIRE_AUTH` / `_AUTH_TOKEN`
 - `LLMLIBRARIAN_CONFIG`
 - `LLMLIBRARIAN_MODEL`
 - `LLMLIBRARIAN_VISION_MODEL`

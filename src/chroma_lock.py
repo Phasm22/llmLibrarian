@@ -34,6 +34,10 @@ Policy layers (do not mix up which one you are holding):
 MCP tools still invoke code paths that acquire flock, so both layers may apply: the
 threading lock serializes overlapping tool calls; flock coordinates with ``llmli`` /
 ``pal`` subprocesses and other hosts.
+
+Both layers read their wait budget from ``lock_timeout_seconds()`` below, so
+``LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS=0`` means "block indefinitely"
+everywhere rather than block-forever in one layer and fail-instantly in the other.
 """
 
 from __future__ import annotations
@@ -43,7 +47,7 @@ import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, TypeVar
+from typing import Any, Iterator
 import os
 import time
 
@@ -51,8 +55,6 @@ try:
     import fcntl  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover — Windows
     fcntl = None  # type: ignore[assignment]
-
-_T = TypeVar("_T")
 
 _LOCK_BASENAME = ".llmli_chroma.flock"
 _DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
@@ -105,8 +107,21 @@ def _lock_file_path(db_path: str) -> Path:
     return root / _LOCK_BASENAME
 
 
-def _lock_timeout_seconds() -> float | None:
-    raw = os.environ.get("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS", "").strip()
+def lock_timeout_seconds(env_name: str | None = None) -> float | None:
+    """Seconds to wait for a Chroma lock, or None meaning "block indefinitely".
+
+    ``env_name`` optionally names a more specific variable to consult first
+    (the MCP server has its own override), falling back to the shared
+    ``LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS``. Every lock layer must read
+    this through one function: "0" is a block-forever sentinel here, and a
+    caller that reimplemented it as a plain float would turn the same setting
+    into an instant timeout.
+    """
+    raw = ""
+    if env_name:
+        raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        raw = os.environ.get("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS", "").strip()
     if not raw:
         return _DEFAULT_LOCK_TIMEOUT_SECONDS
     if raw.lower() in {"0", "none", "off", "false", "no"}:
@@ -115,6 +130,10 @@ def _lock_timeout_seconds() -> float | None:
         return max(0.0, float(raw))
     except ValueError:
         return _DEFAULT_LOCK_TIMEOUT_SECONDS
+
+
+# Back-compat alias for the pre-consolidation private name.
+_lock_timeout_seconds = lock_timeout_seconds
 
 
 def _lock_holders(path: Path) -> list[int]:
@@ -151,7 +170,7 @@ def chroma_lock_snapshot(db_path: str | Path) -> dict[str, Any]:
 
 
 def _acquire_flock(f: Any, operation: int, *, mode: str, db_path: str, path: Path) -> None:
-    timeout = _lock_timeout_seconds()
+    timeout = lock_timeout_seconds()
     if timeout is None:
         fcntl.flock(f.fileno(), operation)
         return
@@ -227,13 +246,3 @@ def chroma_exclusive_lock(db_path: str | Path) -> Iterator[None]:
                 finally:
                     gate.fd.close()
                     gate.fd = None
-
-
-def chroma_call_shared(db_path: str | Path, fn: Callable[[], _T]) -> _T:
-    with chroma_shared_lock(db_path):
-        return fn()
-
-
-def chroma_call_exclusive(db_path: str | Path, fn: Callable[[], _T]) -> _T:
-    with chroma_exclusive_lock(db_path):
-        return fn()

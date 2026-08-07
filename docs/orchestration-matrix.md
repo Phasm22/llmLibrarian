@@ -54,7 +54,7 @@ Use `git log -G 'run_add|pull_all|add_silo|chroma_lock'` for mechanical hotspots
 | Item | Status |
 |------|--------|
 | `add_silo` single-file parity with `run_add` | Closed: accepts file paths like `llmli add`. |
-| `add_silo` explicit write confirmation | Closed: `confirm` is supported (defaults to true); clients can pass it explicitly. |
+| `add_silo` explicit write confirmation | Closed: every write tool takes `confirm`, defaulting to **false**. `add_silo` reads an arbitrary filesystem path, so it is not exempt. |
 | Every `llmli` flag on MCP | Open: add flags only as agents need them (`workers`, etc.). |
 | Streaming progress over MCP | Open: ingest remains synchronous; use `health` / `inspect_silo` after. |
 

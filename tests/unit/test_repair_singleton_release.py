@@ -2,7 +2,7 @@
 Call-ordering contract: `op_repair_silo` must release the cached singleton
 PersistentClient BEFORE invoking `run_add(...)`. Two live PersistentClients on
 the same persist dir corrupt the HNSW segment writer
-(see src/chroma_client.py:148).
+(see the write-generation comment in src/chroma_client.py).
 
 Asserted via mocked `chroma_client.release` + `ingest.run_add` — no real Chroma.
 """

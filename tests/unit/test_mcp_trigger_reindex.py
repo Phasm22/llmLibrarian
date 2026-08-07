@@ -24,11 +24,15 @@ def mcp_module(monkeypatch, tmp_path):
 
 
 def _patch_state(monkeypatch, *, slug, silos):
-    fake_state = SimpleNamespace(
-        list_silos=lambda _db: silos,
-        resolve_silo_to_slug=lambda _db, _name: slug,
-    )
-    monkeypatch.setitem(sys.modules, "state", fake_state)
+    """Patch the two lookups trigger_reindex uses, on the real state module.
+
+    Swapping sys.modules["state"] for a stub breaks any import that reaches the
+    rest of state's surface — `ingest` imports several other names from it.
+    """
+    import state
+
+    monkeypatch.setattr(state, "list_silos", lambda _db: silos)
+    monkeypatch.setattr(state, "resolve_silo_to_slug", lambda _db, _name: slug)
 
 
 def test_trigger_reindex_db_missing(monkeypatch, tmp_path):
@@ -121,14 +125,15 @@ def test_trigger_reindex_happy_path_returns_started(monkeypatch, mcp_module, tmp
     started_threads = []
 
     class _NoopThread:
-        def __init__(self, target=None, daemon=None):
+        def __init__(self, target=None, args=(), kwargs=None, daemon=None, **_ignored):
             self.target = target
+            self.args = args
             self.daemon = daemon
 
         def start(self):
             started_threads.append(self)
 
-    monkeypatch.setattr(mcp_module.threading, "Thread", _NoopThread)
+    monkeypatch.setattr(mcp_module.jobs, "_thread_cls", _NoopThread)
 
     res = mcp_module.trigger_reindex("docs", confirm=True)
 

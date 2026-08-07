@@ -213,18 +213,12 @@ def _warn_mcp_desktop_extension_stale() -> None:
     )
 
 
-def _pid_is_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
+import watch_locks  # noqa: E402
+from constants import pid_is_running as _pid_is_running  # noqa: E402
+from watch_locks import (  # noqa: E402
+    read_watch_lock as _read_watch_lock,
+    read_watch_lock_pid as _read_watch_lock_pid,
+)
 
 
 def _watch_lock_path(db_path: str | Path, silo_slug: str) -> Path:
@@ -236,39 +230,10 @@ def _watch_lock_path(db_path: str | Path, silo_slug: str) -> Path:
 
 
 def _iter_watch_locks() -> list[Path]:
-    if not WATCH_LOCKS_DIR.exists():
-        return []
-    return sorted(WATCH_LOCKS_DIR.glob("*.pid"))
-
-
-def _read_watch_lock(lock_path: Path) -> dict | None:
-    try:
-        raw = lock_path.read_text(encoding="utf-8").strip()
-    except Exception:
-        return None
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    try:
-        return {"pid": int(raw)}
-    except Exception:
-        return None
-
-
-def _read_watch_lock_pid(lock_path: Path) -> int | None:
-    data = _read_watch_lock(lock_path)
-    if not data:
-        return None
-    value = data.get("pid")
-    try:
-        return int(value)
-    except Exception:
-        return None
+    # Explicit dir: pal binds WATCH_LOCKS_DIR at import, while chroma_client
+    # resolves PAL_HOME per call. Passing it keeps both readers on one parser
+    # without changing when either one decides where to look.
+    return watch_locks.iter_watch_locks(WATCH_LOCKS_DIR)
 
 
 def _current_uid() -> int | None:
@@ -1412,6 +1377,9 @@ def _mcp_url() -> str:
 
 
 def _mcp_bearer_token() -> str | None:
+    # _ensure_mcp_client_env copies LLMLIBRARIAN_MCP_AUTH_TOKEN into
+    # LLMLIBRARIAN_MCP_BEARER_TOKEN only when the server requires auth, so a
+    # token is never sent to a server that is not asking for one.
     _ensure_mcp_client_env()
     return os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN") or None
 
@@ -2315,6 +2283,7 @@ _MCP_CLIENT_ENV_KEYS = {
     "LLMLIBRARIAN_MCP_HOST",
     "LLMLIBRARIAN_MCP_PORT",
     "LLMLIBRARIAN_MCP_PATH",
+    "LLMLIBRARIAN_MCP_AUTH_TOKEN",
     "LLMLIBRARIAN_MCP_BEARER_TOKEN",
 }
 
@@ -2435,7 +2404,7 @@ def _install_mcp_service(install_dir: Path, manager: str) -> tuple[bool, str]:
         enable_cmd = ["systemctl", "--user", "daemon-reload"]
         start_cmd = ["systemctl", "--user", "enable", "--now", "llmlibrarian-mcp.service"]
     elif manager == "launchd":
-        template = deploy_dir / "launchd" / "com.tjm4.llmlibrarian-mcp.plist"
+        template = deploy_dir / "launchd" / "com.llmlibrarian.mcp.plist"
         label = "com.llmlibrarian.mcp"
         dest_dir = jobsrt.launchd_agents_dir()
         dest = dest_dir / f"{label}.plist"

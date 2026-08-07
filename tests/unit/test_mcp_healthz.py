@@ -20,7 +20,10 @@ def mcp_module(monkeypatch, tmp_path):
     return mcp_server
 
 
-def test_healthz_returns_probe_fields(mcp_module, tmp_path):
+def test_healthz_returns_probe_fields(mcp_module, monkeypatch, tmp_path):
+    monkeypatch.delenv("LLMLIBRARIAN_CHROMA_HOST", raising=False)
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_TRANSPORT", raising=False)
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_HOST", raising=False)
     scope = {"type": "http", "method": "GET", "path": "/healthz", "headers": []}
     request = Request(scope)
     expected_db = str(tmp_path / "db")
@@ -33,6 +36,8 @@ def test_healthz_returns_probe_fields(mcp_module, tmp_path):
             "ok": True,
             "service": "llmLibrarian-mcp",
             "version": "0.1.0-test",
+            "transport": "stdio",
+            "chroma_transport": "embedded",
             "db_path": expected_db,
             "db_exists": True,
             "started_at": "2026-05-19T12:00:00+00:00",

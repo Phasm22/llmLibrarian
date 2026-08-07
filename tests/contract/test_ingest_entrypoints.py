@@ -82,8 +82,30 @@ def test_pull_all_subprocess_does_not_capture_output(monkeypatch):
     assert "add" in seen["cmd"]
 
 
+
+class _InlineThread:
+    """Runs the target synchronously so background-job assertions are deterministic."""
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None, **_ignored):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        self._target(*self._args, **self._kwargs)
+
+    def join(self, timeout=None):
+        return None
+
+
 def test_mcp_add_silo_file_reaches_run_ingest(monkeypatch, tmp_path):
-    """MCP add_silo allows a single file and delegates to run_ingest."""
+    """MCP add_silo allows a single file and delegates to run_ingest.
+
+    add_silo is asynchronous: it returns `started` plus the job key, and the
+    ingest outcome lands in the job registry once the background thread
+    finishes. Run the job inline so the assertion is deterministic.
+    """
+    from mcp_runtime import jobs
     from orchestration.ingest import IngestResult
 
     import mcp_server
@@ -98,6 +120,9 @@ def test_mcp_add_silo_file_reaches_run_ingest(monkeypatch, tmp_path):
     monkeypatch.setattr("orchestration.ingest.run_ingest", fake_run_ingest)
     monkeypatch.setattr(state, "resolve_silo_by_path", lambda db, p: "solo-txt")
     monkeypatch.setattr(state, "resolve_silo_to_slug", lambda db, s: s or "solo-txt")
+    monkeypatch.setattr(jobs, "_thread_cls", _InlineThread)
+    jobs.reset_for_tests()
+
     db_dir = tmp_path / "db"
     db_dir.mkdir()
     monkeypatch.setattr(mcp_server, "_DB_PATH", str(db_dir))
@@ -105,7 +130,27 @@ def test_mcp_add_silo_file_reaches_run_ingest(monkeypatch, tmp_path):
     f = tmp_path / "solo.txt"
     f.write_text("ok", encoding="utf-8")
 
-    out = mcp_server.add_silo(str(f))
+    out = mcp_server.add_silo(str(f), confirm=True)
     assert Path(called["path"]).resolve() == f.resolve()
-    assert out.get("status") == "ok"
-    assert out.get("files_indexed") == 1
+    assert out.get("status") == "started"
+
+    # The job key add_silo hands back must locate its own outcome.
+    outcome = jobs.snapshot()["last_background_reindex"][out["job_key"]]
+    assert outcome["ok"] is True
+    assert outcome["files_indexed"] == 1
+    assert outcome["silo"] == "solo-txt"
+
+
+def test_mcp_add_silo_requires_confirm(monkeypatch, tmp_path):
+    """add_silo indexes an arbitrary filesystem path, so the guard is not optional."""
+    import mcp_server
+
+    db_dir = tmp_path / "db"
+    db_dir.mkdir()
+    monkeypatch.setattr(mcp_server, "_DB_PATH", str(db_dir))
+    f = tmp_path / "solo.txt"
+    f.write_text("ok", encoding="utf-8")
+
+    out = mcp_server.add_silo(str(f))
+    assert out["status"] == "not_started"
+    assert "confirm=True" in out["message"]

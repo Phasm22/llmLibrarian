@@ -8,7 +8,7 @@ If any other document conflicts with this file, follow `AGENTS.md`.
 
 llmLibrarian is a **local personal knowledge index**: folders → chunks in Chroma → retrieval tools for assistants or CLI. It is **not** a chat product; it is a **context engine** with deterministic ingest, registry/manifest state, and observable repair paths.
 
-**Human story:** [README.md](../README.md) and [docs/GUIDE.md](docs/GUIDE.md).  
+**Human story:** [README.md](README.md) and [docs/GUIDE.md](docs/GUIDE.md).  
 **Contracts:** [docs/TECH.md](docs/TECH.md), [docs/orchestration-matrix.md](docs/orchestration-matrix.md).
 
 Agent priorities:
@@ -30,8 +30,8 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 | `multi_query_knowledge` | Parallel queries, merged chunks |
 | `explain_retrieval` | Debug hybrid/vector signals |
 | `find_files` | Manifest-only path/date search |
-| `add_silo` | Index path (`confirm=True`) |
-| `trigger_reindex` | Incremental reindex (`confirm=True`; **not** right after `add_silo`) |
+| `add_silo` | Index path (**requires** `confirm=True`; returns `job_key` for `health()` lookup) |
+| `trigger_reindex` | Incremental reindex (**requires** `confirm=True`; returns `job_key`; **not** right after `add_silo`) |
 | `repair_silo` | Hard wipe + re-index silo |
 | `update_file` / `remove_file` | Single-file maintenance |
 | `watch_coverage` | Read-only daemon/bookmark diagnostics |
@@ -92,7 +92,8 @@ llmli rehydrate --dry-run
 ### Test
 
 ```bash
-uv run pytest -q tests/unit
+uv run pytest            # tests/unit + tests/contract (see pyproject)
+uv run pytest tests/integration   # spawns subprocesses + real Chroma
 ```
 
 ## Command notes

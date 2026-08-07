@@ -28,14 +28,14 @@ def test_lock_snapshot_reports_holder(tmp_path):
     assert snapshot["holder_pids"]
 
 
-def test_chroma_call_helpers(tmp_path):
-    db = str(tmp_path / "db")
+def test_call_wrapper_helpers_stay_removed():
+    """chroma_call_shared/exclusive had no production callers and were removed.
 
-    def f():
-        return 42
-
-    assert cl.chroma_call_exclusive(db, f) == 42
-    assert cl.chroma_call_shared(db, f) == 42
+    The context managers are the only supported entry points; a thin fn-wrapper
+    variant invites a second locking idiom for no benefit.
+    """
+    assert not hasattr(cl, "chroma_call_shared")
+    assert not hasattr(cl, "chroma_call_exclusive")
 
 
 def test_shared_lock_timeout_surfaces_busy_db(monkeypatch, tmp_path):

@@ -20,8 +20,9 @@ from doc_type_taxonomy import doc_type_bucket_for_extension
 
 # Chroma HNSW `link_lists.bin` should stay modest for a single-user index.
 # Concurrent writers (multiple processes on one PersistentClient path) can
-# corrupt it to hundreds of GiB; see chroma_lock.py and mcp_server.py _chroma_lock.
-_HNSW_BLOAT_BYTES = 1 << 30  # 1 GiB
+# corrupt it to hundreds of GiB; see chroma_lock.py and mcp_runtime/jobs.py.
+# One threshold, shared with chroma_client's storage preflight.
+from chroma_client import HNSW_BLOAT_BYTES as _HNSW_BLOAT_BYTES
 
 
 def op_db_storage_summary(db_path: str) -> dict[str, Any]:
@@ -314,7 +315,7 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
 
             # Drop the singleton PersistentClient before run_add opens its own
             # writer_client. Two live PersistentClients on the same persist dir
-            # corrupt the HNSW segment writer (chroma_client.py:148).
+            # corrupt the HNSW segment writer (see src/chroma_client.py).
             coll = None
             release()
 
