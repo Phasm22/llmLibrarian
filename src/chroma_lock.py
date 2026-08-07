@@ -178,32 +178,45 @@ def _lock_file_path(db_path: str) -> Path:
     return root / _LOCK_BASENAME
 
 
-def _lock_timeout_seconds(write: bool = False) -> float | None:
-    """Seconds to wait for the flock; None means block indefinitely.
+_BLOCK_FOREVER = {"0", "none", "off", "false", "no"}
 
-    Writers get their own (much longer) budget — see the module constants.
-    ``LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS`` overrides writers only;
-    ``LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS`` overrides both.
-    """
-    if write:
-        raw = os.environ.get("LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS", "").strip()
-        if raw:
-            if raw.lower() in {"0", "none", "off", "false", "no"}:
-                return None
-            try:
-                return max(0.0, float(raw))
-            except ValueError:
-                return _DEFAULT_WRITE_LOCK_TIMEOUT_SECONDS
-    default = _DEFAULT_WRITE_LOCK_TIMEOUT_SECONDS if write else _DEFAULT_LOCK_TIMEOUT_SECONDS
-    raw = os.environ.get("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS", "").strip()
-    if not raw:
-        return default
-    if raw.lower() in {"0", "none", "off", "false", "no"}:
+
+def _parse_timeout(raw: str, default: float) -> float | None:
+    """Parse one timeout value. Empty means "not set" (caller falls through)."""
+    if raw.lower() in _BLOCK_FOREVER:
         return None
     try:
         return max(0.0, float(raw))
     except ValueError:
         return default
+
+
+def _lock_timeout_seconds(write: bool = False, env_name: str | None = None) -> float | None:
+    """Seconds to wait for a Chroma lock; None means block indefinitely.
+
+    Consulted in order: ``env_name`` (a caller-specific override, e.g. the MCP
+    server's in-process mutex), then the writer-only variable, then the shared
+    one. Writers get their own much longer default — see the module constants.
+
+    Every lock layer must read its budget through this function. The
+    block-forever sentinel is why: a caller that reimplemented it as a plain
+    float turns ``...LOCK_TIMEOUT_SECONDS=0`` into an instant timeout in one
+    layer while it means "wait forever" in another.
+    """
+    default = _DEFAULT_WRITE_LOCK_TIMEOUT_SECONDS if write else _DEFAULT_LOCK_TIMEOUT_SECONDS
+
+    candidates: list[str] = []
+    if env_name:
+        candidates.append(env_name)
+    if write:
+        candidates.append("LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS")
+    candidates.append("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS")
+
+    for name in candidates:
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            return _parse_timeout(raw, default)
+    return default
 
 
 def _lock_holders(path: Path) -> list[int]:

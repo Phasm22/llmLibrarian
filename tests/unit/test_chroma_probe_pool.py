@@ -129,8 +129,9 @@ def test_mcp_healthz_info_uses_pooled_probe(monkeypatch):
         return 200, payload, None
 
     monkeypatch.setattr(chroma_client, "_probe_http", fake)
-    up, db = chroma_client._mcp_healthz_info()
+    up, db, auth_blocked = chroma_client._mcp_healthz_info()
     assert up is True
+    assert auth_blocked is False
     assert db and db.endswith("/tmp/db")
 
 

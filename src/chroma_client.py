@@ -214,8 +214,27 @@ def check_chroma_server_reachable(
     return False, "heartbeat unreachable"
 
 
-def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
-    """Return (reachable, db_path) for the llmLibrarian MCP HTTP /healthz probe.
+def mcp_auth_token() -> str:
+    """Bearer token for the llmLibrarian MCP HTTP server.
+
+    ``LLMLIBRARIAN_MCP_AUTH_TOKEN`` is the name the server, scripts/run_mcp_http.sh
+    and .env.mcp all use; ``LLMLIBRARIAN_MCP_BEARER_TOKEN`` is the older
+    client-side spelling ``pal`` still writes. Read both — a probe that misses
+    the token gets a 401 it cannot tell apart from "server down".
+    """
+    for name in ("LLMLIBRARIAN_MCP_AUTH_TOKEN", "LLMLIBRARIAN_MCP_BEARER_TOKEN"):
+        tok = os.environ.get(name, "").strip()
+        if tok:
+            return tok
+    return ""
+
+
+def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None, bool]:
+    """Probe the llmLibrarian MCP HTTP /healthz endpoint.
+
+    Returns ``(reachable, db_path, auth_blocked)``. ``auth_blocked`` is True when
+    the server answered but rejected our credentials — a live MCP process we
+    cannot identify, which is very different from nothing listening at all.
 
     Uses the pooled keep-alive probe connection.
     """
@@ -226,35 +245,56 @@ def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
     except ValueError:
         port = 8765
     headers: dict[str, str] = {}
-    tok = os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN", "").strip()
+    tok = mcp_auth_token()
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
     status, body, err = _probe_http(host, port, False, "/healthz", headers=headers, timeout=timeout)
-    if err is not None or status != 200:
-        return False, None
+    if err is not None:
+        return False, None, False
+    if status in (401, 403):
+        return True, None, True
+    if status != 200:
+        return False, None, False
     raw = body.decode("utf-8", errors="replace")
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return True, None
+        return True, None, False
     if not isinstance(payload, dict) or not payload.get("ok"):
-        return False, None
+        return False, None, False
     db_raw = payload.get("db_path")
     if isinstance(db_raw, str) and db_raw.strip():
-        return True, str(Path(db_raw).expanduser().resolve())
-    return True, None
+        return True, str(Path(db_raw).expanduser().resolve()), False
+    return True, None, False
 
 
-def _mcp_blocks_embedded_write(db_path: str) -> bool:
-    """True when a live MCP server holds PersistentClient on this db_path."""
-    up, mcp_db = _mcp_healthz_info()
+def _mcp_blocks_embedded_write(db_path: str) -> str | None:
+    """Reason to refuse an embedded write because of a live MCP server, else None.
+
+    An authenticated probe naming this db_path is a definite block. A probe
+    rejected for bad credentials is also a block: a live MCP process holds
+    *some* DB open and we cannot rule out this one. Guessing wrong SIGSEGVs, so
+    the ambiguous case fails closed and says how to fix it.
+
+    A 200 without a db_path field is genuine version skew against an older
+    server; that stays permissive.
+    """
+    up, mcp_db, auth_blocked = _mcp_healthz_info()
     if not up:
-        return False
-    target = str(Path(db_path).expanduser().resolve())
+        return None
+    if auth_blocked:
+        return (
+            "llmLibrarian MCP HTTP server is running but rejected our /healthz credentials, "
+            "so it cannot be confirmed to be on a different DB. Set LLMLIBRARIAN_MCP_AUTH_TOKEN "
+            "to the server's token, or set LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT=1 if you "
+            "know the MCP server holds a different database"
+        )
     if mcp_db is None:
-        # Cannot confirm MCP is on this DB (upgrade MCP /healthz includes db_path).
-        return False
-    return mcp_db == target
+        # Older MCP whose /healthz omits db_path — cannot confirm, stay permissive.
+        return None
+    if mcp_db == str(Path(db_path).expanduser().resolve()):
+        return "llmLibrarian MCP HTTP server is running on this DB (holds a cached PersistentClient)"
+    return None
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -311,8 +351,9 @@ def preflight_embedded_write(db_path: str) -> str | None:
         return None
 
     reasons: list[str] = []
-    if _mcp_blocks_embedded_write(db_path):
-        reasons.append("llmLibrarian MCP HTTP server is running on this DB (holds a cached PersistentClient)")
+    mcp_reason = _mcp_blocks_embedded_write(db_path)
+    if mcp_reason:
+        reasons.append(mcp_reason)
     watchers = _active_watch_processes_for_db(db_path)
     reasons.extend(watchers)
 
@@ -680,45 +721,53 @@ def get_client(db_path: str) -> "_SafeClient":
     don't get ConnectError after the chroma server is restarted out from
     under us.
     """
+    # One cache key for every map in this module. Callers spell the same
+    # directory several ways ("./my_brain_db" vs the absolute path); keying on
+    # the raw string handed out two PersistentClients for one persist dir,
+    # which is exactly the concurrent-handle SIGSEGV this module prevents.
     key = str(Path(db_path).expanduser().resolve())
     with _lock:
-        if db_path in _clients:
+        if key in _clients:
             if is_http_mode():
-                cached = _clients[db_path]
+                cached = _clients[key]
                 now = time.monotonic()
-                last_ok = _heartbeat_ok_at.get(db_path, 0.0)
+                last_ok = _heartbeat_ok_at.get(key, 0.0)
                 if now - last_ok < _heartbeat_min_interval():
                     return cached
                 try:
                     cached._client.heartbeat()
-                    _heartbeat_ok_at[db_path] = now
+                    _heartbeat_ok_at[key] = now
                     return cached
                 except Exception:
                     # Stale connection (chroma server restarted). Drop and rebuild.
-                    _clients.pop(db_path, None)
-                    _heartbeat_ok_at.pop(db_path, None)
+                    _clients.pop(key, None)
+                    _heartbeat_ok_at.pop(key, None)
             else:
                 opened_at = _client_open_generation.get(key, 0.0)
                 current = _read_generation(key)
-                if current > opened_at:
-                    if _exit_on_stale_enabled():
-                        print(
-                            f"[llmli][chroma_client] writer activity detected on "
-                            f"{db_path} (gen {opened_at:.6f} → {current:.6f}); "
-                            f"exiting (99) so supervisor restarts with fresh state.",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        sys.exit(99)
-                return _clients[db_path]
-        _storage_preflight(db_path)
-        raw = _open_raw_client(db_path)
-        _clients[db_path] = _SafeClient(raw)
+                if current <= opened_at:
+                    return _clients[key]
+                # Another process wrote since we opened. The cached client's
+                # segments are stale either way; never hand it back.
+                if _exit_on_stale_enabled():
+                    print(
+                        f"[llmli][chroma_client] writer activity detected on "
+                        f"{db_path} (gen {opened_at:.6f} → {current:.6f}); "
+                        f"exiting (99) so supervisor restarts with fresh state.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sys.exit(99)
+                _clients.pop(key, None)
+                _client_open_generation.pop(key, None)
+        _storage_preflight(key)
+        raw = _open_raw_client(key)
+        _clients[key] = _SafeClient(raw)
         if is_http_mode():
-            _heartbeat_ok_at[db_path] = time.monotonic()
+            _heartbeat_ok_at[key] = time.monotonic()
         else:
             _client_open_generation[key] = _read_generation(key)
-        return _clients[db_path]
+        return _clients[key]
 
 
 def _exit_on_stale_enabled() -> bool:

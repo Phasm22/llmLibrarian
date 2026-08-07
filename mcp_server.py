@@ -309,16 +309,42 @@ mcp = FastMCP(
 _chroma_lock = threading.Lock()
 
 
-def _mcp_lock_timeout_seconds() -> float:
-    raw = os.environ.get("LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS", "").strip()
-    if not raw:
-        raw = os.environ.get("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS", "").strip()
-    if not raw:
-        return 5.0
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return 5.0
+def _mcp_lock_timeout_seconds() -> float | None:
+    """Wait budget for the in-process Chroma mutex; None means block indefinitely.
+
+    Delegates to chroma_lock so LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS=0 means
+    the same thing here as it does for the flock layer. Reading it separately
+    turned that setting into an instant timeout on this side.
+    """
+    from chroma_lock import _lock_timeout_seconds
+
+    return _lock_timeout_seconds(env_name="LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS")
+
+
+def _acquire_chroma_lock(operation: str) -> None:
+    """Take the in-process Chroma mutex, honouring the block-forever sentinel."""
+    timeout = _mcp_lock_timeout_seconds()
+    acquired = (
+        _chroma_lock.acquire() if timeout is None else _chroma_lock.acquire(timeout=timeout)
+    )
+    if not acquired:
+        raise TimeoutError(
+            f"Timed out after {timeout:g}s waiting for MCP Chroma lock during {operation}. "
+            "A background reindex or another tool call is still using Chroma; call health() "
+            "for last_background_reindex, then retry or restart the stuck MCP server."
+        )
+
+
+def _retry_after_seconds() -> int:
+    """Client retry hint: half the lock budget, floor 1s.
+
+    With no timeout configured there is no budget to halve, so fall back to the
+    default read wait rather than reporting a nonsense delay.
+    """
+    timeout = _mcp_lock_timeout_seconds()
+    if timeout is None:
+        return 5
+    return max(1, round(timeout / 2))
 
 
 def _mcp_read_lock_disabled() -> bool:
@@ -352,13 +378,7 @@ def _mcp_chroma_lock(operation: str, write: bool = False):
     if not write and _mcp_read_lock_disabled():
         yield
         return
-    timeout = _mcp_lock_timeout_seconds()
-    if not _chroma_lock.acquire(timeout=timeout):
-        raise TimeoutError(
-            f"Timed out after {timeout:g}s waiting for MCP Chroma lock during {operation}. "
-            "A background reindex or another tool call is still using Chroma; call health() "
-            "for last_background_reindex, then retry or restart the stuck MCP server."
-        )
+    _acquire_chroma_lock(operation)
     try:
         yield
     finally:
@@ -408,7 +428,7 @@ def _busy_error(exc: BaseException, operation: str) -> dict:
     """Soft, retryable payload for lock contention. Distinct from a hard error
     so the caller retries instead of treating the DB as down or the index as
     empty."""
-    retry_after = max(1, round(_mcp_lock_timeout_seconds() / 2))
+    retry_after = _retry_after_seconds()
     return {
         "db_path": _DB_PATH,
         "busy": True,
@@ -994,7 +1014,7 @@ def multi_query_knowledge(
         **({"retryable": True} if (merged_write_state or {}).get("results_may_be_incomplete") else {}),
         **({"errors": errors} if errors else {}),
         **(
-            {"busy": True, "retryable": True, "retry_after_seconds": max(1, round(_mcp_lock_timeout_seconds() / 2))}
+            {"busy": True, "retryable": True, "retry_after_seconds": _retry_after_seconds()}
             if busy and not all_chunks
             else {}
         ),
@@ -1399,12 +1419,7 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
         try:
             def _acquire_for_write() -> None:
                 nonlocal _write_lock_held
-                timeout = _mcp_lock_timeout_seconds()
-                if not _chroma_lock.acquire(timeout=timeout):
-                    raise TimeoutError(
-                        f"Timed out after {timeout:g}s waiting for MCP Chroma lock during trigger_reindex. "
-                        "A background reindex or another tool call is still using Chroma; retry or restart."
-                    )
+                _acquire_chroma_lock("trigger_reindex")
                 _write_lock_held = True
 
             with _reindex_lock:
@@ -1662,12 +1677,7 @@ def add_silo(
         try:
             def _acquire_for_write() -> None:
                 nonlocal _write_lock_held
-                timeout = _mcp_lock_timeout_seconds()
-                if not _chroma_lock.acquire(timeout=timeout):
-                    raise TimeoutError(
-                        f"Timed out after {timeout:g}s waiting for MCP Chroma lock during add_silo. "
-                        "A background reindex or another tool call is still using Chroma; retry or restart."
-                    )
+                _acquire_chroma_lock("add_silo")
                 _write_lock_held = True
 
             with _reindex_lock:
