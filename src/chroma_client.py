@@ -297,42 +297,17 @@ def _mcp_blocks_embedded_write(db_path: str) -> str | None:
     return None
 
 
-def _pid_is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
-
 def _active_watch_processes_for_db(db_path: str) -> list[str]:
-    """Return human-readable labels for running pal pull --watch processes on db_path."""
-    db_resolved = str(Path(db_path).expanduser().resolve())
-    pal_home = Path(os.environ.get("PAL_HOME", str(Path.home() / ".pal"))).expanduser()
-    locks_dir = pal_home / "watch_locks"
-    if not locks_dir.is_dir():
-        return []
-    active: list[str] = []
-    for lock_path in sorted(locks_dir.glob("*.pid")):
-        try:
-            data = json.loads(lock_path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        lock_db = str(data.get("db_path") or "").strip()
-        if lock_db and lock_db != db_resolved:
-            continue
-        pid_val = data.get("pid")
-        try:
-            pid = int(pid_val) if pid_val is not None else None
-        except (TypeError, ValueError):
-            pid = None
-        if pid is None or not _pid_is_running(pid):
-            continue
-        silo = str(data.get("silo") or lock_path.stem)
-        active.append(f"pal pull --watch (silo={silo}, pid={pid})")
-    return active
+    """Labels for running ``pal pull --watch`` processes holding ``db_path``.
+
+    Delegates to watch_locks so this and pal read the lock files with one
+    parser. A private copy here understood only the JSON form, so a legacy
+    bare-integer lock file made this return nothing and silently disarmed
+    preflight_embedded_write while a watcher held the index.
+    """
+    from watch_locks import active_watchers_for_db
+
+    return active_watchers_for_db(db_path)
 
 
 def preflight_embedded_write(db_path: str) -> str | None:
