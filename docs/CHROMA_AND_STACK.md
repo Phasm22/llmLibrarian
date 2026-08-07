@@ -13,15 +13,15 @@ Operator-focused notes for **one Chroma process on disk** and many HTTP clients 
 
 ChromaDB 1.x is **thread-safe but not process-safe** for embedded `PersistentClient` on one `persist_directory`. Two processes each opening `PersistentClient` on the same path can **SIGSEGV** in native HNSW code (not a Python lock error).
 
-### Embedded mode (default)
+### Embedded mode (zero-config; safe only when nothing else holds the index)
 
-- One long-lived reader (MCP HTTP, `pal pull --watch`) plus a separate `pal pull` / `llmli add` writer is unsafe.
-- llmLibrarian blocks embedded writes when MCP `/healthz` or an active watch process is detected (`preflight_embedded_write`).
-- Long-lived readers use `.llmli_chroma_generation` + optional `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION=1` to restart after external writes.
+- One long-lived reader (MCP, `pal pull --watch`) plus a separate `pal pull` / `llmli add` writer is unsafe.
+- llmLibrarian refuses embedded writes when MCP `/healthz` or an active watch process is detected (`preflight_embedded_write`). If `/healthz` answers but rejects our credentials, the write is also refused: a live MCP server that cannot be identified is not evidence it is safe to proceed. Set `LLMLIBRARIAN_MCP_AUTH_TOKEN` so the probe can authenticate, or `LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT=1` if you know it holds a different DB.
+- Long-lived readers track `.llmli_chroma_generation`. When another process writes, a reader either exits 99 for its supervisor to restart it (`LLMLIBRARIAN_EXIT_ON_STALE_GENERATION`, which `mcp_server` **defaults to on**) or drops and reopens its cached client. A stale client is never returned to a caller.
 
 **While MCP is up:** use MCP `add_silo` / `trigger_reindex`, or stop MCP before `pal pull`.
 
-### Server mode (recommended for MCP + CLI together)
+### Server mode (the supported deployment)
 
 Run a single local Chroma server; all clients use `HttpClient`:
 
@@ -41,6 +41,8 @@ Same `LLMLIBRARIAN_DB` path is passed to `chroma run --path`. No DB migration.
 **Every client on that path must be HTTP.** Any client missing `LLMLIBRARIAN_CHROMA_HOST` / `LLMLIBRARIAN_CHROMA_PORT` opens an embedded `PersistentClient` on the path the server owns — the exact concurrent-client hazard server mode exists to remove.
 
 **One MCP process, reached over HTTP.** The plugin no longer ships a stdio `.mcp.json`: a stdio entry spawns a *new* `mcp_server.py` per client, so a desktop session, a phone session, and a local checkout each got their own process against one Chroma path — and a bug reproduced in one told you nothing about the others. The supported topology is a single `llmlibrarian-mcp.service` on `LLMLIBRARIAN_MCP_PORT` that every client connects to. Point Claude Code at it with an `http` MCP entry in your **local** config (the URL embeds `LLMLIBRARIAN_MCP_PATH`, so it must not be committed). After changing `mcp_server.py`, run `pc-stacks redeploy llmlibrarian`.
+
+The repo's root `.mcp.json` is still a stdio entry, so a checkout opened in Claude Code spawns its own `mcp_server.py` alongside the service. That is tolerable only because it now sets `LLMLIBRARIAN_CHROMA_HOST`/`PORT`: every one of those processes is an HTTP client of the single `chroma run`, not a second embedded writer. Drop those two variables and the same setup becomes the corruption case. `mcp_runtime_status` counts live `mcp_server.py` processes if you need to confirm what is actually running.
 
 #### Lock contention & query availability
 
@@ -81,15 +83,46 @@ Traceability: **PC Idle Quietdown** plan (Cursor plans, Jul 2025).
 
 ## Environment
 
+Boolean variables accept `1`, `true`, `yes`, or `on` (case-insensitive).
+
+**Storage and transport**
+
 | Variable | Role |
 |----------|------|
 | `LLMLIBRARIAN_DB` | Persist directory (embedded path and `chroma run --path`) |
 | `LLMLIBRARIAN_CHROMA_HOST` | If set, use HTTP client instead of embedded |
 | `LLMLIBRARIAN_CHROMA_PORT` | Chroma server port (default `8000`) |
-| `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` | Max wait for the Chroma flock before a busy/timeout (default `5`; `0`/`off` = block forever) |
-| `LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS` | Max wait for the in-process MCP Chroma lock before a busy/timeout (default `5`; falls back to the flock timeout var) |
+| `LLMLIBRARIAN_CHROMA_SSL` | Use HTTPS for the Chroma client |
+| `LLMLIBRARIAN_CHROMA_HTTP_RETRIES` | Connection-level retry attempts in HTTP mode (default `3`; `0` disables) |
+| `LLMLIBRARIAN_CHROMA_HEARTBEAT_INTERVAL_SEC` | Min seconds between cached-client heartbeats (default `5`) |
+
+**Locking**
+
+| Variable | Role |
+|----------|------|
+| `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` | Max wait for a Chroma lock (default `5` read; `0`/`off`/`none` = block indefinitely). Read by *both* the flock layer and the MCP in-process mutex, so the sentinel means the same thing everywhere. |
+| `LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS` | Writer-only override (default `120`) — a queued `llmli add` can afford to wait where a reader cannot |
+| `LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS` | Override for the MCP in-process mutex only; falls through to the shared var |
 | `LLMLIBRARIAN_CHROMA_SHARED_LOCK` | Force the shared read flock even in server mode (default off — read lock skipped in HTTP mode) |
-| `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` | Embedded readers exit 99 after external write |
+| `LLMLIBRARIAN_CHROMA_EXCLUSIVE_LOCK` | Force the exclusive write flock even in server mode |
+| `LLMLIBRARIAN_MCP_READ_LOCK` | Force MCP reads to take the in-process mutex in server mode |
+
+**MCP serving**
+
+| Variable | Role |
+|----------|------|
+| `LLMLIBRARIAN_MCP_TRANSPORT` | `stdio` (default) or `streamable-http` |
+| `LLMLIBRARIAN_MCP_HOST` / `_PORT` / `_PATH` | Bind address and route for the HTTP service |
+| `LLMLIBRARIAN_MCP_REQUIRE_AUTH` | Require a static bearer token on HTTP transports |
+| `LLMLIBRARIAN_MCP_AUTH_TOKEN` | The bearer token. Used by the server *and* by the embedded-write guard's `/healthz` probe — without it that guard cannot identify an authenticated server. |
+| `LLMLIBRARIAN_MCP_BEARER_TOKEN` | Older client-side spelling, still written by `pal`; read as a fallback |
+| `LLMLIBRARIAN_MCP_URL` | Full MCP endpoint for `pal`'s client, overriding host/port/path |
+
+**Recovery / testing**
+
+| Variable | Role |
+|----------|------|
+| `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` | Embedded readers exit 99 after an external write (default **on** in `mcp_server`); when off, the cached client is dropped and reopened instead |
 | `LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT` | Tests only; disable embedded write guard |
 
 ## See also

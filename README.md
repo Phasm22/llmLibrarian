@@ -77,7 +77,7 @@ pal ls
 pal ask --in my-project "what is this repo about?"
 ```
 
-For **Cursor**, run the MCP server (see [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md)) and connect to `http://127.0.0.1:8765`. Call `list_silos` before trusting retrieval.
+For **Cursor**, run the MCP server (`./scripts/run_mcp_http.sh`; see [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md#server-mode-the-supported-deployment)) and connect to `http://127.0.0.1:8765`. Call `list_silos` before trusting retrieval.
 
 **Secrets:** do not commit API keys. Prefer `~/.config/llmLibrarian/.llmlibrarian.env` (mode `600`). Details in [docs/GUIDE.md](docs/GUIDE.md#configuration).
 

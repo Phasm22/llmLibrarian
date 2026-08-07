@@ -8,7 +8,7 @@ If any other document conflicts with this file, follow `AGENTS.md`.
 
 llmLibrarian is a **local personal knowledge index**: folders → chunks in Chroma → retrieval tools for assistants or CLI. It is **not** a chat product; it is a **context engine** with deterministic ingest, registry/manifest state, and observable repair paths.
 
-**Human story:** [README.md](../README.md) and [docs/GUIDE.md](docs/GUIDE.md).  
+**Human story:** [README.md](README.md) and [docs/GUIDE.md](docs/GUIDE.md).  
 **Contracts:** [docs/TECH.md](docs/TECH.md), [docs/orchestration-matrix.md](docs/orchestration-matrix.md).
 
 Agent priorities:
@@ -105,7 +105,7 @@ llmli rehydrate --dry-run
 ### Test
 
 ```bash
-uv run pytest -q tests/unit
+uv run pytest -q tests/unit tests/contract
 ```
 
 ## Command notes
