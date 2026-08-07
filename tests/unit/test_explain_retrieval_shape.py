@@ -76,7 +76,11 @@ def test_add_silo_forwards_exclude_patterns(monkeypatch, tmp_path):
         return IngestResult(files_indexed=1, failures=0, silo_slug="src")
 
     monkeypatch.setattr("orchestration.ingest.run_ingest", _fake_run_ingest)
-    out = mcp_server.add_silo(path=str(target), exclude_patterns=["node_modules/", "*.tmp"])
+    out = mcp_server.add_silo(
+        path=str(target),
+        exclude_patterns=["node_modules/", "*.tmp"],
+        confirm=True,
+    )
     assert out["status"] == "started"
     # the background thread should get the same values once it runs
     import time

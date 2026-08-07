@@ -91,3 +91,14 @@ packages = ["src"]
 dev = [
     "pytest>=9.0.2",
 ]
+
+[tool.pytest.ini_options]
+# tests/integration spawns real subprocesses and opens real Chroma, so a bare
+# `pytest` must not collect it. Run it explicitly: `pytest tests/integration`.
+testpaths = ["tests/unit", "tests/contract"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: spawns subprocesses and/or opens real Chroma",
+    "race: cross-process concurrency tests; require LLMLI_RACE_TEST=1",
+    "chroma_server: require a running `chroma run` and LLMLI_CHROMA_SERVER_TEST=1",
+]

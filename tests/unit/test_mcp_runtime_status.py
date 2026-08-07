@@ -33,8 +33,8 @@ def test_mcp_runtime_status_shape(monkeypatch, mcp_module):
         },
     )
     monkeypatch.setattr(
-        mcp_module,
-        "_read_mcp_pid_lock_snapshot",
+        mcp_module.runtime,
+        "pid_lock_snapshot",
         lambda: {
             "pid_lock_path": "/tmp/llmlibrarian-mcp-1000.pid",
             "lock_file_exists": True,
@@ -43,8 +43,8 @@ def test_mcp_runtime_status_shape(monkeypatch, mcp_module):
         },
     )
     monkeypatch.setattr(
-        mcp_module,
-        "_mcp_process_snapshot",
+        mcp_module.runtime,
+        "process_snapshot",
         lambda verbose=False: {"mcp_process_count": 1, "multiple_mcp_processes": False},
     )
     monkeypatch.setattr(mcp_module, "_derive_recommended_actions", lambda *_a, **_k: ["from-health"])
@@ -80,8 +80,8 @@ def test_mcp_runtime_status_adds_runtime_actions(monkeypatch, mcp_module):
         },
     )
     monkeypatch.setattr(
-        mcp_module,
-        "_read_mcp_pid_lock_snapshot",
+        mcp_module.runtime,
+        "pid_lock_snapshot",
         lambda: {
             "pid_lock_path": "/tmp/llmlibrarian-mcp-1000.pid",
             "lock_file_exists": True,
@@ -90,8 +90,8 @@ def test_mcp_runtime_status_adds_runtime_actions(monkeypatch, mcp_module):
         },
     )
     monkeypatch.setattr(
-        mcp_module,
-        "_mcp_process_snapshot",
+        mcp_module.runtime,
+        "process_snapshot",
         lambda verbose=False: {"mcp_process_count": 3, "multiple_mcp_processes": True},
     )
     monkeypatch.setattr(mcp_module, "_derive_recommended_actions", lambda *_a, **_k: [])
@@ -116,13 +116,13 @@ def test_mcp_runtime_status_verbose_includes_summary(monkeypatch, mcp_module):
     }
     monkeypatch.setattr(mcp_module, "_collect_health_summary", lambda include_audit=False: summary)
     monkeypatch.setattr(
-        mcp_module,
-        "_read_mcp_pid_lock_snapshot",
+        mcp_module.runtime,
+        "pid_lock_snapshot",
         lambda: {"pid_lock_path": "/tmp/x", "lock_file_exists": False, "lock_holder_pid": None, "lock_holder_alive": None},
     )
     monkeypatch.setattr(
-        mcp_module,
-        "_mcp_process_snapshot",
+        mcp_module.runtime,
+        "process_snapshot",
         lambda verbose=False: {
             "mcp_process_count": 1,
             "multiple_mcp_processes": False,

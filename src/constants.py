@@ -4,6 +4,42 @@ Centralized constants for llmLibrarian. Shared across ingest, query, and CLI mod
 import os
 from pathlib import Path
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """Read a boolean environment variable.
+
+    One accepted spelling set across the codebase: ``1/true/yes/on`` (case- and
+    whitespace-insensitive). Anything else set is false; unset yields ``default``.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw:
+        return default
+    return raw.lower() in _TRUTHY
+
+
+def pid_is_running(pid: int) -> bool:
+    """True if ``pid`` names a live process.
+
+    A pid we lack permission to signal is still running, so PermissionError
+    counts as alive.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
 
 def _looks_like_checkout(path: Path) -> bool:
     return (path / "cli.py").exists() and (path / "src").is_dir()
