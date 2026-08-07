@@ -1,6 +1,9 @@
 """
-File registry and manifest: track indexed files by hash, silo, and path.
-Atomic JSON writes with file-level locking (fcntl on Unix).
+File manifest state and derived file registry indexes.
+
+``llmli_file_manifest.json`` is the source of truth for indexed files. The
+legacy hash registry shape (``{"by_hash": ...}``) is derived from the manifest
+for callers that need fast content-hash lookup.
 """
 import json
 import os
@@ -14,6 +17,8 @@ try:
     import fcntl  # type: ignore[import-not-found]
 except ImportError:
     fcntl = None  # type: ignore[assignment]
+
+_derived_registry_cache: dict[str, tuple[int, int, dict]] = {}
 
 
 # --- Low-level helpers ---
@@ -85,9 +90,11 @@ def _write_file_manifest(db_path: str | Path, data: dict) -> None:
     path = _file_manifest_path(db_path)
     try:
         _atomic_write_json(path, data)
+        _derived_registry_cache.pop(str(path), None)
     except Exception as e:
         print(f"[llmli] file manifest write failed: {path}: {e}", file=sys.stderr)
         raise
+    _retire_legacy_registry(db_path)
 
 
 def _update_file_manifest(db_path: str | Path, update_fn: Any) -> None:
@@ -119,104 +126,101 @@ def manifest_file_entry(
     return entry
 
 
-# --- File registry (content-hash -> [{silo, path}]) ---
+# --- Derived file registry (content-hash -> [{silo, path}]) ---
 
-def _file_registry_path(db_path: str | Path) -> Path:
+def _legacy_registry_path(db_path: str | Path) -> Path:
+    """Where the retired ``llmli_file_registry.json`` used to live.
+
+    Only ``_retire_legacy_registry`` uses this. The file is no longer read or
+    written; the manifest holds every field it contained.
+    """
     p = Path(db_path).resolve()
     if p.is_dir():
         return p / "llmli_file_registry.json"
     return p.parent / "llmli_file_registry.json"
 
 
+def _retire_legacy_registry(db_path: str | Path) -> None:
+    """Delete a leftover ``llmli_file_registry.json`` if one is still present.
+
+    Nothing reads it, so leaving it behind is worse than removing it: a stale
+    copy of what the manifest already says invites a future reader to trust it.
+
+    Failures are swallowed on purpose — an unwritable DB directory is not a
+    reason to fail an ingest over a file nothing reads. A long-running process
+    that loaded the pre-derive module keeps recreating this until it restarts.
+    """
+    try:
+        _legacy_registry_path(db_path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _registry_from_manifest(manifest: dict) -> dict:
+    by_hash: dict[str, list[dict[str, str]]] = {}
+    silos = manifest.get("silos") or {}
+    if not isinstance(silos, dict):
+        return {"by_hash": by_hash}
+    for silo, silo_entry in silos.items():
+        if not isinstance(silo_entry, dict):
+            continue
+        files = silo_entry.get("files") or {}
+        if not isinstance(files, dict):
+            continue
+        for path_str, meta in files.items():
+            if not isinstance(meta, dict):
+                continue
+            file_hash = str(meta.get("hash") or "")
+            if not file_hash:
+                continue
+            by_hash.setdefault(file_hash, []).append({"silo": str(silo), "path": str(path_str)})
+    return {"by_hash": by_hash}
+
+
+def _manifest_cache_key(path: Path) -> tuple[int, int]:
+    try:
+        st = path.stat()
+    except OSError:
+        return (0, 0)
+    return (st.st_mtime_ns, st.st_size)
+
+
 def _read_file_registry(db_path: str | Path) -> dict:
-    path = _file_registry_path(db_path)
-    if not path.exists():
-        return {"by_hash": {}}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data.get("by_hash"), dict) else {"by_hash": {}}
-    except Exception as e:
-        print(f"[llmli] file registry read failed: {path}: {e}; using empty.", file=sys.stderr)
-        return {"by_hash": {}}
-
-
-def _write_file_registry(db_path: str | Path, data: dict) -> None:
-    path = _file_registry_path(db_path)
-    try:
-        _atomic_write_json(path, data)
-    except Exception as e:
-        print(f"[llmli] file registry write failed: {path}: {e}", file=sys.stderr)
-        raise
-
-
-def _update_file_registry(db_path: str | Path, update_fn: Any) -> None:
-    path = _file_registry_path(db_path)
-    with _registry_lock(path):
-        reg = _read_file_registry(db_path)
-        update_fn(reg)
-        _write_file_registry(db_path, reg)
+    """Return the legacy registry shape, derived from the file manifest."""
+    manifest_path = _file_manifest_path(db_path)
+    cache_key = _manifest_cache_key(manifest_path)
+    path_key = str(manifest_path)
+    cached = _derived_registry_cache.get(path_key)
+    if cached and cached[0] == cache_key[0] and cached[1] == cache_key[1]:
+        return cached[2]
+    reg = _registry_from_manifest(_read_file_manifest(db_path))
+    _derived_registry_cache[path_key] = (cache_key[0], cache_key[1], reg)
+    return reg
 
 
 def _file_registry_get(db_path: str | Path, file_hash: str) -> list[dict]:
-    """Return list of {silo, path} that have indexed this hash."""
+    """Return list of {silo, path} that have indexed this hash.
+
+    This is the one lookup the derived index exists for: "is this content
+    already indexed anywhere?", which the manifest cannot answer without a full
+    scan. Everything else reads the manifest directly.
+    """
     reg = _read_file_registry(db_path)
     return list(reg.get("by_hash", {}).get(file_hash, []))
 
 
-def _file_registry_add(db_path: str | Path, file_hash: str, silo: str, path_str: str) -> None:
-    def _apply(reg: dict) -> None:
-        by_hash = reg.setdefault("by_hash", {})
-        entries = by_hash.setdefault(file_hash, [])
-        if not any(e.get("silo") == silo and e.get("path") == path_str for e in entries):
-            entries.append({"silo": silo, "path": path_str})
-
-    _update_file_registry(db_path, _apply)
-
-
-def _file_registry_remove_path(db_path: str | Path, silo: str, path_str: str, file_hash: str | None = None) -> None:
-    def _apply(reg: dict) -> None:
-        by_hash = reg.get("by_hash", {})
-        if file_hash and file_hash in by_hash:
-            entries = by_hash.get(file_hash, [])
-            entries = [e for e in entries if not (e.get("silo") == silo and e.get("path") == path_str)]
-            if entries:
-                by_hash[file_hash] = entries
-            else:
-                del by_hash[file_hash]
-            return
-        # Fallback: scan all hashes for the path (slower but safe).
-        for h, entries in list(by_hash.items()):
-            new_entries = [e for e in entries if not (e.get("silo") == silo and e.get("path") == path_str)]
-            if not new_entries:
-                del by_hash[h]
-            else:
-                by_hash[h] = new_entries
-
-    _update_file_registry(db_path, _apply)
-
-
-def _file_registry_remove_silo(db_path: str | Path, silo: str) -> None:
-    def _apply(reg: dict) -> None:
-        by_hash = reg.get("by_hash", {})
-        for h, entries in list(by_hash.items()):
-            new_entries = [e for e in entries if e.get("silo") != silo]
-            if not new_entries:
-                del by_hash[h]
-            else:
-                by_hash[h] = new_entries
-
-    _update_file_registry(db_path, _apply)
-
-
 def get_paths_by_silo(db_path: str | Path) -> dict[str, set[str]]:
-    """Build catalog: silo -> set of indexed paths. Derived from file registry (by_hash -> [{silo, path}])."""
-    reg = _read_file_registry(db_path)
+    """Build catalog: silo -> set of indexed paths from the manifest."""
+    manifest = _read_file_manifest(db_path)
+    silos = manifest.get("silos") or {}
     by_silo: dict[str, set[str]] = {}
-    for entries in (reg.get("by_hash") or {}).values():
-        for e in entries:
-            s = e.get("silo")
-            p = e.get("path")
-            if s is not None and p:
-                by_silo.setdefault(s, set()).add(p)
+    if not isinstance(silos, dict):
+        return by_silo
+    for silo, silo_entry in silos.items():
+        if not isinstance(silo_entry, dict):
+            continue
+        files = silo_entry.get("files") or {}
+        if not isinstance(files, dict):
+            continue
+        by_silo.setdefault(str(silo), set()).update(str(path_str) for path_str in files.keys())
     return by_silo

@@ -3206,7 +3206,7 @@ def remove_command(
     if result.get("chroma_warning"):
         print(f"Warning: {result['chroma_warning']}", file=sys.stderr)
     if result["not_found"]:
-        print(f"Removed chunks and file registry for silo: {result['cleaned_slug']} (was not in silo list)")
+        print(f"Removed chunks and file manifest for silo: {result['cleaned_slug']} (was not in silo list)")
     else:
         print(f"Removed silo: {result['removed_slug']}")
     if source_path:

@@ -55,12 +55,7 @@ from file_registry import (
     _read_file_manifest,
     _write_file_manifest,
     _update_file_manifest,
-    _file_registry_path,
-    _read_file_registry,
     _file_registry_get,
-    _file_registry_add,
-    _file_registry_remove_path,
-    _file_registry_remove_silo,
     get_paths_by_silo,
 )
 from load_config import load_config, get_archetype
@@ -2374,12 +2369,12 @@ def run_add(
             except Exception:
                 pass
     
-        if not incremental:
-            # NOTE: the Chroma row delete for a rebuild is deliberately NOT here.
-            # It is deferred to just before _batch_add (see _delete_silo_rows_for_rebuild)
-            # so the silo is not left empty for the whole crawl/extract/embed phase.
-            # The file registry is cleared now because the crawl below rebuilds it.
-            _file_registry_remove_silo(db_path, silo_slug)
+        # NOTE: on a rebuild the Chroma row delete is deliberately NOT here. It is
+        # deferred to just before _batch_add (see _delete_silo_rows_for_rebuild) so
+        # the silo is not left empty for the whole crawl/extract/embed phase.
+        # The on-disk manifest likewise still holds this silo's previous file set
+        # until _overwrite_manifest runs at the end, which is why the duplicate
+        # check below filters this silo out when not incremental.
 
         # Pre-pass: resolve paths, hash, skip duplicates (same file already indexed in any silo)
         regular_with_hash: list[tuple[Path, str, str, Path | None]] = []
@@ -2410,16 +2405,19 @@ def run_add(
                 if incremental:
                     prev = manifest_files.get(str(p_res)) if isinstance(manifest_files, dict) else None
                     if prev and prev.get("mtime") == mtime and prev.get("size") == size:
-                        if not h:
-                            continue
-                        existing_same = any(
-                            str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") == str(p_res)
-                            for e in _file_registry_get(db_path, h)
-                        )
-                        if existing_same:
+                        # Unchanged stat, but still confirm the content hash: an edit
+                        # that preserves both mtime and size would otherwise be skipped.
+                        # The manifest entry is the hash record, so this is a local
+                        # compare rather than a lookup through the derived index.
+                        if not h or prev.get("hash") == h:
                             continue
                 if h:
                     existing_entries = _file_registry_get(db_path, h)
+                    if not incremental:
+                        existing_entries = [
+                            e for e in existing_entries
+                            if str(e.get("silo") or "") != silo_slug
+                        ]
                     # Warn when identical content is already indexed in this silo under a different path.
                     same_silo_dupes = [
                         str(e.get("path") or "")
@@ -2478,15 +2476,12 @@ def run_add(
                         silo_slug=silo_slug,
                         source_path=path_str,
                     )
-                    prev = manifest_files.get(path_str) or {}
-                    _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
     
         all_chunks = []
         all_image_vectors: list[ImageVectorTuple] = []
         tax_rows: list[dict[str, Any]] = []
         files_indexed = 0
         failures = []
-        to_register: list[tuple[str, str]] = []  # (file_hash, path_str) for main-thread registry update
         image_total = sum(1 for _p, kind in regular if kind == "image")
         image_done = 0
         eager_summaries = 0
@@ -2505,8 +2500,6 @@ def run_add(
                     silo_slug=silo_slug,
                     source_path=path_str,
                 )
-                prev = manifest_files.get(path_str) or {}
-                _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
     
         if precloned_by_path:
             for path_str, (fhash, cloned_chunks) in precloned_by_path.items():
@@ -2534,8 +2527,6 @@ def run_add(
                         deferred_summaries += 1
                 tax_rows.extend(extract_tax_rows_from_chunks(cloned_norm))
                 files_indexed += 1
-                if fhash:
-                    to_register.append((fhash, path_str))
     
         total_to_process = len(regular_with_hash) + len(zips)
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -2606,8 +2597,6 @@ def run_add(
                     files_indexed += 1
                     if not quiet and sys.stdout.isatty():
                         status_line(f"↻ {files_indexed}/{total_to_process}: {p.name}")
-                    if fhash:
-                        to_register.append((fhash, str(p)))
                 elif kind == "pdf" and not _suppress_recoverable_warnings():
                     print(
                         warn_style(
@@ -2755,8 +2744,6 @@ def run_add(
                 )
     
         # State writes — all happen after ChromaDB batch_add succeeds.
-        for fhash, path_str in to_register:
-            _file_registry_add(db_path, fhash, silo_slug, path_str)
         if incremental:
             _update_file_manifest(db_path, _update_manifest)
         else:
@@ -2993,8 +2980,6 @@ def remove_single_file(
             silo_slug=silo_slug,
             source_path=path_str,
         )
-        if prev:
-            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
         def _update_manifest(manifest_data: dict) -> None:
             silos = manifest_data.setdefault("silos", {})
@@ -3105,11 +3090,10 @@ def update_single_file(
         if prev and prev.get("mtime") == mtime and prev.get("size") == size:
             if not file_hash:
                 return ("unchanged", path_str)
-            existing_same = any(
-                str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") == path_str
-                for e in _file_registry_get(db_path, file_hash)
-            )
-            if prev.get("hash") == file_hash and existing_same:
+            # The manifest entry IS this path's hash record, so comparing it is
+            # the whole check — the derived index would only report back what
+            # prev already says.
+            if prev.get("hash") == file_hash:
                 return ("unchanged", path_str)
         if file_hash:
             existing = _file_registry_get(db_path, file_hash)
@@ -3184,8 +3168,6 @@ def update_single_file(
             silo_slug=silo_slug,
             source_path=path_str,
         )
-        if prev:
-            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
         if chunks:
             _now_iso = datetime.now(timezone.utc).isoformat()
@@ -3224,8 +3206,6 @@ def update_single_file(
                     batch_size=1,
                     no_color=no_color,
                 )
-            if file_hash:
-                _file_registry_add(db_path, file_hash, silo_slug, path_str)
         tax_rows = extract_tax_rows_from_chunks(chunks) if chunks else []
 
         def _update_manifest(manifest_data: dict) -> None:
