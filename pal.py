@@ -2510,9 +2510,47 @@ def _check_ollama_reachable() -> bool:
         return False
 
 
+_APP_BUNDLE_PATH = Path("/Applications/llmLibrarian.app")
+
+
+def _ensure_app_bundle(install_dir: Path) -> Path | None:
+    """Install/refresh /Applications/llmLibrarian.app; return its MacOS dir.
+
+    The bundle anchors the launchd items in System Settings > Login Items:
+    pointing a plist's program at a launcher inside the bundle makes the item
+    display as "llmLibrarian" instead of a bare shell-script name. Returns
+    None (callers fall back to the raw scripts) if the bundle can't be
+    installed — non-macOS, missing installer, or a failed codesign.
+    """
+    if sys.platform != "darwin":
+        return None
+    installer = install_dir / "scripts" / "install_app_bundle.sh"
+    if not installer.exists():
+        return None
+    result = subprocess.run(
+        ["bash", str(installer), str(install_dir)], capture_output=True, text=True
+    )
+    launcher_dir = _APP_BUNDLE_PATH / "Contents" / "Resources"
+    if result.returncode != 0 or not launcher_dir.is_dir():
+        return None
+    return launcher_dir
+
+
 def _render_mcp_template(template_path: Path, install_dir: Path, log_dir: Path) -> str:
     text = template_path.read_text(encoding="utf-8")
-    return text.replace("{{INSTALL_DIR}}", str(install_dir)).replace("{{LOG_DIR}}", str(log_dir))
+    bundle_bin = _ensure_app_bundle(install_dir)
+    if bundle_bin is not None:
+        chroma_program = str(bundle_bin / "llmlibrarian-chroma")
+        mcp_program = str(bundle_bin / "llmlibrarian-mcp")
+    else:
+        chroma_program = f"{install_dir}/scripts/run_chroma_server.sh"
+        mcp_program = f"{install_dir}/scripts/run_mcp_http.sh"
+    return (
+        text.replace("{{CHROMA_PROGRAM}}", chroma_program)
+        .replace("{{MCP_PROGRAM}}", mcp_program)
+        .replace("{{INSTALL_DIR}}", str(install_dir))
+        .replace("{{LOG_DIR}}", str(log_dir))
+    )
 
 
 def _mcp_service_paths(manager: str, install_dir: Path | None = None) -> tuple[Path, Path, list[str], list[str], list[str], list[str]]:
@@ -2965,11 +3003,19 @@ def pull_command(
     image_vision: bool = typer.Option(False, "--image-vision", help="Enable multimodal image summaries for this silo (default: off unless previously enabled)."),
     workers: int | None = typer.Option(None, "--workers", help="Override file/extraction worker count for this run."),
     embedding_workers: int | None = typer.Option(None, "--embedding-workers", help="Override embedding worker count for this run."),
+    fast: bool = typer.Option(False, "--fast", help="Auto-tune ingest for this host (device, batch sizes, workers); explicit env vars still win."),
     interval: float = typer.Option(10.0, "--interval", help="Reconcile interval (watch mode).", hidden=True),
     debounce: float = typer.Option(1.0, "--debounce", help="Debounce delay (watch mode).", hidden=True),
     follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks.", hidden=True),
 ) -> None:
     image_vision_requested: bool | None = True if image_vision else None
+    if fast and not (status or stop):
+        # Exported env is inherited by the llmli subprocesses that do the
+        # actual ingest (and by the watcher in --watch mode).
+        _ensure_src_on_path()
+        from perf_profile import apply_fast_profile
+
+        apply_fast_profile()
     mode_count = int(bool(watch)) + int(bool(status)) + int(bool(stop))
     if mode_count > 1:
         print("Use only one operation mode: --watch, --status, or --stop.", file=sys.stderr)
@@ -3754,6 +3800,8 @@ def uninstall_command(
         print(f"  - {len(daemon_jobs)} watch daemon service(s)")
     if chroma_installed:
         print("  - Chroma server service")
+    if manager == "launchd" and _APP_BUNDLE_PATH.exists():
+        print(f"  - {_APP_BUNDLE_PATH}")
     if purge:
         extra = " and the ChromaDB data directory" if purge_data else ""
         print(f"  - ~/.pal (logs, registry, daemon metadata){extra}")
@@ -3787,6 +3835,15 @@ def uninstall_command(
         except FileNotFoundError:
             pass
         removed_summary.append(f"chroma: {dest}")
+
+    if manager == "launchd" and _APP_BUNDLE_PATH.exists():
+        # The app bundle exists only to anchor the launchd items in System
+        # Settings; with the services gone it has no purpose.
+        try:
+            shutil.rmtree(_APP_BUNDLE_PATH)
+            removed_summary.append(f"app bundle: {_APP_BUNDLE_PATH}")
+        except OSError as exc:
+            print(f"Could not remove {_APP_BUNDLE_PATH}: {exc}", file=sys.stderr)
 
     if manager == "systemd":
         subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
