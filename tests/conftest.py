@@ -55,6 +55,12 @@ os.environ["TERM"] = "dumb"
 os.environ.pop("GITHUB_ACTIONS", None)
 os.environ.pop("CI", None)
 
+# Chroma autodetect probes 127.0.0.1:8000 and silently switches the transport
+# to HTTP when a managed server answers. That makes the embedded-mode tests
+# (transport defaults, lock acquisition, client caching) pass on CI and fail on
+# any developer box with the stack running. Tests pick their own transport.
+os.environ["LLMLIBRARIAN_CHROMA_AUTODETECT"] = "0"
+
 # Ensure tests target the workspace module, not an installed site-packages copy.
 _pal_path = (ROOT / "pal.py").resolve()
 _pal_spec = importlib.util.spec_from_file_location("pal", _pal_path)
