@@ -216,3 +216,101 @@ def test_shared_lock_timeout_surfaces_busy_db(monkeypatch, tmp_path):
     with pytest.raises(cl.ChromaLockTimeoutError, match="waiting for shared ChromaDB lock"):
         with cl.chroma_shared_lock(db):
             pass
+
+
+# ── holder introspection: both backends, on every host ──────────────────────
+# Linux reads /proc/locks; macOS/BSD has no procfs and its lsof leaves the
+# lock field blank, so it falls back to "who has the lock file open". Cover
+# both paths everywhere so CI (Linux) still guards the lsof branch.
+
+
+def test_lock_holders_prefers_procfs_when_present(monkeypatch, tmp_path):
+    target = tmp_path / "chroma.lock"
+    target.write_text("")
+    monkeypatch.setattr(cl.Path, "exists", lambda self: True)
+    monkeypatch.setattr(cl, "_lock_holders_proc", lambda p: [101])
+    monkeypatch.setattr(
+        cl, "_lock_holders_lsof", lambda p: pytest.fail("lsof must not run when procfs exists")
+    )
+
+    assert cl._lock_holders(target) == [101]
+
+
+def test_lock_holders_falls_back_to_lsof_without_procfs(monkeypatch, tmp_path):
+    target = tmp_path / "chroma.lock"
+    target.write_text("")
+    monkeypatch.setattr(cl.Path, "exists", lambda self: False)
+    monkeypatch.setattr(cl, "_lock_holders_lsof", lambda p: [202])
+
+    assert cl._lock_holders(target) == [202]
+
+
+def test_lsof_backend_parses_pids(monkeypatch, tmp_path):
+    target = tmp_path / "chroma.lock"
+    monkeypatch.setattr(
+        cl.subprocess,
+        "run",
+        lambda *a, **k: type("R", (), {"stdout": "p310\nf3\np310\np42\n", "returncode": 0})(),
+    )
+
+    assert cl._lock_holders_lsof(target) == [42, 310]
+
+
+def test_lsof_backend_treats_no_holders_as_empty_not_error(monkeypatch, tmp_path):
+    """lsof exits 1 when nobody has the file open — that is 'uncontended'."""
+    target = tmp_path / "chroma.lock"
+    monkeypatch.setattr(
+        cl.subprocess,
+        "run",
+        lambda *a, **k: type("R", (), {"stdout": "", "returncode": 1})(),
+    )
+
+    assert cl._lock_holders_lsof(target) == []
+
+
+def test_lsof_backend_survives_missing_binary(monkeypatch, tmp_path):
+    target = tmp_path / "chroma.lock"
+
+    def _boom(*a, **k):
+        raise FileNotFoundError("lsof")
+
+    monkeypatch.setattr(cl.subprocess, "run", _boom)
+
+    assert cl._lock_holders_lsof(target) == []
+
+
+def test_snapshot_flags_whether_holder_pids_are_exact(tmp_path):
+    db = str(tmp_path / "db")
+    snapshot = cl.chroma_lock_snapshot(db)
+    assert snapshot["holder_pids_exact"] is cl.Path("/proc/locks").exists()
+
+
+def test_procfs_backend_reports_holders_but_not_waiters(monkeypatch, tmp_path):
+    """Pins the /proc/locks column layout so Linux stays covered from any host.
+
+    The '->' rows are processes blocked on the lock; they shift every field
+    by one and must be skipped rather than misparsed.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    target = tmp_path / "chroma.lock"
+    target.write_text("")
+    st = target.stat()
+    dev = f"{_os.major(st.st_dev):02x}:{_os.minor(st.st_dev):02x}"
+    ino = st.st_ino
+    sample = (
+        "1: POSIX  ADVISORY  WRITE 1234 00:1b:9999 0 EOF\n"
+        f"2: FLOCK  ADVISORY  WRITE 4321 {dev}:{ino} 0 EOF\n"
+        f"2: -> FLOCK  ADVISORY  WRITE 4322 {dev}:{ino} 0 EOF\n"
+        "3: FLOCK  ADVISORY  READ  777 fd:01:12345 0 EOF\n"
+    )
+    orig = _Path.read_text
+    monkeypatch.setattr(
+        _Path,
+        "read_text",
+        lambda self, *a, **k: sample if str(self) == "/proc/locks" else orig(self, *a, **k),
+    )
+
+    # 4321 holds it; 4322 is only waiting; the other two are unrelated files.
+    assert cl._lock_holders_proc(target) == [4321]

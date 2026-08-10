@@ -50,6 +50,7 @@ threading lock serializes overlapping tool calls; flock coordinates with ``llmli
 
 from __future__ import annotations
 
+import subprocess
 import threading
 import warnings
 from collections import defaultdict
@@ -219,7 +220,20 @@ def _lock_timeout_seconds(write: bool = False, env_name: str | None = None) -> f
     return default
 
 
-def _lock_holders(path: Path) -> list[int]:
+def _lock_holders_proc(path: Path) -> list[int]:
+    """Exact flock holders from /proc/locks (Linux only).
+
+    Lines look like::
+
+        2: FLOCK  ADVISORY  WRITE 4321 fd:01:1234 0 EOF
+        2: -> FLOCK  ADVISORY  WRITE 4322 fd:01:1234 0 EOF
+
+    The ``->`` form is a process *blocked waiting* on that lock, and it
+    shifts every subsequent field by one. Drop the marker explicitly and
+    skip those rows: this function reports holders, not waiters. (Relying
+    on the shift to make waiters fail the match happens to work, but only
+    by accident, and it silently misreads the columns.)
+    """
     try:
         stat = path.stat()
         dev = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}"
@@ -230,6 +244,8 @@ def _lock_holders(path: Path) -> list[int]:
     holders: list[int] = []
     for line in lines:
         parts = line.split()
+        if len(parts) > 1 and parts[1] == "->":
+            continue  # blocked waiter, not a holder
         if len(parts) < 6:
             continue
         if parts[5].startswith(f"{dev}:{inode}") or (parts[5].endswith(f":{inode}") and dev in parts[5]):
@@ -240,8 +256,52 @@ def _lock_holders(path: Path) -> list[int]:
     return sorted(set(holders))
 
 
+def _lock_holders_lsof(path: Path) -> list[int]:
+    """Processes holding the lock file open, via lsof (macOS/BSD fallback).
+
+    macOS has no /proc/locks, and its lsof leaves the lock field blank for
+    flock, so an exact holder list is not obtainable. What lsof does report
+    is who has the file *open* — and since the lock file is opened only
+    inside the acquire paths below, an open descriptor means the process
+    holds the lock or is blocked waiting for it. That is the contention
+    signal these diagnostics exist to surface, so it is reported under the
+    same key; see the accuracy note on holder_pids in chroma_lock_snapshot.
+    """
+    try:
+        proc = subprocess.run(
+            ["lsof", "-F", "p", "--", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    # lsof exits 1 when no process has the file open — a normal "uncontended"
+    # answer, not an error, so parse stdout regardless of return code.
+    holders: list[int] = []
+    for line in proc.stdout.splitlines():
+        if line.startswith("p"):
+            try:
+                holders.append(int(line[1:]))
+            except ValueError:
+                continue
+    return sorted(set(holders))
+
+
+def _lock_holders(path: Path) -> list[int]:
+    if Path("/proc/locks").exists():
+        return _lock_holders_proc(path)
+    return _lock_holders_lsof(path)
+
+
 def chroma_lock_snapshot(db_path: str | Path) -> dict[str, Any]:
-    """Return current flock path and holder PIDs without opening Chroma."""
+    """Return current flock path and holder PIDs without opening Chroma.
+
+    ``holder_pids`` is exact on Linux (/proc/locks). Elsewhere it falls back
+    to lsof and lists processes with the lock file open, which includes
+    blocked waiters as well as the holder — treat it as "who is contending
+    on this DB", not as a precise holder identity.
+    """
     key = _resolve_db(db_path)
     path = _lock_file_path(key)
     return {
@@ -249,6 +309,7 @@ def chroma_lock_snapshot(db_path: str | Path) -> dict[str, Any]:
         "exists": path.exists(),
         "available": chroma_lock_available(),
         "holder_pids": _lock_holders(path) if path.exists() else [],
+        "holder_pids_exact": Path("/proc/locks").exists(),
     }
 
 

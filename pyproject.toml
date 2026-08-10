@@ -92,3 +92,8 @@ packages = ["src"]
 dev = [
     "pytest>=9.0.2",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: exercises real Chroma/subprocess behavior; slower than unit tests",
+]

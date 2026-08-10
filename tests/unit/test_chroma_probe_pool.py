@@ -10,6 +10,7 @@ paid one round-trip per client access.
 from __future__ import annotations
 
 import http.client
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -187,7 +188,9 @@ def test_get_client_drops_cache_on_failed_heartbeat(monkeypatch):
 
     assert first._client is stale
     assert second._client is fresh
-    assert "/tmp/db" in chroma_client._heartbeat_ok_at
+    # /tmp is a symlink to /private/tmp on macOS and get_client resolves it,
+    # so compare against the derived key rather than the literal.
+    assert str(Path("/tmp/db").expanduser().resolve()) in chroma_client._heartbeat_ok_at
 
 
 def test_release_closes_probe_pool(monkeypatch):

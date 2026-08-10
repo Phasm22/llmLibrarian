@@ -3,6 +3,7 @@ import errno
 import logging
 import os
 import signal
+import subprocess
 import sys
 import traceback
 from importlib.metadata import PackageNotFoundError, version as package_version
@@ -649,33 +650,69 @@ def _read_mcp_pid_lock_snapshot() -> dict:
         return out
 
 
-def _mcp_process_snapshot(*, verbose: bool = False) -> dict:
-    """Count mcp_server.py processes via /proc scanning (Linux) with graceful fallback."""
-    out: dict = {"mcp_process_count": 0, "multiple_mcp_processes": False}
-    proc_root = Path("/proc")
-    if not proc_root.is_dir():
-        out["introspection_error"] = "procfs unavailable"
-        return out
+def _is_mcp_cmdline(joined: str) -> bool:
+    return "mcp_server.py" in joined and "llmLibrarian" in joined
 
+
+def _mcp_rows_from_proc() -> list[dict]:
+    """Scan /proc for MCP processes (Linux)."""
     rows: list[dict] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        parts = [p.decode("utf-8", errors="replace") for p in raw.split(b"\x00") if p]
+        joined = " ".join(parts)
+        if _is_mcp_cmdline(joined):
+            rows.append({"pid": int(entry.name), "cmdline": joined})
+    return rows
+
+
+def _mcp_rows_from_ps() -> list[dict]:
+    """Scan the process table via ps (macOS/BSD, where there is no procfs).
+
+    Detecting more than one live MCP process is the whole point of this
+    snapshot — concurrent embedded writers are what corrupted the HNSW
+    segment on 7/28 — so returning "0 processes, no duplicates" on a
+    procfs-less host is worse than useless. ps gives the same answer
+    everywhere POSIX. -ww defeats the default column truncation, which
+    would otherwise cut long venv paths before the script name.
+    """
+    proc = subprocess.run(
+        ["ps", "-axww", "-o", "pid=,command="],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    rows: list[dict] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        pid_str, _, joined = line.partition(" ")
+        if not pid_str.isdigit() or not _is_mcp_cmdline(joined):
+            continue
+        pid = int(pid_str)
+        if pid == os.getpid():
+            rows.append({"pid": pid, "cmdline": joined, "self": True})
+        else:
+            rows.append({"pid": pid, "cmdline": joined})
+    return rows
+
+
+def _mcp_process_snapshot(*, verbose: bool = False) -> dict:
+    """Count live mcp_server.py processes: /proc on Linux, ps elsewhere."""
+    out: dict = {"mcp_process_count": 0, "multiple_mcp_processes": False}
     try:
-        for entry in proc_root.iterdir():
-            if not entry.name.isdigit():
-                continue
-            cmdline_path = entry / "cmdline"
-            try:
-                raw = cmdline_path.read_bytes()
-            except Exception:
-                continue
-            if not raw:
-                continue
-            parts = [p.decode("utf-8", errors="replace") for p in raw.split(b"\x00") if p]
-            joined = " ".join(parts)
-            if "mcp_server.py" in joined and "llmLibrarian" in joined:
-                row = {"pid": int(entry.name)}
-                if verbose:
-                    row["cmdline"] = joined
-                rows.append(row)
+        if Path("/proc").is_dir():
+            rows = _mcp_rows_from_proc()
+            out["introspection_source"] = "procfs"
+        else:
+            rows = _mcp_rows_from_ps()
+            out["introspection_source"] = "ps"
     except Exception as e:
         out["introspection_error"] = f"{type(e).__name__}: {e}"
         return out
@@ -684,6 +721,9 @@ def _mcp_process_snapshot(*, verbose: bool = False) -> dict:
     out["multiple_mcp_processes"] = len(rows) > 1
     if verbose:
         out["processes"] = rows
+    else:
+        for row in rows:
+            row.pop("cmdline", None)
     return out
 
 
