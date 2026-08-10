@@ -219,6 +219,10 @@ def render_launchd_plist(
         "HardResourceLimits": {"NumberOfFiles": 8192},
         "StandardOutPath": job.log_path,
         "StandardErrorPath": stderr_path or job.log_path,
+        # Group under the /Applications/llmLibrarian.app identity in System
+        # Settings > Login Items instead of "pal.py — unidentified developer"
+        # (see scripts/install_app_bundle.sh; harmless if the app is absent).
+        "AssociatedBundleIdentifiers": ["com.llmlibrarian.app"],
     }
     return plistlib.dumps(payload).decode("utf-8")
 

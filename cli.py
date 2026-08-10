@@ -644,6 +644,7 @@ def main() -> int:
     p_add.add_argument("--image-vision", action="store_true", default=None, help="Enable multimodal image summaries for this silo (default: off unless previously enabled)")
     p_add.add_argument("--workers", type=int, help="Override file/extraction worker count for this run")
     p_add.add_argument("--embedding-workers", type=int, help="Override embedding worker count for this run")
+    p_add.add_argument("--fast", action="store_true", help="Auto-tune ingest for this host (device, batch sizes, workers); explicit env vars still win")
     p_add.add_argument("--silo", dest="silo", help=argparse.SUPPRESS)
     p_add.add_argument("--display-name", dest="display_name", help=argparse.SUPPRESS)
     p_add.set_defaults(db=None)
@@ -716,6 +717,7 @@ def main() -> int:
     )
     rehydrate_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
     p_rehydrate.add_argument("--dry-run", action="store_true", help="Show what would run without indexing")
+    p_rehydrate.add_argument("--fast", action="store_true", help="Auto-tune ingest for this host (device, batch sizes, workers); explicit env vars still win")
     p_rehydrate.add_argument("--quiet", action="store_true", help="Suppress per-silo progress output")
     p_rehydrate.add_argument("--json", action="store_true", help="Emit result as JSON")
     p_rehydrate.set_defaults(_run=cmd_rehydrate)
@@ -766,6 +768,13 @@ def main() -> int:
     except ImportError:
         pass
     args = parser.parse_args()
+    if getattr(args, "fast", False):
+        src = _ROOT / "src"
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
+        from perf_profile import apply_fast_profile
+
+        apply_fast_profile()
     try:
         src = _ROOT / "src"
         if str(src) not in sys.path:

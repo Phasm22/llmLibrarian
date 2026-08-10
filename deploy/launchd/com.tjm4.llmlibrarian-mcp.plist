@@ -7,7 +7,7 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>{{INSTALL_DIR}}/scripts/run_mcp_http.sh</string>
+    <string>{{MCP_PROGRAM}}</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -37,6 +37,14 @@
   <string>{{LOG_DIR}}/llmlibrarian-mcp.stderr.log</string>
 
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
+
+  <!-- Group under /Applications/llmLibrarian.app in System Settings > Login
+       Items instead of "run_mcp_http.sh - unidentified developer"
+       (see scripts/install_app_bundle.sh; harmless if the app is absent). -->
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>com.llmlibrarian.app</string>
+  </array>
 </dict>
 </plist>
