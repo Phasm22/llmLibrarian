@@ -54,18 +54,39 @@ def _mps_available() -> bool:
         return False
 
 
+def _cuda_available() -> bool:
+    try:
+        import torch
+
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 def detect_fast_profile() -> dict:
-    """Return {'env': {...}, 'summary': str} for this host."""
+    """Return {'env': {...}, 'summary': str} for this host.
+
+    Accelerator order matches embeddings._pick_device: MPS > CUDA > CPU.
+    Keeping CUDA here is not an optimization but a correctness requirement —
+    --fast *pins* LLMLIBRARIAN_EMBEDDING_DEVICE, which short-circuits that
+    autodetection, so omitting CUDA would make --fast pin a Linux GPU box to
+    the CPU and run slower than passing no flag at all.
+    """
     ram_gb = _total_ram_gb()
     use_mps = _mps_available() and ram_gb >= 16
 
     if use_mps:
         device, embed_batch = "mps", 128
+    elif _cuda_available():
+        # Batch 128 mirrors the MPS tuning: both are throughput-bound
+        # accelerators where the launch overhead that makes small batches
+        # win on CPU no longer dominates.
+        device, embed_batch = "cuda", 128
     else:
         device, embed_batch = "cpu", 32
 
     # Embedding workers are threads sharing one model; 2 overlaps
-    # tokenization/IO with compute. More just contend (CPU) or queue (MPS).
+    # tokenization/IO with compute. More just contend (CPU) or queue (GPU).
     embed_workers = 2
 
     if ram_gb >= 32:
@@ -84,7 +105,7 @@ def detect_fast_profile() -> dict:
     summary = (
         f"fast profile: device={device} embed_batch={embed_batch} "
         f"embed_workers={embed_workers} add_batch={add_batch} "
-        f"(ram={ram_gb:.0f}GB, mps={'yes' if use_mps else 'no'})"
+        f"(ram={ram_gb:.0f}GB, accel={device if device != 'cpu' else 'none'})"
     )
     return {"env": env, "summary": summary}
 
