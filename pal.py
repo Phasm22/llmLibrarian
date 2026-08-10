@@ -1530,6 +1530,35 @@ def _mcp_healthcheck() -> tuple[bool, str]:
     return (True, "")
 
 
+def _watch_mcp_wait_seconds() -> float:
+    """How long a watch-mode preflight waits for the MCP server before giving up.
+
+    Watchers are long-running services usually started at boot alongside the
+    shared MCP server (and the Chroma backend it depends on), which can take
+    several seconds to become reachable. Configurable via
+    LLMLIBRARIAN_WATCH_MCP_WAIT (seconds); defaults to 120.
+    """
+    raw = os.environ.get("LLMLIBRARIAN_WATCH_MCP_WAIT")
+    if raw is None:
+        return 120.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 120.0
+
+
+def _mcp_healthcheck_wait(timeout: float, poll: float = 3.0) -> tuple[bool, str]:
+    """Poll _mcp_healthcheck until it succeeds or `timeout` seconds elapse."""
+    ok, msg = _mcp_healthcheck()
+    if ok or timeout <= 0:
+        return ok, msg
+    deadline = time.monotonic() + timeout
+    while not ok and time.monotonic() < deadline:
+        time.sleep(poll)
+        ok, msg = _mcp_healthcheck()
+    return ok, msg
+
+
 class _SiloEventHandler(FileSystemEventHandler):
     def __init__(self, watcher: "SiloWatcher") -> None:
         super().__init__()
@@ -1573,7 +1602,7 @@ class SiloWatcher:
         if Observer is None:
             raise RuntimeError("watchdog is not installed. Install `watchdog` to use watch mode.")
         _ensure_src_on_path()
-        from ingest import (
+        from ingest.watch_scan import (
             _read_file_manifest,
             _load_limits_config,
             collect_files,
@@ -1677,6 +1706,11 @@ class SiloWatcher:
                 return
         except Exception:
             return
+        # Excluded paths (e.g. .git/ churn like index.lock) were never indexed,
+        # so a delete event for them would loop on remove_file failures. Gate on
+        # the same exclude/include rules as enqueue_update.
+        if not self._should_index(str(p), self._include, self._exclude):
+            return
         self._queue_action(str(p), "delete")
 
     def _drain_due(self, now: float | None = None) -> int:
@@ -1766,7 +1800,7 @@ class SiloWatcher:
                     silo=self.silo_slug,
                     error=f"{type(exc).__name__}: {exc}",
                 )
-            time.sleep(0.2)
+            self._stop.wait(0.2)
 
     def _reconcile_once(self) -> tuple[int, int, int]:
         max_file_bytes, max_depth, _max_archive_bytes, _max_files_per_zip, _max_extracted = self._load_limits_config()
@@ -2033,14 +2067,20 @@ def _pull_watch_path_mode(
     if Observer is None:
         print("Error: watchdog is not installed. Install `watchdog` to use --watch.", file=sys.stderr)
         return 1
-    ok, msg = _mcp_healthcheck()
+    # A watcher is a long-running service, typically started at boot alongside
+    # the shared MCP server, which can take several seconds (plus its Chroma
+    # backend) to become reachable. Treat an initial healthcheck failure as a
+    # transient boot race and wait with bounded backoff rather than exiting
+    # immediately: a hard failure here makes systemd burn through StartLimitBurst
+    # and give up permanently, leaving the watcher dead until manually restarted.
+    ok, msg = _mcp_healthcheck_wait(_watch_mcp_wait_seconds())
     if not ok:
         print(
             f"Error: --watch requires the shared MCP server to be running. {msg}\n"
             "Start it (e.g. via the systemd unit in README) and retry.",
             file=sys.stderr,
         )
-        return 2
+        return 1
     path = Path(path_input).resolve()
     # Provisional title from the folder name; upgraded to the silo slug once
     # add_silo resolves it (matches launchd label io.llmlibrarian.watch.<slug>).
@@ -3208,6 +3248,83 @@ def ls_command(
 
 
 
+@app.command("queries", help="Audit past MCP queries: what was asked, of which silo, and which files answered.")
+def queries_command(
+    limit: int = typer.Option(20, "--limit", "-n", min=1, help="Most recent records to show."),
+    silo: str | None = typer.Option(None, "--silo", help="Only this silo slug.", autocompletion=_complete_silo),
+    contains: str | None = typer.Option(None, "--grep", help="Substring over query text, source filenames, or silo."),
+    since: str | None = typer.Option(None, "--since", help="Window: 30m, 24h, 7d, or an ISO timestamp."),
+    tool: str | None = typer.Option(None, "--tool", help="query_personal_knowledge or multi_query_knowledge."),
+    summary: bool = typer.Option(False, "--summary", help="Roll-up only, no individual records."),
+    as_json: bool = typer.Option(False, "--json", help="Emit raw JSONL records."),
+) -> None:
+    _ensure_src_on_path()
+    import query_audit
+
+    log_path = query_audit.audit_log_path()
+    records = query_audit.read_records(
+        limit=limit, silo=silo, contains=contains, since=since, tool=tool
+    )
+
+    if as_json:
+        for entry in records:
+            print(json.dumps(entry))
+        return
+
+    if not records:
+        if not log_path.exists():
+            print(f"No query audit log yet ({log_path}).")
+            print("It is written on the first MCP query after the current build is running.")
+        else:
+            print("No matching queries.")
+        if not query_audit.audit_enabled():
+            print("Note: auditing is disabled (LLMLIBRARIAN_QUERY_AUDIT).", file=sys.stderr)
+        raise typer.Exit(code=0 if log_path.exists() else 1)
+
+    roll = query_audit.summarize_records(records)
+    if not summary:
+        for entry in records:
+            result = entry.get("result") or {}
+            ts = str(entry.get("ts") or "").replace("T", " ").replace("+00:00", "Z")
+            head = f"{ts}  {entry.get('tool')}  silo={entry.get('silo') or 'unscoped'}"
+            flags = []
+            if result.get("truncated"):
+                flags.append("TRUNCATED")
+            if result.get("errors"):
+                flags.append("ERRORS")
+            if not result.get("chunks"):
+                flags.append("EMPTY")
+            if flags:
+                head += "  [" + " ".join(flags) + "]"
+            print(head)
+            for q in entry.get("queries") or []:
+                print(f"    ? {q}")
+            srcs = result.get("sources") or []
+            if srcs:
+                shown = ", ".join(f"{s.get('file')}×{s.get('chunks')}" for s in srcs[:5])
+                extra = f" (+{result.get('sources_total', len(srcs)) - min(5, len(srcs))} more)" if result.get("sources_total", 0) > 5 else ""
+                print(f"    → {result.get('chunks')} chunks from {shown}{extra}")
+            else:
+                print(f"    → {result.get('chunks')} chunks")
+            print()
+
+    print(f"# {roll['calls']} call(s)  {roll.get('first_ts')} → {roll.get('last_ts')}")
+    if roll["by_silo"]:
+        print("  silos: " + ", ".join(f"{k}×{v}" for k, v in roll["by_silo"].items()))
+    if roll["top_sources"]:
+        print("  top sources: " + ", ".join(f"{s['file']}×{s['chunks']}" for s in roll["top_sources"][:5]))
+    notes = []
+    if roll["empty_results"]:
+        notes.append(f"{roll['empty_results']} empty")
+    if roll["truncated_results"]:
+        notes.append(f"{roll['truncated_results']} truncated")
+    if roll["errored_calls"]:
+        notes.append(f"{roll['errored_calls']} errored")
+    if notes:
+        print("  flags: " + ", ".join(notes))
+    print(f"  log: {log_path}")
+
+
 @app.command("remove", help="Remove a silo.")
 def remove_command(
     silo: list[str] = typer.Argument(..., help="Silo slug, display name, or path.", autocompletion=_complete_silo),
@@ -3221,7 +3338,7 @@ def remove_command(
     if result.get("chroma_warning"):
         print(f"Warning: {result['chroma_warning']}", file=sys.stderr)
     if result["not_found"]:
-        print(f"Removed chunks and file registry for silo: {result['cleaned_slug']} (was not in silo list)")
+        print(f"Removed chunks and file manifest for silo: {result['cleaned_slug']} (was not in silo list)")
     else:
         print(f"Removed silo: {result['removed_slug']}")
     if source_path:

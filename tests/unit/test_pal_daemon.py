@@ -10,9 +10,10 @@ import pal
 runner = CliRunner()
 
 
-def test_pull_path_mode_syncs_daemon_when_installed(monkeypatch):
+def test_pull_path_mode_syncs_daemon_when_installed(monkeypatch, tmp_path: Path):
     seen = {"sync": 0}
     monkeypatch.delenv("PAL_SUPPRESS_DAEMON_SYNC", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_DB", str(tmp_path / "db"))
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
     monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)

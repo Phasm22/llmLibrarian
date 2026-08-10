@@ -215,13 +215,39 @@ def test_pull_watch_errors_when_mcp_unreachable(monkeypatch, tmp_path):
 
     monkeypatch.setattr("pal.Observer", object())
     monkeypatch.setattr("pal._mcp_healthcheck", lambda: (False, "connection refused"))
+    # Disable the boot-race wait so the preflight fails fast in the test.
+    monkeypatch.setenv("LLMLIBRARIAN_WATCH_MCP_WAIT", "0")
     folder = tmp_path / "folder"
     folder.mkdir()
     from typer.testing import CliRunner
     runner = CliRunner()
     res = runner.invoke(pal.app, ["pull", str(folder), "--watch"])
-    assert res.exit_code == 2
+    # Exit 1 (generic failure), not 2: exit 2 collides with systemd's generic
+    # "INVALIDARGUMENT" label and misrepresents a dependency-not-ready condition.
+    assert res.exit_code == 1
     assert "MCP server" in (res.output + (res.stderr if hasattr(res, "stderr") and res.stderr_bytes is not None else ""))
+
+
+def test_pull_watch_waits_for_mcp_then_proceeds(monkeypatch, tmp_path):
+    """A transient MCP-unreachable at startup is retried, not fatal (boot race)."""
+    import pal
+
+    calls = {"n": 0}
+
+    def flaky_healthcheck():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return (False, "connection refused")
+        return (True, "")
+
+    monkeypatch.setattr("pal.Observer", object())
+    monkeypatch.setattr("pal._mcp_healthcheck", flaky_healthcheck)
+    monkeypatch.setattr("pal.time.sleep", lambda _s: None)  # don't actually wait
+    monkeypatch.setenv("LLMLIBRARIAN_WATCH_MCP_WAIT", "60")
+
+    ok, msg = pal._mcp_healthcheck_wait(pal._watch_mcp_wait_seconds(), poll=0.01)
+    assert ok is True
+    assert calls["n"] == 3
 
 
 def test_temporary_env_restores_previous_values(monkeypatch):
@@ -366,7 +392,8 @@ def test_pull_with_path_passes_clear_prompt_option(monkeypatch):
     assert called["clear_prompt"] is True
 
 
-def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
+def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLMLIBRARIAN_DB", str(tmp_path / "db"))
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
     monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)
@@ -384,7 +411,8 @@ def test_pull_path_mode_sets_prompt_override_when_requested(monkeypatch):
     assert calls["args"][2] is False
 
 
-def test_pull_path_mode_errors_when_prompt_override_target_missing(monkeypatch):
+def test_pull_path_mode_errors_when_prompt_override_target_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("LLMLIBRARIAN_DB", str(tmp_path / "db"))
     monkeypatch.setattr("pal.Path.is_dir", lambda _self: True)
     monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: (5, 0))
     monkeypatch.setattr("pal._record_source_path", lambda _path: None)

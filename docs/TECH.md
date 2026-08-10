@@ -46,6 +46,12 @@ Scope rules:
 - accept per-run `--workers` and `--embedding-workers`
 - persist per-silo `--image-vision`
 
+File state:
+- `llmli_file_manifest.json` is the single source of truth for per-silo indexed files
+- content-hash lookup and silo path catalogs are derived from it in memory, cached on the manifest's `(mtime, size)` so another process's write is picked up on the next read
+- `llmli_file_registry.json` is retired: never read, and deleted on the next manifest write
+- a `pal`/MCP process started before this change keeps recreating that file until it is restarted — check the running process, not the code on disk
+
 Watch lifecycle:
 - start: `pal pull <path> --watch`
 - status: `pal pull --status`

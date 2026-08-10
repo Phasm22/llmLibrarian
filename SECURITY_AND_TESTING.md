@@ -10,7 +10,15 @@ This is the concise, maintained security/testing reference.
 
 ## Security Posture (Local-Only)
 
-- Threat model: single-user local CLI.
+- Threat model: single-user local CLI, **plus** an optional MCP HTTP service.
+- That service listens on a socket. On loopback without auth any local process
+  can reach it; off-loopback (including `scripts/publish_mcp_funnel.sh`) it must
+  run with `LLMLIBRARIAN_MCP_REQUIRE_AUTH=true` and a token from
+  `openssl rand -hex 32`.
+- MCP write tools require `confirm=True`. That makes a destructive call
+  deliberate; it is not an authorization boundary, since any caller can pass it.
+  `add_silo` indexes an arbitrary filesystem path, so the bearer token is the
+  only real boundary.
 - Retrieved context is treated as untrusted evidence.
 - Sensitive path/file exclusions are enforced in ingest defaults.
 - Watch stop logic includes safety checks (ownership/signature checks where available).
@@ -24,7 +32,7 @@ This is the concise, maintained security/testing reference.
 
 Before merging behavior changes:
 ```bash
-uv run pytest -q tests/unit
+uv run pytest -q tests/unit tests/contract
 ```
 
 For focused changes, run the relevant subset first, then full unit suite.

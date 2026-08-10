@@ -309,27 +309,76 @@ mcp = FastMCP(
 _chroma_lock = threading.Lock()
 
 
-def _mcp_lock_timeout_seconds() -> float:
-    raw = os.environ.get("LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS", "").strip()
-    if not raw:
-        raw = os.environ.get("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS", "").strip()
-    if not raw:
-        return 10.0
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return 10.0
+def _mcp_lock_timeout_seconds() -> float | None:
+    """Wait budget for the in-process Chroma mutex; None means block indefinitely.
+
+    Delegates to chroma_lock so LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS=0 means
+    the same thing here as it does for the flock layer. Reading it separately
+    turned that setting into an instant timeout on this side.
+    """
+    from chroma_lock import _lock_timeout_seconds
+
+    return _lock_timeout_seconds(env_name="LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS")
 
 
-@contextmanager
-def _mcp_chroma_lock(operation: str):
+def _acquire_chroma_lock(operation: str) -> None:
+    """Take the in-process Chroma mutex, honouring the block-forever sentinel."""
     timeout = _mcp_lock_timeout_seconds()
-    if not _chroma_lock.acquire(timeout=timeout):
+    acquired = (
+        _chroma_lock.acquire() if timeout is None else _chroma_lock.acquire(timeout=timeout)
+    )
+    if not acquired:
         raise TimeoutError(
             f"Timed out after {timeout:g}s waiting for MCP Chroma lock during {operation}. "
             "A background reindex or another tool call is still using Chroma; call health() "
             "for last_background_reindex, then retry or restart the stuck MCP server."
         )
+
+
+def _retry_after_seconds() -> int:
+    """Client retry hint: half the lock budget, floor 1s.
+
+    With no timeout configured there is no budget to halve, so fall back to the
+    default read wait rather than reporting a nonsense delay.
+    """
+    timeout = _mcp_lock_timeout_seconds()
+    if timeout is None:
+        return 5
+    return max(1, round(timeout / 2))
+
+
+def _mcp_read_lock_disabled() -> bool:
+    """True when MCP read tools should not take the in-process Chroma mutex.
+
+    The 680 GB corruption this mutex was added for came from an *embedded*
+    client: two threads driving one PersistentClient into the Rust HNSW writer
+    at once. Under ``chroma run`` no thread here touches HNSW — every call is an
+    HTTP request the server orders itself. The mutex then only makes MCP reads
+    queue behind this process's own background reindex, which is why a query
+    returns ``busy`` for the whole duration of a watcher-triggered index.
+
+    Writes keep taking it in both modes: they are rare, and serializing our own
+    ingest against itself is cheap insurance.
+
+    Escape hatch: ``LLMLIBRARIAN_MCP_READ_LOCK=1`` restores the old behavior.
+    """
+    if (os.environ.get("LLMLIBRARIAN_MCP_READ_LOCK", "").strip().lower()
+            in {"1", "true", "yes", "force"}):
+        return False
+    try:
+        from chroma_client import is_http_mode
+
+        return is_http_mode()
+    except Exception:
+        return False
+
+
+@contextmanager
+def _mcp_chroma_lock(operation: str, write: bool = False):
+    if not write and _mcp_read_lock_disabled():
+        yield
+        return
+    _acquire_chroma_lock(operation)
     try:
         yield
     finally:
@@ -364,6 +413,33 @@ def _release_chroma() -> None:
         release()
     except Exception:
         pass
+
+
+def _is_lock_timeout(exc: BaseException) -> bool:
+    """True when an exception is a transient Chroma/MCP lock timeout.
+
+    Covers both the cross-process flock (``ChromaLockTimeoutError``, a
+    ``TimeoutError`` subclass) and the in-process ``_mcp_chroma_lock``
+    (``TimeoutError``). These mean "busy, retry", not "index broken"."""
+    return isinstance(exc, TimeoutError)
+
+
+def _busy_error(exc: BaseException, operation: str) -> dict:
+    """Soft, retryable payload for lock contention. Distinct from a hard error
+    so the caller retries instead of treating the DB as down or the index as
+    empty."""
+    retry_after = _retry_after_seconds()
+    return {
+        "db_path": _DB_PATH,
+        "busy": True,
+        "retryable": True,
+        "retry_after_seconds": retry_after,
+        "error": (
+            f"ChromaDB is busy ({type(exc).__name__} during {operation}); another "
+            "index/query is holding the lock. This is transient — retry shortly. "
+            "If it persists, call health() / mcp_runtime_status to find the holder."
+        ),
+    }
 
 
 def _db_missing_error() -> dict:
@@ -671,6 +747,66 @@ from operations import _doc_type_breakdown, _inject_staleness
 
 
 # ---------------------------------------------------------------------------
+# Usage telemetry (Argus usage-dashboard rollout — see argus/docs/
+# usage-dashboard-rollout.md). Dedicated log file, separate from anything
+# Argus's llmlibrarian.mcp liveness binding tails, so a quiet query week
+# can't be misread as a liveness gap and vice versa. Best-effort: never let
+# telemetry failures affect a query response.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def _usage_log_path() -> Path:
+    import jobs_runtime as _jobsrt
+    pal_home = Path(os.environ.get("PAL_HOME", str(Path.home() / ".pal"))).expanduser()
+    return _jobsrt.watch_log_dir(pal_home) / "usage.log"
+
+
+def _emit_usage_event(event: str, metrics: dict) -> None:
+    try:
+        path = _usage_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = _json.dumps({
+            "event": event,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "metrics": metrics,
+        })
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        _logger.debug("usage event emit failed", exc_info=True)
+
+
+def _rebuild_note(write_state: dict | None) -> str | None:
+    """Warning text for a result set taken while a silo was being rebuilt."""
+    if not write_state or not write_state.get("results_may_be_incomplete"):
+        return None
+    return (
+        f"Index rebuild in progress for {', '.join(write_state['rebuilding'])} — these "
+        "results may be partial or empty. Do not read an empty result as absence of "
+        "evidence; retry once the rebuild finishes."
+    )
+
+
+def _with_rebuild_note(coverage_note: str | None, write_state: dict | None) -> str | None:
+    note = _rebuild_note(write_state)
+    if not note:
+        return coverage_note
+    return f"{coverage_note} {note}".strip() if coverage_note else note
+
+
+def _emit_query_audit(**kwargs) -> None:
+    """Append a query-audit record (query text + source breakdown). Best-effort."""
+    try:
+        import query_audit
+
+        query_audit.record(**kwargs)
+    except Exception:
+        _logger.debug("query audit emit failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -701,6 +837,11 @@ def query_personal_knowledge(
     For tax queries, also returns a tax_ledger field with structured extracted values.
     Response includes answer_confidence and coverage_note to calibrate hedging.
     When no silo filter is passed, also returns chunks_by_silo grouped by silo.
+
+    If an index write was running during retrieval, the response carries
+    write_in_progress. When results_may_be_incomplete is true a silo was being
+    rebuilt — treat zero/thin chunks as unknown, not as absence of evidence, and
+    retry once it finishes.
     """
     from query.core import run_retrieve
     if not Path(_DB_PATH).is_dir():
@@ -718,11 +859,15 @@ def query_personal_knowledge(
             )
             chunks = result.get("chunks", [])
 
-            # Answer-level confidence signal
+            _emit_usage_event("usage.llmlibrarian.query", {"silo": silo or "unscoped"})
+
+            # Answer-level confidence signal. Recomputing coverage_note here would
+            # drop the rebuild warning run_retrieve attached, and that note is the
+            # part the calling model actually reads — so re-apply it.
             conf_level, conf_score, coverage_note = _compute_answer_confidence(chunks)
             result["answer_confidence"] = conf_level
             result["answer_confidence_score"] = conf_score
-            result["coverage_note"] = coverage_note
+            result["coverage_note"] = _with_rebuild_note(coverage_note, result.get("write_in_progress"))
 
             # Retrieval signal summary — helps LLM calibrate how to weight chunks
             lexical_hits = sum(1 for c in chunks if (c.get("_signals") or {}).get("lexical_rank") is not None)
@@ -737,8 +882,20 @@ def query_personal_knowledge(
                     by_silo.setdefault(c.get("silo", ""), []).append(c)
                 result["chunks_by_silo"] = by_silo
 
-            return {"db_path": _DB_PATH, **result}
+        # Audit outside the lock — the append is small, but this lock is on the
+        # hot path for every reader and has been a contention source before.
+        _emit_query_audit(
+            tool="query_personal_knowledge",
+            queries=[query],
+            silo=silo,
+            params={"n_results": n_results, "section": section, "doc_type": doc_type},
+            chunks=chunks,
+            outcome={"confidence": conf_level, "confidence_score": conf_score},
+        )
+        return {"db_path": _DB_PATH, **result}
     except Exception as e:
+        if _is_lock_timeout(e):
+            return {**_busy_error(e, "query_personal_knowledge"), "chunks": []}
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}
     finally:
         _release_chroma()
@@ -768,6 +925,11 @@ def multi_query_knowledge(
     max_total_chunks caps the merged output (default 50) to avoid context overflow.
     If the cap is hit, response includes truncated=True — lower n_results or reduce queries.
     Response includes answer_confidence, answer_confidence_score, and coverage_note.
+
+    If an index write was running during retrieval, the response carries
+    write_in_progress. When results_may_be_incomplete is true a silo was being
+    rebuilt — treat zero/thin chunks as unknown, not as absence of evidence, and
+    retry once it finishes.
     """
     from query.core import run_retrieve
     if not Path(_DB_PATH).is_dir():
@@ -775,6 +937,8 @@ def multi_query_knowledge(
     seen: set[str] = set()
     all_chunks: list[dict] = []
     errors: list[str] = []
+    busy = False
+    write_states: list[dict] = []
     for q in queries:
         try:
             with _mcp_chroma_lock("multi_query_knowledge"):
@@ -787,6 +951,8 @@ def multi_query_knowledge(
                     db_path=_DB_PATH,
                     config_path=_CONFIG_PATH,
                 )
+            if res.get("write_in_progress"):
+                write_states.append(res["write_in_progress"])
             for chunk in res.get("chunks", []):
                 key = (chunk.get("text") or "")[:200]
                 if key and key not in seen:
@@ -794,6 +960,8 @@ def multi_query_knowledge(
                     chunk["query"] = q
                     all_chunks.append(chunk)
         except Exception as e:
+            if _is_lock_timeout(e):
+                busy = True
             errors.append(f"{q!r}: {type(e).__name__}: {e}")
     all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
     truncated = len(all_chunks) > max_total_chunks
@@ -802,6 +970,35 @@ def multi_query_knowledge(
 
     # Feature 6: answer-level confidence on merged results
     conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
+
+    # A rebuild seen by any sub-query taints the merged set.
+    from ingest_journal import merge_write_states
+
+    merged_write_state = merge_write_states(write_states)
+    coverage_note = _with_rebuild_note(coverage_note, merged_write_state)
+
+    _emit_usage_event(
+        "usage.llmlibrarian.query",
+        {"silo": silo or "unscoped", "query_count": len(queries)},
+    )
+    _emit_query_audit(
+        tool="multi_query_knowledge",
+        queries=queries,
+        silo=silo,
+        params={
+            "n_results": n_results,
+            "max_total_chunks": max_total_chunks,
+            "section": section,
+            "doc_type": doc_type,
+        },
+        chunks=all_chunks,
+        outcome={
+            "confidence": conf_level,
+            "confidence_score": conf_score,
+            "truncated": truncated,
+            **({"errors": errors} if errors else {}),
+        },
+    )
 
     _release_chroma()
     return {
@@ -813,8 +1010,71 @@ def multi_query_knowledge(
         "answer_confidence_score": conf_score,
         "coverage_note": coverage_note,
         "chunks": all_chunks,
+        **({"write_in_progress": merged_write_state} if merged_write_state else {}),
+        **({"retryable": True} if (merged_write_state or {}).get("results_may_be_incomplete") else {}),
         **({"errors": errors} if errors else {}),
+        **(
+            {"busy": True, "retryable": True, "retry_after_seconds": _retry_after_seconds()}
+            if busy and not all_chunks
+            else {}
+        ),
     }
+
+
+@mcp.tool()
+def recent_queries(
+    limit: int = 20,
+    silo: str | None = None,
+    contains: str | None = None,
+    since: str | None = None,
+    tool: str | None = None,
+    summary_only: bool = False,
+) -> dict:
+    """
+    Use when: auditing what was already retrieved — which queries ran, against which silo, and which files answered them.
+    Do not use when: you need the chunk text itself (`query_personal_knowledge`) or live index health (`session_context`/`health`).
+    Pairs with: `inspect_silo` to check whether a silo mixes documents, `explain_retrieval` to re-debug a specific query.
+
+    Reads the local query-audit trail written by `query_personal_knowledge` and
+    `multi_query_knowledge`. Each record carries the query text, the silo scope,
+    the call parameters, and a per-source-file breakdown of the chunks returned —
+    which is how you spot a prior answer that pulled from the wrong document in a
+    multi-document silo, or one that hit max_total_chunks and truncated.
+
+    Filters: silo (exact slug), contains (substring over query text, source
+    filenames, and silo), since ('30m', '24h', '7d', or an ISO timestamp),
+    tool ('query_personal_knowledge' or 'multi_query_knowledge').
+    Pass summary_only=True for roll-up counts without individual records.
+
+    Returns records oldest-first plus a summary with call counts, silo mix,
+    most-hit source files, and how many calls came back empty or truncated.
+    """
+    try:
+        import query_audit
+
+        records = query_audit.read_records(
+            limit=limit,
+            silo=silo,
+            contains=contains,
+            since=since,
+            tool=tool,
+        )
+        summary = query_audit.summarize_records(records)
+        payload = {
+            "log_path": str(query_audit.audit_log_path()),
+            "audit_enabled": query_audit.audit_enabled(),
+            "summary": summary,
+        }
+        if not summary_only:
+            payload["records"] = records
+        if not records and not query_audit.audit_log_path().exists():
+            payload["note"] = (
+                "No audit log yet — it is created on the first query after this "
+                "build is running. Check mcp_runtime_status if you expected history."
+            )
+        return payload
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "records": [], "summary": {}}
 
 
 @mcp.tool()
@@ -909,6 +1169,8 @@ def explain_retrieval(
                 "ranked_chunks": ranked_chunks,
             }
     except Exception as e:
+        if _is_lock_timeout(e):
+            return {**_busy_error(e, "explain_retrieval"), "ranked_chunks": []}
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "ranked_chunks": []}
     finally:
         _release_chroma()
@@ -1017,6 +1279,8 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
             result = op_inspect_silo(_DB_PATH, silo, top=top)
         return result
     except Exception as e:
+        if _is_lock_timeout(e):
+            return _busy_error(e, "inspect_silo")
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}"}
     finally:
         _release_chroma()
@@ -1094,6 +1358,8 @@ def find_files(
             )
         return result
     except Exception as e:
+        if _is_lock_timeout(e):
+            return _busy_error(e, "find_files")
         return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}"}
     finally:
         if include_chunk_count:
@@ -1153,12 +1419,7 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
         try:
             def _acquire_for_write() -> None:
                 nonlocal _write_lock_held
-                timeout = _mcp_lock_timeout_seconds()
-                if not _chroma_lock.acquire(timeout=timeout):
-                    raise TimeoutError(
-                        f"Timed out after {timeout:g}s waiting for MCP Chroma lock during trigger_reindex. "
-                        "A background reindex or another tool call is still using Chroma; retry or restart."
-                    )
+                _acquire_chroma_lock("trigger_reindex")
                 _write_lock_held = True
 
             with _reindex_lock:
@@ -1233,7 +1494,7 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
 
     from operations import op_repair_silo
     try:
-        with _mcp_chroma_lock("repair_silo"):
+        with _mcp_chroma_lock("repair_silo", write=True):
             result = op_repair_silo(_DB_PATH, silo, verbose=False)
         if result.get("status") == "completed":
             result["message"] = (
@@ -1300,7 +1561,7 @@ def update_file(silo: str, path: str, confirm: bool = False) -> dict:
     if err:
         return err
     try:
-        with _mcp_chroma_lock("update_file"):
+        with _mcp_chroma_lock("update_file", write=True):
             from ingest import update_single_file
 
             status, resolved = update_single_file(
@@ -1342,7 +1603,7 @@ def remove_file(silo: str, path: str, confirm: bool = False) -> dict:
     if err:
         return err
     try:
-        with _mcp_chroma_lock("remove_file"):
+        with _mcp_chroma_lock("remove_file", write=True):
             from ingest import remove_single_file
 
             status, resolved = remove_single_file(
@@ -1416,12 +1677,7 @@ def add_silo(
         try:
             def _acquire_for_write() -> None:
                 nonlocal _write_lock_held
-                timeout = _mcp_lock_timeout_seconds()
-                if not _chroma_lock.acquire(timeout=timeout):
-                    raise TimeoutError(
-                        f"Timed out after {timeout:g}s waiting for MCP Chroma lock during add_silo. "
-                        "A background reindex or another tool call is still using Chroma; retry or restart."
-                    )
+                _acquire_chroma_lock("add_silo")
                 _write_lock_held = True
 
             with _reindex_lock:

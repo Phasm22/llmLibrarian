@@ -53,7 +53,6 @@ def test_op_repair_silo_releases_singleton_before_run_add(fake_silo):
     with patch("chroma_client.get_client", _get_client), \
          patch("chroma_client.release", _release), \
          patch("ingest.run_add", _run_add), \
-         patch("ingest._file_registry_remove_silo", lambda *a, **k: None), \
          patch("state.list_silos", _list_silos), \
          patch("state.resolve_silo_to_slug", _resolve), \
          patch("state.resolve_silo_prefix", _resolve), \

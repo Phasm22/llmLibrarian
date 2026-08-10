@@ -12,6 +12,7 @@ PersistentClient mode applies (not safe for concurrent processes on one path).
 
 from __future__ import annotations
 
+import errno
 import http.client
 import json
 import os
@@ -251,8 +252,27 @@ def check_chroma_server_reachable(
     return False, "heartbeat unreachable"
 
 
-def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
-    """Return (reachable, db_path) for the llmLibrarian MCP HTTP /healthz probe.
+def mcp_auth_token() -> str:
+    """Bearer token for the llmLibrarian MCP HTTP server.
+
+    ``LLMLIBRARIAN_MCP_AUTH_TOKEN`` is the name the server, scripts/run_mcp_http.sh
+    and .env.mcp all use; ``LLMLIBRARIAN_MCP_BEARER_TOKEN`` is the older
+    client-side spelling ``pal`` still writes. Read both — a probe that misses
+    the token gets a 401 it cannot tell apart from "server down".
+    """
+    for name in ("LLMLIBRARIAN_MCP_AUTH_TOKEN", "LLMLIBRARIAN_MCP_BEARER_TOKEN"):
+        tok = os.environ.get(name, "").strip()
+        if tok:
+            return tok
+    return ""
+
+
+def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None, bool]:
+    """Probe the llmLibrarian MCP HTTP /healthz endpoint.
+
+    Returns ``(reachable, db_path, auth_blocked)``. ``auth_blocked`` is True when
+    the server answered but rejected our credentials — a live MCP process we
+    cannot identify, which is very different from nothing listening at all.
 
     Uses the pooled keep-alive probe connection.
     """
@@ -263,35 +283,56 @@ def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None]:
     except ValueError:
         port = 8765
     headers: dict[str, str] = {}
-    tok = os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN", "").strip()
+    tok = mcp_auth_token()
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
     status, body, err = _probe_http(host, port, False, "/healthz", headers=headers, timeout=timeout)
-    if err is not None or status != 200:
-        return False, None
+    if err is not None:
+        return False, None, False
+    if status in (401, 403):
+        return True, None, True
+    if status != 200:
+        return False, None, False
     raw = body.decode("utf-8", errors="replace")
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return True, None
+        return True, None, False
     if not isinstance(payload, dict) or not payload.get("ok"):
-        return False, None
+        return False, None, False
     db_raw = payload.get("db_path")
     if isinstance(db_raw, str) and db_raw.strip():
-        return True, str(Path(db_raw).expanduser().resolve())
-    return True, None
+        return True, str(Path(db_raw).expanduser().resolve()), False
+    return True, None, False
 
 
-def _mcp_blocks_embedded_write(db_path: str) -> bool:
-    """True when a live MCP server holds PersistentClient on this db_path."""
-    up, mcp_db = _mcp_healthz_info()
+def _mcp_blocks_embedded_write(db_path: str) -> str | None:
+    """Reason to refuse an embedded write because of a live MCP server, else None.
+
+    An authenticated probe naming this db_path is a definite block. A probe
+    rejected for bad credentials is also a block: a live MCP process holds
+    *some* DB open and we cannot rule out this one. Guessing wrong SIGSEGVs, so
+    the ambiguous case fails closed and says how to fix it.
+
+    A 200 without a db_path field is genuine version skew against an older
+    server; that stays permissive.
+    """
+    up, mcp_db, auth_blocked = _mcp_healthz_info()
     if not up:
-        return False
-    target = str(Path(db_path).expanduser().resolve())
+        return None
+    if auth_blocked:
+        return (
+            "llmLibrarian MCP HTTP server is running but rejected our /healthz credentials, "
+            "so it cannot be confirmed to be on a different DB. Set LLMLIBRARIAN_MCP_AUTH_TOKEN "
+            "to the server's token, or set LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT=1 if you "
+            "know the MCP server holds a different database"
+        )
     if mcp_db is None:
-        # Cannot confirm MCP is on this DB (upgrade MCP /healthz includes db_path).
-        return False
-    return mcp_db == target
+        # Older MCP whose /healthz omits db_path — cannot confirm, stay permissive.
+        return None
+    if mcp_db == str(Path(db_path).expanduser().resolve()):
+        return "llmLibrarian MCP HTTP server is running on this DB (holds a cached PersistentClient)"
+    return None
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -348,8 +389,9 @@ def preflight_embedded_write(db_path: str) -> str | None:
         return None
 
     reasons: list[str] = []
-    if _mcp_blocks_embedded_write(db_path):
-        reasons.append("llmLibrarian MCP HTTP server is running on this DB (holds a cached PersistentClient)")
+    mcp_reason = _mcp_blocks_embedded_write(db_path)
+    if mcp_reason:
+        reasons.append(mcp_reason)
     watchers = _active_watch_processes_for_db(db_path)
     reasons.extend(watchers)
 
@@ -475,21 +517,131 @@ def _storage_preflight(db_path: str) -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# Transport retry (HTTP mode)
+#
+# A `chroma run` restart — pc-stacks redeploy, an OOM kill against MemoryMax, a
+# systemd restart — makes in-flight calls fail for a second or two. Without a
+# retry here that reaches the MCP caller as a tool error, and the caller is a
+# model: it may not retry, and can read "the tool failed" as "the knowledge base
+# has nothing", answering from training data instead. Worst on a phone, where
+# the tool error is invisible and there is no prompt to re-ask. An in-process
+# retry costs ~200ms and the model never learns it happened.
+#
+# Deliberately narrow: connection-level failures only, never application errors
+# (a bad filter or missing collection will not fix itself by sleeping). The
+# budget stays under a second so a genuinely down server still fails fast — a
+# slow error is worse than a quick one.
+# ---------------------------------------------------------------------------
+
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 0.1
+_RETRY_MAX_DELAY = 0.4
+
+
+def _retry_attempts() -> int:
+    raw = os.environ.get("LLMLIBRARIAN_CHROMA_HTTP_RETRIES", "").strip()
+    if not raw:
+        return _RETRY_ATTEMPTS
+    try:
+        return max(1, int(raw) + 1)
+    except ValueError:
+        return _RETRY_ATTEMPTS
+
+
+def _transport_error_types() -> tuple[type, ...]:
+    types: list[type] = [ConnectionError, TimeoutError]
+    try:
+        import httpx
+
+        types.append(httpx.TransportError)
+    except Exception:
+        pass
+    return tuple(types)
+
+
+def _is_transient_transport_error(exc: BaseException) -> bool:
+    """Connection-level failure that a moment's wait might clear."""
+    if isinstance(exc, _transport_error_types()):
+        return True
+    # EMFILE during a reindex storm: the MCP unit raises LimitNOFILE for exactly
+    # this, and fd exhaustion has previously cascaded into false "silo not found".
+    return isinstance(exc, OSError) and exc.errno in {
+        errno.EMFILE,
+        errno.ENFILE,
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EPIPE,
+    }
+
+
+def _never_reached_server(exc: BaseException) -> bool:
+    """True when the request certainly did not arrive, so replaying it is safe."""
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    if isinstance(exc, OSError) and exc.errno == errno.ECONNREFUSED:
+        return True
+    try:
+        import httpx
+
+        return isinstance(exc, httpx.ConnectError)
+    except Exception:
+        return False
+
+
+def _retry_transport(fn: Any, *, label: str, replayable: bool = True) -> Any:
+    """Run fn, retrying connection-level failures.
+
+    replayable=False (writes) retries only when the request provably never
+    reached the server. Chunk ids are deterministic, so a replayed add is
+    idempotent — but a read timeout may mean the write landed and is still being
+    applied, and replaying that races the server rather than helping.
+    """
+    attempts = _retry_attempts()
+    delay = _RETRY_BASE_DELAY
+    last: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last = exc
+            if attempt >= attempts or not _is_transient_transport_error(exc):
+                raise
+            if not replayable and not _never_reached_server(exc):
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, _RETRY_MAX_DELAY)
+    raise last  # unreachable; loop either returns or raises
+
+
 def _open_raw_client(db_path: str) -> Any:
     if is_http_mode():
         host, port, ssl = chroma_http_settings()
-        ok, detail = check_chroma_server_reachable(host, port, ssl=ssl)
-        if not ok:
-            raise RuntimeError(
-                f"Chroma HTTP server not reachable at {host}:{port} ({detail}). "
-                "Start it with: pal chroma start"
+
+        def _connect() -> Any:
+            ok, detail = check_chroma_server_reachable(host, port, ssl=ssl)
+            if not ok:
+                # Raised as a transport error so the retry loop treats a
+                # restarting server the same as a refused connection.
+                raise ConnectionError(
+                    f"Chroma HTTP server not reachable at {host}:{port} ({detail})"
+                )
+            return chromadb.HttpClient(
+                host=host,
+                port=port,
+                ssl=ssl,
+                settings=Settings(anonymized_telemetry=False),
             )
-        return chromadb.HttpClient(
-            host=host,
-            port=port,
-            ssl=ssl,
-            settings=Settings(anonymized_telemetry=False),
-        )
+
+        try:
+            return _retry_transport(_connect, label="open_client")
+        except Exception as exc:
+            if _is_transient_transport_error(exc):
+                raise RuntimeError(
+                    f"Chroma HTTP server not reachable at {host}:{port} ({exc}). "
+                    "Start it with: pal chroma start"
+                ) from exc
+            raise
     return chromadb.PersistentClient(
         path=db_path,
         settings=Settings(anonymized_telemetry=False),
@@ -517,7 +669,7 @@ class _SafeClient:
                 name=name, embedding_function=embedding_function, **kwargs
             )
             self._effective_efs[name] = embedding_function
-            return coll
+            return self._wrap(coll)
         except Exception as exc:
             msg = str(exc).lower()
             if embedding_function is not None and "conflict" in msg and "default" in msg:
@@ -536,8 +688,19 @@ class _SafeClient:
                         "this DB to sentence-transformers/CUDA embeddings.",
                         file=sys.stderr,
                     )
-                return coll
+                return self._wrap(coll)
             raise
+
+    @staticmethod
+    def _wrap(collection: Any) -> Any:
+        """Add transport retry to a collection in HTTP mode only.
+
+        Embedded mode has no transport to fail, so the proxy would be pure
+        indirection there.
+        """
+        if not is_http_mode():
+            return collection
+        return _RetryingCollection(collection)
 
     def get_effective_ef(self, name: str):
         """Return the EF that was actually used when opening the named collection."""
@@ -545,6 +708,46 @@ class _SafeClient:
 
     def __getattr__(self, name: str):
         return getattr(self._client, name)
+
+
+# Read methods are freely replayable; write methods only when the request
+# provably never reached the server (see _retry_transport).
+_COLLECTION_READ_METHODS = frozenset({"query", "get", "count", "peek"})
+_COLLECTION_WRITE_METHODS = frozenset({"add", "update", "upsert", "delete", "modify"})
+
+
+class _RetryingCollection:
+    """Wraps a Chroma collection so a server restart mid-call is not fatal.
+
+    Only the data-plane methods are wrapped; everything else (``name``, ``id``,
+    private attrs) passes straight through.
+    """
+
+    __slots__ = ("_collection",)
+
+    def __init__(self, collection: Any) -> None:
+        object.__setattr__(self, "_collection", collection)
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._collection, name)
+        if name in _COLLECTION_READ_METHODS or name in _COLLECTION_WRITE_METHODS:
+            replayable = name in _COLLECTION_READ_METHODS
+
+            def _wrapped(*args, **kwargs):
+                return _retry_transport(
+                    lambda: attr(*args, **kwargs),
+                    label=f"collection.{name}",
+                    replayable=replayable,
+                )
+
+            return _wrapped
+        return attr
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._collection, name, value)
+
+    def __repr__(self) -> str:
+        return f"_RetryingCollection({self._collection!r})"
 
 
 def get_client(db_path: str) -> "_SafeClient":
@@ -556,45 +759,53 @@ def get_client(db_path: str) -> "_SafeClient":
     don't get ConnectError after the chroma server is restarted out from
     under us.
     """
+    # One cache key for every map in this module. Callers spell the same
+    # directory several ways ("./my_brain_db" vs the absolute path); keying on
+    # the raw string handed out two PersistentClients for one persist dir,
+    # which is exactly the concurrent-handle SIGSEGV this module prevents.
     key = str(Path(db_path).expanduser().resolve())
     with _lock:
-        if db_path in _clients:
+        if key in _clients:
             if is_http_mode():
-                cached = _clients[db_path]
+                cached = _clients[key]
                 now = time.monotonic()
-                last_ok = _heartbeat_ok_at.get(db_path, 0.0)
+                last_ok = _heartbeat_ok_at.get(key, 0.0)
                 if now - last_ok < _heartbeat_min_interval():
                     return cached
                 try:
                     cached._client.heartbeat()
-                    _heartbeat_ok_at[db_path] = now
+                    _heartbeat_ok_at[key] = now
                     return cached
                 except Exception:
                     # Stale connection (chroma server restarted). Drop and rebuild.
-                    _clients.pop(db_path, None)
-                    _heartbeat_ok_at.pop(db_path, None)
+                    _clients.pop(key, None)
+                    _heartbeat_ok_at.pop(key, None)
             else:
                 opened_at = _client_open_generation.get(key, 0.0)
                 current = _read_generation(key)
-                if current > opened_at:
-                    if _exit_on_stale_enabled():
-                        print(
-                            f"[llmli][chroma_client] writer activity detected on "
-                            f"{db_path} (gen {opened_at:.6f} → {current:.6f}); "
-                            f"exiting (99) so supervisor restarts with fresh state.",
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                        sys.exit(99)
-                return _clients[db_path]
-        _storage_preflight(db_path)
-        raw = _open_raw_client(db_path)
-        _clients[db_path] = _SafeClient(raw)
+                if current <= opened_at:
+                    return _clients[key]
+                # Another process wrote since we opened. The cached client's
+                # segments are stale either way; never hand it back.
+                if _exit_on_stale_enabled():
+                    print(
+                        f"[llmli][chroma_client] writer activity detected on "
+                        f"{db_path} (gen {opened_at:.6f} → {current:.6f}); "
+                        f"exiting (99) so supervisor restarts with fresh state.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sys.exit(99)
+                _clients.pop(key, None)
+                _client_open_generation.pop(key, None)
+        _storage_preflight(key)
+        raw = _open_raw_client(key)
+        _clients[key] = _SafeClient(raw)
         if is_http_mode():
-            _heartbeat_ok_at[db_path] = time.monotonic()
+            _heartbeat_ok_at[key] = time.monotonic()
         else:
             _client_open_generation[key] = _read_generation(key)
-        return _clients[db_path]
+        return _clients[key]
 
 
 def _exit_on_stale_enabled() -> bool:

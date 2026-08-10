@@ -14,6 +14,47 @@ if str(ROOT) not in sys.path:
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+# --- Environment isolation (must run before pal/cli/mcp_server imports) ---
+# pal bootstraps ~/.config/llmLibrarian/.llmlibrarian.env into os.environ at
+# import time. On an operator machine that sets LLMLIBRARIAN_CHROMA_HOST,
+# which silently flips get_client() into HTTP mode and makes "unit" tests
+# write into the production Chroma server. Block the bootstrap and scrub any
+# host-specific vars so tests only ever touch per-test tmp paths.
+os.environ["LLMLIBRARIAN_ENV_BOOTSTRAPPED"] = "1"
+# Query auditing appends to $PAL_HOME/logs (default ~/.pal) on every MCP query
+# tool call. Off by default here so tests can't write into the operator's real
+# audit trail; test_query_audit.py re-enables it against tmp paths.
+os.environ["LLMLIBRARIAN_QUERY_AUDIT"] = "0"
+for _key in (
+    "LLMLIBRARIAN_DB",
+    "LLMLIBRARIAN_CHROMA_HOST",
+    "LLMLIBRARIAN_CHROMA_PORT",
+    "LLMLIBRARIAN_CHROMA_SSL",
+    "LLMLIBRARIAN_MCP_URL",
+    "LLMLIBRARIAN_MCP_PATH",
+    "LLMLIBRARIAN_EMBEDDING_MODEL",
+    "LLMLIBRARIAN_EMBEDDING_DEVICE",
+):
+    os.environ.pop(_key, None)
+# ONNX MiniLM path: keeps the torch/sentence-transformers stack out of test
+# runs entirely (CI installs without torch); override explicitly if a test
+# needs the sentence-transformer path.
+os.environ.setdefault("LLMLIBRARIAN_EMBEDDING", "default")
+
+# Deterministic terminal rendering: rich/typer help output and answer
+# wrapping (_answer_wrap_width) depend on detected terminal width and TTY
+# color support, which differ on CI runners. Pin width 88 (the suite's
+# phrasing asserts expect the resulting 86-column answer wrap) and disable
+# color so substring asserts see plain text.
+os.environ["COLUMNS"] = "88"
+os.environ["NO_COLOR"] = "1"
+os.environ.pop("FORCE_COLOR", None)
+# rich force-enables ANSI when it sees GitHub Actions env, ignoring the lack
+# of a TTY; a dumb terminal keeps help output plain everywhere.
+os.environ["TERM"] = "dumb"
+os.environ.pop("GITHUB_ACTIONS", None)
+os.environ.pop("CI", None)
+
 # Ensure tests target the workspace module, not an installed site-packages copy.
 _pal_path = (ROOT / "pal.py").resolve()
 _pal_spec = importlib.util.spec_from_file_location("pal", _pal_path)

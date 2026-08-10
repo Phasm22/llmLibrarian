@@ -136,6 +136,40 @@ def test_multi_query_per_query_errors_are_collected(monkeypatch, mcp):
     assert "RuntimeError" in res["errors"][0]
 
 
+def test_query_lock_timeout_returns_busy(monkeypatch, mcp):
+    """A lock timeout on the read path degrades to a retryable busy payload,
+    not a hard error that reads as a broken index."""
+    from chroma_lock import ChromaLockTimeoutError
+
+    def _boom(*, query, **_kwargs):
+        raise ChromaLockTimeoutError("db busy")
+
+    monkeypatch.setitem(sys.modules, "query.core", SimpleNamespace(run_retrieve=_boom))
+
+    res = mcp.query_personal_knowledge("anything")
+
+    assert res["busy"] is True
+    assert res["retryable"] is True
+    assert res["retry_after_seconds"] >= 1
+    assert res["chunks"] == []
+
+
+def test_multi_query_all_busy_sets_busy_flag(monkeypatch, mcp):
+    from chroma_lock import ChromaLockTimeoutError
+
+    def _boom(*, query, **_kwargs):
+        raise ChromaLockTimeoutError("db busy")
+
+    monkeypatch.setitem(sys.modules, "query.core", SimpleNamespace(run_retrieve=_boom))
+
+    res = mcp.multi_query_knowledge(["a", "b"])
+
+    assert res["busy"] is True
+    assert res["retryable"] is True
+    assert res["chunks"] == []
+    assert len(res["errors"]) == 2
+
+
 def test_multi_query_empty_chunks_returns_empty_chunks(monkeypatch, mcp):
     _install_run_retrieve(monkeypatch, {"q": {"chunks": []}})
 

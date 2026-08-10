@@ -48,6 +48,9 @@ def watcher_setup(monkeypatch, tmp_path):
     fake_ingest._read_file_manifest.return_value = {"silos": {}}
     fake_ingest._load_limits_config.return_value = (1_000_000, 10, 1_000_000, 100, 100)
     monkeypatch.setitem(__import__("sys").modules, "ingest", fake_ingest)
+    # SiloWatcher imports from the ingest.watch_scan submodule; a MagicMock is
+    # not a package, so stub the submodule entry explicitly.
+    monkeypatch.setitem(__import__("sys").modules, "ingest.watch_scan", fake_ingest)
 
     fake_state = MagicMock()
     fake_state.get_silo_exclude_patterns.return_value = []
@@ -104,6 +107,23 @@ def test_drain_due_treats_skipped_as_success(watcher_setup, monkeypatch):
     assert watcher._queue == {}
     batch = [e for e in emitted if e.get("event") == "batch_drain"]
     assert batch and batch[-1].get("skipped") == 1
+
+
+def test_enqueue_delete_skips_excluded_paths(watcher_setup):
+    """Delete events for excluded paths (e.g. .git/ churn) must not be queued,
+    otherwise remove_file loops forever on files that were never indexed."""
+    watcher, _emitted, _db = watcher_setup
+    watcher._should_index = lambda path, include, exclude: ".git/" not in path
+
+    git_dir = watcher.root / ".git"
+    git_dir.mkdir(exist_ok=True)
+    excluded = str(git_dir / "index.lock")
+    watcher.enqueue_delete(excluded)
+    assert watcher._queue == {}
+
+    kept = str(watcher.root / "a.txt")
+    watcher.enqueue_delete(kept)
+    assert str(Path(kept).resolve()) in watcher._queue
 
 
 def test_reconcile_emits_event_when_queued(watcher_setup, monkeypatch):

@@ -8,7 +8,7 @@ If any other document conflicts with this file, follow `AGENTS.md`.
 
 llmLibrarian is a **local personal knowledge index**: folders → chunks in Chroma → retrieval tools for assistants or CLI. It is **not** a chat product; it is a **context engine** with deterministic ingest, registry/manifest state, and observable repair paths.
 
-**Human story:** [README.md](../README.md) and [docs/GUIDE.md](docs/GUIDE.md).  
+**Human story:** [README.md](README.md) and [docs/GUIDE.md](docs/GUIDE.md).  
 **Contracts:** [docs/TECH.md](docs/TECH.md), [docs/orchestration-matrix.md](docs/orchestration-matrix.md).
 
 Agent priorities:
@@ -29,6 +29,7 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 | `query_personal_knowledge` | Primary retrieval → chunks (no LLM in MCP) |
 | `multi_query_knowledge` | Parallel queries, merged chunks |
 | `explain_retrieval` | Debug hybrid/vector signals |
+| `recent_queries` | Audit past queries: text, silo scope, per-source-file chunk breakdown |
 | `find_files` | Manifest-only path/date search |
 | `add_silo` | Index path (`confirm=True`) |
 | `trigger_reindex` | Incremental reindex (`confirm=True`; **not** right after `add_silo`) |
@@ -42,8 +43,20 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 MCP returns **chunks**; the host model answers. Local synthesis: `pal ask` / `llmli ask` (Ollama).
 MCP tool docstrings follow: **Use when / Do not use when / Pairs with**.
 
+## Host runtime (`pc-stacks`)
+
+On TJ's Linux desktop, Chroma + MCP + watchers are **cold at login**. Before MCP tools or `:8765` health checks:
+
+```bash
+pc-stacks status
+pc-stacks up llmlibrarian   # if cold
+```
+
+Canonical index: [`/home/tj/bin/README.md`](/home/tj/bin/README.md). Traceability: **PC Idle Quietdown** plan (Cursor plans, Jul 2025).
+
 ## Session-start checklist (MCP)
 
+0. Confirm stack is warm (`pc-stacks status` or `curl -fsS http://127.0.0.1:8765/healthz`); if not, `pc-stacks up llmlibrarian`.
 1. Prefer `session_context(check_staleness=True)` before retrieval.
 2. If `is_stale: true` and `stale_file_count` is substantial → `trigger_reindex` before querying.
 3. If `stale_file_count` is small (≤2–3) **and** `newest_source_mtime_iso` matches the silo `updated` timestamp → treat as index race noise; skip reindex.
@@ -92,7 +105,7 @@ llmli rehydrate --dry-run
 ### Test
 
 ```bash
-uv run pytest -q tests/unit
+uv run pytest -q tests/unit tests/contract
 ```
 
 ## Command notes
@@ -100,7 +113,9 @@ uv run pytest -q tests/unit
 - `pal` — operator CLI (pull, ask, ls, daemon, chroma service).
 - `llmli` — engine CLI (scripting, repair, rehydrate, log).
 - `pal sync` — refresh dev self-silo `__self__` when needed.
-- **Claude Desktop MCP (.mcpb):** after `mcp_server.py` changes, `pal extension pack` when `LLMLIBRARIAN_MCP_PACK_CMD` is set; stdio via `.mcp.json` does not update the Desktop binary. `pal ls --status` / `pal sync` warn on stale pack hash.
+- **After `mcp_server.py` / `src/` changes: `pc-stacks redeploy llmlibrarian`.** systemd services keep serving the code they imported at startup — a process from last week outlives every fix since. `redeploy` restarts MCP + watchers (leaving `chroma run` up) and prints each unit's start time so you can confirm the running process is the one you just changed.
+- **Claude Desktop MCP (.mcpb):** after `mcp_server.py` changes, `pal extension pack` when `LLMLIBRARIAN_MCP_PACK_CMD` is set. `pal ls --status` / `pal sync` warn on stale pack hash.
+- **No stdio MCP.** The plugin ships no `.mcp.json`; every client (Claude Code, Desktop, phone via Funnel) connects to the one `llmlibrarian-mcp.service` over HTTP. A stdio entry would spawn a second server per client and make bugs unreproducible across sessions.
 - `pal ask in <silo> "..."` → normalized to `--in`.
 
 ## Documentation policy

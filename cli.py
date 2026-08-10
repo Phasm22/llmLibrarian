@@ -287,7 +287,7 @@ def cmd_rm(args: argparse.Namespace) -> int:
     if not result["not_found"]:
         print(f"Removed silo: {result['removed_slug']}")
     else:
-        print(f"Removed chunks and file registry for silo: {result['cleaned_slug']} (was not in silo list)")
+        print(f"Removed chunks and file manifest for silo: {result['cleaned_slug']} (was not in silo list)")
     return 0
 
 def cmd_repair(args: argparse.Namespace) -> int:

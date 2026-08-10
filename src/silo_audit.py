@@ -1,6 +1,9 @@
 """
 Silo audit utilities: detect duplicate content, overlapping silos, and registry mismatches.
-Read-only helpers for llmli registry, file registry, and file manifest.
+Read-only helpers over the llmli registry and the file manifest.
+
+Content-hash views come from ``file_registry``, which derives them from the
+manifest — this module must not re-read state from a second file.
 """
 import json
 import sys
@@ -13,13 +16,6 @@ def _registry_path(db_path: str | Path) -> Path:
     if p.is_dir():
         return p / "llmli_registry.json"
     return p.parent / "llmli_registry.json"
-
-
-def _file_registry_path(db_path: str | Path) -> Path:
-    p = Path(db_path).resolve()
-    if p.is_dir():
-        return p / "llmli_file_registry.json"
-    return p.parent / "llmli_file_registry.json"
 
 
 def _file_manifest_path(db_path: str | Path) -> Path:
@@ -51,7 +47,9 @@ def load_registry(db_path: str | Path) -> list[dict[str, Any]]:
 
 
 def load_file_registry(db_path: str | Path) -> dict[str, Any]:
-    return _read_json(_file_registry_path(db_path))
+    from file_registry import _read_file_registry
+
+    return _read_file_registry(db_path)
 
 
 def load_manifest(db_path: str | Path) -> dict[str, Any]:

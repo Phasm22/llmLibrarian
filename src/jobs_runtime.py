@@ -11,10 +11,14 @@ from pathlib import Path
 from typing import Any
 
 SERVICE_DEBOUNCE_DEFAULT = 30.0
-SERVICE_INTERVAL_DEFAULT = 600.0
+SERVICE_INTERVAL_DEFAULT = 3600.0
 SERVICE_RESTART_DELAY_DEFAULT = 15
 SERVICE_PREFIX_LAUNCHD = "io.llmlibrarian.watch."
 SERVICE_PREFIX_SYSTEMD = "llmlibrarian-watch-"
+# The shared MCP server unit a watcher's --watch preflight depends on. Ordered
+# as a soft (Wants=) dependency so watchers start after it at boot instead of
+# racing it; if the unit is absent under this name, systemd simply ignores it.
+SERVICE_MCP_SYSTEMD = "llmlibrarian-mcp.service"
 LOG_DIRNAME = "logs"
 # Activating N watch daemons back-to-back means N processes all connect to
 # Chroma within the same instant. Reproduced empirically: loading 8 daemons
@@ -257,7 +261,8 @@ def render_systemd_unit(
     lines = [
         "[Unit]",
         f"Description=llmLibrarian watch silo {job.slug}",
-        "After=default.target",
+        f"After=default.target {SERVICE_MCP_SYSTEMD}",
+        f"Wants={SERVICE_MCP_SYSTEMD}",
         "StartLimitIntervalSec=300",
         "StartLimitBurst=3",
         "",

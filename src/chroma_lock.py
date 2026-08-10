@@ -15,6 +15,18 @@ Non-POSIX: locking is a no-op (see chroma_lock_available()).
 ``run_retrieve`` and ``run_ask`` (CLI / pal) take a shared lock around Chroma access so
 reads coordinate with exclusive writers; writers block until shared readers finish.
 
+**Both locks are skipped in HTTP server mode.** The flock exists to stop two embedded
+``PersistentClient`` processes from mutating HNSW on one path at once. When
+``chroma run`` fronts the directory, no llmLibrarian process touches disk at all —
+the server is the single on-disk reader/writer and orders access itself. Keeping the
+flock there serializes our own clients against each other for no safety benefit, which
+is how a background index starves a query (shared) or fails a peer ``llmli add``
+outright (exclusive).
+
+Overrides, if a stray embedded writer is ever suspected:
+``LLMLIBRARIAN_CHROMA_SHARED_LOCK=1`` / ``LLMLIBRARIAN_CHROMA_EXCLUSIVE_LOCK=1``.
+In embedded mode both locks are always taken — there they are load-bearing.
+
 Policy layers (do not mix up which one you are holding):
 
 +------------------+------------------------------------------+-----------------------------+
@@ -55,8 +67,14 @@ except ImportError:  # pragma: no cover — Windows
 _T = TypeVar("_T")
 
 _LOCK_BASENAME = ".llmli_chroma.flock"
-_DEFAULT_LOCK_TIMEOUT_SECONDS = 10.0
-_LOCK_POLL_SECONDS = 0.1
+# Writers wait far longer than readers: a reader that blocks 5s looks hung to the
+# caller, but an `llmli add` queued behind another index has nothing better to do
+# than wait, and failing it outright just pushes the retry onto a human.
+_DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
+_DEFAULT_WRITE_LOCK_TIMEOUT_SECONDS = 120.0
+_LOCK_POLL_MIN_SECONDS = 0.02
+_LOCK_POLL_MAX_SECONDS = 0.5
+_LOCK_POLL_BACKOFF = 1.6
 _warned_no_fcntl = False
 
 
@@ -78,6 +96,61 @@ _excl_gates: dict[str, _ExclusiveGate] = defaultdict(_ExclusiveGate)
 
 def chroma_lock_available() -> bool:
     return fcntl is not None
+
+
+def _http_mode() -> bool:
+    """True when this process talks to ``chroma run`` over HTTP rather than on disk."""
+    try:
+        from chroma_client import is_http_mode
+    except Exception:
+        return False
+    try:
+        return is_http_mode()
+    except Exception:
+        return False
+
+
+def _forced(var: str) -> bool:
+    return os.environ.get(var, "").strip().lower() in {"1", "true", "yes", "force"}
+
+
+def _shared_read_lock_disabled() -> bool:
+    """True when the cross-process shared (read) flock should be skipped.
+
+    In HTTP server mode a single ``chroma run`` process is the only on-disk
+    reader/writer, and it serializes concurrent access safely. Holding the
+    shared flock around reads there is redundant and, worse, blocks all reads
+    for the full duration of any writer's exclusive lock — the main way lock
+    contention interferes with query availability. Skipping it lets reads flow
+    concurrently with an in-progress index write.
+
+    Escape hatch: set ``LLMLIBRARIAN_CHROMA_SHARED_LOCK=1`` (or force) to keep
+    the shared flock even in HTTP mode.
+    """
+    if _forced("LLMLIBRARIAN_CHROMA_SHARED_LOCK"):
+        return False
+    return _http_mode()
+
+
+def _exclusive_lock_disabled() -> bool:
+    """True when the cross-process exclusive (write) flock should be skipped.
+
+    Same reasoning as the shared lock, one step further. The flock exists to stop
+    two *embedded* ``PersistentClient`` processes from mutating HNSW on one path
+    concurrently. In HTTP server mode nobody does that: ``chroma run`` is the only
+    process touching disk, and it serializes writes itself. The flock then only
+    serializes llmLibrarian's own writers against each other — so a `llmli add`
+    fails after ``LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS`` waiting on a peer
+    whose write the server was already going to order safely.
+
+    Kept as the default in embedded mode, where it is load-bearing.
+
+    Escape hatch: ``LLMLIBRARIAN_CHROMA_EXCLUSIVE_LOCK=1`` forces the flock even
+    in HTTP mode (belt-and-braces if a stray embedded writer is suspected).
+    """
+    if _forced("LLMLIBRARIAN_CHROMA_EXCLUSIVE_LOCK"):
+        return False
+    return _http_mode()
 
 
 def _resolve_db(db_path: str | Path) -> str:
@@ -105,16 +178,45 @@ def _lock_file_path(db_path: str) -> Path:
     return root / _LOCK_BASENAME
 
 
-def _lock_timeout_seconds() -> float | None:
-    raw = os.environ.get("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS", "").strip()
-    if not raw:
-        return _DEFAULT_LOCK_TIMEOUT_SECONDS
-    if raw.lower() in {"0", "none", "off", "false", "no"}:
+_BLOCK_FOREVER = {"0", "none", "off", "false", "no"}
+
+
+def _parse_timeout(raw: str, default: float) -> float | None:
+    """Parse one timeout value. Empty means "not set" (caller falls through)."""
+    if raw.lower() in _BLOCK_FOREVER:
         return None
     try:
         return max(0.0, float(raw))
     except ValueError:
-        return _DEFAULT_LOCK_TIMEOUT_SECONDS
+        return default
+
+
+def _lock_timeout_seconds(write: bool = False, env_name: str | None = None) -> float | None:
+    """Seconds to wait for a Chroma lock; None means block indefinitely.
+
+    Consulted in order: ``env_name`` (a caller-specific override, e.g. the MCP
+    server's in-process mutex), then the writer-only variable, then the shared
+    one. Writers get their own much longer default — see the module constants.
+
+    Every lock layer must read its budget through this function. The
+    block-forever sentinel is why: a caller that reimplemented it as a plain
+    float turns ``...LOCK_TIMEOUT_SECONDS=0`` into an instant timeout in one
+    layer while it means "wait forever" in another.
+    """
+    default = _DEFAULT_WRITE_LOCK_TIMEOUT_SECONDS if write else _DEFAULT_LOCK_TIMEOUT_SECONDS
+
+    candidates: list[str] = []
+    if env_name:
+        candidates.append(env_name)
+    if write:
+        candidates.append("LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS")
+    candidates.append("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS")
+
+    for name in candidates:
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            return _parse_timeout(raw, default)
+    return default
 
 
 def _lock_holders(path: Path) -> list[int]:
@@ -150,19 +252,31 @@ def chroma_lock_snapshot(db_path: str | Path) -> dict[str, Any]:
     }
 
 
-def _acquire_flock(f: Any, operation: int, *, mode: str, db_path: str, path: Path) -> None:
-    timeout = _lock_timeout_seconds()
+def _acquire_flock(
+    f: Any, operation: int, *, mode: str, db_path: str, path: Path, write: bool = False
+) -> None:
+    """Take the flock, waiting up to the configured timeout.
+
+    Polls with exponential backoff rather than a fixed 100ms tick: under
+    contention a tight poll makes every waiter wake, fail, and re-queue in
+    lockstep, which is how a busy index turns into a thundering herd. Backoff
+    keeps the fast path (lock free within a few ms) fast while thinning out
+    retries as the wait gets long.
+    """
+    timeout = _lock_timeout_seconds(write=write)
     if timeout is None:
         fcntl.flock(f.fileno(), operation)
         return
 
     deadline = time.monotonic() + timeout
+    delay = _LOCK_POLL_MIN_SECONDS
     while True:
         try:
             fcntl.flock(f.fileno(), operation | fcntl.LOCK_NB)
             return
         except BlockingIOError:
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 holders = _lock_holders(path)
                 holder_text = f" holder_pids={holders}" if holders else ""
                 raise ChromaLockTimeoutError(
@@ -171,14 +285,22 @@ def _acquire_flock(f: Any, operation: int, *, mode: str, db_path: str, path: Pat
                     "Another llmLibrarian index/query process is using the database; "
                     "retry when it finishes or stop the stuck process."
                 )
-            time.sleep(_LOCK_POLL_SECONDS)
+            time.sleep(min(delay, remaining))
+            delay = min(delay * _LOCK_POLL_BACKOFF, _LOCK_POLL_MAX_SECONDS)
 
 
 @contextmanager
 def chroma_shared_lock(db_path: str | Path) -> Iterator[None]:
-    """Advisory shared lock for Chroma reads (query/get)."""
+    """Advisory shared lock for Chroma reads (query/get).
+
+    No-op in HTTP server mode (the ``chroma run`` server is the single on-disk
+    reader/writer and serializes safely); see ``_shared_read_lock_disabled``.
+    """
     if fcntl is None:
         _warn_no_fcntl_once()
+        yield
+        return
+    if _shared_read_lock_disabled():
         yield
         return
     key = _resolve_db(db_path)
@@ -197,9 +319,16 @@ def chroma_shared_lock(db_path: str | Path) -> Iterator[None]:
 
 @contextmanager
 def chroma_exclusive_lock(db_path: str | Path) -> Iterator[None]:
-    """Advisory exclusive lock for Chroma writes (add/delete/repair). Reentrant."""
+    """Advisory exclusive lock for Chroma writes (add/delete/repair). Reentrant.
+
+    No-op in HTTP server mode — ``chroma run`` owns the persist directory and
+    orders writes itself; see ``_exclusive_lock_disabled``.
+    """
     if fcntl is None:
         _warn_no_fcntl_once()
+        yield
+        return
+    if _exclusive_lock_disabled():
         yield
         return
     key = _resolve_db(db_path)
@@ -210,7 +339,9 @@ def chroma_exclusive_lock(db_path: str | Path) -> Iterator[None]:
             path = _lock_file_path(key)
             gate.fd = open(path, "a+", encoding="utf-8")
             try:
-                _acquire_flock(gate.fd, fcntl.LOCK_EX, mode="exclusive", db_path=key, path=path)
+                _acquire_flock(
+                    gate.fd, fcntl.LOCK_EX, mode="exclusive", db_path=key, path=path, write=True
+                )
             except Exception:
                 gate.fd.close()
                 gate.fd = None
