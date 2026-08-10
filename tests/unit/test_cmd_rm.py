@@ -43,13 +43,11 @@ def test_cmd_rm_removes_registered_silo(monkeypatch, capsys):
     monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _raw: None)
     monkeypatch.setattr("state.resolve_silo_prefix", lambda _db, _raw: None)
     monkeypatch.setattr("state.remove_manifest_silo", lambda _db, slug: deleted.setdefault("manifest", slug))
-    monkeypatch.setattr("ingest._file_registry_remove_silo", lambda _db, slug: deleted.setdefault("registry", slug))
 
     rc = cli.cmd_rm(SimpleNamespace(silo="Tax", db="/tmp/db"))
     assert rc == 0
     assert fake_coll.deleted_where == {"silo": "tax-1234abcd"}
     assert deleted["manifest"] == "tax-1234abcd"
-    assert deleted["registry"] == "tax-1234abcd"
     assert "Removed silo: tax-1234abcd" in capsys.readouterr().out
 
 
@@ -62,7 +60,6 @@ def test_cmd_rm_cleans_orphan_slug_when_not_in_registry(monkeypatch, capsys):
     monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _raw: None)
     monkeypatch.setattr("state.resolve_silo_prefix", lambda _db, _raw: None)
     monkeypatch.setattr("state.remove_manifest_silo", lambda _db, slug: deleted.setdefault("manifest", slug))
-    monkeypatch.setattr("ingest._file_registry_remove_silo", lambda _db, slug: deleted.setdefault("registry", slug))
 
     rc = cli.cmd_rm(SimpleNamespace(silo="unknown", db="/tmp/db"))
     out = capsys.readouterr().out
@@ -70,7 +67,6 @@ def test_cmd_rm_cleans_orphan_slug_when_not_in_registry(monkeypatch, capsys):
     assert "derived-slug" in out
     assert fake_coll.deleted_where == {"silo": "derived-slug"}
     assert deleted["manifest"] == "derived-slug"
-    assert deleted["registry"] == "derived-slug"
 
 
 def test_cmd_rm_path_with_spaces_resolves_to_registered_slug(monkeypatch, tmp_path):
@@ -82,7 +78,6 @@ def test_cmd_rm_path_with_spaces_resolves_to_registered_slug(monkeypatch, tmp_pa
     monkeypatch.setattr("state.slugify", lambda raw: f"slug-{raw}")
     monkeypatch.setattr("state.remove_silo", lambda _db, name: observed.setdefault("remove_arg", name) or "resolved-by-path")
     monkeypatch.setattr("state.remove_manifest_silo", lambda _db, _slug: None)
-    monkeypatch.setattr("ingest._file_registry_remove_silo", lambda _db, _slug: None)
 
     path_with_spaces = tmp_path / "Become a Linear Algebra Master"
     path_with_spaces.mkdir()
@@ -103,11 +98,9 @@ def test_cmd_rm_continues_when_db_delete_fails(monkeypatch, capsys):
     monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _raw: None)
     monkeypatch.setattr("state.resolve_silo_prefix", lambda _db, _raw: None)
     monkeypatch.setattr("state.remove_manifest_silo", lambda _db, slug: deleted.setdefault("manifest", slug))
-    monkeypatch.setattr("ingest._file_registry_remove_silo", lambda _db, slug: deleted.setdefault("registry", slug))
 
     rc = cli.cmd_rm(SimpleNamespace(silo="Tax", db="/tmp/db"))
     err = capsys.readouterr().err
     assert rc == 0
     assert "could not delete chunks from DB" in err
     assert deleted["manifest"] == "tax-1234abcd"
-    assert deleted["registry"] == "tax-1234abcd"

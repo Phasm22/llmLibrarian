@@ -217,7 +217,6 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
     """
     from state import remove_silo, slugify, resolve_silo_by_path, resolve_silo_prefix, remove_manifest_silo
     from constants import LLMLI_COLLECTION
-    from ingest import _file_registry_remove_silo
     from chroma_client import get_client, release
 
     raw = slug_or_name
@@ -240,7 +239,6 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
     finally:
         release()
 
-    _file_registry_remove_silo(db_path, slug_to_clean)
     remove_manifest_silo(db_path, slug_to_clean)
 
     return {
@@ -265,7 +263,7 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
     """
     from state import list_silos, resolve_silo_to_slug, resolve_silo_prefix, remove_manifest_silo
     from constants import LLMLI_COLLECTION
-    from ingest import _file_registry_remove_silo, run_add
+    from ingest import run_add
     from chroma_client import get_client, release
 
     raw = slug_or_name
@@ -308,8 +306,7 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
                     pass
 
             if verbose:
-                print(f"[repair] Clearing file registry for silo '{slug}'...")
-            _file_registry_remove_silo(db_path, slug)
+                print(f"[repair] Clearing file manifest for silo '{slug}'...")
             remove_manifest_silo(db_path, slug)
 
             # Drop the singleton PersistentClient before run_add opens its own

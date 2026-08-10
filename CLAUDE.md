@@ -7,8 +7,10 @@ Guidance for Claude Code working in this repository.
 llmLibrarian indexes **folders you choose** into a local vector store and answers questions from **that index only** — via MCP tools (chunks for the host model) or `pal ask` (retrieve + local Ollama). No built-in chat memory; each query is grounded in indexed files + current question.
 
 **Why it exists (user-facing):** [README.md](README.md), [docs/GUIDE.md](docs/GUIDE.md).  
-**Agent operations:** [AGENTS.md](AGENTS.md).  
+**Agent operations:** [AGENTS.md](AGENTS.md) (includes `pc-stacks` host runtime).  
 **Technical contracts:** [docs/TECH.md](docs/TECH.md).
+
+**Linux desktop:** stack is cold at login — `pc-stacks up llmlibrarian` before MCP. See [`/home/tj/bin/README.md`](/home/tj/bin/README.md).
 
 ## Development commands
 
@@ -32,6 +34,7 @@ llmli capabilities
 pal pull <folder>              # --watch for daemon
 pal ask --in <silo> "query"
 pal ls --status
+pal queries                    # audit past MCP queries (--grep/--silo/--since/--summary)
 pal chroma install|start|stop|status|logs|uninstall
 pal mcp install|start|stop|status|logs|uninstall
 pal daemon install|sync|logs|prune-logs|uninstall
@@ -48,12 +51,15 @@ pal uninstall [--purge|--purge-data] [--yes]   # tears down mcp+daemon+chroma; k
 - `query/` — `intent.py`, `retrieval.py` (hybrid/RRF), `core.py` (`run_ask`, `run_retrieve`)
 - `chroma_client.py` — singleton client; HTTP vs embedded; `writer_client` for writes
 - `chroma_lock.py` — cross-process flock
-- `state.py` — registry, manifest, query health
+- `state.py` — silo registry, ingest failures, query health
+- `file_registry.py` — file manifest (source of truth for indexed files); the content-hash index is derived from it in memory
 - `mcp_server.py` — FastMCP tools + HTTP `/healthz`
 
 **Storage:** `LLMLIBRARIAN_DB` (default `./my_brain_db`); collection `llmli`; silo in metadata. Server mode: `chroma run` + `LLMLIBRARIAN_CHROMA_HOST`.
 
-**MCP tools:** `session_context`, `mcp_runtime_status`, `query_personal_knowledge`, `multi_query_knowledge`, `list_silos`, `add_silo`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md).
+**MCP tools:** `session_context`, `mcp_runtime_status`, `query_personal_knowledge`, `multi_query_knowledge`, `recent_queries`, `list_silos`, `add_silo`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md).
+
+**Query audit:** every MCP query appends query text + params + per-source-file chunk breakdown to `~/.pal/logs/query-audit.jsonl` (`src/query_audit.py`; disable with `LLMLIBRARIAN_QUERY_AUDIT=0`). Read it via `pal queries` or the `recent_queries` MCP tool. Separate from `usage.log`, which stays a text-free metrics feed for the Argus dashboard.
 
 **Data flow:**
 

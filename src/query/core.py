@@ -130,8 +130,9 @@ def run_retrieve(
     from query.retrieve_locked import execute_retrieve_chroma_phase
 
     _gc = get_chroma_client or get_client
+    before = _sample_write_state(db, silo_slug)
     with chroma_shared_lock(str(db)):
-        return execute_retrieve_chroma_phase(
+        result = execute_retrieve_chroma_phase(
             db=db,
             intent=intent,
             query=query,
@@ -144,6 +145,45 @@ def run_retrieve(
             db_path=str(db_path) if db_path is not None else None,
             get_chroma_client=_gc,
         )
+    return annotate_write_state(result, before, _sample_write_state(db, silo_slug))
+
+
+def _sample_write_state(db: str, silo_slug: str | None) -> dict | None:
+    try:
+        from ingest_journal import write_in_progress
+
+        return write_in_progress(db, silo_slug)
+    except Exception:
+        return None
+
+
+def annotate_write_state(result: dict, before: dict | None, after: dict | None) -> dict:
+    """Tag a retrieval result when a write was in flight while it ran.
+
+    A full rebuild empties the silo before re-adding it, so a query landing in
+    that window returns zero chunks and no error — which reads as "the source
+    doesn't contain that." Sampled either side of the read and merged, because a
+    write starting mid-read is exactly the case that corrupts the answer.
+    """
+    from ingest_journal import merge_write_states
+
+    if not isinstance(result, dict):
+        return result
+    merged = merge_write_states([before, after])
+    if not merged:
+        return result
+    result["write_in_progress"] = merged
+    rebuilding = merged["rebuilding"]
+    if merged["results_may_be_incomplete"]:
+        result["retryable"] = True
+        note = (
+            f"Index rebuild in progress for {', '.join(rebuilding)} — these results may be "
+            "partial or empty. Do not read an empty result as absence of evidence; retry "
+            "once the rebuild finishes."
+        )
+        existing = result.get("coverage_note")
+        result["coverage_note"] = f"{existing} {note}" if existing else note
+    return result
 
 
 def main() -> None:

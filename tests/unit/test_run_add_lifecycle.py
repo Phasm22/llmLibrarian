@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from ingest import CloudSyncPathError, _file_manifest_path, run_add
-from file_registry import _file_registry_path
 from processors import ImageExtractionError
 from image_embeddings import ImageEmbeddingError
 from state import get_silo_exclude_patterns, update_silo, resolve_silo_by_path
@@ -292,21 +291,104 @@ def test_run_add_reuses_cross_silo_duplicates(monkeypatch, tmp_path):
 
 
 def test_run_add_full_reindex_deletes_existing_silo_before_add(monkeypatch, tmp_path):
+    """A rebuild drops the silo's Chroma rows.
+
+    File state is not cleared here: the manifest keeps the silo's previous file
+    set for the whole crawl and is replaced wholesale by _overwrite_manifest at
+    the end. See test_full_reindex_does_not_flag_its_own_prior_files.
+    """
     root = tmp_path / "docs"
     root.mkdir()
     coll = _FakeCollection()
     _patch_runtime(monkeypatch, coll)
-    removed = {}
 
     monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _path: None)
     monkeypatch.setattr("state.slugify", lambda _name, _path=None: "silo-fixed")
     monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [])
-    monkeypatch.setattr("ingest._file_registry_remove_silo", lambda _db, slug: removed.setdefault("slug", slug))
 
     run_add(root, db_path=tmp_path / "db", allow_cloud=True, incremental=False)
     assert {"silo": "silo-fixed"} in coll.delete_calls
-    assert removed["slug"] == "silo-fixed"
 
+
+
+def _seed_silo_manifest(db_path, slug, root, entries):
+    """Write a manifest for `slug` mapping resolved path -> {mtime,size,hash}."""
+    db_path.mkdir(parents=True, exist_ok=True)
+    manifest_path = _file_manifest_path(db_path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps({"silos": {slug: {"path": str(root.resolve()), "files": entries}}}),
+        encoding="utf-8",
+    )
+
+
+def test_full_reindex_does_not_flag_its_own_prior_files(monkeypatch, tmp_path, capsys):
+    """A rebuild leaves the silo's previous entries in the manifest for the whole
+    crawl, so the duplicate-content check would otherwise match the file against
+    its own prior record and warn on every single file."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    f = root / "a.txt"
+    f.write_text("hello", encoding="utf-8")
+    stat = f.resolve().stat()
+
+    db_path = tmp_path / "db"
+    # Prior run recorded this same content at a DIFFERENT path in this silo.
+    _seed_silo_manifest(
+        db_path,
+        "silo-fixed",
+        root,
+        {str(root.resolve() / "old-name.txt"): {"mtime": stat.st_mtime, "size": stat.st_size, "hash": "h1"}},
+    )
+
+    coll = _FakeCollection()
+    _patch_runtime(monkeypatch, coll)
+    monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _path: None)
+    monkeypatch.setattr("state.slugify", lambda _name, _path=None: "silo-fixed")
+    monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [(f, "code")])
+    monkeypatch.setattr("ingest.get_file_hash", lambda _p: "h1")
+    monkeypatch.setattr("ingest.process_one_file", lambda *a, **k: [])
+
+    capsys.readouterr()
+    run_add(root, db_path=db_path, allow_cloud=True, incremental=False)
+
+    captured = capsys.readouterr()
+    assert "Duplicate content" not in captured.err
+    assert "Duplicate content" not in captured.out
+
+
+def test_incremental_reindexes_when_content_changes_under_same_mtime_and_size(
+    monkeypatch, tmp_path
+):
+    """mtime and size alone are not proof a file is unchanged. The manifest's
+    hash is the tiebreak, so an edit that preserves both must still re-index."""
+    root = tmp_path / "docs"
+    root.mkdir()
+    f = root / "a.txt"
+    f.write_text("hello", encoding="utf-8")
+    stat = f.resolve().stat()
+
+    db_path = tmp_path / "db"
+    _seed_silo_manifest(
+        db_path,
+        "silo-fixed",
+        root,
+        {str(f.resolve()): {"mtime": stat.st_mtime, "size": stat.st_size, "hash": "OLD-HASH"}},
+    )
+
+    coll = _FakeCollection()
+    _patch_runtime(monkeypatch, coll)
+    called = {"process": 0}
+    monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _path: None)
+    monkeypatch.setattr("state.slugify", lambda _name, _path=None: "silo-fixed")
+    monkeypatch.setattr("ingest.collect_files", lambda *a, **k: [(f, "code")])
+    monkeypatch.setattr("ingest.get_file_hash", lambda _p: "NEW-HASH")
+    monkeypatch.setattr(
+        "ingest.process_one_file", lambda *a, **k: called.__setitem__("process", 1) or []
+    )
+
+    run_add(root, db_path=db_path, allow_cloud=True, incremental=True)
+    assert called["process"] == 1, "content change with identical stat was skipped"
 
 def test_run_add_incremental_skips_unchanged_files(monkeypatch, tmp_path):
     root = tmp_path / "docs"
@@ -339,18 +421,7 @@ def test_run_add_incremental_skips_unchanged_files(monkeypatch, tmp_path):
         ),
         encoding="utf-8",
     )
-    registry_path = _file_registry_path(db_path)
-    registry_path.parent.mkdir(parents=True, exist_ok=True)
-    registry_path.write_text(
-        json.dumps(
-            {
-                "by_hash": {
-                    "h1": [{"silo": "silo-fixed", "path": str(f.resolve())}],
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
+    # No separate registry seeding: the manifest entry above is the hash record.
 
     coll = _FakeCollection()
     _patch_runtime(monkeypatch, coll)

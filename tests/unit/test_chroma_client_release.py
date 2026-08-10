@@ -8,11 +8,21 @@ intentionally drops only the Python-side references and never calls
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 import chroma_client
+
+
+def _key(db_path: str) -> str:
+    """The cache key get_client derives for a path.
+
+    Asserting against a raw literal breaks on macOS, where /tmp is a symlink
+    to /private/tmp and the product's .resolve() follows it.
+    """
+    return str(Path(db_path).expanduser().resolve())
 
 
 @pytest.fixture(autouse=True)
@@ -131,4 +141,4 @@ def test_get_client_runs_preflight_only_on_creation(monkeypatch):
     chroma_client.get_client("/tmp/db")
     chroma_client.get_client("/tmp/db")
 
-    assert preflight_calls == ["/tmp/db"]
+    assert preflight_calls == [_key("/tmp/db")]

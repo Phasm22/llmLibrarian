@@ -55,12 +55,7 @@ from file_registry import (
     _read_file_manifest,
     _write_file_manifest,
     _update_file_manifest,
-    _file_registry_path,
-    _read_file_registry,
     _file_registry_get,
-    _file_registry_add,
-    _file_registry_remove_path,
-    _file_registry_remove_silo,
     get_paths_by_silo,
 )
 from load_config import load_config, get_archetype
@@ -2121,6 +2116,86 @@ def run_index(
         _run_index_chroma_phase(client)
 
 
+# Observed HNSW settle lag after a batch write is sub-second; this is headroom,
+# not an expected wait. Only index-build errors are retried (see below), so a
+# genuinely broken collection returns immediately rather than burning the budget.
+_QUERYABLE_TIMEOUT_SECONDS = 10.0
+_QUERYABLE_POLL_SECONDS = 0.1
+
+
+def _wait_until_queryable(collection: Any, silo_slug: str, timeout: float | None = None) -> bool:
+    """Block until a *vector* query against the silo stops erroring.
+
+    Probes with a stored embedding rather than fresh text so this costs no model
+    inference and needs no knowledge of the embedding dimension. It must be a
+    query, not a get: `get` answers from metadata and succeeds while HNSW is
+    still building, which is exactly the window that raises "Error finding id"
+    on the read path.
+
+    Returns True once the silo answers, False if it never settled within the
+    budget — best-effort quiesce, not a correctness gate, so the caller proceeds
+    either way.
+    """
+    budget = _QUERYABLE_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time.monotonic() + budget
+    probe: Any = None
+    while True:
+        try:
+            if probe is None:
+                sample = collection.get(
+                    where={"silo": silo_slug}, limit=1, include=["embeddings"]
+                )
+                embeddings = (sample or {}).get("embeddings") or []
+                if len(embeddings) == 0:
+                    return True  # nothing stored for this silo; nothing to settle
+                probe = embeddings[0]
+            collection.query(
+                query_embeddings=[probe],
+                n_results=1,
+                where={"silo": silo_slug},
+                include=[],
+            )
+            return True
+        except Exception as e:
+            # Only the HNSW build-lag error is worth waiting on. Anything else
+            # (missing collection, transport failure, a stub in tests) will not
+            # resolve by sleeping, so return instead of burning the budget.
+            from query.core_support import _is_chroma_index_error
+
+            if not _is_chroma_index_error(e) or time.monotonic() >= deadline:
+                return False
+            probe = None  # re-fetch: the earlier get may itself have been mid-build
+            time.sleep(_QUERYABLE_POLL_SECONDS)
+
+
+def _delete_silo_rows_for_rebuild(
+    db_path: str | Path,
+    silo_slug: str,
+    collection: Any,
+    image_collection: Any,
+    no_color: bool = False,
+) -> None:
+    """Drop a silo's existing rows as the first step of a full rebuild.
+
+    Called immediately before the replacement batch is written, not at the top of
+    ``run_add``: the delete is what makes the silo queryable-but-empty, so the
+    window between it and the re-add should be as short as possible.
+    """
+    for label, coll in (("chunks", collection), ("images", image_collection)):
+        try:
+            coll.delete(where={"silo": silo_slug})
+        except Exception as e:
+            try:
+                from state import record_index_error
+                record_index_error(db_path, silo_slug, e)
+            except Exception:
+                pass
+            print(
+                f"[ingest] warn: rebuild delete ({label}) failed for {silo_slug}: {e}",
+                file=sys.stderr,
+            )
+
+
 def run_add(
     path: str | Path,
     db_path: str | Path | None = None,
@@ -2295,33 +2370,13 @@ def run_add(
             except Exception:
                 pass
     
-        if not incremental:
-            try:
-                collection.delete(where={"silo": silo_slug})
-            except Exception as e:
-                try:
-                    from state import record_index_error
-                    record_index_error(db_path, silo_slug, e)
-                except Exception:
-                    pass
-                print(
-                    f"[ingest] warn: rebuild delete (chunks) failed for {silo_slug}: {e}",
-                    file=sys.stderr,
-                )
-            try:
-                image_collection.delete(where={"silo": silo_slug})
-            except Exception as e:
-                try:
-                    from state import record_index_error
-                    record_index_error(db_path, silo_slug, e)
-                except Exception:
-                    pass
-                print(
-                    f"[ingest] warn: rebuild delete (images) failed for {silo_slug}: {e}",
-                    file=sys.stderr,
-                )
-            _file_registry_remove_silo(db_path, silo_slug)
-    
+        # NOTE: on a rebuild the Chroma row delete is deliberately NOT here. It is
+        # deferred to just before _batch_add (see _delete_silo_rows_for_rebuild) so
+        # the silo is not left empty for the whole crawl/extract/embed phase.
+        # The on-disk manifest likewise still holds this silo's previous file set
+        # until _overwrite_manifest runs at the end, which is why the duplicate
+        # check below filters this silo out when not incremental.
+
         # Pre-pass: resolve paths, hash, skip duplicates (same file already indexed in any silo)
         regular_with_hash: list[tuple[Path, str, str, Path | None]] = []
         manifest = _read_file_manifest(db_path) if incremental else {"silos": {}}
@@ -2351,16 +2406,19 @@ def run_add(
                 if incremental:
                     prev = manifest_files.get(str(p_res)) if isinstance(manifest_files, dict) else None
                     if prev and prev.get("mtime") == mtime and prev.get("size") == size:
-                        if not h:
-                            continue
-                        existing_same = any(
-                            str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") == str(p_res)
-                            for e in _file_registry_get(db_path, h)
-                        )
-                        if existing_same:
+                        # Unchanged stat, but still confirm the content hash: an edit
+                        # that preserves both mtime and size would otherwise be skipped.
+                        # The manifest entry is the hash record, so this is a local
+                        # compare rather than a lookup through the derived index.
+                        if not h or prev.get("hash") == h:
                             continue
                 if h:
                     existing_entries = _file_registry_get(db_path, h)
+                    if not incremental:
+                        existing_entries = [
+                            e for e in existing_entries
+                            if str(e.get("silo") or "") != silo_slug
+                        ]
                     # Warn when identical content is already indexed in this silo under a different path.
                     same_silo_dupes = [
                         str(e.get("path") or "")
@@ -2419,15 +2477,12 @@ def run_add(
                         silo_slug=silo_slug,
                         source_path=path_str,
                     )
-                    prev = manifest_files.get(path_str) or {}
-                    _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
     
         all_chunks = []
         all_image_vectors: list[ImageVectorTuple] = []
         tax_rows: list[dict[str, Any]] = []
         files_indexed = 0
         failures = []
-        to_register: list[tuple[str, str]] = []  # (file_hash, path_str) for main-thread registry update
         image_total = sum(1 for _p, kind in regular if kind == "image")
         image_done = 0
         eager_summaries = 0
@@ -2446,8 +2501,6 @@ def run_add(
                     silo_slug=silo_slug,
                     source_path=path_str,
                 )
-                prev = manifest_files.get(path_str) or {}
-                _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
     
         if precloned_by_path:
             for path_str, (fhash, cloned_chunks) in precloned_by_path.items():
@@ -2475,8 +2528,6 @@ def run_add(
                         deferred_summaries += 1
                 tax_rows.extend(extract_tax_rows_from_chunks(cloned_norm))
                 files_indexed += 1
-                if fhash:
-                    to_register.append((fhash, path_str))
     
         total_to_process = len(regular_with_hash) + len(zips)
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="llmli-file") as executor:
@@ -2547,8 +2598,6 @@ def run_add(
                     files_indexed += 1
                     if not quiet and sys.stdout.isatty():
                         status_line(f"↻ {files_indexed}/{total_to_process}: {p.name}")
-                    if fhash:
-                        to_register.append((fhash, str(p)))
                 elif kind == "pdf" and not _suppress_recoverable_warnings():
                     print(
                         warn_style(
@@ -2645,9 +2694,18 @@ def run_add(
             _pre_write_hook()
 
         # Write-ahead marker: if we crash between here and clear_pending, the next
-        # run will detect this silo as interrupted and force a full non-incremental re-index.
+        # run will detect this silo as interrupted and force a full non-incremental
+        # re-index. It also makes the write visible to concurrent readers while it
+        # runs — see ingest_journal.write_in_progress.
         from ingest_journal import write_pending, clear_pending
-        write_pending(str(db_path), silo_slug)
+        write_pending(str(db_path), silo_slug, kind="incremental" if incremental else "full")
+
+        # Deferred rebuild delete: replacements are embedded and in hand, so the
+        # empty window is now the batch write rather than the whole extract phase.
+        if not incremental:
+            _delete_silo_rows_for_rebuild(
+                db_path, silo_slug, collection, image_collection, no_color=no_color
+            )
     
         if all_chunks:
             batch_size = ADD_BATCH_SIZE
@@ -2687,8 +2745,6 @@ def run_add(
                 )
     
         # State writes — all happen after ChromaDB batch_add succeeds.
-        for fhash, path_str in to_register:
-            _file_registry_add(db_path, fhash, silo_slug, path_str)
         if incremental:
             _update_file_manifest(db_path, _update_manifest)
         else:
@@ -2767,6 +2823,13 @@ def run_add(
             exclude_patterns=effective_excludes if effective_excludes else None,
         )
         set_last_failures(db_path, failures)
+        # Hold the in-progress marker until the silo is actually queryable. Chroma
+        # keeps building HNSW for a beat after the batch write returns, and queries
+        # landing in that gap raise "Error finding id" and fall back to a global
+        # scan — which can yield zero chunks for a silo that is in fact complete.
+        # Clearing the marker on write-completion alone left that window unflagged.
+        if all_chunks:
+            _wait_until_queryable(collection, silo_slug)
         clear_pending(str(db_path), silo_slug)
         elapsed_seconds = time.perf_counter() - run_started_at
         elapsed_label = f"{elapsed_seconds:.1f}s"
@@ -2918,8 +2981,6 @@ def remove_single_file(
             silo_slug=silo_slug,
             source_path=path_str,
         )
-        if prev:
-            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
         def _update_manifest(manifest_data: dict) -> None:
             silos = manifest_data.setdefault("silos", {})
@@ -3030,11 +3091,10 @@ def update_single_file(
         if prev and prev.get("mtime") == mtime and prev.get("size") == size:
             if not file_hash:
                 return ("unchanged", path_str)
-            existing_same = any(
-                str(e.get("silo") or "") == silo_slug and str(e.get("path") or "") == path_str
-                for e in _file_registry_get(db_path, file_hash)
-            )
-            if prev.get("hash") == file_hash and existing_same:
+            # The manifest entry IS this path's hash record, so comparing it is
+            # the whole check — the derived index would only report back what
+            # prev already says.
+            if prev.get("hash") == file_hash:
                 return ("unchanged", path_str)
         if file_hash:
             existing = _file_registry_get(db_path, file_hash)
@@ -3110,8 +3170,6 @@ def update_single_file(
             silo_slug=silo_slug,
             source_path=path_str,
         )
-        if prev:
-            _file_registry_remove_path(db_path, silo_slug, path_str, prev.get("hash"))
 
         if chunks:
             _now_iso = datetime.now(timezone.utc).isoformat()
@@ -3150,8 +3208,6 @@ def update_single_file(
                     batch_size=1,
                     no_color=no_color,
                 )
-            if file_hash:
-                _file_registry_add(db_path, file_hash, silo_slug, path_str)
         tax_rows = extract_tax_rows_from_chunks(chunks) if chunks else []
 
         def _update_manifest(manifest_data: dict) -> None:
