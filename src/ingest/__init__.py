@@ -69,22 +69,9 @@ DEFAULT_MAX_ARCHIVE_SIZE_BYTES = 100 * 1024 * 1024  # 100 MB
 DEFAULT_MAX_FILES_PER_ZIP = 500
 DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP = 50 * 1024 * 1024  # 50 MB
 # Default include/exclude for llmli add. First-class: text + code + pdf/docx + xlsx/pptx (no silent ignore).
-ADD_DEFAULT_INCLUDE = [
-    "*.py", "*.ts", "*.tsx", "*.js", "*.go", "*.rs", "*.sh", "*.md", "*.txt",
-    "*.yml", "*.yaml", "*.json", "*.csv", "*.xml", "*.html", "*.htm", "*.rst", "*.toml", "*.ini", "*.cfg", "*.sql",
-    "*.pdf", "*.docx", "*.xlsx", "*.pptx",
-    "*.png", "*.jpg", "*.jpeg", "*.heic", "*.heif", "*.tif", "*.tiff",
-]
-ADD_DEFAULT_EXCLUDE = [
-    # Obsidian / journalLinker intent cortex lives under .../cortex/; keep out of retrieval silos.
-    "/cortex/",
-    "node_modules/", ".venv/", "venv/", "env/", "__pycache__/", "vendor", "dist", "build", ".git",
-    "llmLibrarianVenv/", "site-packages/", "Old Firefox Data", "Firefox", ".app/",
-    ".env", ".env.*", ".aws/", ".ssh/", "*.pem", "*.key", "secrets.json", "credentials.json", "credentials*.json",
-    "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "Pipfile.lock", "poetry.lock",
-    "composer.lock", "Gemfile.lock", "Cargo.lock", "uv.lock",
-    "my_brain_db/", "*.db", "*.sqlite", "*.sqlite3", "*.sqlite3-journal",
-]
+# Defined in scan_patterns so the watch daemons' lightweight scanner shares
+# exactly one copy; re-exported here for existing callers.
+from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE  # noqa: F401,E402
 
 
 def _normalize_patterns(patterns: list[str] | tuple[str, ...] | None) -> list[str]:

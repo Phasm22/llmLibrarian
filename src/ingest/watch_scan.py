@@ -13,21 +13,7 @@ DEFAULT_MAX_DEPTH = 10
 DEFAULT_MAX_FILES_PER_ZIP = 500
 DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP = 50 * 1024 * 1024
 
-ADD_DEFAULT_INCLUDE = [
-    "*.py", "*.ts", "*.tsx", "*.js", "*.go", "*.rs", "*.sh", "*.md", "*.txt",
-    "*.yml", "*.yaml", "*.json", "*.csv", "*.xml", "*.html", "*.htm", "*.rst", "*.toml", "*.ini", "*.cfg", "*.sql",
-    "*.pdf", "*.docx", "*.xlsx", "*.pptx",
-    "*.png", "*.jpg", "*.jpeg", "*.heic", "*.heif", "*.tif", "*.tiff",
-]
-ADD_DEFAULT_EXCLUDE = [
-    "/cortex/",
-    "node_modules/", ".venv/", "venv/", "env/", "__pycache__/", "vendor", "dist", "build", ".git",
-    "llmLibrarianVenv/", "site-packages/", "Old Firefox Data", "Firefox", ".app/",
-    ".env", ".env.*", ".aws/", ".ssh/", "*.pem", "*.key", "secrets.json", "credentials.json", "credentials*.json",
-    "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "Pipfile.lock", "poetry.lock",
-    "composer.lock", "Gemfile.lock", "Cargo.lock", "uv.lock",
-    "my_brain_db/", "*.db", "*.sqlite", "*.sqlite3", "*.sqlite3-journal",
-]
+from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE  # noqa: F401  (re-exported)
 
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"})
 _PREVIEW_SKIPPED_EXTENSIONS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".wav", ".mp3", ".aac"})
