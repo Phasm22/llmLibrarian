@@ -650,8 +650,43 @@ def _read_mcp_pid_lock_snapshot() -> dict:
         return out
 
 
+_MCP_PROCTITLE_PREFIX = "llmLibrarian-mcp"
+
+
 def _is_mcp_cmdline(joined: str) -> bool:
-    return "mcp_server.py" in joined and "llmLibrarian" in joined
+    """True for an actual MCP server, not a launcher that spawned one.
+
+    Servers set a proctitle (src/proctitle.py) such as
+    ``llmLibrarian-mcp:stdio:claude``, which *replaces* argv. So a
+    ``"mcp_server.py" in joined`` test gets it exactly backwards: it misses
+    every real server while matching the launchers whose argv still carries
+    the script path — ``uv run mcp_server.py``, the host app's helper, and a
+    client binary whose ``--mcp-config`` merely mentions it. Observed live as
+    "3 processes" when three of those were launchers and one real server went
+    uncounted.
+    """
+    if joined.startswith(_MCP_PROCTITLE_PREFIX):
+        return True
+    # Fallback for installs without setproctitle: the interpreter itself
+    # running the script. Launchers name the same path but are not the
+    # interpreter executing it.
+    parts = joined.split()
+    if len(parts) < 2:
+        return False
+    exe = parts[0].rsplit("/", 1)[-1]
+    return exe.startswith("python") and any(a.endswith("mcp_server.py") for a in parts[1:])
+
+
+def _mcp_transport(joined: str) -> str | None:
+    """Transport from a proctitle (``llmLibrarian-mcp:<transport>:...``).
+
+    None when the process predates proctitles or setproctitle is absent.
+    """
+    if not joined.startswith(_MCP_PROCTITLE_PREFIX):
+        return None
+    # ps appends inherited env after the title; the title is the first token.
+    segments = joined.split()[0].split(":")
+    return segments[1] if len(segments) > 1 else None
 
 
 def _mcp_rows_from_proc() -> list[dict]:
@@ -717,8 +752,19 @@ def _mcp_process_snapshot(*, verbose: bool = False) -> dict:
         out["introspection_error"] = f"{type(e).__name__}: {e}"
         return out
 
+    for row in rows:
+        transport = _mcp_transport(row.get("cmdline", ""))
+        if transport:
+            row["transport"] = transport
+
     out["mcp_process_count"] = len(rows)
     out["multiple_mcp_processes"] = len(rows) > 1
+    # One shared http service plus per-client stdio servers is the documented
+    # topology, so a bare count over-warns. Two servers on the same transport
+    # is the shape that actually signals a leaked or duplicated process.
+    stdio = [r for r in rows if r.get("transport") == "stdio"]
+    out["mcp_stdio_count"] = len(stdio)
+    out["multiple_stdio_processes"] = len(stdio) > 1
     if verbose:
         out["processes"] = rows
     else:
@@ -1810,8 +1856,16 @@ def mcp_runtime_status(verbose: bool = False) -> dict:
     }
 
     actions = _derive_recommended_actions([], summary)
-    if bool(mcp_http.get("multiple_mcp_processes")):
-        actions.append("Multiple mcp_server.py processes detected; stop orphan MCP processes and keep one service instance.")
+    # Deliberately keyed on the stdio count, not the total: one shared http
+    # service alongside per-client stdio servers is the supported topology, so
+    # warning on the total fires on a healthy stack. Two stdio servers is the
+    # shape that means a client spawned a duplicate or a stale one was never
+    # reaped.
+    if bool(mcp_http.get("multiple_stdio_processes")):
+        actions.append(
+            "Multiple stdio MCP servers detected; a stale one was likely never reaped. "
+            "Stop the orphans, or point clients at the shared http service."
+        )
     if bool(mcp_http.get("lock_file_exists")) and mcp_http.get("lock_holder_pid") and not bool(mcp_http.get("lock_holder_alive")):
         actions.append("MCP PID lock file points to a dead process; restart MCP service to refresh lock state.")
     actions = _dedupe_lines(actions)
