@@ -37,3 +37,7 @@ tests/integration/test_income_year_query.py
 .env
 .env.mcp
 llmLibrarian.mcpb
+
+# macOS status app (SwiftPM build products)
+macos/.build/
+macos/build/
