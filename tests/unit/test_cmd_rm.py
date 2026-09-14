@@ -8,11 +8,13 @@ class _FakeCollection:
     def __init__(self, raise_on_delete: bool = False):
         self.raise_on_delete = raise_on_delete
         self.deleted_where = None
+        self.all_deleted_where: list[dict] = []
 
     def delete(self, where):
         if self.raise_on_delete:
             raise RuntimeError("delete failed")
         self.deleted_where = where
+        self.all_deleted_where.append(where)
 
 
 class _FakeClient:
@@ -52,21 +54,32 @@ def test_cmd_rm_removes_registered_silo(monkeypatch, capsys):
 
 
 def test_cmd_rm_cleans_orphan_slug_when_not_in_registry(monkeypatch, capsys):
-    deleted = {}
+    """Orphan recovery: the literal name is tried first, the slugified form too.
+
+    This used to assert that only `slugify(raw)` was used. That was the bug: a
+    real orphan is an already-hashed slug, and re-slugifying it appends a second
+    hash ("alpha-deb12c9c" -> "alpha-deb12c9c-9b411e47"), so the delete matched
+    nothing while still reporting success. Both candidates are attempted now;
+    a `where` that matches nothing is a no-op.
+    """
+    deleted = []
     fake_coll = _FakeCollection()
     _patch_chromadb(monkeypatch, fake_coll)
     monkeypatch.setattr("state.remove_silo", lambda _db, _name: None)
     monkeypatch.setattr("state.slugify", lambda raw: "derived-slug")
     monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _raw: None)
     monkeypatch.setattr("state.resolve_silo_prefix", lambda _db, _raw: None)
-    monkeypatch.setattr("state.remove_manifest_silo", lambda _db, slug: deleted.setdefault("manifest", slug))
+    monkeypatch.setattr("state.remove_manifest_silo", lambda _db, slug: deleted.append(slug))
 
     rc = cli.cmd_rm(SimpleNamespace(silo="unknown", db="/tmp/db"))
     out = capsys.readouterr().out
     assert rc == 0
-    assert "derived-slug" in out
-    assert fake_coll.deleted_where == {"silo": "derived-slug"}
-    assert deleted["manifest"] == "derived-slug"
+    assert "unknown" in out
+    attempted = [w["silo"] for w in fake_coll.all_deleted_where]
+    assert attempted[0] == "unknown", "the literal slug must be tried first"
+    assert "derived-slug" in attempted, "the slugified form is still tried"
+    assert deleted[0] == "unknown"
+    assert "derived-slug" in deleted
 
 
 def test_cmd_rm_path_with_spaces_resolves_to_registered_slug(monkeypatch, tmp_path):

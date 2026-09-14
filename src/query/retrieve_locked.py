@@ -9,6 +9,7 @@ from constants import LLMLI_COLLECTION, MAX_CHUNKS_PER_FILE
 from embeddings import get_embedding_function
 
 from query.core_support import _safe_query
+from state import private_filter_clause
 from query.intent import INTENT_EVIDENCE_PROFILE, INTENT_TAX_QUERY
 from query.retrieval import (
     PROFILE_LEXICAL_PHRASES,
@@ -52,10 +53,19 @@ def execute_retrieve_chroma_phase(
     client = _gc(str(db))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
 
+    # Resolved once per retrieval: an unscoped query must never reach a private
+    # silo. Reading it here (rather than per stream) keeps the clause consistent
+    # across the vector and lexical arms, which share this where filter.
+    private_clause = private_filter_clause(db)
+
     def _where_for_silo(target_silo: str | None) -> dict | None:
         parts: list[dict[str, Any]] = []
         if target_silo:
+            # Explicit silo= is the only way into a private silo. The caller named
+            # it, so honor it — including when it is private.
             parts.append({"silo": target_silo})
+        elif private_clause is not None:
+            parts.append(private_clause)
         if doc_type:
             parts.append({"doc_type": doc_type})
         if len(parts) == 1:

@@ -61,7 +61,7 @@ MAX_WORKERS = 8
 
 # Query defaults
 DEFAULT_N_RESULTS = 12
-DEFAULT_MODEL = "llama3.1:8b"
+DEFAULT_MODEL = "llama3.2:latest"
 # Keep snippets short enough for terminal readability while still showing enough context.
 SNIPPET_MAX_LEN = 180
 # Limit per-source chunks to avoid a single file dominating answers.

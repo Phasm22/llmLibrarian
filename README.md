@@ -59,6 +59,8 @@ There is **no** built-in “the AI remembers you forever.” Each question uses 
 
 **Privacy in one line:** the **full corpus** stays local; **only retrieved chunks** go to a cloud model when you use MCP with a cloud host. `pal ask` keeps retrieval and answer on your machine.
 
+**Private silos.** Some folders should not be reachable by a broad question at all. Mark one with `llmli private <silo>` (or `pal private <silo>`, or the lock toggle in the macOS app) and it is excluded from every unscoped query — it only answers when a caller names it with `--in <silo>` / `silo=<silo>`. The filter is applied in the query itself, not left to the calling model's judgement.
+
 ---
 
 ## Quick start
@@ -66,7 +68,7 @@ There is **no** built-in “the AI remembers you forever.” Each question uses 
 ```bash
 uv venv && source .venv/bin/activate
 uv sync
-ollama pull llama3.1:8b   # only needed for pal ask / llmli ask
+ollama pull llama3.2:latest   # only needed for pal ask / llmli ask
 ```
 
 Index a folder (silo name = folder basename unless you override):

@@ -2,7 +2,7 @@ import chromadb
 from chromadb.config import Settings
 
 from ingest import run_add
-from state import slugify
+from state import resolve_silo_by_path
 from constants import LLMLI_COLLECTION
 
 
@@ -21,8 +21,13 @@ def test_incremental_add_skips_unchanged_and_removes_deleted(tmp_path):
 
     db_path = tmp_path / "db"
     run_add(data_dir, db_path=db_path, incremental=True)
-    slug = slugify(data_dir.name)
+    # Resolve the slug the ingest actually registered. Slugs hash "<name>|<path>",
+    # so `slugify(data_dir.name)` alone names a silo that never existed — every
+    # count below came back 0 and all four assertions passed by comparing 0 to 0.
+    slug = resolve_silo_by_path(str(db_path), data_dir)
+    assert slug, "ingest registered no silo"
     count1 = _count_chunks(db_path, slug)
+    assert count1 > 0, "baseline ingest indexed nothing; the rest asserts nothing"
 
     # No changes: should not increase chunk count.
     run_add(data_dir, db_path=db_path, incremental=True)

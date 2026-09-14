@@ -195,7 +195,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             query,
             config_path=config,
             n_results=getattr(args, "n_results", 12),
-            model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.1:8b"),
+            model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.2:latest"),
             no_color=args.no_color or getattr(args, "quiet", False),
             silo=silo_slug,
             db_path=_db_path(args),
@@ -228,21 +228,60 @@ def cmd_ls(args: argparse.Namespace) -> int:
         files = int(s.get("files_indexed", 0) or 0)
         chunks = int(s.get("chunks_count", 0) or 0)
         updated = (s.get("updated", "") or "")[:19]
-        rows.append((display, slug, files, chunks, updated, path))
+        private = bool(s.get("private"))
+        rows.append((display, slug, files, chunks, updated, path, private))
 
     name_w = min(max(len(r[0]) for r in rows), 24)
     slug_w = min(max(len(r[1]) for r in rows), 20)
-    path_w = 60
-    header = f"{'Name':<{name_w}}  {'Slug':<{slug_w}}  {'Files':>5}  {'Chunks':>7}  {'Updated':<19}  Path"
+    path_w = 56
+    header = f"{'Name':<{name_w}}  {'Slug':<{slug_w}}  {'Files':>5}  {'Chunks':>7}  {'Updated':<19}  {'Scope':<7}  Path"
     print(header)
     print("-" * len(header))
-    for display, slug, files, chunks, updated, path in rows:
+    for display, slug, files, chunks, updated, path, private in rows:
         display = _truncate_mid(display, name_w)
         slug = _truncate_mid(slug, slug_w)
         short_path = _truncate_tail(path, path_w)
         url = f"file://{path}" if path and path != "?" else ""
         path_cell = link_style(args.no_color, url, short_path)
-        print(f"{display:<{name_w}}  {slug:<{slug_w}}  {files:>5}  {chunks:>7}  {updated:<19}  {path_cell}")
+        scope = "private" if private else "-"
+        print(
+            f"{display:<{name_w}}  {slug:<{slug_w}}  {files:>5}  {chunks:>7}  "
+            f"{updated:<19}  {scope:<7}  {path_cell}"
+        )
+    n_private = sum(1 for r in rows if r[6])
+    if n_private:
+        print()
+        print(dim(args.no_color, (
+            f"{n_private} private silo(s): excluded from unscoped retrieval; "
+            "reach them with --in <slug>."
+        )))
+    return 0
+
+
+def cmd_private(args: argparse.Namespace) -> int:
+    """Set or clear a silo's private flag."""
+    from state import is_silo_private, list_silos, resolve_silo_to_slug, resolve_silo_prefix, set_silo_private
+    db = _db_path(args)
+    raw = args.silo
+    slug = resolve_silo_to_slug(db, raw) or resolve_silo_prefix(db, raw)
+    if not slug:
+        print(f"Error: silo not found: {raw}", file=sys.stderr)
+        known = ", ".join(sorted(s.get("slug", "") for s in list_silos(db)))
+        if known:
+            print(f"Known silos: {known}", file=sys.stderr)
+        return 1
+    if args.off:
+        if not is_silo_private(db, slug):
+            print(f"{slug} is already not private.")
+            return 0
+        set_silo_private(db, slug, False)
+        print(f"{slug}: private cleared — it can now be returned by unscoped queries.")
+        return 0
+    if is_silo_private(db, slug):
+        print(f"{slug} is already private.")
+        return 0
+    set_silo_private(db, slug, True)
+    print(f"{slug}: private set — excluded from unscoped retrieval; use --in {slug} to query it.")
     return 0
 
 def cmd_index(args: argparse.Namespace) -> int:
@@ -603,7 +642,7 @@ def cmd_eval_adversarial(args: argparse.Namespace) -> int:
 
     db = _db_path(args)
     out = getattr(args, "out", None)
-    model = getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.1:8b")
+    model = getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.2:latest")
     limit = getattr(args, "limit", None)
     strict_mode = bool(getattr(args, "strict_mode", True))
     direct_decisive_mode = getattr(args, "direct_decisive_mode", None)
@@ -659,7 +698,7 @@ def main() -> int:
     p_ask.add_argument("--quiet", "-q", action="store_true", help="Answer only (no source footer); useful for scripting")
     p_ask.add_argument("--explain", action="store_true", help="Print deterministic catalog diagnostics to stderr when applicable")
     p_ask.add_argument("--force", action="store_true", help="Allow deterministic catalog queries to run on stale scope")
-    p_ask.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.1:8b)")
+    p_ask.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.2:latest)")
     p_ask.add_argument("--n-results", type=int, default=12, help="Retrieval count")
     p_ask.add_argument("query", nargs="+", help="Question")
     p_ask.set_defaults(_run=cmd_ask)
@@ -667,6 +706,18 @@ def main() -> int:
     # ls
     p_ls = sub.add_parser("ls", help="List silos")
     p_ls.set_defaults(_run=cmd_ls)
+
+    p_private = sub.add_parser(
+        "private",
+        help="Mark a silo local-only (excluded from unscoped retrieval), or clear the mark",
+    )
+    p_private.add_argument("silo", help="Silo slug, slug prefix, or display name")
+    p_private.add_argument(
+        "--off",
+        action="store_true",
+        help="Clear the flag — the silo becomes reachable from unscoped queries again",
+    )
+    p_private.set_defaults(_run=cmd_private)
 
     # inspect <silo> [--top N] [--filter pdf|docx|code]
     p_inspect = sub.add_parser("inspect", help="Show silo details and top files by chunk count (default: top 20)")
@@ -751,7 +802,7 @@ def main() -> int:
 
     # eval-adversarial [--model M] [--out report.json] [--limit N]
     p_eval = sub.add_parser("eval-adversarial", help="Run synthetic adversarial trustfulness eval")
-    p_eval.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.1:8b)")
+    p_eval.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.2:latest)")
     p_eval.add_argument("--out", help="Write JSON report to this path")
     p_eval.add_argument("--limit", type=int, help="Run only first N queries from the fixed suite")
     p_eval.add_argument("--strict-mode", dest="strict_mode", action="store_true", default=True, help="Run eval queries with strict ask mode (default: on)")

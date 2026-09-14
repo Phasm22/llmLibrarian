@@ -939,13 +939,23 @@ def _llmli_registry_path(db_path: str | Path) -> Path:
     return p.parent / "llmli_registry.json"
 
 
-def _read_llmli_registry(db_path: str | Path) -> dict:
-    from pal_registry import cleanup_stale_registry_entries
+def _read_llmli_registry(db_path: str | Path, *, cleanup: bool = False) -> dict:
+    """Read the llmli silo registry.
+
+    Pure by default. This used to call ``cleanup_stale_registry_entries`` on
+    every read, which meant an ordinary ``pal`` command could silently delete a
+    silo entry — and once silo paths were canonicalized through symlinks, one
+    did. Callers that genuinely want the legacy-slug migration pass
+    ``cleanup=True``; everything else just reads.
+    """
     path = _llmli_registry_path(db_path)
     if not path.exists():
         return {}
     try:
-        cleanup_stale_registry_entries(path)
+        if cleanup:
+            from pal_registry import cleanup_stale_registry_entries
+
+            cleanup_stale_registry_entries(path)
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f) or {}
     except Exception:
@@ -2853,7 +2863,7 @@ def _exit(rc: int) -> None:
 @app.command("install", help="Bootstrap a fresh install: create dirs, write env config, and install daemon services.")
 def install_command(
     db_path: str = typer.Option("", "--db", help="ChromaDB path. Defaults to ~/.local/share/llmLibrarian/db"),
-    model: str = typer.Option("llama3.1:8b", "--model", help="Default Ollama model to write into the env file."),
+    model: str = typer.Option("llama3.2:latest", "--model", help="Default Ollama model to write into the env file."),
     mcp: bool = typer.Option(False, "--mcp", help="Also install the MCP HTTP server as a user service."),
     skip_daemon: bool = typer.Option(False, "--skip-daemon", help="Skip installing watch daemon services."),
     force: bool = typer.Option(False, "--force", help="Overwrite existing env file."),
@@ -3248,6 +3258,24 @@ def ls_command(
 
 
 
+@app.command(
+    "private",
+    help="Mark a silo local-only (excluded from unscoped retrieval), or clear the mark with --off.",
+)
+def private_command(
+    silo: str = typer.Argument(..., help="Silo slug, slug prefix, or display name.", autocompletion=_complete_silo),
+    off: bool = typer.Option(
+        False,
+        "--off",
+        help="Clear the flag. The silo becomes reachable from unscoped queries again.",
+    ),
+) -> None:
+    """Private silos are skipped by every unscoped query and by automatic scope
+    binding; only an explicit `--in <slug>` / `silo=<slug>` reaches them."""
+    args = ["private", silo] + (["--off"] if off else [])
+    _exit(_run_llmli(args))
+
+
 @app.command("queries", help="Audit past MCP queries: what was asked, of which silo, and which files answered.")
 def queries_command(
     limit: int = typer.Option(20, "--limit", "-n", min=1, help="Most recent records to show."),
@@ -3571,6 +3599,17 @@ def daemon_install_command() -> None:
 
 @daemon_app.command("sync", help="Reconcile daemon services against registered silos.")
 def daemon_sync_command() -> None:
+    # The legacy-slug migration runs here, deliberately and visibly, rather than
+    # on every registry read. `sync` is already the explicit reconcile step, and
+    # a command that removes registry entries should be one the user invoked.
+    from pal_registry import cleanup_stale_registry_entries
+
+    db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
+    try:
+        if cleanup_stale_registry_entries(_llmli_registry_path(db_path)):
+            print("Removed legacy hash-less silo slugs superseded by hashed slugs.")
+    except Exception as e:
+        print(f"Warning: registry cleanup skipped: {e}", file=sys.stderr)
     _exit(_sync_daemon_services(emit_output=True))
 
 

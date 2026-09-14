@@ -13,10 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-try:
-    import fcntl  # type: ignore[import-not-found]
-except ImportError:
-    fcntl = None  # type: ignore[assignment]
+from registry_lock import lock_path_for, registry_transaction
 
 _derived_registry_cache: dict[str, tuple[int, int, dict]] = {}
 
@@ -24,24 +21,23 @@ _derived_registry_cache: dict[str, tuple[int, int, dict]] = {}
 # --- Low-level helpers ---
 
 def _registry_lock_path(registry_path: Path) -> Path:
-    if registry_path.suffix:
-        return registry_path.with_suffix(registry_path.suffix + ".lock")
-    return registry_path.with_name(registry_path.name + ".lock")
+    return lock_path_for(registry_path)
 
 
 @contextmanager
 def _registry_lock(registry_path: Path) -> Iterator[None]:
-    if fcntl is None:
+    """Exclusive cross-process lock over one JSON state file.
+
+    Delegates to ``registry_lock.registry_transaction`` so the manifest and the
+    silo registry share one implementation. That version adds two things this
+    one lacked: a wait budget (an unkillable holder used to hang the caller
+    forever) and same-process reentrancy (a locked function calling another
+    locked function deadlocked, because flock conflicts across separate open
+    file descriptions even inside one process). The lock file path is unchanged,
+    so a process running older code still excludes correctly.
+    """
+    with registry_transaction(registry_path):
         yield
-        return
-    lock_path = _registry_lock_path(registry_path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "a", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -84,6 +80,26 @@ def _read_file_manifest(db_path: str | Path) -> dict:
     except Exception as e:
         print(f"[llmli] file manifest read failed: {path}: {e}; using empty.", file=sys.stderr)
         return {"silos": {}}
+
+
+def read_visible_manifest(db_path: str | Path, *, silo: str | None = None) -> dict:
+    """File manifest with private silos dropped, unless one is named explicitly.
+
+    Deterministic intents (file lists, timelines, language stats, scope binding)
+    read the manifest rather than Chroma, so filtering only the vector where-clause
+    would still let an unscoped "what files do I have" walk a private silo's
+    filenames — which for the tax corpus are themselves identifier-bearing.
+    """
+    from state import private_silo_slugs
+
+    data = _read_file_manifest(db_path)
+    if silo:
+        return data
+    private = set(private_silo_slugs(db_path))
+    if not private:
+        return data
+    silos = data.get("silos") or {}
+    return {**data, "silos": {k: v for k, v in silos.items() if k not in private}}
 
 
 def _write_file_manifest(db_path: str | Path, data: dict) -> None:
