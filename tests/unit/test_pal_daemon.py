@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -111,3 +112,80 @@ def test_daemon_logs_reads_stdout_and_stderr(monkeypatch, tmp_path: Path):
     assert "# docs-aaaa1111 stdout" in res.stdout
     assert "hello" in res.stdout
     assert "# docs-aaaa1111 stderr" in res.stdout
+
+
+def test_cleanup_generated_state_preserves_active_and_protected_files(monkeypatch, tmp_path: Path):
+    pal_home = tmp_path / ".pal"
+    log_dir = pal_home / "logs"
+    db_dir = tmp_path / "db"
+    log_dir.mkdir(parents=True)
+    db_dir.mkdir()
+    old_ts = 1_577_836_800
+
+    def old_file(path: Path) -> Path:
+        path.write_text("x\n", encoding="utf-8")
+        os.utime(path, (old_ts, old_ts))
+        return path
+
+    active_stdout = old_file(log_dir / "watch-docs-aaaa1111.log")
+    active_stderr = old_file(log_dir / "watch-docs-aaaa1111.stderr.log")
+    rotated = old_file(log_dir / "watch-docs-aaaa1111.log.1")
+    stale = old_file(log_dir / "watch-stale-bbbb2222.log")
+    service_current = old_file(log_dir / "llmlibrarian-mcp.stdout.log")
+    service_rotated = old_file(log_dir / "llmlibrarian-mcp.stdout.log.1")
+    audit = old_file(log_dir / "query-audit.jsonl")
+    registry = old_file(pal_home / "registry.json")
+    pal_backup = old_file(pal_home / "registry.json.20200101")
+    llmli_registry = old_file(db_dir / "llmli_registry.json")
+    llmli_backup = old_file(db_dir / "llmli_registry.json.20200101")
+    vector_store = old_file(db_dir / "chroma.sqlite3")
+
+    job = pal.jobsrt.JobSpec(
+        id="watch_silo:docs-aaaa1111",
+        kind="watch_silo",
+        slug="docs-aaaa1111",
+        source_path="/tmp/docs",
+        service_name="llmlibrarian-watch-docs-aaaa1111.service",
+        log_path=str(active_stdout),
+        interval=60,
+        debounce=30,
+    )
+    monkeypatch.setattr("pal.PAL_HOME", pal_home)
+    monkeypatch.setattr("pal._daemon_metadata", lambda: {"manager": "systemd", "db_path": str(db_dir)})
+    monkeypatch.setattr("pal._derive_watch_jobs_for_daemon", lambda _manager, db_path=None: ([job], []))
+
+    removed = pal._cleanup_generated_state(
+        pal_home=pal_home,
+        db_path=db_dir,
+        older_than_days=30,
+        dry_run=False,
+    )
+
+    assert str(rotated) in removed["logs"]
+    assert str(stale) in removed["logs"]
+    assert str(service_rotated) in removed["logs"]
+    assert str(pal_backup) in removed["registry_backups"]
+    assert str(llmli_backup) in removed["registry_backups"]
+    for protected in (active_stdout, active_stderr, service_current, audit, registry, llmli_registry, vector_store):
+        assert protected.exists()
+    for deleted in (rotated, stale, service_rotated, pal_backup, llmli_backup):
+        assert not deleted.exists()
+
+
+def test_cleanup_command_supports_dry_run(monkeypatch, tmp_path: Path):
+    pal_home = tmp_path / ".pal"
+    log_dir = pal_home / "logs"
+    db_dir = tmp_path / "db"
+    log_dir.mkdir(parents=True)
+    db_dir.mkdir()
+    stale = log_dir / "watch-stale.log"
+    stale.write_text("x\n", encoding="utf-8")
+    os.utime(stale, (1_577_836_800, 1_577_836_800))
+    monkeypatch.setattr("pal.PAL_HOME", pal_home)
+    monkeypatch.setattr("pal._daemon_metadata", lambda: None)
+
+    res = runner.invoke(pal.app, ["cleanup", "--db", str(db_dir), "--dry-run"])
+
+    assert res.exit_code == 0
+    assert "Would remove 1 generated log(s)" in res.stdout
+    assert stale.exists()

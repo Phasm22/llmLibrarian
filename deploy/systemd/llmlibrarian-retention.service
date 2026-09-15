@@ -1,0 +1,10 @@
+[Unit]
+Description=llmLibrarian generated log retention
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Desktop/llmLibrarian
+ExecStart=%h/Desktop/llmLibrarian/.venv/bin/python %h/Desktop/llmLibrarian/pal.py cleanup --older-than-days 30
+
+[Install]
+WantedBy=default.target

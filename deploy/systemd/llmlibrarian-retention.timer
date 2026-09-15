@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly llmLibrarian generated log retention
+
+[Timer]
+OnCalendar=Mon *-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -12,7 +12,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import threading
 import getpass
 import re
@@ -937,6 +937,89 @@ def _llmli_registry_path(db_path: str | Path) -> Path:
     if p.is_dir():
         return p / "llmli_registry.json"
     return p.parent / "llmli_registry.json"
+
+
+def _active_daemon_log_names() -> set[str]:
+    active_names: set[str] = set()
+    metadata = _daemon_metadata()
+    if not metadata:
+        return active_names
+    manager_name = str(metadata.get("manager") or "")
+    jobs, _warnings = _derive_watch_jobs_for_daemon(manager_name, db_path=str(metadata.get("db_path") or _DEFAULT_DB))
+    for job in jobs:
+        active_names.add(Path(job.log_path).name)
+        active_names.add(jobsrt.watch_stderr_log_path(PAL_HOME, job.slug).name)
+    return active_names
+
+
+def _is_generated_log_name(name: str) -> bool:
+    return bool(
+        re.fullmatch(r"watch-.+\.log(?:\.\d+)?", name)
+        or re.fullmatch(r"watch-.+\.stderr\.log(?:\.\d+)?", name)
+        or re.fullmatch(r"llmlibrarian-(?:mcp|chroma)\.(?:stdout|stderr)\.log\.\d+", name)
+        or re.fullmatch(r"mcp-http\.log\.\d+", name)
+        or re.fullmatch(r"rehydrate-\d{8}-\d{6}\.log", name)
+    )
+
+
+def _registry_backup_paths(pal_home: Path, db_path: str | Path) -> list[Path]:
+    db_registry = _llmli_registry_path(db_path)
+    db_dir = db_registry.parent
+    candidates: set[Path] = set()
+    for pattern in ("registry.json.*", "registry-*.json"):
+        candidates.update(pal_home.glob(pattern))
+    backups_dir = pal_home / "backups"
+    if backups_dir.exists():
+        candidates.update(backups_dir.glob("*registry*.json*"))
+    for pattern in ("llmli_registry.json.*", "llmli_registry-*.json"):
+        candidates.update(db_dir.glob(pattern))
+    protected = {pal_home / "registry.json", db_registry}
+    return sorted(p for p in candidates if p not in protected and p.is_file())
+
+
+def _cleanup_generated_state(
+    *,
+    pal_home: Path,
+    db_path: str | Path,
+    older_than_days: int,
+    dry_run: bool,
+) -> dict[str, list[str]]:
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).timestamp()
+    active_log_names = _active_daemon_log_names() if pal_home == PAL_HOME else set()
+    removed: dict[str, list[str]] = {"logs": [], "registry_backups": []}
+
+    log_dir = jobsrt.watch_log_dir(pal_home)
+    if log_dir.exists():
+        for path in sorted(log_dir.iterdir()):
+            if not path.is_file() or not _is_generated_log_name(path.name):
+                continue
+            if path.name in active_log_names:
+                continue
+            try:
+                if path.stat().st_mtime >= cutoff_ts:
+                    continue
+            except OSError:
+                continue
+            removed["logs"].append(str(path))
+            if not dry_run:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    for path in _registry_backup_paths(pal_home, db_path):
+        try:
+            if path.stat().st_mtime >= cutoff_ts:
+                continue
+        except OSError:
+            continue
+        removed["registry_backups"].append(str(path))
+        if not dry_run:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+    return removed
 
 
 def _read_llmli_registry(db_path: str | Path) -> dict:
@@ -2848,6 +2931,29 @@ def extension_pack_command(
 def _exit(rc: int) -> None:
     if rc != 0:
         raise typer.Exit(code=rc)
+
+
+@app.command("cleanup", help="Prune old generated pal logs and registry backups; never deletes silos or vector stores.")
+def cleanup_command(
+    older_than_days: int = typer.Option(30, "--older-than-days", min=1, help="Delete generated files older than this many days."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print what would be removed without deleting files."),
+    db_path: str = typer.Option(_DEFAULT_DB, "--db", help="DB path used to find llmli_registry.json backups."),
+) -> None:
+    removed = _cleanup_generated_state(
+        pal_home=PAL_HOME,
+        db_path=db_path,
+        older_than_days=older_than_days,
+        dry_run=dry_run,
+    )
+    verb = "Would remove" if dry_run else "Removed"
+    log_count = len(removed["logs"])
+    backup_count = len(removed["registry_backups"])
+    print(f"{verb} {log_count} generated log(s) and {backup_count} registry backup(s).")
+    for label, paths in (("logs", removed["logs"]), ("registry backups", removed["registry_backups"])):
+        if paths:
+            print(f"# {label}")
+            for path in paths:
+                print(path)
 
 
 @app.command("install", help="Bootstrap a fresh install: create dirs, write env config, and install daemon services.")
