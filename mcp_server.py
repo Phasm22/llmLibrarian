@@ -302,6 +302,24 @@ mcp = FastMCP(
 )
 
 
+_MCP_PROFILE = os.environ.get("LLMLIBRARIAN_MCP_PROFILE", "full").strip().lower() or "full"
+if _MCP_PROFILE not in {"full", "lite"}:
+    raise RuntimeError(
+        "LLMLIBRARIAN_MCP_PROFILE must be 'full' or 'lite' "
+        f"(got {_MCP_PROFILE!r})."
+    )
+
+if _MCP_PROFILE == "lite":
+    # Open WebUI's small local models should not spend their context budget on
+    # the full diagnostic playbook. The profile is process-local: the regular
+    # HTTP service and stdio clients retain the full instructions and tools.
+    mcp.instructions = (
+        "Use silo_roster only when you need an exact silo slug. "
+        "Use retrieve_knowledge with that slug to answer from the user's indexed files. "
+        "If results_may_be_incomplete is true, retry after the index rebuild finishes."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Serializes ALL ChromaDB client use across concurrent MCP tool calls (in-process).
 # Cross-process safety uses flock in src/chroma_lock.py (shared reads, exclusive writes).
@@ -1910,6 +1928,177 @@ def capabilities() -> str:
     """
     from ingest import get_capabilities_text
     return get_capabilities_text()
+
+
+def silo_roster() -> dict:
+    """Use when: choosing an exact silo slug on a small-context client.
+    Do not use when: you need index diagnostics or staleness details.
+    Pairs with: `retrieve_knowledge`.
+
+    Return the compact, machine-local silo roster: exact slug, display name,
+    and indexed chunk count. Entries are sorted by slug for stable output.
+    """
+    if not Path(_DB_PATH).is_dir():
+        return {**_db_missing_error(), "silo_count": 0, "silos": []}
+
+    from state import list_silos as _list_silos
+
+    silos = [
+        {
+            "slug": str(entry.get("slug") or ""),
+            "display_name": str(entry.get("display_name") or entry.get("slug") or ""),
+            "chunks_count": int(entry.get("chunks_count") or 0),
+        }
+        for entry in _list_silos(_DB_PATH)
+        if entry.get("slug")
+    ]
+    silos.sort(key=lambda entry: entry["slug"])
+    return {
+        "db_exists": True,
+        "silo_count": len(silos),
+        "silos": silos,
+    }
+
+
+def _compact_lite_chunk(chunk: dict) -> dict:
+    """Keep only answer evidence needed by small-context MCP clients."""
+    out = {
+        "text": str(chunk.get("text") or ""),
+        "score": chunk.get("score"),
+        "source": str(chunk.get("source") or ""),
+        "section": str(chunk.get("section") or ""),
+        "doc_type": str(chunk.get("doc_type") or "other"),
+    }
+    for field in ("page", "line_start"):
+        value = chunk.get(field)
+        if value is not None:
+            out[field] = value
+    return out
+
+
+def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
+    """Project shared retrieval output without hiding an in-flight rebuild."""
+    chunks = result.get("chunks", []) if isinstance(result, dict) else []
+    out: dict = {
+        "query": result.get("query") if isinstance(result, dict) else None,
+        "silo": silo,
+        "chunks": [
+            _compact_lite_chunk(chunk)
+            for chunk in chunks
+            if isinstance(chunk, dict)
+        ],
+    }
+    write_state = result.get("write_in_progress") if isinstance(result, dict) else None
+    if write_state is not None:
+        out["write_in_progress"] = write_state
+    if isinstance(result, dict):
+        incomplete = result.get("results_may_be_incomplete")
+        if isinstance(write_state, dict):
+            incomplete = incomplete or write_state.get("results_may_be_incomplete")
+        out["results_may_be_incomplete"] = bool(incomplete)
+    if isinstance(result, dict) and result.get("retryable"):
+        out["retryable"] = True
+    return out
+
+
+def retrieve_knowledge(query: str, silo: str, n_results: int = 3) -> dict:
+    """Use when: answering from one known silo on a small-context client.
+    Do not use when: you need diagnostics, broad discovery, or more than five chunks.
+    Pairs with: `silo_roster`.
+
+    Retrieve compact source chunks for the exact silo slug. Defaults to three
+    chunks to leave room for reasoning; request up to five when needed.
+    """
+    if not Path(_DB_PATH).is_dir():
+        return {**_db_missing_error(), "chunks": []}
+    if isinstance(n_results, bool) or not isinstance(n_results, int) or not 1 <= n_results <= 5:
+        return {
+            "error": "n_results must be an integer from 1 through 5 for retrieve_knowledge.",
+            "chunks": [],
+        }
+
+    from state import list_silos as _list_silos
+
+    registered_slugs = {
+        str(entry.get("slug"))
+        for entry in _list_silos(_DB_PATH)
+        if entry.get("slug")
+    }
+    if silo not in registered_slugs:
+        return {
+            "error": (
+                f"Unknown silo slug: {silo!r}. Call silo_roster and use one of its exact slugs."
+            ),
+            "chunks": [],
+        }
+
+    from query.core import run_retrieve
+
+    try:
+        with _mcp_chroma_lock("retrieve_knowledge"):
+            result = run_retrieve(
+                query=query,
+                silo=silo,
+                n_results=n_results,
+                db_path=_DB_PATH,
+                config_path=_CONFIG_PATH,
+            )
+            chunks = result.get("chunks", [])
+            _emit_usage_event(
+                "usage.llmlibrarian.query",
+                {"silo": silo, "profile": "lite"},
+            )
+
+        confidence, confidence_score, _coverage_note = _compute_answer_confidence(chunks)
+        _emit_query_audit(
+            tool="retrieve_knowledge",
+            queries=[query],
+            silo=silo,
+            params={"n_results": n_results},
+            chunks=chunks,
+            outcome={"confidence": confidence, "confidence_score": confidence_score},
+        )
+        return _compact_lite_retrieval(result, silo=silo)
+    except Exception as e:
+        if _is_lock_timeout(e):
+            return {**_busy_error(e, "retrieve_knowledge"), "chunks": []}
+        return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}
+    finally:
+        _release_chroma()
+
+
+_FULL_TOOL_NAMES = (
+    "query_personal_knowledge",
+    "multi_query_knowledge",
+    "recent_queries",
+    "find_files",
+    "explain_retrieval",
+    "list_silos",
+    "session_context",
+    "inspect_silo",
+    "watch_coverage",
+    "add_silo",
+    "trigger_reindex",
+    "repair_silo",
+    "update_file",
+    "remove_file",
+    "mcp_runtime_status",
+    "health",
+    "capabilities",
+)
+
+
+def _apply_mcp_profile() -> None:
+    """Replace the public tool catalog for the process-local lite profile."""
+    if _MCP_PROFILE != "lite":
+        return
+    for name in _FULL_TOOL_NAMES:
+        mcp.local_provider.remove_tool(name)
+    mcp.tool(name="silo_roster")(silo_roster)
+    mcp.tool(name="retrieve_knowledge")(retrieve_knowledge)
+
+
+_apply_mcp_profile()
 
 
 @mcp.resource("silos://list")

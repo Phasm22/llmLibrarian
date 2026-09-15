@@ -45,6 +45,18 @@ Typical agent flow:
 
 The **host model** (Claude, etc.) reads chunk text and writes the answer. llmLibrarian does **not** run Ollama inside MCP — that keeps MCP fast and lets you choose the brain in the IDE.
 
+### Small local models / Open WebUI
+
+For a small-context model, run its dedicated MCP process with
+`LLMLIBRARIAN_MCP_PROFILE=lite`. That process exposes only two compact tools:
+
+1. `silo_roster()` — use only when you need an exact, machine-local silo slug.
+2. `retrieve_knowledge(query, silo, n_results=3)` — retrieve from that exact slug; it returns three compact evidence chunks by default (up to five).
+
+The lite profile is process-local. It does not change the normal MCP server or
+Claude/Desktop clients. If `results_may_be_incomplete` is true, the index is
+being rebuilt; retry instead of treating an empty result as absence of evidence.
+
 **What crosses the network:** only what the tool returns (top chunks), plus normal chat context — not your entire disk. Provider training/memory policies are up to **Cursor/your API settings**, not this repo.
 
 ### MCP cheat sheet (use / avoid)
