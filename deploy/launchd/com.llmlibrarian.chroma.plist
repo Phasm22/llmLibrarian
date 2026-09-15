@@ -5,9 +5,12 @@
   <key>Label</key>
   <string>com.llmlibrarian.chroma</string>
 
+  <!-- Rendered to the llmLibrarian.app launcher when the bundle installs
+       (System Settings then shows "llmLibrarian" instead of the script name),
+       else to {{INSTALL_DIR}}/scripts/run_chroma_server.sh directly. -->
   <key>ProgramArguments</key>
   <array>
-    <string>{{INSTALL_DIR}}/scripts/run_chroma_server.sh</string>
+    <string>{{CHROMA_PROGRAM}}</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -38,6 +41,14 @@
   <string>{{LOG_DIR}}/llmlibrarian-chroma.stderr.log</string>
 
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Standard</string>
+
+  <!-- Group under /Applications/llmLibrarian.app in System Settings > Login
+       Items instead of "run_chroma_server.sh - unidentified developer"
+       (see scripts/install_app_bundle.sh; harmless if the app is absent). -->
+  <key>AssociatedBundleIdentifiers</key>
+  <array>
+    <string>com.llmlibrarian.app</string>
+  </array>
 </dict>
 </plist>
