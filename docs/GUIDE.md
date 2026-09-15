@@ -51,7 +51,7 @@ For a small-context model, run its dedicated MCP process with
 `LLMLIBRARIAN_MCP_PROFILE=lite`. That process exposes only two compact tools:
 
 1. `silo_roster()` — use only when you need an exact, machine-local silo slug.
-2. `retrieve_knowledge(query, silo, n_results=3)` — retrieve from that exact slug; it returns three compact evidence chunks by default (up to five).
+2. `retrieve_knowledge(query, silo, n_results=8)` — retrieve from that exact slug; it returns eight compact evidence chunks by default (up to twelve).
 
 The lite profile is process-local. It does not change the normal MCP server or
 Claude/Desktop clients. If `results_may_be_incomplete` is true, the index is

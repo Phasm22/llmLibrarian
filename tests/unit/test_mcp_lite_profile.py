@@ -93,7 +93,7 @@ def test_retrieve_knowledge_projects_evidence_and_rebuild_signal(monkeypatch, mc
 
     def fake_retrieve(**kwargs):
         assert kwargs["silo"] == "notes-1234abcd"
-        assert kwargs["n_results"] == 3
+        assert kwargs["n_results"] == 8
         return {
             "query": kwargs["query"],
             "chunks": [
@@ -134,17 +134,17 @@ def test_retrieve_knowledge_projects_evidence_and_rebuild_signal(monkeypatch, mc
     assert "tax_ledger" not in out
     assert "chunks_by_silo" not in out
     assert audit_calls[0]["tool"] == "retrieve_knowledge"
-    assert audit_calls[0]["params"] == {"n_results": 3}
+    assert audit_calls[0]["params"] == {"n_results": 8}
     assert usage_calls[0][1]["profile"] == "lite"
 
 
-@pytest.mark.parametrize("n_results", [0, 6, True, "3"])
+@pytest.mark.parametrize("n_results", [0, 13, True, "3"])
 def test_retrieve_knowledge_rejects_unsafe_result_counts(mcp_module, n_results):
     _register_silo(Path(mcp_module._DB_PATH))
 
     out = mcp_module.retrieve_knowledge("q", "notes-1234abcd", n_results=n_results)
 
-    assert "n_results must be an integer from 1 through 5" in out["error"]
+    assert "n_results must be an integer from 1 through 12" in out["error"]
     assert out["chunks"] == []
 
 

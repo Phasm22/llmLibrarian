@@ -59,6 +59,15 @@ def test_diversify_by_source_handles_empty_docs():
     assert dists == []
 
 
+def test_source_diversity_cap_honors_n_results_when_silo_scoped():
+    from query.retrieval import source_diversity_cap
+
+    assert source_diversity_cap("LOOKUP", 3, silo_scoped=False, default=50) == 3
+    assert source_diversity_cap("LOOKUP", 8, silo_scoped=False, default=50) == 3
+    assert source_diversity_cap("LOOKUP", 8, silo_scoped=True, default=50) == 8
+    assert source_diversity_cap("LOOKUP", 3, silo_scoped=True, default=50) == 3
+
+
 def test_sort_by_image_chunk_priority_prefers_summary_then_best_region():
     docs, metas, dists = sort_by_image_chunk_priority(
         docs=["region-2", "summary", "region-1", "other"],

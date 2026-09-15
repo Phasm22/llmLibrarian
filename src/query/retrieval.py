@@ -94,6 +94,26 @@ def max_chunks_for_intent(intent: str, default: int) -> int:
     return cap if cap >= 1 else default
 
 
+def source_diversity_cap(
+    intent: str,
+    n_results: int,
+    *,
+    silo_scoped: bool,
+    default: int,
+) -> int:
+    """Per-source cap passed to diversify_by_source.
+
+    LOOKUP's cap of 3 exists so one huge file cannot dominate *unified*
+    retrieval. When the caller already scoped to a silo, honor n_results —
+    otherwise a one-file cookbook is stuck at three hybrid hits and can drop
+    the vector-#1 recipe (Classic Carrot Cake at hybrid rank 6).
+    """
+    per_cap = max_chunks_for_intent(intent, default)
+    if silo_scoped:
+        return max(per_cap, max(1, n_results))
+    return per_cap
+
+
 def max_silo_chunks_for_intent(intent: str, default: int) -> int:
     """Return per-intent cross-silo cap when unified retrieval spans many silos."""
     cap = SILO_DIVERSITY_CAPS.get((intent or "").upper(), default)

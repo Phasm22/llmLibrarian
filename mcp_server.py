@@ -2001,19 +2001,20 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
     return out
 
 
-def retrieve_knowledge(query: str, silo: str, n_results: int = 3) -> dict:
+def retrieve_knowledge(query: str, silo: str, n_results: int = 8) -> dict:
     """Use when: answering from one known silo on a small-context client.
-    Do not use when: you need diagnostics, broad discovery, or more than five chunks.
+    Do not use when: you need diagnostics, broad discovery, or more than twelve chunks.
     Pairs with: `silo_roster`.
 
-    Retrieve compact source chunks for the exact silo slug. Defaults to three
-    chunks to leave room for reasoning; request up to five when needed.
+    Retrieve compact source chunks for the exact silo slug. Defaults to eight
+    chunks so a one-file cookbook can still surface a hybrid-ranked hit;
+    request up to twelve when needed.
     """
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "chunks": []}
-    if isinstance(n_results, bool) or not isinstance(n_results, int) or not 1 <= n_results <= 5:
+    if isinstance(n_results, bool) or not isinstance(n_results, int) or not 1 <= n_results <= 12:
         return {
-            "error": "n_results must be an integer from 1 through 5 for retrieve_knowledge.",
+            "error": "n_results must be an integer from 1 through 12 for retrieve_knowledge.",
             "chunks": [],
         }
 

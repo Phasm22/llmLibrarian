@@ -16,9 +16,9 @@ from query.retrieval import (
     diversify_by_silo,
     diversify_by_source,
     merge_dual_streams_rrf,
-    max_chunks_for_intent,
     max_silo_chunks_for_intent,
     run_hybrid_retrieve,
+    source_diversity_cap,
 )
 
 
@@ -87,7 +87,12 @@ def execute_retrieve_chroma_phase(
             top_k=n_stage1,
             lexical_phrases=_lexical_phrases,
         )
-        per_cap = max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
+        per_cap = source_diversity_cap(
+            intent,
+            n_results,
+            silo_scoped=bool(target_silo),
+            default=MAX_CHUNKS_PER_FILE,
+        )
         docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, n_results, max_per_source=per_cap)
         docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
         return docs_h, metas_h, dists_h, _warn
