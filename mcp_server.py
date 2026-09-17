@@ -933,7 +933,9 @@ def query_personal_knowledge(
 
     Specify silo to scope retrieval by slug or display name; call list_silos first
     rather than inferring a silo's domain from its slug. Returns chunks with text, score (0–1),
-    confidence, section heading, source path, date, doc_type, and position.
+    confidence, section heading, source path, date, doc_type, and position. Image chunks also
+    include embedded capture, camera, exposure, dimensions, and GPS data under photo_metadata
+    when present.
 
     Pass section= to restrict to a document section.
     Pass doc_type= to restrict by file type.
@@ -1983,6 +1985,13 @@ def _compact_lite_chunk(chunk: dict) -> dict:
         value = chunk.get(field)
         if value is not None:
             out[field] = value
+    for field in ("source_modality", "summary_status", "needs_vision_enrichment"):
+        value = chunk.get(field)
+        if value is not None:
+            out[field] = value
+    photo_metadata = chunk.get("photo_metadata")
+    if isinstance(photo_metadata, dict) and photo_metadata:
+        out["photo_metadata"] = dict(photo_metadata)
     return out
 
 
@@ -2008,6 +2017,10 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
         out["results_may_be_incomplete"] = bool(incomplete)
     if isinstance(result, dict) and result.get("retryable"):
         out["retryable"] = True
+    if isinstance(result, dict) and result.get("image_search"):
+        out["image_search"] = result["image_search"]
+    if isinstance(result, dict) and result.get("recommended_action"):
+        out["recommended_action"] = result["recommended_action"]
     return out
 
 

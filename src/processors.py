@@ -20,6 +20,8 @@ from html.parser import HTMLParser
 from typing import Any, Protocol
 
 # ChunkTuple imported from ingest to avoid circular; use forward reference in type hints.
+from src.geocode import reverse_geocode
+
 ChunkTuple = tuple[str, str, dict[str, Any]]
 
 
@@ -123,6 +125,27 @@ _VISION_HELPER_BINARY: Path | None = None
 _VISION_HELPER_READY: bool | None = None
 _VISION_MODEL_READY: dict[str, bool] = {}
 _IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff")
+PHOTO_METADATA_FIELDS = (
+    "photo_taken_at",
+    "camera_make",
+    "camera_model",
+    "lens_model",
+    "image_width",
+    "image_height",
+    "image_format",
+    "image_orientation",
+    "exposure_time_s",
+    "f_number",
+    "iso",
+    "focal_length_mm",
+    "gps_latitude",
+    "gps_longitude",
+    "gps_altitude_m",
+    "place_name",
+    "place_address",
+    "place_category",
+    "nearby_places",
+)
 
 
 @dataclass(frozen=True)
@@ -1455,8 +1478,202 @@ class PPTXProcessor:
             raise PPTXExtractionError("Failed to extract PPTX content.")
 
 
-def _build_image_summary_text(summary: str, visible_text: str) -> str:
+def _clean_exif_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return str(value or "").replace("\x00", "").strip()
+
+
+def _exif_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return round(number, 8)
+
+
+def _exif_datetime(value: Any, offset: Any = None, subsecond: Any = None) -> str | None:
+    raw = _clean_exif_text(value)
+    if not raw:
+        return None
+    match = re.fullmatch(r"(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})", raw)
+    if not match:
+        return None
+    base = f"{match[1]}-{match[2]}-{match[3]}T{match[4]}:{match[5]}:{match[6]}"
+    fractional = re.sub(r"\D", "", _clean_exif_text(subsecond))[:6]
+    if fractional:
+        base += f".{fractional}"
+    timezone_offset = _clean_exif_text(offset)
+    if timezone_offset == "Z" or re.fullmatch(r"[+-]\d{2}:\d{2}", timezone_offset):
+        base += timezone_offset
+    try:
+        datetime.fromisoformat(base.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return base
+
+
+def _gps_coordinate(value: Any, reference: Any) -> float | None:
+    try:
+        degrees, minutes, seconds = value
+    except (TypeError, ValueError):
+        return None
+    parts = [_exif_number(part) for part in (degrees, minutes, seconds)]
+    if any(part is None for part in parts):
+        return None
+    coordinate = float(parts[0]) + (float(parts[1]) / 60.0) + (float(parts[2]) / 3600.0)
+    if _clean_exif_text(reference).upper() in {"S", "W"}:
+        coordinate *= -1
+    return round(coordinate, 7)
+
+
+def _extract_photo_metadata(data: bytes) -> dict[str, Any]:
+    """Extract a stable, scalar-only subset of embedded image metadata."""
+    try:
+        from PIL import Image
+        try:
+            from pillow_heif import register_heif_opener
+
+            register_heif_opener()
+        except ImportError:
+            pass
+
+        with Image.open(io.BytesIO(data)) as image:
+            metadata: dict[str, Any] = {
+                "image_width": int(image.width),
+                "image_height": int(image.height),
+            }
+            if image.format:
+                metadata["image_format"] = str(image.format).upper()
+            exif = image.getexif()
+            if not exif:
+                return metadata
+
+            try:
+                exif_ifd = exif.get_ifd(34665) or {}
+            except Exception:
+                exif_ifd = {}
+            combined = dict(exif)
+            combined.update(dict(exif_ifd))
+
+            text_fields = {
+                "camera_make": 271,
+                "camera_model": 272,
+                "lens_model": 42036,
+            }
+            for field, tag in text_fields.items():
+                cleaned = _clean_exif_text(combined.get(tag))
+                if cleaned:
+                    metadata[field] = cleaned
+
+            taken_at = _exif_datetime(
+                combined.get(36867) or combined.get(36868) or combined.get(306),
+                combined.get(36881) or combined.get(36882) or combined.get(36880),
+                combined.get(37521) or combined.get(37522) or combined.get(37520),
+            )
+            if taken_at:
+                metadata["photo_taken_at"] = taken_at
+
+            orientation = combined.get(274)
+            try:
+                orientation_int = int(orientation)
+            except (TypeError, ValueError):
+                orientation_int = 0
+            if 1 <= orientation_int <= 8:
+                metadata["image_orientation"] = orientation_int
+
+            numeric_fields = {
+                "exposure_time_s": 33434,
+                "f_number": 33437,
+                "iso": 34855,
+                "focal_length_mm": 37386,
+            }
+            for field, tag in numeric_fields.items():
+                number = _exif_number(combined.get(tag))
+                if number is not None:
+                    metadata[field] = int(number) if field == "iso" and number.is_integer() else number
+
+            try:
+                gps = exif.get_ifd(34853) or {}
+            except Exception:
+                raw_gps = exif.get(34853)
+                gps = raw_gps if isinstance(raw_gps, dict) else {}
+            latitude = _gps_coordinate(gps.get(2), gps.get(1))
+            longitude = _gps_coordinate(gps.get(4), gps.get(3))
+            if latitude is not None and longitude is not None:
+                metadata["gps_latitude"] = latitude
+                metadata["gps_longitude"] = longitude
+                # Opt-in and best-effort: returns {} when disabled or offline,
+                # so the photo still indexes with raw coordinates either way.
+                metadata.update(reverse_geocode(latitude, longitude))
+            altitude = _exif_number(gps.get(6))
+            if altitude is not None:
+                if int(_exif_number(gps.get(5)) or 0) == 1:
+                    altitude *= -1
+                metadata["gps_altitude_m"] = round(altitude, 3)
+            return metadata
+    except Exception:
+        return {}
+
+
+def _photo_metadata_lines(metadata: dict[str, Any] | None) -> list[str]:
+    meta = metadata or {}
+    lines: list[str] = []
+    if meta.get("photo_taken_at"):
+        lines.append(f"Taken: {meta['photo_taken_at']}")
+    camera_make = _clean_exif_text(meta.get("camera_make"))
+    camera_model = _clean_exif_text(meta.get("camera_model"))
+    if camera_make and camera_model.lower().startswith(camera_make.lower()):
+        camera = camera_model
+    else:
+        camera = " ".join(part for part in (camera_make, camera_model) if part)
+    if camera:
+        lines.append(f"Camera: {camera}")
+    if meta.get("lens_model"):
+        lines.append(f"Lens: {meta['lens_model']}")
+    if meta.get("image_width") and meta.get("image_height"):
+        lines.append(f"Dimensions: {meta['image_width']} x {meta['image_height']}")
+    if meta.get("gps_latitude") is not None and meta.get("gps_longitude") is not None:
+        lines.append(f"GPS: {meta['gps_latitude']}, {meta['gps_longitude']}")
+    # Emitted as its own line so the venue name is retrievable text, not just a
+    # metadata field a semantic search would never match on.
+    place = ", ".join(
+        str(meta[key])
+        for key in ("place_name", "place_address")
+        if meta.get(key)
+    )
+    if place:
+        lines.append(f"Location: {place}")
+    # Kept alongside the chosen venue so a wrong pick stays visible and
+    # correctable rather than silently becoming the only candidate on record.
+    if meta.get("nearby_places"):
+        lines.append(f"Nearby: {meta['nearby_places']}")
+    settings: list[str] = []
+    if meta.get("iso") is not None:
+        settings.append(f"ISO {meta['iso']}")
+    if meta.get("f_number") is not None:
+        settings.append(f"f/{meta['f_number']}")
+    if meta.get("exposure_time_s") is not None:
+        settings.append(f"{meta['exposure_time_s']} s")
+    if meta.get("focal_length_mm") is not None:
+        settings.append(f"{meta['focal_length_mm']} mm")
+    if settings:
+        lines.append("Settings: " + ", ".join(settings))
+    return lines
+
+
+def _build_image_summary_text(
+    summary: str,
+    visible_text: str,
+    photo_metadata: dict[str, Any] | None = None,
+) -> str:
     lines = [f"Image summary: {(summary or '').strip()}"]
+    metadata_lines = _photo_metadata_lines(photo_metadata)
+    if metadata_lines:
+        lines.append("Photo metadata:")
+        lines.extend(metadata_lines)
     cleaned_visible = (visible_text or "").strip()
     if cleaned_visible:
         preview_lines = [line.strip() for line in cleaned_visible.splitlines() if line.strip()]
@@ -1479,6 +1696,7 @@ class ImageProcessor:
         enable_multimodal: bool = True,
     ) -> ExtractedImage | None:
         try:
+            photo_metadata = _extract_photo_metadata(data)
             ocr_result = _ocr_image_file_detailed(data, source_path, ocr_mode="image_file")
             signal = _image_ocr_signal_assessment(ocr_result)
             raw_visible_text = (ocr_result.text if ocr_result else "").strip()
@@ -1564,6 +1782,7 @@ class ImageProcessor:
                     for region in regions
                 ],
                 "raw_vision_payload": raw_payload,
+                "photo_metadata": photo_metadata,
             }
             meta = {
                 "ocr_backend": backend,
@@ -1571,11 +1790,12 @@ class ImageProcessor:
                 "source_modality": "image",
                 "summary_status": summary_status,
                 "needs_vision_enrichment": summary_status == "deferred",
+                **photo_metadata,
             }
             if vision_model:
                 meta["vision_model"] = vision_model
             return ExtractedImage(
-                summary=_build_image_summary_text(summary_text, visible_text),
+                summary=_build_image_summary_text(summary_text, visible_text, photo_metadata),
                 visible_text=visible_text,
                 regions=tuple(regions),
                 meta=meta,

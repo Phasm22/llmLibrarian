@@ -138,6 +138,24 @@ def test_retrieve_knowledge_projects_evidence_and_rebuild_signal(monkeypatch, mc
     assert usage_calls[0][1]["profile"] == "lite"
 
 
+def test_compact_lite_chunk_preserves_photo_metadata(mcp_module):
+    out = mcp_module._compact_lite_chunk(
+        {
+            "text": "Image summary: Trevi Fountain",
+            "source": "/photos/IMG_3083.JPG",
+            "photo_metadata": {
+                "photo_taken_at": "2009-11-27T07:56:43",
+                "camera_model": "Canon PowerShot A1000 IS",
+            },
+        }
+    )
+
+    assert out["photo_metadata"] == {
+        "photo_taken_at": "2009-11-27T07:56:43",
+        "camera_model": "Canon PowerShot A1000 IS",
+    }
+
+
 @pytest.mark.parametrize("n_results", [0, 13, True, "3"])
 def test_retrieve_knowledge_rejects_unsafe_result_counts(mcp_module, n_results):
     _register_silo(Path(mcp_module._DB_PATH))

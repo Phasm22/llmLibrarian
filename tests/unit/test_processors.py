@@ -460,6 +460,63 @@ def test_image_processor_returns_structured_image_result(monkeypatch):
     assert out.regions[0].role == "ocr_block"
 
 
+def test_extract_photo_metadata_from_embedded_exif():
+    image_lib = pytest.importorskip("PIL.Image")
+    image = image_lib.new("RGB", (640, 480), "blue")
+    exif = image_lib.Exif()
+    exif[271] = "Canon"
+    exif[272] = "Canon PowerShot Test"
+    exif[274] = 6
+    exif[36867] = "2009:11:27 07:56:43"
+    exif[34855] = 125
+    exif[33437] = 2.7
+    exif[37386] = 6.2
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", exif=exif)
+
+    metadata = processors._extract_photo_metadata(buf.getvalue())
+
+    assert metadata == {
+        "image_width": 640,
+        "image_height": 480,
+        "image_format": "JPEG",
+        "camera_make": "Canon",
+        "camera_model": "Canon PowerShot Test",
+        "photo_taken_at": "2009-11-27T07:56:43",
+        "image_orientation": 6,
+        "f_number": 2.7,
+        "iso": 125,
+        "focal_length_mm": 6.2,
+    }
+
+
+def test_photo_metadata_summary_is_searchable_and_camera_is_not_duplicated():
+    text = processors._build_image_summary_text(
+        "Trevi Fountain in Rome",
+        "",
+        {
+            "photo_taken_at": "2009-11-27T07:56:43-07:00",
+            "camera_make": "Canon",
+            "camera_model": "Canon PowerShot A1000 IS",
+            "image_width": 3648,
+            "image_height": 2736,
+            "gps_latitude": 41.9009,
+            "gps_longitude": 12.4833,
+        },
+    )
+
+    assert "Taken: 2009-11-27T07:56:43-07:00" in text
+    assert "Camera: Canon PowerShot A1000 IS" in text
+    assert "Canon Canon" not in text
+    assert "Dimensions: 3648 x 2736" in text
+    assert "GPS: 41.9009, 12.4833" in text
+
+
+def test_gps_coordinate_converts_dms_and_hemisphere():
+    assert processors._gps_coordinate((41, 54, 3.24), "N") == 41.9009
+    assert processors._gps_coordinate((12, 28, 59.88), b"W") == -12.4833
+
+
 def test_image_ocr_signal_assessment_prefers_text_heavy_images():
     signal = processors._image_ocr_signal_assessment(
         processors._OCRResult(

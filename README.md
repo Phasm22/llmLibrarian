@@ -69,6 +69,20 @@ uv sync
 ollama pull llama3.1:8b   # only needed for pal ask / llmli ask
 ```
 
+To index standalone photos, install the optional image embedding stack:
+
+```bash
+uv sync --extra image
+```
+
+Photo questions use two stages: `query_personal_knowledge` searches the sibling
+image-vector collection and returns candidate image paths; when a candidate has
+only a deferred summary, call `ask_image` with that indexed path to inspect the
+original pixels. Image dependency failures stop photo ingest before any index or
+manifest writes, rather than registering a silo with silently skipped images.
+The image extra also installs the HEIC/HEIF decoder required for those advertised
+formats; base Pillow alone cannot open them.
+
 Index a folder (silo name = folder basename unless you override):
 
 ```bash

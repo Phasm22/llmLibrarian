@@ -37,3 +37,10 @@ tests/integration/test_income_year_query.py
 .env
 .env.mcp
 llmLibrarian.mcpb
+
+# Open WebUI session secret -- generated locally, never shared
+.webui_secret_key
+
+# Swift app build output (no sources tracked here)
+macos/.build/
+macos/build/

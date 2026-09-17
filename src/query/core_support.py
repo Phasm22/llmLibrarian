@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from processors import _build_image_summary_text
+from processors import PHOTO_METADATA_FIELDS, _build_image_summary_text
 
 from query.context import query_mentioned_years, context_block
 from query.intent import INTENT_FIELD_LOOKUP, INTENT_LOOKUP, INTENT_TAX_QUERY
@@ -254,9 +254,13 @@ def _safe_query(
 
 
 def _query_is_image_relevant(query: str, docs: list[str], metas: list[dict | None]) -> bool:
-    if _IMAGE_QUERY_PATTERN.search(query or ""):
+    if _query_explicitly_requests_image(query):
         return True
     return any(str((meta or {}).get("source_modality") or "") == "image" for meta in metas[:4]) or not docs
+
+
+def _query_explicitly_requests_image(query: str) -> bool:
+    return bool(_IMAGE_QUERY_PATTERN.search(query or ""))
 
 
 def _meta_allows_image_vision(db_path: str, meta: dict[str, Any] | None) -> bool:
@@ -296,7 +300,8 @@ def _hydrate_single_image_summary_doc(
         meta_dict["needs_vision_enrichment"] = False
         if artifact.get("vision_model"):
             meta_dict["vision_model"] = artifact.get("vision_model")
-        return _build_image_summary_text(summary_text, visible_text), meta_dict
+        photo_metadata = {field: meta_dict.get(field) for field in PHOTO_METADATA_FIELDS}
+        return _build_image_summary_text(summary_text, visible_text, photo_metadata), meta_dict
 
     if summary_status != "deferred" or not allow_lazy:
         return doc, meta
@@ -323,7 +328,8 @@ def _hydrate_single_image_summary_doc(
     meta_dict["needs_vision_enrichment"] = False
     if vision_model:
         meta_dict["vision_model"] = vision_model
-    return _build_image_summary_text(summary_text, visible_text), meta_dict
+    photo_metadata = {field: meta_dict.get(field) for field in PHOTO_METADATA_FIELDS}
+    return _build_image_summary_text(summary_text, visible_text, photo_metadata), meta_dict
 
 
 def _hydrate_image_summary_docs(

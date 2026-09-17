@@ -314,6 +314,10 @@ def test_image_vector_from_chunks_uses_summary_metadata():
                 "vision_model": "llava:test",
                 "needs_vision_enrichment": True,
                 "summary_status": "deferred",
+                "photo_taken_at": "2009-11-27T07:56:43",
+                "camera_model": "Canon PowerShot A1000 IS",
+                "image_width": 3648,
+                "image_height": 2736,
             },
         )
     ]
@@ -326,3 +330,7 @@ def test_image_vector_from_chunks_uses_summary_metadata():
     assert meta["record_type"] == "image_vector"
     assert meta["parent_image_id"] == "abc123"
     assert meta["summary_status"] == "deferred"
+    assert meta["photo_taken_at"] == "2009-11-27T07:56:43"
+    assert meta["camera_model"] == "Canon PowerShot A1000 IS"
+    assert meta["image_width"] == 3648
+    assert meta["image_height"] == 2736

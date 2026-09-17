@@ -7,8 +7,18 @@ from typing import Any, Callable
 from chroma_client import get_client
 from constants import LLMLI_COLLECTION, MAX_CHUNKS_PER_FILE
 from embeddings import get_embedding_function
+from image_embeddings import (
+    get_image_embedding_adapter,
+    image_collection_name,
+    image_embedding_unavailable_reason,
+)
 
-from query.core_support import _safe_query
+from query.core_support import (
+    _query_explicitly_requests_image,
+    _query_image_collection,
+    _query_is_image_relevant,
+    _safe_query,
+)
 from query.intent import INTENT_EVIDENCE_PROFILE, INTENT_TAX_QUERY
 from query.retrieval import (
     PROFILE_LEXICAL_PHRASES,
@@ -20,6 +30,7 @@ from query.retrieval import (
     run_hybrid_retrieve,
     source_diversity_cap,
 )
+from processors import PHOTO_METADATA_FIELDS
 
 
 def _artifact_stream_enabled(db: str, silo_slug: str) -> bool:
@@ -115,8 +126,63 @@ def execute_retrieve_chroma_phase(
             docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
             retrieval_method = "dual_stream_rrf"
 
+    image_search: dict[str, Any] = {"attempted": False, "status": "not_applicable", "matches": 0}
+    explicit_image_query = _query_explicitly_requests_image(query)
+    if _query_is_image_relevant(query, docs, metas):
+        image_search["attempted"] = True
+        image_adapter = get_image_embedding_adapter()
+        if image_adapter is None:
+            image_search["status"] = "unavailable"
+            reason = image_embedding_unavailable_reason()
+            image_search["warning"] = (
+                "Image-vector search is unavailable"
+                + (f": {reason}" if reason else "")
+                + ". Do not treat text-only results as evidence that no matching photo exists."
+            )
+        else:
+            image_collection = client.get_or_create_collection(name=image_collection_name(LLMLI_COLLECTION))
+            image_docs, image_metas, image_dists = _query_image_collection(
+                collection=collection,
+                image_collection=image_collection,
+                image_adapter=image_adapter,
+                query_text=query_for_retrieval,
+                n_results=max(2, min(8, n_results)),
+                base_where=_where_for_silo(silo_slug),
+                db_path=db_path or db,
+            )
+            image_sources = {
+                str((meta or {}).get("source") or "")
+                for meta in image_metas
+                if str((meta or {}).get("source") or "")
+            }
+            image_search["matches"] = len(image_sources) or len(image_docs)
+            image_search["returned_chunks"] = len(image_docs)
+            image_search["status"] = "ok" if image_docs else "no_matches"
+            if image_docs:
+                if explicit_image_query:
+                    docs, metas, dists = diversify_by_source(
+                        image_docs,
+                        image_metas,
+                        image_dists,
+                        n_results,
+                        max_per_source=2,
+                    )
+                    retrieval_method = "image_vector"
+                else:
+                    docs, metas, dists = merge_dual_streams_rrf(
+                        image_docs,
+                        image_metas,
+                        image_dists,
+                        docs,
+                        metas,
+                        dists,
+                        top_k=n_results,
+                    )
+                    retrieval_method = f"{retrieval_method}+image_rrf"
+                docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+
     if silo_slug is None:
-        per_silo_cap = max_silo_chunks_for_intent(intent, 3)
+        per_silo_cap = n_results if explicit_image_query and image_search["status"] == "ok" else max_silo_chunks_for_intent(intent, 3)
         silo_cache = [str(((m or {}).get("silo") or "")) for m in metas]
         docs, metas, dists = diversify_by_silo(
             docs, metas, dists, n_results, max_per_silo=per_silo_cap, silos=silo_cache
@@ -150,7 +216,12 @@ def execute_retrieve_chroma_phase(
                 confidence = "high" if score >= 0.5 else "medium" if score >= 0.2 else "low"
             except Exception:
                 pass
-        chunks.append({
+        photo_metadata = {
+            field: m.get(field)
+            for field in PHOTO_METADATA_FIELDS
+            if m.get(field) is not None
+        }
+        chunk = {
             "rank": rank,
             "text": doc or "",
             "score": score,
@@ -164,17 +235,37 @@ def execute_retrieve_chroma_phase(
             "line_start": m.get("line_start"),
             "chunk_index": m.get("chunk_index"),
             "record_type": m.get("record_type"),
+            "source_modality": m.get("source_modality"),
+            "summary_status": m.get("summary_status"),
+            "needs_vision_enrichment": m.get("needs_vision_enrichment"),
             "indexed_at": m.get("indexed_at"),
             "_signals": signals,
-        })
+        }
+        if photo_metadata:
+            chunk["photo_metadata"] = photo_metadata
+        chunks.append(chunk)
 
     result: dict = {
         "query": query,
         "intent": intent,
         "silo_filter": silo_slug,
         "retrieval_method": retrieval_method,
+        "image_search": image_search,
         "chunks": chunks,
     }
+    visual_follow_up = [
+        str(chunk.get("source") or "")
+        for chunk in chunks
+        if chunk.get("source_modality") == "image"
+        and chunk.get("summary_status") in {"deferred", "disabled"}
+        and chunk.get("source")
+    ]
+    if visual_follow_up:
+        result["recommended_action"] = {
+            "tool": "ask_image",
+            "reason": "The matched image has no visual summary; inspect the original pixels before answering visual details.",
+            "files": list(dict.fromkeys(visual_follow_up))[:3],
+        }
     if _silo_warning:
         result["silo_warning"] = _silo_warning
 

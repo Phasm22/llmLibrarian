@@ -27,7 +27,13 @@ dependencies = [
 image = [
     "open-clip-torch>=2.26.1",
     "torch>=2.4.0",
+    # Keep torchvision in the project's lock contract instead of relying on
+    # open-clip's transitive dependency.  A mismatched ad-hoc torchvision
+    # install can import successfully by name but fail while registering ops.
+    "torchvision>=0.19.0",
     "Pillow>=10.0.0",
+    # Pillow does not decode advertised HEIC/HEIF inputs by itself.
+    "pillow-heif>=0.18.0",
 ]
 # OCR for scanned PDFs and image text extraction
 ocr = [

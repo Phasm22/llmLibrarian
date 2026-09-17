@@ -46,6 +46,7 @@ except Exception:
 
 from embeddings import get_embedding_function, validate_embedding_dimension
 from image_embeddings import (
+    ensure_image_decoders_ready,
     ensure_image_embedding_adapter_ready,
     image_collection_name,
     image_embedding_backend_name,
@@ -138,7 +139,7 @@ def get_capabilities_text() -> str:
         if backend:
             lines.append(f"  Image embeddings: yes ({backend} -> {LLMLI_IMAGE_COLLECTION})")
         else:
-            lines.append(f"  Image embeddings: no (run `uv sync` to install the multimodal embedding backend for {LLMLI_IMAGE_COLLECTION})")
+            lines.append(f"  Image embeddings: no (run `uv sync --extra image` to install the multimodal embedding backend for {LLMLI_IMAGE_COLLECTION})")
     else:
         if (os.environ.get("LLMLIBRARIAN_OCR_BACKEND") or "").strip().lower() == "none":
             lines.append("  PDF OCR fallback: no (LLMLIBRARIAN_OCR_BACKEND=none)")
@@ -432,6 +433,7 @@ from processors import (
     ExtractedImage,
     ImageRegion,
     ExtractedText,
+    PHOTO_METADATA_FIELDS,
     ensure_vision_model_ready,
 )
 from tax.ledger import extract_tax_rows_from_chunks, replace_tax_rows_for_sources
@@ -829,6 +831,7 @@ def _image_vector_from_chunks(
         "summary_status": meta.get("summary_status"),
         "is_local": meta.get("is_local"),
     }
+    vector_meta.update({field: meta.get(field) for field in PHOTO_METADATA_FIELDS})
     vector_meta = {k: v for k, v in vector_meta.items() if v is not None}
     return (_image_vector_id(parent_image_id), source_path, doc, vector_meta)
 
@@ -1962,14 +1965,10 @@ def run_index(
             file_list.extend(collect_files(p, include, exclude, max_depth, max_file_bytes, follow_symlinks=follow_symlinks))
     
         log(f"Collected {len(file_list)} files")
-        _image_embed_ok = True
         if _requires_standalone_image_enrichment(file_list):
+            ensure_image_decoders_ready([p for p, kind in file_list if kind == "image"])
             ensure_vision_model_ready()  # always required in run_index (archetype-driven indexing)
-            try:
-                ensure_image_embedding_adapter_ready()
-            except Exception as _img_err:
-                print(warn_style(no_color, f"  ⚠️ Image embedding unavailable ({_img_err}); image files will be skipped."))
-                _image_embed_ok = False
+            ensure_image_embedding_adapter_ready()
         # 2. Split: regular files (parallel) vs zips (main thread, limits)
         regular = [(path, kind) for path, kind in file_list if kind != "zip"]
         zips = [path for path, kind in file_list if kind == "zip"]
@@ -2094,7 +2093,7 @@ def run_index(
                 embedding_fn=ef,
                 embedding_workers=embedding_workers,
             )
-        if all_image_vectors and _image_embed_ok:
+        if all_image_vectors:
             _batch_add_image_vectors(
                 image_collection,
                 all_image_vectors,
@@ -2299,15 +2298,24 @@ def run_add(
             follow_symlinks=follow_symlinks,
             stats=collect_stats,
         )
-    _image_embed_ok = True
+    # Initialize both embedding stacks before extraction or Chroma mutation.
+    # A photo-only ingest still writes searchable text summary chunks, so both
+    # backends are required; silently skipping photos creates a registered silo
+    # that can never answer the query it was created for.
+    from embeddings import _best_device as _pick_device
+    from embeddings import ingest_parallel_embedding_device
+
+    _ingest_embed_device = ingest_parallel_embedding_device(len(file_list))
+    _embed_batch_hint = len(file_list) or 64
+    text_embedding_function = get_embedding_function(
+        batch_size=_embed_batch_hint,
+        device=_ingest_embed_device,
+    )
     if _requires_standalone_image_enrichment(file_list):
+        ensure_image_decoders_ready([p for p, kind in file_list if kind == "image"])
         if effective_image_vision_enabled:
             ensure_vision_model_ready()  # hard-fail: user explicitly requested vision
-        try:
-            ensure_image_embedding_adapter_ready()
-        except Exception as _img_err:
-            print(f"  ⚠️ Image embedding unavailable ({_img_err}); image files will be skipped.")
-            _image_embed_ok = False
+        ensure_image_embedding_adapter_ready()
     regular = [(p, k) for p, k in file_list if k != "zip"]
     zips = [p for p, k in file_list if k == "zip"]
 
@@ -2324,11 +2332,6 @@ def run_add(
     # MPS (Apple Silicon) is not thread-safe for concurrent inference; cap to 1
     # when embeddings run on MPS. Large multi-file ingests force CPU instead so
     # parallel embedding workers stay enabled (see ingest_parallel_embedding_device).
-    from embeddings import _best_device as _pick_device
-    from embeddings import ingest_parallel_embedding_device
-
-    _ingest_embed_device = ingest_parallel_embedding_device(len(file_list))
-    _embed_batch_hint = len(file_list) or 64
     _effective_embed_device = (
         _ingest_embed_device if _ingest_embed_device is not None else _pick_device(batch_size=_embed_batch_hint)
     )
@@ -2341,10 +2344,7 @@ def run_add(
 
     def _run_add_chroma_phase(client) -> tuple[int, int]:
         nonlocal incremental
-        ef = get_embedding_function(
-            batch_size=len(file_list) or 64,
-            device=_ingest_embed_device,
-        )
+        ef = text_embedding_function
         collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
         if hasattr(client, "get_effective_ef"):
             ef = client.get_effective_ef(LLMLI_COLLECTION) or ef
@@ -2723,7 +2723,7 @@ def run_add(
                 embedding_fn=ef,
                 embedding_workers=embedding_workers,
             )
-        if all_image_vectors and _image_embed_ok:
+        if all_image_vectors:
             _batch_add_image_vectors(
                 image_collection,
                 all_image_vectors,

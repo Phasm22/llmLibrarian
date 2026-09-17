@@ -66,6 +66,7 @@ being rebuilt; retry instead of treating an empty result as absence of evidence.
 | `session_context` | Start-of-session bootstrap | Deep storage audit (`health`) |
 | `mcp_runtime_status` | Lock/process/runtime troubleshooting | Content retrieval |
 | `query_personal_knowledge` | Content/meaning Q&A | Filename/date lookup (`find_files`) |
+| `ask_image` | Inspect visual details in one indexed image returned by retrieval | Search for the candidate image (`query_personal_knowledge`) |
 | `multi_query_knowledge` | Multi-angle retrieval in one call | Basic single-query retrieval |
 | `find_files` | Path/date discovery | “What does this document say?” |
 | `add_silo` | Index new/updated path | Calling `trigger_reindex` immediately after |

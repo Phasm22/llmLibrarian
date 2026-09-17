@@ -180,6 +180,11 @@ def _env_for_service(env: dict[str, str] | None = None) -> dict[str, str]:
         "LLMLIBRARIAN_CHROMA_HOST",
         "LLMLIBRARIAN_CHROMA_PORT",
         "LLMLIBRARIAN_CHROMA_SSL",
+        # Without these the watcher re-ingests a changed photo with no location,
+        # silently stripping the place name a foreground `llmli add` resolved.
+        "LLMLIBRARIAN_REVERSE_GEOCODE",
+        "LLMLIBRARIAN_NEARBY_CATEGORIES",
+        "LLMLIBRARIAN_GEOCODE_CACHE",
         "PAL_HOME",
     }
     source = env if env is not None else os.environ

@@ -83,6 +83,25 @@ Standalone images:
 - also write one image-vector row into a sibling image collection
 - store raw Vision/output artifacts under `<db>/image_artifacts/<file_hash>.json`
 - keep Chroma metadata scalar-only
+- extract embedded photo metadata when available: capture time, camera/lens, dimensions,
+  orientation, exposure settings, and GPS coordinates; retrieval groups these scalar fields
+  under `photo_metadata`
+
+Reverse geocoding (`src/geocode.py`, off by default):
+- `LLMLIBRARIAN_REVERSE_GEOCODE=1` resolves a photo's GPS pair against OpenStreetMap
+  Nominatim at ingest and adds `place_name`, `place_address`, `place_category` and
+  `nearby_places`, plus `Location:` / `Nearby:` lines in the summary chunk text
+- off by default because it is the only part of ingestion that leaves the machine, and
+  photo coordinates are usually a home, a workplace, or a school
+- indoor GPS drifts 10-30 m, so the containing feature is often a parking lot; a bounded
+  search of `LLMLIBRARIAN_NEARBY_CATEGORIES` (default `restaurant,cafe,bar,hotel`) supplies
+  named venues, and the nearest within 50 m becomes `place_name`. Set the variable empty to
+  skip that pass
+- results cache forever in `~/.pal/geocode-cache.json` (override with
+  `LLMLIBRARIAN_GEOCODE_CACHE`), keyed at ~1 m, which is what keeps Nominatim's 1 req/sec
+  policy affordable across re-ingests
+- every failure path returns no location rather than raising: a disabled, offline or slow
+  geocoder must never fail an ingest run
 
 Adaptive image behavior:
 - OCR happens at ingest
@@ -92,11 +111,19 @@ Adaptive image behavior:
 - when `image_vision_enabled` is true for a silo, obvious natural-photo images are deferred
 - query may lazily summarize at most one deferred image hit, then cache it back to the artifact as `cached_query_time`
 - silos with `image_vision_enabled=false` never run multimodal image vision at ask time
+- MCP `query_personal_knowledge` routes explicit photo/image queries to image-vector
+  results, merges image candidates for implicit mixed queries, and returns
+  `image_search` diagnostics; deferred candidates include a
+  deterministic `ask_image` recommendation instead of allowing text-only misses
+  to be presented as evidence that no photo exists
 
 Requirements for standalone images:
+- install the image embedding dependencies with `uv sync --extra image`
+- the image extra includes `pillow-heif`; HEIC/HEIF is not decodable by base Pillow alone
 - `LLMLIBRARIAN_VISION_MODEL` must be a vision-capable Ollama model when `image_vision_enabled` is true
 - OpenCLIP image embedding dependencies must be installed
-- if image embeddings are unavailable, standalone image ingest fails fast
+- text and image embedding backends are initialized before extraction or Chroma
+  mutation; if either is unavailable, standalone image ingest fails fast
 - if image vision is enabled and the model is missing/non-vision, ingest fails fast
 
 ## Tax Contract

@@ -34,6 +34,10 @@ _ef_cache: dict[tuple, Any] = {}
 _ef_cache_lock = threading.Lock()
 
 
+class EmbeddingDependencyError(RuntimeError):
+    """The configured text-embedding backend is missing or cannot initialize."""
+
+
 def _mps_threshold() -> int:
     try:
         return int(os.environ.get("LLMLIBRARIAN_MPS_BATCH_THRESHOLD", _DEFAULT_MPS_THRESHOLD))
@@ -115,28 +119,37 @@ def get_embedding_function(batch_size: int | None = None, device: str | None = N
         if cached is not None:
             return cached
 
-        if kind == "default":
-            # Explicit opt-in to ONNX MiniLM path; onnxruntime will automatically
-            # use CoreMLExecutionProvider on macOS when available.
-            ef: Any = embedding_functions.DefaultEmbeddingFunction()
-        elif encode_batch_size is not None:
-            base_cls = embedding_functions.SentenceTransformerEmbeddingFunction
+        try:
+            if kind == "default":
+                # Explicit opt-in to ONNX MiniLM path; onnxruntime will automatically
+                # use CoreMLExecutionProvider on macOS when available.
+                ef: Any = embedding_functions.DefaultEmbeddingFunction()
+            elif encode_batch_size is not None:
+                base_cls = embedding_functions.SentenceTransformerEmbeddingFunction
 
-            class BatchedSentenceTransformerEmbeddingFunction(base_cls):  # type: ignore[misc, valid-type]
-                def __call__(self, input: Any) -> Any:
-                    import numpy as np
+                class BatchedSentenceTransformerEmbeddingFunction(base_cls):  # type: ignore[misc, valid-type]
+                    def __call__(self, input: Any) -> Any:
+                        import numpy as np
 
-                    embeddings = self._model.encode(
-                        list(input),
-                        batch_size=encode_batch_size,
-                        convert_to_numpy=True,
-                        normalize_embeddings=self.normalize_embeddings,
-                    )
-                    return [np.array(embedding, dtype=np.float32) for embedding in embeddings]
+                        embeddings = self._model.encode(
+                            list(input),
+                            batch_size=encode_batch_size,
+                            convert_to_numpy=True,
+                            normalize_embeddings=self.normalize_embeddings,
+                        )
+                        return [np.array(embedding, dtype=np.float32) for embedding in embeddings]
 
-            ef = BatchedSentenceTransformerEmbeddingFunction(model_name=model, device=resolved)
-        else:
-            ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model, device=resolved)
+                ef = BatchedSentenceTransformerEmbeddingFunction(model_name=model, device=resolved)
+            else:
+                ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=model, device=resolved)
+        except Exception as exc:
+            backend = "Chroma ONNX" if kind == "default" else "sentence-transformers"
+            raise EmbeddingDependencyError(
+                f"Text embedding backend {backend!r} could not initialize: "
+                f"{type(exc).__name__}: {exc}. "
+                "Run `uv sync` in the project checkout"
+                + (" (or `uv sync --extra image` for photo indexing)." if kind != "default" else ".")
+            ) from exc
 
         _ef_cache[cache_key] = ef
         return ef

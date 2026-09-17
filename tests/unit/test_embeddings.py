@@ -4,7 +4,9 @@ import sys
 from types import SimpleNamespace
 from typing import Any
 
-from embeddings import _embedding_batch_size, get_embedding_function
+import pytest
+
+from embeddings import EmbeddingDependencyError, _embedding_batch_size, get_embedding_function
 
 
 class _FakeModel:
@@ -113,6 +115,29 @@ def test_default_path_uses_sentence_transformer_with_mpnet(monkeypatch: Any) -> 
     assert ef.model_name == "all-mpnet-base-v2"
 
 
+def test_sentence_transformer_initialization_failure_is_actionable(monkeypatch: Any) -> None:
+    class _BrokenSentenceTransformerEmbeddingFunction:
+        def __init__(self, **_kwargs: Any) -> None:
+            raise ValueError("sentence_transformers is not installed")
+
+    fake_embedding_functions = SimpleNamespace(
+        DefaultEmbeddingFunction=_FakeDefaultEmbeddingFunction,
+        SentenceTransformerEmbeddingFunction=_BrokenSentenceTransformerEmbeddingFunction,
+    )
+    fake_utils = SimpleNamespace(embedding_functions=fake_embedding_functions)
+    monkeypatch.setitem(sys.modules, "chromadb", SimpleNamespace(utils=fake_utils))
+    monkeypatch.setitem(sys.modules, "chromadb.utils", fake_utils)
+    monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING", raising=False)
+    monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING_BATCH_SIZE", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", "broken-model")
+
+    with pytest.raises(EmbeddingDependencyError) as excinfo:
+        get_embedding_function()
+
+    assert "sentence-transformers" in str(excinfo.value)
+    assert "uv sync --extra image" in str(excinfo.value)
+
+
 def test_explicit_device_arg_overrides_env(monkeypatch: Any) -> None:
     _install_fake_chroma(monkeypatch)
     monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING", raising=False)
@@ -206,4 +231,3 @@ def test_best_device_falls_back_to_cpu_without_torch(monkeypatch: Any) -> None:
     monkeypatch.setitem(sys.modules, "torch", None)  # Forces ImportError on `import torch`
 
     assert _best_device(batch_size=100) == "cpu"
-
