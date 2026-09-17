@@ -298,10 +298,17 @@ def is_cloud_sync_path(path: str | Path) -> str | None:
 
 
 def _path_matches(path_str: str, pattern: str) -> bool:
-    """Match pattern against path. If pattern has no path sep, match against basename only (so *.pdf works)."""
+    """Match pattern against path. If pattern has no path sep, match against basename only (so *.pdf works).
+
+    Matching is case-insensitive: fnmatch normcases via os.path.normcase, which
+    is a no-op on POSIX, so a `*.jpg` include would silently skip `IMG_1.JPG`
+    (the spelling most cameras and scanners use).
+    """
+    lowered = path_str.lower()
+    pattern = pattern.lower()
     if "/" in pattern or "\\" in pattern:
-        return fnmatch.fnmatch(path_str, pattern)
-    return fnmatch.fnmatch(path_str, pattern) or fnmatch.fnmatch(os.path.basename(path_str), pattern)
+        return fnmatch.fnmatch(lowered, pattern)
+    return fnmatch.fnmatch(lowered, pattern) or fnmatch.fnmatch(os.path.basename(lowered), pattern)
 
 
 def should_index(file_path: str | Path, include_patterns: list[str], exclude_patterns: list[str]) -> bool:
@@ -687,8 +694,12 @@ def _chunks_from_content(
 
 
 def _image_parent_id(source_path: str, file_hash: str | None, mtime: float) -> str:
+    # Mix the path in even when a content hash exists: the id keys the image
+    # vector row, and two byte-identical images in one silo (a photo imported
+    # twice, "IMG_1.JPG" beside "IMG_1 copy.JPG") otherwise collide and Chroma
+    # rejects the whole batch with "Expected IDs to be unique".
     if file_hash:
-        return file_hash
+        return hashlib.sha256(f"image|{source_path}|{file_hash}".encode()).hexdigest()[:20]
     return hashlib.sha256(f"image|{source_path}|{mtime}".encode()).hexdigest()[:20]
 
 

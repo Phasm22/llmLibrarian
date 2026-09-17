@@ -171,6 +171,20 @@ def _pdf_tables_enabled() -> bool:
     return val not in ("0", "false", "no")
 
 
+def _eager_image_summary_enabled() -> bool:
+    """Whether every image gets its vision summary during ingest.
+
+    Default OFF: only text-bearing images (`eager_summary`) are summarized at
+    ingest, and text-free photos store a placeholder to be filled in lazily at
+    query time. That lazy path only runs in the image-collection branch of
+    run_ask, so MCP retrieval (run_retrieve) never fills it in and a photo silo
+    answers with "deferred visual summary". Turn this on to pay one vision call
+    per image at ingest and have real descriptions in every retrieval path.
+    """
+    val = (os.environ.get("LLMLIBRARIAN_IMAGE_EAGER_SUMMARY") or "0").strip().lower()
+    return val not in ("0", "false", "no")
+
+
 def _ocr_preprocess_enabled() -> bool:
     """Whether OCR preprocessing and enhanced OCR mode is enabled."""
     val = os.environ.get("LLMLIBRARIAN_OCR_PREPROCESS", "0").strip().lower()
@@ -371,7 +385,7 @@ def _image_ocr_signal_assessment(ocr_result: _OCRResult | None) -> dict[str, Any
         and meaningful_word_ratio >= 0.7
         and alnum_ratio >= 0.85
     )
-    eager_summary = bool(text_structured or ocr_strong)
+    eager_summary = bool(text_structured or ocr_strong or _eager_image_summary_enabled())
     keep_visible_text = bool(
         visible_text
         and quality_ok
@@ -734,6 +748,47 @@ def _summarize_image_with_vision_model(image_bytes: bytes, source_path: str, vis
         raise ImageExtractionError(f"Vision image summary failed for {source_path}: {e}") from e
     if not text:
         raise ImageExtractionError(f"Vision image summary returned no content for {source_path}.")
+    return text, model
+
+
+def answer_image_question(image_bytes: bytes, source_path: str, question: str) -> tuple[str, str]:
+    """Answer a free-form question about one image by re-reading the pixels.
+
+    The ingest-time summary is one or two sentences chosen without knowing what
+    would later be asked, so follow-ups about a detail ("the spongy one bottom
+    left") cannot be served from the index. This re-runs the vision model
+    against the original file with the caller's question.
+    """
+    model = ensure_vision_model_ready()
+    asked = (question or "").strip()
+    if not asked:
+        raise ImageExtractionError("A question is required to inspect an image.")
+    try:
+        import ollama
+
+        resp = ollama.chat(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Answer the question about this image using only what is visible. "
+                        "Be specific and concrete about the region or item asked about. "
+                        "If the detail is genuinely not discernible, say so plainly rather "
+                        "than guessing. Do not invent unreadable text or identities.\n\n"
+                        f"Question: {asked}"
+                    ),
+                    "images": [image_bytes],
+                }
+            ],
+            keep_alive=0,
+            options={"temperature": 0, "seed": 42},
+        )
+        text = ((resp.get("message") or {}).get("content") or "").strip()
+    except Exception as e:
+        raise ImageExtractionError(f"Vision image question failed for {source_path}: {e}") from e
+    if not text:
+        raise ImageExtractionError(f"Vision image question returned no content for {source_path}.")
     return text, model
 
 

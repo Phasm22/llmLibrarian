@@ -121,6 +121,25 @@ def test_mcp_call_sync_diagnoses_404_path_mismatch(monkeypatch):
     assert "LLMLIBRARIAN_MCP_PATH" in msg
 
 
+def test_mcp_call_sync_diagnoses_lite_profile_missing_write_tool(monkeypatch):
+    """A lite-profile server passes /healthz but has no write tools.
+
+    The raw FastMCP error is just "Unknown tool: 'add_silo'", which points at
+    pal rather than at the server's profile; name the real cause instead.
+    """
+    async def _boom(tool, **args):
+        raise RuntimeError("Unknown tool: 'add_silo'")
+
+    monkeypatch.setattr(pal, "_mcp_call", _boom)
+    monkeypatch.setattr(pal, "_mcp_url", lambda: "http://127.0.0.1:8766/mcp")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        pal._mcp_call_sync("add_silo", path="/tmp/x", confirm=True)
+    msg = str(excinfo.value)
+    assert "LLMLIBRARIAN_MCP_PROFILE=lite" in msg
+    assert "add_silo" in msg
+
+
 def test_mcp_call_sync_reraises_other_errors_unchanged(monkeypatch):
     async def _boom(tool, **args):
         raise RuntimeError("Session terminated")

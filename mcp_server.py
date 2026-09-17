@@ -1735,6 +1735,9 @@ def add_silo(
     allow_cloud: bool = False,
     exclude_patterns: list[str] | None = None,
     full: bool = False,
+    image_vision: bool | None = None,
+    workers: int | None = None,
+    embedding_workers: int | None = None,
     confirm: bool = True,
 ) -> dict:
     """
@@ -1747,6 +1750,10 @@ def add_silo(
     display_name: optional human-readable name override.
     allow_cloud: set True to allow OneDrive/iCloud/Dropbox paths (blocked by default).
     full: set True to force a full non-incremental reindex (default: incremental).
+    image_vision: set True to summarize images with the multimodal model. Persisted on
+      the silo, so later calls inherit it unless overridden; None keeps the stored value
+      (False for a new silo).
+    workers / embedding_workers: per-run concurrency overrides; None uses the defaults.
     Returns immediately; indexing runs in a background thread (same process, serialized via lock).
     Call list_silos() or health() after a minute or two to confirm completion.
 
@@ -1798,6 +1805,9 @@ def add_silo(
                         allow_cloud=allow_cloud,
                         incremental=not full,
                         exclude_patterns=exclude_patterns,
+                        image_vision_enabled=image_vision,
+                        workers=workers,
+                        embedding_workers=embedding_workers,
                         pre_write_hook=_acquire_for_write,
                     )
                 )
@@ -2068,9 +2078,89 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8) -> dict:
         _release_chroma()
 
 
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}
+
+
+def _resolve_indexed_image(file: str, silo: str | None) -> tuple[str | None, list[str], str | None]:
+    """Map a filename or path to an indexed image. Returns (path, candidates, error).
+
+    Only files present in the manifest resolve. The vision call reads bytes off
+    disk, so an unindexed path must never reach it — that would turn a retrieval
+    tool into arbitrary local file read.
+    """
+    from silo_audit import load_manifest
+
+    wanted = (file or "").strip()
+    if not wanted:
+        return None, [], "file is required"
+    manifest = load_manifest(_DB_PATH) or {}
+    silos = manifest.get("silos") or {}
+    target_slug = (silo or "").strip()
+
+    matches: list[str] = []
+    for slug, entry in silos.items():
+        if target_slug and slug != target_slug and (entry or {}).get("path") != target_slug:
+            continue
+        for path in ((entry or {}).get("files") or {}):
+            if Path(path).suffix.lower() not in _IMAGE_SUFFIXES:
+                continue
+            if path == wanted or Path(path).name == wanted or Path(path).name.lower() == wanted.lower():
+                matches.append(path)
+    if not matches:
+        return None, [], f"no indexed image matches {file!r}" + (f" in silo {silo!r}" if silo else "")
+    if len(matches) > 1:
+        return None, sorted(matches), "multiple indexed images match; pass a full path"
+    return matches[0], [], None
+
+
+@mcp.tool()
+def ask_image(file: str, question: str, silo: str | None = None) -> dict:
+    """
+    Use when: the user asks about a visual detail of one indexed image that the
+    stored summary does not cover ("what is the spongy piece bottom left",
+    "what does the label say", "how many people are in it").
+    Do not use when: a text query over summaries suffices (`query_personal_knowledge`)
+    or you need to find which image to ask about (`find_files` first).
+    Pairs with: `query_personal_knowledge` to locate the image, then this for detail.
+
+    Re-reads the original image with the local vision model and answers the
+    question. The ingest-time summary is one or two sentences written without
+    knowing what would be asked later, so follow-up detail questions cannot be
+    served from the index — this looks at the pixels again.
+
+    file: filename (e.g. "IMG_9383.jpeg") or absolute path. Must already be indexed.
+    silo: optional slug to disambiguate when the same filename exists in several silos.
+    Runs locally against LLMLIBRARIAN_VISION_MODEL; nothing leaves the machine.
+    """
+    path, candidates, err = _resolve_indexed_image(file, silo)
+    if err:
+        out: dict = {"status": "error", "error": err}
+        if candidates:
+            out["candidates"] = candidates
+        return out
+    try:
+        image_bytes = Path(path).read_bytes()
+    except OSError as e:
+        return {"status": "error", "error": f"cannot read {path}: {e}"}
+    try:
+        from processors import answer_image_question
+
+        answer, model = answer_image_question(image_bytes, path, question)
+    except Exception as e:
+        return {"status": "error", "error": f"{type(e).__name__}: {e}", "source_file": path}
+    return {
+        "status": "ok",
+        "source_file": path,
+        "question": question,
+        "answer": answer,
+        "vision_model": model,
+    }
+
+
 _FULL_TOOL_NAMES = (
     "query_personal_knowledge",
     "multi_query_knowledge",
+    "ask_image",
     "recent_queries",
     "find_files",
     "explain_retrieval",

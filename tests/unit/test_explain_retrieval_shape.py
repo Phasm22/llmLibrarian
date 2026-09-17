@@ -86,3 +86,33 @@ def test_add_silo_forwards_exclude_patterns(monkeypatch, tmp_path):
             break
         time.sleep(0.02)
     assert seen["exclude_patterns"] == ["node_modules/", "*.tmp"]
+
+
+def test_add_silo_forwards_ingest_options(monkeypatch, tmp_path):
+    """image_vision / workers must reach the ingest request, not be dropped."""
+    target = tmp_path / "pics"
+    target.mkdir()
+    seen = {}
+
+    def _fake_run_ingest(request):
+        seen["image_vision_enabled"] = request.image_vision_enabled
+        seen["workers"] = request.workers
+        seen["embedding_workers"] = request.embedding_workers
+        from orchestration.ingest import IngestResult
+
+        return IngestResult(files_indexed=1, failures=0, silo_slug="pics")
+
+    monkeypatch.setattr("orchestration.ingest.run_ingest", _fake_run_ingest)
+    out = mcp_server.add_silo(
+        path=str(target), image_vision=True, workers=7, embedding_workers=3
+    )
+    assert out["status"] == "started"
+    import time
+
+    for _ in range(50):
+        if "image_vision_enabled" in seen:
+            break
+        time.sleep(0.02)
+    assert seen["image_vision_enabled"] is True
+    assert seen["workers"] == 7
+    assert seen["embedding_workers"] == 3

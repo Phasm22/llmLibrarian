@@ -20,9 +20,17 @@ _PREVIEW_SKIPPED_EXTENSIONS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm"
 
 
 def _path_matches(path_str: str, pattern: str) -> bool:
+    """Match pattern against path. If pattern has no path sep, match against basename only (so *.pdf works).
+
+    Matching is case-insensitive: fnmatch normcases via os.path.normcase, which
+    is a no-op on POSIX, so a `*.jpg` include would silently skip `IMG_1.JPG`
+    (the spelling most cameras and scanners use).
+    """
+    lowered = path_str.lower()
+    pattern = pattern.lower()
     if "/" in pattern or "\\" in pattern:
-        return fnmatch.fnmatch(path_str, pattern)
-    return fnmatch.fnmatch(path_str, pattern) or fnmatch.fnmatch(os.path.basename(path_str), pattern)
+        return fnmatch.fnmatch(lowered, pattern)
+    return fnmatch.fnmatch(lowered, pattern) or fnmatch.fnmatch(os.path.basename(lowered), pattern)
 
 
 def should_index(file_path: str | Path, include_patterns: list[str], exclude_patterns: list[str]) -> bool:

@@ -210,6 +210,84 @@ def test_pull_watch_with_path_uses_path_watcher(monkeypatch):
     assert watched["watcher_processor_log_level"] == "ERROR"
 
 
+def test_pull_watch_forwards_image_vision_and_worker_flags(monkeypatch):
+    """--image-vision in watch mode must reach add_silo.
+
+    Watch mode hands ingestion to the shared MCP server, so a flag that is not
+    forwarded is silently lost: the silo is built with vision off and persists
+    that, which for an image folder discards the whole point of the run.
+    """
+    watched = {}
+
+    def _fake_mcp_call(tool, **kwargs):
+        watched["mcp_tool"] = tool
+        watched["mcp_args"] = kwargs
+        return {"status": "ok"}
+
+    monkeypatch.setattr("pal._mcp_healthcheck", lambda: (True, ""))
+    monkeypatch.setattr("pal._mcp_call_sync", _fake_mcp_call)
+    monkeypatch.setattr(
+        "pal._read_llmli_registry",
+        lambda _db: {"folder-slug": {"path": str(Path('/tmp/folder').resolve())}},
+    )
+
+    class _DummyWatcher:
+        def __init__(self, root, db_path, interval, debounce, silo_slug, **kwargs):
+            pass
+
+    monkeypatch.setattr("pal.SiloWatcher", _DummyWatcher)
+    monkeypatch.setattr("pal._run_watcher", lambda *_a, **_k: 0)
+    monkeypatch.setattr("pal.Observer", object())
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    res = runner.invoke(
+        pal.app,
+        ["pull", "/tmp/folder", "--watch", "--image-vision", "--workers", "7", "--embedding-workers", "3"],
+    )
+    assert res.exit_code == 0
+    assert watched["mcp_tool"] == "add_silo"
+    assert watched["mcp_args"]["image_vision"] is True
+    assert watched["mcp_args"]["workers"] == 7
+    assert watched["mcp_args"]["embedding_workers"] == 3
+
+
+def test_pull_watch_waits_for_new_silo_registration(monkeypatch):
+    """A first-time watch must not race add_silo's background registration.
+
+    add_silo returns as soon as its ingest thread starts, so the registry has
+    no entry yet for a brand-new folder; reading it once fails the watch.
+    """
+    resolved = Path("/tmp/folder").resolve()
+    calls = {"n": 0}
+
+    def _fake_read_registry(_db):
+        calls["n"] += 1
+        # The slug only appears after the background ingest registers it.
+        if calls["n"] < 3:
+            return {}
+        return {"folder-slug": {"path": str(resolved)}}
+
+    monkeypatch.setattr("pal._mcp_healthcheck", lambda: (True, ""))
+    monkeypatch.setattr("pal._mcp_call_sync", lambda tool, **kw: {"status": "ok"})
+    monkeypatch.setattr("pal._read_llmli_registry", _fake_read_registry)
+    monkeypatch.setattr("pal.time.sleep", lambda _s: None)
+
+    seen = {}
+
+    class _DummyWatcher:
+        def __init__(self, root, db_path, interval, debounce, silo_slug, **kwargs):
+            seen["silo_slug"] = silo_slug
+
+    monkeypatch.setattr("pal.SiloWatcher", _DummyWatcher)
+    monkeypatch.setattr("pal._run_watcher", lambda *_a, **_k: 0)
+    monkeypatch.setattr("pal.Observer", object())
+    from typer.testing import CliRunner
+    res = CliRunner().invoke(pal.app, ["pull", "/tmp/folder", "--watch"])
+    assert res.exit_code == 0
+    assert seen["silo_slug"] == "folder-slug"
+    assert calls["n"] >= 3
+
+
 def test_pull_watch_errors_when_mcp_unreachable(monkeypatch, tmp_path):
     import pal
 

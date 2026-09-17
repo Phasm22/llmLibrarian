@@ -1035,6 +1035,25 @@ def _read_llmli_registry(db_path: str | Path) -> dict:
         return {}
 
 
+def _wait_for_llmli_silo_by_path(
+    db_path: str | Path, path: Path, timeout: float = 60.0, poll: float = 0.5
+) -> str | None:
+    """Resolve a silo slug by path, waiting for a pending add_silo to register it.
+
+    add_silo returns as soon as its background ingest thread starts, so a
+    first-time watch on a new folder can read the registry before the slug
+    exists. Poll instead of failing on that race.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        slug = _resolve_llmli_silo_by_path(_read_llmli_registry(db_path), path)
+        if slug is not None:
+            return slug
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(poll)
+
+
 def _resolve_llmli_silo_by_path(registry: dict, path: Path) -> str | None:
     target = str(path.resolve())
     for slug, data in registry.items():
@@ -1579,6 +1598,16 @@ def _mcp_path_mismatch_hint() -> str:
     )
 
 
+def _mcp_missing_tool_hint(tool: str) -> str:
+    return (
+        f"the MCP server at {_mcp_url()} does not expose {tool!r}. The write tools "
+        "(add_silo, trigger_reindex, repair_silo, update_file, remove_file) exist only "
+        "in the full profile; a server started with LLMLIBRARIAN_MCP_PROFILE=lite serves "
+        "just silo_roster and retrieve_knowledge. Set lite only on a dedicated "
+        "small-context client's process, not on the shared server pal writes through."
+    )
+
+
 def _mcp_call_sync(tool: str, **args) -> dict:
     import asyncio
 
@@ -1589,6 +1618,10 @@ def _mcp_call_sync(tool: str, **args) -> dict:
         # as an opaque "Session terminated"; diagnose it explicitly.
         if "session terminated" in str(exc).lower() and _mcp_endpoint_http_status() == 404:
             raise RuntimeError(_mcp_path_mismatch_hint()) from exc
+        # A healthy lite-profile server answers /healthz but has no write tools,
+        # so the healthcheck passes and every write dies on "Unknown tool".
+        if f"unknown tool: '{tool}'" in str(exc).lower():
+            raise RuntimeError(_mcp_missing_tool_hint(tool)) from exc
         raise
 
 
@@ -2182,6 +2215,9 @@ def _pull_watch_path_mode(
                 path=str(path),
                 allow_cloud=allow_cloud,
                 exclude_patterns=exclude_patterns or [],
+                image_vision=image_vision,
+                workers=workers,
+                embedding_workers=embedding_workers,
                 confirm=True,
             )
         except Exception as exc:
@@ -2197,10 +2233,13 @@ def _pull_watch_path_mode(
                 print("Error: unable to resolve silo for prompt override.", file=sys.stderr)
                 return 1
         db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
-        llmli_registry = _read_llmli_registry(db_path)
-        slug = _resolve_llmli_silo_by_path(llmli_registry, path)
+        slug = _wait_for_llmli_silo_by_path(db_path, path)
         if slug is None:
-            print("Error: unable to resolve silo slug for watched folder.", file=sys.stderr)
+            print(
+                "Error: unable to resolve silo slug for watched folder "
+                f"after waiting for indexing to register it: {path}",
+                file=sys.stderr,
+            )
             return 1
         _set_process_title("watch", slug)
         watcher = SiloWatcher(

@@ -285,7 +285,15 @@ def test_chunks_from_image_result_writes_artifact(tmp_path: Path):
     assert payload["ocr_signal_score"] == 0.12
     assert chunks[0][2]["image_artifact_relpath"] == "image_artifacts/abc123.json"
     assert chunks[0][2]["summary_status"] == "deferred"
-    assert chunks[1][2]["parent_image_id"] == "abc123"
+    # parent_image_id joins an image's chunks to its vector row. It mixes the
+    # source path in rather than being the bare content hash, so two identical
+    # images in one silo get distinct ids instead of colliding.
+    from ingest import _image_parent_id
+
+    expected_parent = _image_parent_id("/tmp/dog.jpg", "abc123", 123.0)
+    assert expected_parent != "abc123"
+    assert chunks[1][2]["parent_image_id"] == expected_parent
+    assert chunks[0][2]["parent_image_id"] == chunks[1][2]["parent_image_id"]
 
 
 def test_image_vector_from_chunks_uses_summary_metadata():
