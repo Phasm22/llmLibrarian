@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from ingest.watch_scan import (
+from watch_scan import (
     ADD_DEFAULT_EXCLUDE,
     ADD_DEFAULT_INCLUDE,
     should_index,
@@ -94,3 +94,24 @@ def test_scan_patterns_stays_import_light():
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "[]", f"scan_patterns pulled in {out.stdout.strip()}"
+
+
+def test_watch_daemon_imports_stay_light():
+    """A watcher is resident for days per silo; every heavy import is paid x N.
+
+    Covers everything SiloWatcher pulls in (watch_scan, state, telemetry) plus
+    pal itself, whose MCP client must not drag in fastmcp/pydantic/httpx.
+    """
+    root = pathlib.Path(__file__).resolve().parents[2]
+    code = (
+        "import sys; sys.path[:0] = [%r, %r];"
+        "import pal, watch_scan, state, watch_telemetry;"
+        "heavy = {'chromadb', 'torch', 'sentence_transformers', 'numpy', 'grpc',"
+        " 'onnxruntime', 'fastmcp', 'mcp', 'httpx', 'pydantic'} & {m.split('.')[0] for m in sys.modules};"
+        "print(sorted(heavy))" % (str(root), str(root / "src"))
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "[]", f"watch daemon imports pulled in {out.stdout.strip()}"

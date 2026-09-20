@@ -97,3 +97,19 @@ def test_watch_retries_error_with_backoff(monkeypatch, tmp_path: Path):
     assert queued["action"] == "update"
     assert int(queued["attempts"]) == 1
     assert any("failed via MCP" in line and "boom" in line for line in logged)
+
+
+def test_worker_sleeps_until_next_due_instead_of_polling(monkeypatch, tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    watcher = _make_watcher(monkeypatch, root)
+
+    assert watcher._seconds_until_next_due() is None  # idle: block until woken
+    watcher._wake.clear()
+    watcher._queue_action(str(root / "a.py"), "update", delay=30.0)
+    assert watcher._wake.is_set()  # enqueue wakes the worker to reschedule
+    wait = watcher._seconds_until_next_due()
+    assert wait is not None and 29.0 < wait <= 30.0
+
+    watcher.stop()
+    assert watcher._wake.is_set()  # stop releases a worker blocked on an empty queue

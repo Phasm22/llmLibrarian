@@ -1554,22 +1554,84 @@ def _mcp_bearer_token() -> str | None:
     return os.environ.get("LLMLIBRARIAN_MCP_BEARER_TOKEN") or None
 
 
-async def _mcp_call(tool: str, **args) -> dict:
-    from fastmcp import Client
+class _MCPHTTPError(RuntimeError):
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(f"MCP HTTP {status}: {detail}")
+        self.status = status
 
+
+def _mcp_post(body: dict, timeout: float) -> dict | None:
+    """POST one JSON-RPC message to the MCP endpoint; return the reply, if any.
+
+    The server speaks streamable HTTP and may answer with plain JSON or with an
+    SSE stream of ``data:`` lines; both are handled.
+    """
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        _mcp_url(),
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+    )
     tok = _mcp_bearer_token()
-    client_kwargs: dict = {}
     if tok:
-        client_kwargs["auth"] = tok
-    async with Client(_mcp_url(), **client_kwargs) as client:
-        result = await client.call_tool(tool, arguments=args)
-    data = getattr(result, "data", None)
-    if isinstance(data, dict):
-        return data
-    structured = getattr(result, "structured_content", None)
+        req.add_header("Authorization", f"Bearer {tok}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = resp.headers.get("Content-Type") or ""
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise _MCPHTTPError(exc.code, exc.read().decode("utf-8", errors="replace")[:500]) from exc
+    if "id" not in body or not raw.strip():
+        return None
+    if "text/event-stream" in ctype:
+        for line in raw.splitlines():
+            if not line.startswith("data:"):
+                continue
+            msg = json.loads(line[5:].strip())
+            if msg.get("id") == body["id"]:
+                return msg
+        raise RuntimeError("MCP stream ended without a reply")
+    return json.loads(raw)
+
+
+def _mcp_call(tool: str, timeout: float = 600.0, **args) -> dict:
+    """Call one MCP tool over stateless streamable HTTP using only the stdlib.
+
+    Watch daemons call this for every file event; the fastmcp client it
+    replaces pulled ~40 MB of imports (pydantic, httpx, opentelemetry) into
+    each long-lived watcher and spun up an event loop per call.
+    """
+    reply = _mcp_post(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": args},
+        },
+        timeout,
+    )
+    if reply is None:
+        raise RuntimeError("MCP server returned an empty reply")
+    if "error" in reply:
+        err = reply["error"] or {}
+        raise RuntimeError(str(err.get("message") or err))
+    result = reply.get("result") or {}
+    text = "".join(c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict))
+    if result.get("isError"):
+        raise RuntimeError(text or "MCP tool call failed")
+    structured = result.get("structuredContent")
     if isinstance(structured, dict):
         return structured
-    return {"status": "ok", "raw": str(result)}
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    return {"status": "ok", "raw": text}
 
 
 def _mcp_endpoint_http_status() -> int | None:
@@ -1609,14 +1671,11 @@ def _mcp_missing_tool_hint(tool: str) -> str:
 
 
 def _mcp_call_sync(tool: str, **args) -> dict:
-    import asyncio
-
     try:
-        return asyncio.run(_mcp_call(tool, **args))
+        return _mcp_call(tool, **args)
     except Exception as exc:
-        # A 404 from a path mismatch dies at the transport layer and surfaces
-        # as an opaque "Session terminated"; diagnose it explicitly.
-        if "session terminated" in str(exc).lower() and _mcp_endpoint_http_status() == 404:
+        # A path mismatch comes back as a bare 404; name the likely cause.
+        if isinstance(exc, _MCPHTTPError) and exc.status == 404:
             raise RuntimeError(_mcp_path_mismatch_hint()) from exc
         # A healthy lite-profile server answers /healthz but has no write tools,
         # so the healthcheck passes and every write dies on "Unknown tool".
@@ -1718,7 +1777,7 @@ class SiloWatcher:
         if Observer is None:
             raise RuntimeError("watchdog is not installed. Install `watchdog` to use watch mode.")
         _ensure_src_on_path()
-        from ingest.watch_scan import (
+        from watch_scan import (
             _read_file_manifest,
             _load_limits_config,
             collect_files,
@@ -1756,6 +1815,9 @@ class SiloWatcher:
         self._queue: dict[str, dict[str, object]] = {}
         self._queue_lock = threading.Lock()
         self._stop = threading.Event()
+        # Set whenever the queue changes so the worker can sleep until the next
+        # item is due instead of polling.
+        self._wake = threading.Event()
         self._lock = threading.Lock()
         self._logger = self._build_logger()
 
@@ -1783,6 +1845,7 @@ class SiloWatcher:
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
 
     def _retry_delay(self, attempts: int) -> float:
         schedule = [30.0, 60.0, 120.0, 300.0]
@@ -1797,6 +1860,7 @@ class SiloWatcher:
                 "action": action,
                 "attempts": attempts,
             }
+        self._wake.set()
 
     def enqueue_update(self, path: str) -> None:
         try:
@@ -1916,7 +1980,16 @@ class SiloWatcher:
                     silo=self.silo_slug,
                     error=f"{type(exc).__name__}: {exc}",
                 )
-            self._stop.wait(0.2)
+            self._wake.wait(self._seconds_until_next_due())
+            self._wake.clear()
+
+    def _seconds_until_next_due(self) -> float | None:
+        """Time until the earliest queued item is due; None when the queue is empty."""
+        with self._queue_lock:
+            if not self._queue:
+                return None
+            next_due = min(float(meta.get("due_at") or 0.0) for meta in self._queue.values())
+        return max(next_due - time.time(), 0.0)
 
     def _reconcile_once(self) -> tuple[int, int, int]:
         max_file_bytes, max_depth, _max_archive_bytes, _max_files_per_zip, _max_extracted = self._load_limits_config()
@@ -1980,10 +2053,7 @@ class SiloWatcher:
         )
 
     def _reconcile_loop(self) -> None:
-        while not self._stop.is_set():
-            time.sleep(self.interval)
-            if self._stop.is_set():
-                break
+        while not self._stop.wait(self.interval):
             started = time.perf_counter()
             queued_updates, queued_removes, skipped = self._reconcile_once()
             duration_ms = int((time.perf_counter() - started) * 1000)
@@ -2027,8 +2097,7 @@ class SiloWatcher:
             )
         self._emit_reconcile_event(queued_updates, queued_removes, skipped, duration_ms)
         try:
-            while not self._stop.is_set():
-                time.sleep(1.0)
+            self._stop.wait()
         finally:
             self._stop.set()
             self._observer.stop()

@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from ingest import should_index as should_index_main
-from ingest.watch_scan import (
+from watch_scan import (
     ADD_DEFAULT_EXCLUDE,
     ADD_DEFAULT_INCLUDE,
     should_index as should_index_watch,

@@ -48,9 +48,9 @@ def watcher_setup(monkeypatch, tmp_path):
     fake_ingest._read_file_manifest.return_value = {"silos": {}}
     fake_ingest._load_limits_config.return_value = (1_000_000, 10, 1_000_000, 100, 100)
     monkeypatch.setitem(__import__("sys").modules, "ingest", fake_ingest)
-    # SiloWatcher imports from the ingest.watch_scan submodule; a MagicMock is
-    # not a package, so stub the submodule entry explicitly.
-    monkeypatch.setitem(__import__("sys").modules, "ingest.watch_scan", fake_ingest)
+    # SiloWatcher imports from the top-level watch_scan module (kept out of
+    # the ingest package so watchers never load chromadb); stub it too.
+    monkeypatch.setitem(__import__("sys").modules, "watch_scan", fake_ingest)
 
     fake_state = MagicMock()
     fake_state.get_silo_exclude_patterns.return_value = []

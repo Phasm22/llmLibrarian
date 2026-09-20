@@ -1,7 +1,7 @@
 """Default include/exclude patterns for file scanning.
 
 Single source for both scanners: ``ingest`` (full pipeline) and
-``ingest.watch_scan`` (watch daemons, deliberately free of chromadb/torch
+``watch_scan`` (watch daemons, deliberately free of chromadb/torch
 imports). They previously carried byte-identical copies, which is a silent
 drift hazard — a pattern added to one scanner but not the other means
 ``llmli add`` and the watcher disagree about what belongs in a silo.

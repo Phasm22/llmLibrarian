@@ -5,6 +5,7 @@ the server's .env.mcp configured a secret LLMLIBRARIAN_MCP_PATH, pal clients in 
 fresh shell defaulted to /mcp, and the resulting 404 surfaced as an opaque
 transport-level error.
 """
+import json
 import os
 from pathlib import Path
 
@@ -107,11 +108,10 @@ def test_missing_env_mcp_falls_back_to_defaults(monkeypatch, tmp_path):
 
 
 def test_mcp_call_sync_diagnoses_404_path_mismatch(monkeypatch):
-    async def _boom(tool, **args):
-        raise RuntimeError("Session terminated")
+    def _boom(tool, **args):
+        raise pal._MCPHTTPError(404, "Not Found")
 
     monkeypatch.setattr(pal, "_mcp_call", _boom)
-    monkeypatch.setattr(pal, "_mcp_endpoint_http_status", lambda: 404)
     monkeypatch.setattr(pal, "_mcp_url", lambda: "http://127.0.0.1:8765/mcp")
 
     with pytest.raises(RuntimeError) as excinfo:
@@ -124,10 +124,10 @@ def test_mcp_call_sync_diagnoses_404_path_mismatch(monkeypatch):
 def test_mcp_call_sync_diagnoses_lite_profile_missing_write_tool(monkeypatch):
     """A lite-profile server passes /healthz but has no write tools.
 
-    The raw FastMCP error is just "Unknown tool: 'add_silo'", which points at
+    The raw server error is just "Unknown tool: 'add_silo'", which points at
     pal rather than at the server's profile; name the real cause instead.
     """
-    async def _boom(tool, **args):
+    def _boom(tool, **args):
         raise RuntimeError("Unknown tool: 'add_silo'")
 
     monkeypatch.setattr(pal, "_mcp_call", _boom)
@@ -141,13 +141,12 @@ def test_mcp_call_sync_diagnoses_lite_profile_missing_write_tool(monkeypatch):
 
 
 def test_mcp_call_sync_reraises_other_errors_unchanged(monkeypatch):
-    async def _boom(tool, **args):
-        raise RuntimeError("Session terminated")
+    def _boom(tool, **args):
+        raise pal._MCPHTTPError(500, "boom")
 
     monkeypatch.setattr(pal, "_mcp_call", _boom)
-    monkeypatch.setattr(pal, "_mcp_endpoint_http_status", lambda: 405)
 
-    with pytest.raises(RuntimeError, match="Session terminated"):
+    with pytest.raises(RuntimeError, match="MCP HTTP 500"):
         pal._mcp_call_sync("health")
 
 
@@ -184,3 +183,62 @@ def test_daemon_env_bakes_mcp_keys_from_candidate_env_file(monkeypatch, tmp_path
     assert env["LLMLIBRARIAN_MCP_PATH"] == "/secret123/mcp"
     assert env["LLMLIBRARIAN_MCP_PORT"] == "8765"
     assert env["LLMLIBRARIAN_CHROMA_HOST"] == "127.0.0.1"
+
+
+def _serve_once(reply_body: bytes, content_type: str):
+    import http.server
+    import threading
+
+    seen: dict = {}
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen["accept"] = self.headers.get("Accept")
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.end_headers()
+            self.wfile.write(reply_body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    return srv, seen
+
+
+@pytest.mark.parametrize("framing", ["sse", "json"])
+def test_mcp_call_parses_structured_content(monkeypatch, framing):
+    msg = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "content": [{"type": "text", "text": '{"status":"unchanged"}'}],
+            "structuredContent": {"status": "unchanged", "silo": "s"},
+            "isError": False,
+        },
+    }
+    if framing == "sse":
+        srv, seen = _serve_once(f"event: message\ndata: {json.dumps(msg)}\n\n".encode(), "text/event-stream")
+    else:
+        srv, seen = _serve_once(json.dumps(msg).encode(), "application/json")
+    monkeypatch.setattr(pal, "_mcp_url", lambda: f"http://127.0.0.1:{srv.server_port}/mcp")
+    monkeypatch.setattr(pal, "_mcp_bearer_token", lambda: None)
+
+    assert pal._mcp_call("update_file", silo="s", path="/x", confirm=True) == {"status": "unchanged", "silo": "s"}
+    assert seen["body"]["method"] == "tools/call"
+    assert seen["body"]["params"] == {"name": "update_file", "arguments": {"silo": "s", "path": "/x", "confirm": True}}
+    assert "text/event-stream" in seen["accept"]
+    srv.server_close()
+
+
+def test_mcp_call_raises_tool_error_text(monkeypatch):
+    msg = {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "Unknown tool: 'add_silo'"}], "isError": True}}
+    srv, _seen = _serve_once(f"data: {json.dumps(msg)}\n\n".encode(), "text/event-stream")
+    monkeypatch.setattr(pal, "_mcp_url", lambda: f"http://127.0.0.1:{srv.server_port}/mcp")
+    monkeypatch.setattr(pal, "_mcp_bearer_token", lambda: None)
+
+    with pytest.raises(RuntimeError, match="LLMLIBRARIAN_MCP_PROFILE=lite"):
+        pal._mcp_call_sync("add_silo", path="/tmp/x", confirm=True)
+    srv.server_close()
