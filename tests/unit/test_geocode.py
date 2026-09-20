@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from src import geocode
+import geocode
 
 
 @pytest.fixture(autouse=True)

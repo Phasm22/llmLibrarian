@@ -20,7 +20,7 @@ from html.parser import HTMLParser
 from typing import Any, Protocol
 
 # ChunkTuple imported from ingest to avoid circular; use forward reference in type hints.
-from src.geocode import reverse_geocode
+from geocode import reverse_geocode
 
 ChunkTuple = tuple[str, str, dict[str, Any]]
 
