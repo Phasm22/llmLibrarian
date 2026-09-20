@@ -122,6 +122,9 @@ Requirements for standalone images:
 - the image extra includes `pillow-heif`; HEIC/HEIF is not decodable by base Pillow alone
 - `LLMLIBRARIAN_VISION_MODEL` must be a vision-capable Ollama model when `image_vision_enabled` is true
 - OpenCLIP image embedding dependencies must be installed
+- OpenCLIP runs on CPU by default: on Apple Silicon, MPS pinned ~1.6 GB of GPU memory in the
+  resident MCP server with no measurable per-image speedup. Set
+  `LLMLIBRARIAN_IMAGE_EMBEDDING_DEVICE=mps` (or `cuda`) to override
 - text and image embedding backends are initialized before extraction or Chroma
   mutation; if either is unavailable, standalone image ingest fails fast
 - if image vision is enabled and the model is missing/non-vision, ingest fails fast
@@ -143,6 +146,9 @@ If `LLMLIBRARIAN_TRACE` is set, asks append JSON-lines traces.
 - `LLMLIBRARIAN_CONFIG`
 - `LLMLIBRARIAN_MODEL`
 - `LLMLIBRARIAN_VISION_MODEL`
+- `LLMLIBRARIAN_IMAGE_EMBEDDING_DEVICE`
+- `LLMLIBRARIAN_MODEL_IDLE_UNLOAD_SECONDS` (MCP server drops cached embedding/rerank models after this long
+  without use; default 900, `0` keeps them loaded)
 - `LLMLIBRARIAN_TRACE`
 - `LLMLIBRARIAN_RERANK`
 - `LLMLIBRARIAN_OCR_BACKEND`

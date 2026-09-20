@@ -2310,6 +2310,12 @@ if __name__ == "__main__":
         _acquire_server_lock()
         _SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
+    # Resident for days but queried in bursts: free the embedding models
+    # between bursts, except while a background ingest is still using them.
+    from model_idle import start_idle_reaper
+
+    start_idle_reaper(is_busy=lambda: bool(_active_background_jobs))
+
     auth_provider = _auth_for_transport(transport)
     if auth_provider is not None:
         mcp.auth = auth_provider

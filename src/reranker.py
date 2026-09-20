@@ -32,6 +32,9 @@ def _get_reranker_device() -> str:
 
 def _get_model(model_name: str, device: str) -> Any:
     """Return a cached CrossEncoder; load on first use."""
+    import model_idle
+
+    model_idle.touch()
     key = (model_name, device)
     with _cache_lock:
         if key not in _model_cache:

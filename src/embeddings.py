@@ -109,6 +109,9 @@ def get_embedding_function(batch_size: int | None = None, device: str | None = N
     If device is set (e.g. "cpu" from ingest_parallel_embedding_device), it overrides auto selection.
     """
     from chromadb.utils import embedding_functions
+    import model_idle
+
+    model_idle.touch()
     kind = os.environ.get("LLMLIBRARIAN_EMBEDDING", "").lower()
     model = os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2")
     resolved = device if device is not None else _best_device(batch_size)

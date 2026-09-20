@@ -8,12 +8,15 @@ we can swap multimodal embedding backends without reshaping the rest of the app.
 from __future__ import annotations
 
 import importlib.util
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
 from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
+
+import model_idle
 
 
 class ImageEmbeddingError(Exception):
@@ -50,16 +53,15 @@ def _open_clip_available() -> bool:
 
 
 def _preferred_device() -> str:
-    try:
-        import torch
+    """CPU unless LLMLIBRARIAN_IMAGE_EMBEDDING_DEVICE names another torch device.
 
-        if bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available():
-            return "mps"
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
+    On Apple Silicon, CLIP ViT-B/32 on MPS pinned ~1.6 GB of GPU memory in the
+    long-lived MCP server (the MPS heap is not returned even after unloading)
+    while buying nothing: measured per-image embed time was 127 ms on MPS vs
+    124 ms on CPU, since image decode dominates, and a text query was 8 ms vs
+    25 ms. CPU holds the same model in about half the memory.
+    """
+    return os.environ.get("LLMLIBRARIAN_IMAGE_EMBEDDING_DEVICE", "").strip() or "cpu"
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,7 @@ class OpenCLIPAdapter:
 
 def get_image_embedding_adapter() -> ImageEmbeddingAdapter | None:
     global _IMAGE_ADAPTER_ERROR
+    model_idle.touch()
     cached = _IMAGE_ADAPTER_CACHE.get("default")
     if cached is not None:
         return cached
