@@ -328,21 +328,33 @@ if _MCP_PROFILE == "lite":
 _chroma_lock = threading.Lock()
 
 
-def _mcp_lock_timeout_seconds() -> float | None:
+def _mcp_lock_timeout_seconds(*, write: bool = False) -> float | None:
     """Wait budget for the in-process Chroma mutex; None means block indefinitely.
 
     Delegates to chroma_lock so LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS=0 means
     the same thing here as it does for the flock layer. Reading it separately
     turned that setting into an instant timeout on this side.
+
+    ``write=True`` selects the longer writer budget (default 120s) so a
+    background reindex write phase can wait out a brief ``update_file`` hold
+    instead of failing its own acquire after the 5s read budget.
     """
     from chroma_lock import _lock_timeout_seconds
 
-    return _lock_timeout_seconds(env_name="LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS")
+    return _lock_timeout_seconds(
+        write=write,
+        env_name="LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS",
+    )
 
 
-def _acquire_chroma_lock(operation: str) -> None:
-    """Take the in-process Chroma mutex, honouring the block-forever sentinel."""
-    timeout = _mcp_lock_timeout_seconds()
+def _acquire_chroma_lock(operation: str, *, write: bool = False) -> None:
+    """Take the in-process Chroma mutex, honouring the block-forever sentinel.
+
+    ``write=True`` uses the writer wait budget. Sync high-frequency tools
+    (``update_file`` / ``remove_file``) keep the short budget and return
+    ``busy`` on timeout; background ingest hooks pass ``write=True``.
+    """
+    timeout = _mcp_lock_timeout_seconds(write=write)
     acquired = (
         _chroma_lock.acquire() if timeout is None else _chroma_lock.acquire(timeout=timeout)
     )
@@ -354,13 +366,13 @@ def _acquire_chroma_lock(operation: str) -> None:
         )
 
 
-def _retry_after_seconds() -> int:
+def _retry_after_seconds(*, write: bool = False) -> int:
     """Client retry hint: half the lock budget, floor 1s.
 
     With no timeout configured there is no budget to halve, so fall back to the
     default read wait rather than reporting a nonsense delay.
     """
-    timeout = _mcp_lock_timeout_seconds()
+    timeout = _mcp_lock_timeout_seconds(write=write)
     if timeout is None:
         return 5
     return max(1, round(timeout / 2))
@@ -393,11 +405,19 @@ def _mcp_read_lock_disabled() -> bool:
 
 
 @contextmanager
-def _mcp_chroma_lock(operation: str, write: bool = False):
+def _mcp_chroma_lock(operation: str, write: bool = False, *, writer_wait: bool = False):
+    """Serialize Chroma use inside this MCP process.
+
+    ``write=True`` keeps the lock even in HTTP/server mode (writers must still
+    serialize against each other). ``writer_wait=True`` additionally uses the
+    long writer timeout budget — for background ingest hooks and rare sync
+    repairs, not for watcher ``update_file`` traffic (those should return
+    ``busy`` quickly rather than hang the HTTP request for up to 120s).
+    """
     if not write and _mcp_read_lock_disabled():
         yield
         return
-    _acquire_chroma_lock(operation)
+    _acquire_chroma_lock(operation, write=writer_wait)
     try:
         yield
     finally:
@@ -443,12 +463,17 @@ def _is_lock_timeout(exc: BaseException) -> bool:
     return isinstance(exc, TimeoutError)
 
 
-def _busy_error(exc: BaseException, operation: str) -> dict:
+def _busy_error(exc: BaseException, operation: str, *, write: bool = False) -> dict:
     """Soft, retryable payload for lock contention. Distinct from a hard error
     so the caller retries instead of treating the DB as down or the index as
-    empty."""
-    retry_after = _retry_after_seconds()
+    empty.
+
+    Includes ``status="busy"`` so write tools and the watch drain can branch on
+    a stable field without parsing the error string.
+    """
+    retry_after = _retry_after_seconds(write=write)
     return {
+        "status": "busy",
         "db_path": _DB_PATH,
         "busy": True,
         "retryable": True,
@@ -1596,7 +1621,7 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
         try:
             def _acquire_for_write() -> None:
                 nonlocal _write_lock_held
-                _acquire_chroma_lock("trigger_reindex")
+                _acquire_chroma_lock("trigger_reindex", write=True)
                 _write_lock_held = True
 
             with _reindex_lock:
@@ -1671,8 +1696,14 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
 
     from operations import op_repair_silo
     try:
-        with _mcp_chroma_lock("repair_silo", write=True):
-            result = op_repair_silo(_DB_PATH, silo, verbose=False)
+        with _mcp_chroma_lock("repair_silo", write=True, writer_wait=True):
+            try:
+                result = op_repair_silo(_DB_PATH, silo, verbose=False)
+            finally:
+                # Only drop the singleton after we actually held/used Chroma.
+                # Releasing on a lock-acquire timeout would clear the client out
+                # from under the holder (background reindex / peer write).
+                _release_chroma()
         if result.get("status") == "completed":
             result["message"] = (
                 f"Repair complete. {result['files_indexed']} file(s) re-indexed, "
@@ -1680,9 +1711,9 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
             )
         return result
     except Exception as e:
+        if _is_lock_timeout(e):
+            return _busy_error(e, "repair_silo", write=True)
         return {"status": "error", "error": f"{type(e).__name__}: {e}"}
-    finally:
-        _release_chroma()
 
 
 def _resolve_silo_under_path(silo: str, path: str) -> tuple[str | None, str | None, dict | None]:
@@ -1739,24 +1770,33 @@ def update_file(silo: str, path: str, confirm: bool = False) -> dict:
         return err
     try:
         with _mcp_chroma_lock("update_file", write=True):
-            from ingest import update_single_file
+            try:
+                from ingest import update_single_file
 
-            status, resolved = update_single_file(
-                abs_path,
-                db_path=_DB_PATH,
-                silo_slug=slug,
-                allow_cloud=True,  # path was already validated under the registered silo root
-            )
+                status, resolved = update_single_file(
+                    abs_path,
+                    db_path=_DB_PATH,
+                    silo_slug=slug,
+                    allow_cloud=True,  # path was already validated under the registered silo root
+                )
+            finally:
+                # Release only after a successful acquire. A timed-out waiter
+                # must not clear the singleton from under the lock holder.
+                _release_chroma()
         return {"status": status, "silo": slug, "path": resolved}
     except Exception as e:
+        if _is_lock_timeout(e):
+            return {
+                **_busy_error(e, "update_file"),
+                "silo": slug,
+                "path": abs_path,
+            }
         _logger.exception("update_file failed silo=%s path=%s", slug, abs_path)
         err_msg = f"{type(e).__name__}: {e}"
         from state import append_last_failures
 
         append_last_failures(_DB_PATH, [{"path": abs_path, "error": err_msg}])
         return {"status": "error", "error": err_msg}
-    finally:
-        _release_chroma()
 
 
 @mcp.tool()
@@ -1781,23 +1821,30 @@ def remove_file(silo: str, path: str, confirm: bool = False) -> dict:
         return err
     try:
         with _mcp_chroma_lock("remove_file", write=True):
-            from ingest import remove_single_file
+            try:
+                from ingest import remove_single_file
 
-            status, resolved = remove_single_file(
-                abs_path,
-                db_path=_DB_PATH,
-                silo_slug=slug,
-            )
+                status, resolved = remove_single_file(
+                    abs_path,
+                    db_path=_DB_PATH,
+                    silo_slug=slug,
+                )
+            finally:
+                _release_chroma()
         return {"status": status, "silo": slug, "path": resolved}
     except Exception as e:
+        if _is_lock_timeout(e):
+            return {
+                **_busy_error(e, "remove_file"),
+                "silo": slug,
+                "path": abs_path,
+            }
         _logger.exception("remove_file failed silo=%s path=%s", slug, abs_path)
         err_msg = f"{type(e).__name__}: {e}"
         from state import append_last_failures
 
         append_last_failures(_DB_PATH, [{"path": abs_path, "error": err_msg}])
         return {"status": "error", "error": err_msg}
-    finally:
-        _release_chroma()
 
 
 @mcp.tool()
@@ -1865,7 +1912,7 @@ def add_silo(
         try:
             def _acquire_for_write() -> None:
                 nonlocal _write_lock_held
-                _acquire_chroma_lock("add_silo")
+                _acquire_chroma_lock("add_silo", write=True)
                 _write_lock_held = True
 
             with _reindex_lock:

@@ -1937,6 +1937,23 @@ class SiloWatcher:
                         skipped += 1
                     else:
                         updated += 1
+                elif res.get("busy") or res.get("retryable") or status == "busy":
+                    # Lock contention is transient: retry without treating it as a
+                    # hard failure (which used to flood llmli_last_failures.json).
+                    next_attempt = attempts + 1
+                    hint = res.get("retry_after_seconds")
+                    try:
+                        hint_delay = float(hint) if hint is not None else None
+                    except (TypeError, ValueError):
+                        hint_delay = None
+                    delay = self._retry_delay(next_attempt)
+                    if hint_delay is not None:
+                        delay = max(delay, hint_delay)
+                    self._queue_action(path, action, delay=delay, attempts=next_attempt)
+                    self._log(
+                        f"{self.label}: MCP busy on {Path(path).name}; "
+                        f"retry in {delay:g}s (attempt {next_attempt})"
+                    )
                 else:
                     next_attempt = attempts + 1
                     delay = self._retry_delay(next_attempt)

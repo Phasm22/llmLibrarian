@@ -54,6 +54,7 @@ Mitigations that keep contention from surfacing as unavailability:
 - **Writers wait longer than readers.** A reader blocked 5s looks hung to its caller; a queued `llmli add` has nothing better to do than wait. Writers default to 120s (`LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS`), readers stay at 5s.
 - **Waiters back off.** Lock polling grows 20ms → 500ms instead of a fixed 100ms tick, so contending processes stop retrying in lockstep. The final sleep is clamped to the remaining budget.
 - **MCP reads skip the in-process mutex in server mode.** `mcp_server._chroma_lock` exists because two threads driving one *embedded* `PersistentClient` into the Rust HNSW writer once grew `link_lists.bin` to 680 GB. Under `chroma run` no thread touches HNSW, so the mutex only made every MCP read return `busy` for the full duration of a watcher-triggered background reindex. Reads now skip it in HTTP mode; writes (`repair_silo`, `update_file`, `remove_file`, and the background reindex write phase) still take it. Restore with `LLMLIBRARIAN_MCP_READ_LOCK=1`.
+- **MCP write tools return `busy`, not a hard error.** On an MCP lock timeout, `update_file` / `remove_file` / `repair_silo` return `{"status":"busy","busy":true,"retryable":true,...}` and do **not** call `release()` — a timed-out waiter must not clear the singleton from under the holder (that interaction previously surfaced as `Chroma HTTP server not reachable` mid-reindex). Background ingest hooks use the longer writer wait budget (default 120s) via `_acquire_chroma_lock(..., write=True)` so they can wait out a brief single-file update; watcher traffic keeps the short budget and signals busy instead of hanging the HTTP request. `pal pull --watch` retries busy without appending to `llmli_last_failures.json`.
 
 #### Transport retry (HTTP mode)
 
@@ -102,7 +103,7 @@ Boolean variables accept `1`, `true`, `yes`, or `on` (case-insensitive).
 |----------|------|
 | `LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS` | Max wait for a Chroma lock (default `5` read; `0`/`off`/`none` = block indefinitely). Read by *both* the flock layer and the MCP in-process mutex, so the sentinel means the same thing everywhere. |
 | `LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS` | Writer-only override (default `120`) — a queued `llmli add` can afford to wait where a reader cannot |
-| `LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS` | Override for the MCP in-process mutex only; falls through to the shared var |
+| `LLMLIBRARIAN_MCP_LOCK_TIMEOUT_SECONDS` | Override for the MCP in-process mutex only; falls through to the shared var. With `write=True` acquires (background ingest hooks / `repair_silo`), also respects `LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS` / the 120s writer default. |
 | `LLMLIBRARIAN_CHROMA_SHARED_LOCK` | Force the shared read flock even in server mode (default off — read lock skipped in HTTP mode) |
 | `LLMLIBRARIAN_CHROMA_EXCLUSIVE_LOCK` | Force the exclusive write flock even in server mode |
 | `LLMLIBRARIAN_MCP_READ_LOCK` | Force MCP reads to take the in-process mutex in server mode |

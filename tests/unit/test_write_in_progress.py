@@ -160,7 +160,7 @@ def test_mcp_reads_do_not_queue_behind_a_background_write_in_http_mode(monkeypat
 
     monkeypatch.setenv("LLMLIBRARIAN_CHROMA_HOST", "127.0.0.1")
     monkeypatch.delenv("LLMLIBRARIAN_MCP_READ_LOCK", raising=False)
-    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda: 0.01)
+    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
 
     assert mcp_server._chroma_lock.acquire(timeout=1)
     try:
@@ -174,7 +174,7 @@ def test_mcp_writes_still_serialize_in_http_mode(monkeypatch):
     import mcp_server
 
     monkeypatch.setenv("LLMLIBRARIAN_CHROMA_HOST", "127.0.0.1")
-    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda: 0.01)
+    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
 
     assert mcp_server._chroma_lock.acquire(timeout=1)
     try:
@@ -191,7 +191,7 @@ def test_mcp_reads_still_serialize_in_embedded_mode(monkeypatch):
     import mcp_server
 
     monkeypatch.delenv("LLMLIBRARIAN_CHROMA_HOST", raising=False)
-    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda: 0.01)
+    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
 
     assert mcp_server._chroma_lock.acquire(timeout=1)
     try:
@@ -207,7 +207,7 @@ def test_mcp_read_lock_override_restores_serialization(monkeypatch):
 
     monkeypatch.setenv("LLMLIBRARIAN_CHROMA_HOST", "127.0.0.1")
     monkeypatch.setenv("LLMLIBRARIAN_MCP_READ_LOCK", "1")
-    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda: 0.01)
+    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
 
     assert mcp_server._chroma_lock.acquire(timeout=1)
     try:
