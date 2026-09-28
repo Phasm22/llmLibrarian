@@ -99,6 +99,52 @@ def test_watch_retries_error_with_backoff(monkeypatch, tmp_path: Path):
     assert any("failed via MCP" in line and "boom" in line for line in logged)
 
 
+def test_watch_retries_busy_without_recording_failures(monkeypatch, tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    target = root / "file.py"
+    target.write_text("x", encoding="utf-8")
+
+    watcher = _make_watcher(monkeypatch, root)
+    logged = []
+    watcher._log = lambda message: logged.append(message)
+
+    monkeypatch.setattr(
+        pal,
+        "_mcp_call_sync",
+        lambda tool, **kwargs: {
+            "status": "busy",
+            "busy": True,
+            "retryable": True,
+            "retry_after_seconds": 2,
+            "error": "ChromaDB is busy",
+        },
+    )
+
+    recorded: list = []
+
+    def _fake_append(db_path, failures):
+        recorded.extend(failures)
+
+    import state
+
+    monkeypatch.setattr(state, "append_last_failures", _fake_append)
+
+    now = pal.time.time()
+    watcher.enqueue_update(str(target))
+    watcher._drain_due(now=now + 2.0)
+
+    queued = watcher._queue[str(target.resolve())]
+    assert queued["action"] == "update"
+    assert int(queued["attempts"]) == 1
+    # Prefer the MCP retry hint (2s) over the first backoff slot when larger... 
+    # first backoff is 30s, so delay should be max(30, 2) = 30.
+    assert float(queued["due_at"]) >= now + 29.0
+    assert recorded == []
+    assert any("MCP busy" in line for line in logged)
+    assert not any("failed via MCP" in line for line in logged)
+
+
 def test_worker_sleeps_until_next_due_instead_of_polling(monkeypatch, tmp_path: Path):
     root = tmp_path / "repo"
     root.mkdir()

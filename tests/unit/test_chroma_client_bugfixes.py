@@ -142,12 +142,22 @@ def test_zero_means_block_forever_for_the_mcp_mutex(monkeypatch):
 
     monkeypatch.setenv("LLMLIBRARIAN_CHROMA_LOCK_TIMEOUT_SECONDS", "0")
     assert mcp_server._mcp_lock_timeout_seconds() is None
+    assert mcp_server._mcp_lock_timeout_seconds(write=True) is None
 
 
 def test_writers_keep_their_longer_default(monkeypatch):
     read = chroma_lock._lock_timeout_seconds()
     write = chroma_lock._lock_timeout_seconds(write=True)
     assert write > read
+
+
+def test_mcp_write_acquire_uses_writer_budget(monkeypatch):
+    """Background ingest hooks must wait on the writer budget, not the 5s read default."""
+    import mcp_server
+
+    monkeypatch.setenv("LLMLIBRARIAN_CHROMA_WRITE_LOCK_TIMEOUT_SECONDS", "42")
+    assert mcp_server._mcp_lock_timeout_seconds() == chroma_lock._DEFAULT_LOCK_TIMEOUT_SECONDS
+    assert mcp_server._mcp_lock_timeout_seconds(write=True) == 42.0
 
 
 def test_write_specific_override_applies_to_writers_only(monkeypatch):

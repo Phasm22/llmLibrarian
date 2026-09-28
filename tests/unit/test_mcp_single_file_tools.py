@@ -188,3 +188,89 @@ def test_remove_file_happy_path_calls_remove_single_file(monkeypatch, mcp_module
     assert res["silo"] == "docs-1"
     assert len(calls) == 1
     assert calls[0][2] == "docs-1"
+
+
+def test_update_file_lock_timeout_returns_busy_without_release(monkeypatch, mcp_module, tmp_path):
+    """Contention must surface as retryable busy — not a hard error that also
+    clears the singleton client from under the lock holder."""
+    silo_root = tmp_path / "silo"
+    silo_root.mkdir()
+    target = silo_root / "doc.md"
+    target.write_text("hi", encoding="utf-8")
+    _patch_state(
+        monkeypatch,
+        slug="docs-1",
+        silos=[{"slug": "docs-1", "path": str(silo_root)}],
+    )
+
+    released = {"count": 0}
+
+    def _fake_release():
+        released["count"] += 1
+
+    monkeypatch.setattr(mcp_module, "_release_chroma", _fake_release)
+    monkeypatch.setattr(mcp_module, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
+
+    assert mcp_module._chroma_lock.acquire(timeout=1)
+    try:
+        res = mcp_module.update_file("docs", str(target), confirm=True)
+    finally:
+        mcp_module._chroma_lock.release()
+
+    assert res["status"] == "busy"
+    assert res["busy"] is True
+    assert res["retryable"] is True
+    assert res["retry_after_seconds"] >= 1
+    assert res["silo"] == "docs-1"
+    assert released["count"] == 0
+    from state import get_last_failures
+
+    assert get_last_failures(mcp_module._DB_PATH) == []
+
+
+def test_remove_file_lock_timeout_returns_busy_without_release(monkeypatch, mcp_module, tmp_path):
+    silo_root = tmp_path / "silo"
+    silo_root.mkdir()
+    target = silo_root / "gone.md"
+    _patch_state(
+        monkeypatch,
+        slug="docs-1",
+        silos=[{"slug": "docs-1", "path": str(silo_root)}],
+    )
+
+    released = {"count": 0}
+    monkeypatch.setattr(mcp_module, "_release_chroma", lambda: released.__setitem__("count", released["count"] + 1))
+    monkeypatch.setattr(mcp_module, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
+
+    assert mcp_module._chroma_lock.acquire(timeout=1)
+    try:
+        res = mcp_module.remove_file("docs", str(target), confirm=True)
+    finally:
+        mcp_module._chroma_lock.release()
+
+    assert res["status"] == "busy"
+    assert res["busy"] is True
+    assert res["retryable"] is True
+    assert released["count"] == 0
+
+
+def test_writer_wait_flag_selects_write_timeout_budget(monkeypatch, mcp_module):
+    """repair_silo / background hooks opt into the long writer wait via writer_wait."""
+    seen: list[bool] = []
+    real_acquire = mcp_module._acquire_chroma_lock
+
+    def _tracking_acquire(operation, *, write=False):
+        seen.append(write)
+        # Short-circuit: take the real mutex with a tiny timeout so the
+        # context manager's release path stays valid.
+        return real_acquire(operation, write=False)
+
+    monkeypatch.setattr(mcp_module, "_acquire_chroma_lock", _tracking_acquire)
+    monkeypatch.setattr(mcp_module, "_mcp_lock_timeout_seconds", lambda **_: 1.0)
+
+    with mcp_module._mcp_chroma_lock("update_file", write=True):
+        pass
+    with mcp_module._mcp_chroma_lock("repair_silo", write=True, writer_wait=True):
+        pass
+
+    assert seen == [False, True]
