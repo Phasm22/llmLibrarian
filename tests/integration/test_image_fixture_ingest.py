@@ -13,6 +13,12 @@ from state import update_silo
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "sample_images"
 
+# sample_images/ is gitignored (personal photos), so it only exists on the
+# machine that has the files locally; skip elsewhere instead of failing.
+pytestmark = pytest.mark.skipif(
+    not FIXTURES.is_dir(), reason="tests/fixtures/sample_images is local-only (gitignored)"
+)
+
 
 def _collection(db_path: Path):
     client = chromadb.PersistentClient(path=str(db_path), settings=Settings(anonymized_telemetry=False))
