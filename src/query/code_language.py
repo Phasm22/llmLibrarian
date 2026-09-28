@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from file_registry import _read_file_manifest
+from file_registry import read_visible_manifest
 from style import bold, dim, label_style
 from query.formatting import shorten_path
 
@@ -26,8 +26,9 @@ EXT_TO_LANG: dict[str, str] = {
 def get_code_language_stats_from_registry(db_path: str | Path, silo: str | None) -> tuple[dict[str, int], dict[str, list[str]]] | None:
     """Return (by_ext, sample_paths) from registry language_stats, or None if not available. silo=None = aggregate all silos."""
     try:
-        from state import list_silos
-        silos = list_silos(db_path)
+        from state import list_silos, list_visible_silos
+        # Aggregating across "all silos" must mean all *non-private* silos.
+        silos = list_silos(db_path) if silo else list_visible_silos(db_path)
     except Exception:
         return None
     if silo:
@@ -93,7 +94,7 @@ def get_code_language_stats_from_manifest_year(
     - Uses mtime year only.
     - silo=None aggregates across all silos.
     """
-    manifest = _read_file_manifest(db_path)
+    manifest = read_visible_manifest(db_path, silo=silo)
     manifest_silos = (manifest.get("silos") or {}) if isinstance(manifest, dict) else {}
     if not isinstance(manifest_silos, dict):
         return ({}, {})
@@ -147,7 +148,7 @@ def get_code_sources_from_manifest_year(
     - Uses mtime year only.
     - silo=None aggregates across all silos.
     """
-    manifest = _read_file_manifest(db_path)
+    manifest = read_visible_manifest(db_path, silo=silo)
     manifest_silos = (manifest.get("silos") or {}) if isinstance(manifest, dict) else {}
     if not isinstance(manifest_silos, dict):
         return []

@@ -31,7 +31,8 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 | `explain_retrieval` | Debug hybrid/vector signals |
 | `recent_queries` | Audit past queries: text, silo scope, per-source-file chunk breakdown |
 | `find_files` | Manifest-only path/date search |
-| `add_silo` | Index path (`confirm=True`) |
+| `add_silo` | Index path (`confirm=True`; `private=True` for local-only corpora) |
+| `set_silo_privacy` | Flag a silo local-only, or clear it (`confirm=True`) |
 | `trigger_reindex` | Incremental reindex (`confirm=True`; **not** right after `add_silo`) |
 | `repair_silo` | Hard wipe + re-index silo |
 | `update_file` / `remove_file` | Single-file maintenance |
@@ -43,7 +44,23 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 MCP returns **chunks**; the host model answers. Local synthesis: `pal ask` / `llmli ask` (Ollama).
 MCP tool docstrings follow: **Use when / Do not use when / Pairs with**.
 
-## Host runtime (`pc-stacks`)
+### Two scoping rules that are enforced, not advisory
+
+**Private silos.** A silo with `private: true` is skipped by every *unscoped*
+`query_personal_knowledge`, `multi_query_knowledge`, and `find_files`, and by
+automatic scope binding. It is reachable only when a caller passes that exact
+`silo=`. Unscoped responses carry `excluded_private_silos` + `privacy_note` —
+read them before reporting an absence. For a private corpus, prefer telling the
+user to run `pal ask --in <slug>` over pulling values into a cloud context.
+
+**Silos are machine-local.** The Mac and the Linux PC keep separate databases
+over separate filesystems; the Obsidian vault syncs, the index does not. Every
+registry row carries `host`, and `session_context` returns `host` +
+`indexed_by_hosts`. A silo named in notes or memory but missing from
+`list_silos` is **not on this machine** — report that, not "empty" and not
+"broken index".
+
+## Host runtime (`pc-stacks`) — Linux PC only
 
 On TJ's Linux desktop, Chroma + MCP + watchers are **cold at login**. Before MCP tools or `:8765` health checks:
 
@@ -54,9 +71,11 @@ pc-stacks up llmlibrarian   # if cold
 
 Canonical index: [`/home/tj/bin/README.md`](/home/tj/bin/README.md). Traceability: **PC Idle Quietdown** plan (Cursor plans, Jul 2025).
 
+None of this exists on the Mac. There, the same three services are launchd user agents managed through `pal chroma|mcp|daemon`, and the macOS status app (`macos/`) shows their state. Do not run `pc-stacks` on Darwin and do not read its absence as a broken stack.
+
 ## Session-start checklist (MCP)
 
-0. Confirm stack is warm (`pc-stacks status` or `curl -fsS http://127.0.0.1:8765/healthz`); if not, `pc-stacks up llmlibrarian`.
+0. **Linux PC only:** confirm the stack is warm (`pc-stacks status` or `curl -fsS http://127.0.0.1:8765/healthz`); if not, `pc-stacks up llmlibrarian`. On the Mac there is no `pc-stacks` — services are launchd agents (`pal mcp status`, `pal chroma status`), and the roster is a different set of silos.
 1. Prefer `session_context(check_staleness=True)` before retrieval.
 2. If `is_stale: true` and `stale_file_count` is substantial → `trigger_reindex` before querying.
 3. If `stale_file_count` is small (≤2–3) **and** `newest_source_mtime_iso` matches the silo `updated` timestamp → treat as index race noise; skip reindex.
@@ -115,7 +134,9 @@ uv run pytest -q tests/unit tests/contract
 - `pal sync` — refresh dev self-silo `__self__` when needed.
 - **After `mcp_server.py` / `src/` changes: `pc-stacks redeploy llmlibrarian`.** systemd services keep serving the code they imported at startup — a process from last week outlives every fix since. `redeploy` restarts MCP + watchers (leaving `chroma run` up) and prints each unit's start time so you can confirm the running process is the one you just changed.
 - **Claude Desktop MCP (.mcpb):** after `mcp_server.py` changes, `pal extension pack` when `LLMLIBRARIAN_MCP_PACK_CMD` is set. `pal ls --status` / `pal sync` warn on stale pack hash.
-- **No stdio MCP.** The plugin ships no `.mcp.json`; every client (Claude Code, Desktop, phone via Funnel) connects to the one `llmlibrarian-mcp.service` over HTTP. A stdio entry would spawn a second server per client and make bugs unreproducible across sessions.
+- **stdio MCP: one exception, and it is not free.** The *plugin* ships no stdio entry — every client (Desktop, phone via Funnel) reaches the one HTTP server, because a stdio entry spawns a server per client and makes bugs unreproducible across sessions. The exception is this repo's root `.mcp.json`, which is stdio on purpose so a checkout opened in Claude Code can drive its own copy of the code under edit. That is tolerable only because it sets `LLMLIBRARIAN_CHROMA_HOST`/`PORT`: those processes are HTTP clients of the single `chroma run`, never second embedded writers. Drop those two variables and this is the corruption case.
+  - The cost is real: on a dev machine those processes accumulate — nine live `llmLibrarian-mcp:stdio` processes were counted on the Mac at one point, one per session ever opened. Run `mcp_runtime_status` to see what is actually alive before concluding a fix did not take; a stale stdio server serves the code it imported at startup.
+  - `.mcp.json` must stay **machine-portable**. It previously hardcoded `/home/tj/Desktop/llmLibrarian`, so every Mac session failed with `ENOENT` on a path that only exists on the Linux box. Paths in it go through `${LLMLIBRARIAN_HOME:-.}` / `${LLMLIBRARIAN_DB:-./my_brain_db}`; never commit an absolute home directory.
 - `pal ask in <silo> "..."` → normalized to `--in`.
 
 ## Documentation policy

@@ -13,6 +13,11 @@ import pytest
 import mcp_server
 
 
+@pytest.fixture(autouse=True)
+def _no_private_silos(monkeypatch):
+    monkeypatch.setattr("state.private_silo_slugs", lambda _db: [])
+
+
 @pytest.fixture
 def manifest(monkeypatch, tmp_path):
     img = tmp_path / "IMG_9383.jpeg"
@@ -24,7 +29,7 @@ def manifest(monkeypatch, tmp_path):
             "photos-1": {"path": str(tmp_path), "files": {str(img): {}, str(other): {}}},
         }
     }
-    monkeypatch.setattr("silo_audit.load_manifest", lambda _db: data)
+    monkeypatch.setattr("file_registry._read_file_manifest", lambda _db: data)
     return img
 
 
@@ -49,7 +54,7 @@ def test_ambiguous_filename_returns_candidates(monkeypatch, tmp_path):
         "s1": {"files": {str(a): {}}},
         "s2": {"files": {str(b): {}}},
     }}
-    monkeypatch.setattr("silo_audit.load_manifest", lambda _db: data)
+    monkeypatch.setattr("file_registry._read_file_manifest", lambda _db: data)
     path, candidates, err = mcp_server._resolve_indexed_image("IMG.jpeg", None)
     assert path is None and len(candidates) == 2 and "multiple" in err
 
@@ -60,7 +65,7 @@ def test_silo_scopes_resolution(monkeypatch, tmp_path):
         "s1": {"files": {str(a): {}}},
         "s2": {"files": {str(b): {}}},
     }}
-    monkeypatch.setattr("silo_audit.load_manifest", lambda _db: data)
+    monkeypatch.setattr("file_registry._read_file_manifest", lambda _db: data)
     path, _c, err = mcp_server._resolve_indexed_image("IMG.jpeg", "s2")
     assert err is None and path == str(b)
 

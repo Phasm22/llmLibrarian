@@ -5,6 +5,7 @@ Opt-in: verify concurrent CLI ingest against a local chroma run server.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -52,13 +53,19 @@ def chroma_server_env(scratch_db: Path) -> dict[str, str]:
     while time.time() < deadline:
         import urllib.request
 
-        try:
-            with urllib.request.urlopen(f"http://{host}:{port}/api/v1/heartbeat", timeout=1) as resp:
-                if resp.status == 200:
-                    ok = True
-                    break
-        except Exception:
-            time.sleep(0.5)
+        # Chroma 1.x retired /api/v1 (it answers 410); v2 is the live endpoint.
+        # Try v2 first and fall back, so this fixture survives either server.
+        for api in ("v2", "v1"):
+            try:
+                with urllib.request.urlopen(f"http://{host}:{port}/api/{api}/heartbeat", timeout=1) as resp:
+                    if resp.status == 200:
+                        ok = True
+                        break
+            except Exception:
+                continue
+        if ok:
+            break
+        time.sleep(0.5)
     if not ok:
         proc.kill()
         pytest.fail("chroma run did not become ready")
@@ -92,7 +99,7 @@ def test_concurrent_adds_over_http(chroma_server_env: dict[str, str], scratch_db
 
     from chroma_client import get_client, release
     from constants import LLMLI_COLLECTION
-    from state import slugify
+    from state import resolve_silo_by_path
 
     a = _make_fixture(tmp_path / "alpha")
     b = _make_fixture(tmp_path / "beta")
@@ -117,5 +124,64 @@ def test_concurrent_adds_over_http(chroma_server_env: dict[str, str], scratch_db
     client = get_client(str(scratch_db))
     coll = client.get_or_create_collection(name=LLMLI_COLLECTION)
     for folder in (a, b):
-        slug = slugify(folder.name)
+        # Ask the registry which slug the ingest actually created. `slugify(name)`
+        # alone is not that slug: slugs hash "<name>|<path>", so the one-argument
+        # form yields an id no silo ever had, every lookup returns zero chunks,
+        # and the assertion below fails as "baseline ingest failed" while the
+        # ingest was in fact fine.
+        slug = resolve_silo_by_path(str(scratch_db), folder)
+        assert slug, f"no silo registered for {folder}"
         assert_silo_hnsw_consistent(coll, slug, scratch_db)
+
+
+def test_private_silo_excluded_over_http(chroma_server_env: dict[str, str], scratch_db: Path, tmp_path: Path):
+    """Privacy enforcement must hold on the HTTP backend, not just embedded.
+
+    This is the topology the Linux PC's MCP service actually runs: one
+    `chroma run`, every client an HTTP client of it. The embedded path is
+    covered by tests/integration/test_silo_privacy_retrieval.py.
+    """
+    secret = tmp_path / "Tax"
+    secret.mkdir()
+    (secret / "return.txt").write_text(
+        "Adjusted gross income for the tax year was reported on the return. "
+        "Account number and taxpayer identifier appear on every page.",
+        encoding="utf-8",
+    )
+    public = tmp_path / "Recipes"
+    public.mkdir()
+    (public / "bread.txt").write_text(
+        "Sourdough recipe: flour, water, starter. Bulk ferment, shape, proof overnight.",
+        encoding="utf-8",
+    )
+
+    for folder in (secret, public):
+        proc = _llmli_add(folder, chroma_server_env)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+
+    probe = (
+        "import json, sys\n"
+        "from state import resolve_silo_by_path, set_silo_private\n"
+        "from query.core import run_retrieve\n"
+        "db = sys.argv[1]\n"
+        "slug = resolve_silo_by_path(db, sys.argv[2])\n"
+        "set_silo_private(db, slug, True)\n"
+        "r = run_retrieve(query='adjusted gross income account number', n_results=10, db_path=db)\n"
+        "unscoped = sorted({c.get('silo','') for c in r.get('chunks', [])})\n"
+        "r2 = run_retrieve(query='adjusted gross income', silo=slug, n_results=10, db_path=db)\n"
+        "scoped = sorted({c.get('silo','') for c in r2.get('chunks', [])})\n"
+        "print(json.dumps({'slug': slug, 'unscoped': unscoped, 'scoped': scoped}))\n"
+    )
+    run = subprocess.run(
+        [sys.executable, "-c", probe, str(scratch_db), str(secret)],
+        env=chroma_server_env,
+        capture_output=True,
+        text=True,
+        cwd=str(_REPO_ROOT),
+        timeout=600,
+    )
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+
+    assert out["slug"] not in out["unscoped"], f"private silo leaked over HTTP: {out}"
+    assert out["scoped"] == [out["slug"]], f"explicit silo= must still reach it: {out}"

@@ -31,7 +31,7 @@
       "type": "string",
       "title": "Ollama model",
       "description": "Ollama model for local `pal ask` / llmli (not used by MCP retrieval tools)",
-      "default": "llama3.1:8b",
+      "default": "llama3.2:latest",
       "required": false
     }
   },

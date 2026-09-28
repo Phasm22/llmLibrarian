@@ -20,7 +20,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from file_registry import _read_file_manifest
+from file_registry import _read_file_manifest, read_visible_manifest
 from query.filename_dates import (
     month_overlaps_range,
     parse_filename_date,
@@ -78,7 +78,9 @@ def op_find_files(
     if date_start is not None and date_end is not None and date_start > date_end:
         return FindResult(warnings=[f"empty range: {date_start} > {date_end}"]).as_dict()
 
-    manifest = _read_file_manifest(db_path)
+    # Unscoped find walks every silo, so it needs the same privacy filter as
+    # retrieval — tax filenames carry identifiers even when no chunk is returned.
+    manifest = _read_file_manifest(db_path) if silos else read_visible_manifest(db_path)
     silo_map = manifest.get("silos") or {}
     if not isinstance(silo_map, dict):
         return FindResult(warnings=["manifest is malformed"]).as_dict()

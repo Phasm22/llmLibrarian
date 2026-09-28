@@ -223,7 +223,23 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
     path_slug = resolve_silo_by_path(db_path, raw) if Path(raw).exists() else None
     prefix_slug = resolve_silo_prefix(db_path, raw)
     removed_slug = remove_silo(db_path, path_slug or prefix_slug or raw)
-    slug_to_clean = removed_slug if removed_slug is not None else slugify(raw)
+
+    # When the silo was in the registry we know its exact slug. When it was not,
+    # this is the orphan-recovery path — chunks left in Chroma with no registry
+    # entry pointing at them — and `raw` is whatever the user typed.
+    #
+    # `slugify(raw)` alone was wrong here: slugs already carry a "-<hash8>"
+    # suffix, and re-slugifying one appends a second hash
+    # ("alpha-deb12c9c" -> "alpha-deb12c9c-9b411e47"), so the delete matched
+    # nothing and the orphaned chunks silently survived. Try the literal string
+    # first (an unregistered slug is the usual case) and keep the slugified form
+    # for a legacy display name. A `where` that matches nothing is a no-op, so
+    # trying both is safe.
+    if removed_slug is not None:
+        clean_candidates = [removed_slug]
+    else:
+        clean_candidates = list(dict.fromkeys([raw, slugify(raw)]))
+    slug_to_clean = clean_candidates[0]
 
     chroma_error: str | None = None
     from chroma_lock import chroma_exclusive_lock
@@ -231,7 +247,8 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
     try:
         with chroma_exclusive_lock(db_path):
             coll = get_client(db_path).get_or_create_collection(name=LLMLI_COLLECTION)
-            coll.delete(where={"silo": slug_to_clean})
+            for candidate in clean_candidates:
+                coll.delete(where={"silo": candidate})
         from chroma_client import bump_generation
         bump_generation(db_path)
     except Exception as e:
@@ -239,7 +256,8 @@ def op_remove_silo(db_path: str, slug_or_name: str) -> dict:
     finally:
         release()
 
-    remove_manifest_silo(db_path, slug_to_clean)
+    for candidate in clean_candidates:
+        remove_manifest_silo(db_path, candidate)
 
     return {
         "removed_slug": removed_slug,

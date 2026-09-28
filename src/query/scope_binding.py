@@ -7,8 +7,8 @@ import re
 from pathlib import Path
 from typing import TypedDict
 
-from file_registry import _read_file_manifest
-from state import list_silos
+from file_registry import read_visible_manifest
+from state import list_visible_silos
 
 
 SCOPE_QUERY_STOPWORDS = frozenset(
@@ -119,7 +119,7 @@ def bind_scope_from_query(query: str, db_path: str) -> ScopeBindingResult:
             "cleaned_query": cleaned,
         }
 
-    silos = list_silos(db_path)
+    silos = list_visible_silos(db_path)
     if not silos:
         return {
             "bound_slug": None,
@@ -237,8 +237,8 @@ def rank_silos_by_catalog_tokens(query: str, db_path: str, filetype_hints: Filet
     q_tokens = _tokenize_query(query)
     if not q_tokens:
         return []
-    silos = list_silos(db_path)
-    manifest = _read_file_manifest(db_path)
+    silos = list_visible_silos(db_path)
+    manifest = read_visible_manifest(db_path)
     manifest_silos = (manifest.get("silos") or {}) if isinstance(manifest, dict) else {}
     candidates: list[SiloCandidate] = []
     for s in silos:

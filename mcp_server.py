@@ -914,6 +914,43 @@ def _emit_query_audit(**kwargs) -> None:
 # Tools
 # ---------------------------------------------------------------------------
 
+def _current_host() -> str:
+    try:
+        from state import current_host
+
+        return current_host()
+    except Exception:
+        return ""
+
+
+def _private_scope_note(silo: str | None) -> dict:
+    """Describe which silos an unscoped query deliberately skipped.
+
+    Returned on every query so a thin result is read as "scoped away" rather than
+    "no evidence exists" — the distinction the calling model otherwise gets wrong.
+    """
+    if silo:
+        return {}
+    try:
+        from state import private_silo_slugs
+
+        skipped = private_silo_slugs(_DB_PATH)
+    except Exception:
+        return {}
+    if not skipped:
+        return {}
+    return {
+        "excluded_private_silos": skipped,
+        "privacy_note": (
+            "Unscoped query: "
+            + ", ".join(skipped)
+            + " were not searched because they are marked private. If the user's "
+            "question is actually about one of them, either pass silo=<slug> "
+            "explicitly or tell them to run `pal ask --in <slug>` locally."
+        ),
+    }
+
+
 @mcp.tool()
 def query_personal_knowledge(
     query: str,
@@ -982,6 +1019,8 @@ def query_personal_knowledge(
             result["vector_hit_count"] = vector_hits
 
             # Cross-silo grouping (only when unscoped)
+            result.update(_private_scope_note(silo))
+
             if not silo and chunks:
                 by_silo: dict[str, list] = {}
                 for c in chunks:
@@ -1116,6 +1155,7 @@ def multi_query_knowledge(
         "answer_confidence_score": conf_score,
         "coverage_note": coverage_note,
         "chunks": all_chunks,
+        **_private_scope_note(silo),
         **({"write_in_progress": merged_write_state} if merged_write_state else {}),
         **({"retryable": True} if (merged_write_state or {}).get("results_may_be_incomplete") else {}),
         **({"errors": errors} if errors else {}),
@@ -1314,6 +1354,16 @@ def list_silos(check_staleness: bool = False) -> dict:
     Use slugs with `query_personal_knowledge`/`multi_query_knowledge` to scope queries.
     Pass check_staleness=True to also get is_stale, stale_file_count, and
     newest_source_mtime_iso per silo (walks source directory — may be slow for large silos).
+
+    Each row carries private and host. private=true means the silo is excluded
+    from every unscoped query: it is reachable only by passing that exact slug as
+    silo=. Treat those corpora as local-only — retrieve from them when the user
+    asks for that silo by name, and otherwise point them at `pal ask --in <slug>`
+    rather than pulling the contents into this conversation.
+
+    host is the machine that indexed the silo. Silos are machine-local — this
+    roster is the only authority on what exists here. A silo named in notes,
+    logs, or memory but absent from this list does not exist on this machine.
     """
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "silo_count": 0, "silos": []}
@@ -1357,11 +1407,32 @@ def session_context(check_staleness: bool = True, include_audit: bool = False) -
         and hnsw_desynced == 0
     )
 
+    private_silos = [s.get("slug") for s in silos if s.get("private")]
+    hosts = sorted({str(s.get("host") or "") for s in silos if s.get("host")})
+
     return {
         **silos_result,
         "health_summary": summary,
         "recommended_actions": actions,
         "ready_for_retrieval": ready_for_retrieval,
+        "host": _current_host(),
+        "indexed_by_hosts": hosts,
+        "private_silos": private_silos,
+        "scope_policy": (
+            "This roster is the whole of what exists on this machine ("
+            + _current_host()
+            + "). Silos are machine-local; a silo mentioned in notes or memory but "
+            "absent here is not reachable from this session — say so rather than "
+            "reporting it as empty. "
+            + (
+                "Private silos ("
+                + ", ".join(private_silos)
+                + ") are skipped by every unscoped query and require an explicit "
+                "silo=; prefer sending the user to `pal ask --in <slug>` for them."
+                if private_silos
+                else "No silos are marked private."
+            )
+        ),
     }
 
 
@@ -1740,6 +1811,7 @@ def add_silo(
     image_vision: bool | None = None,
     workers: int | None = None,
     embedding_workers: int | None = None,
+    private: bool = False,
     confirm: bool = True,
 ) -> dict:
     """
@@ -1756,6 +1828,9 @@ def add_silo(
       the silo, so later calls inherit it unless overridden; None keeps the stored value
       (False for a new silo).
     workers / embedding_workers: per-run concurrency overrides; None uses the defaults.
+    private: set True for corpora that must never surface unasked (tax, medical,
+      credentials-adjacent). A private silo is skipped by every unscoped query and
+      is only retrievable by passing its exact slug as silo=.
     Returns immediately; indexing runs in a background thread (same process, serialized via lock).
     Call list_silos() or health() after a minute or two to confirm completion.
 
@@ -1819,6 +1894,13 @@ def add_silo(
                     resolve_silo_to_slug(_DB_PATH, silo) if silo
                     else resolve_silo_by_path(_DB_PATH, p)
                 )
+                if private and final_slug:
+                    # Set after ingest: the registry entry does not exist until
+                    # run_ingest writes it, and a private silo that spent its
+                    # first minutes unflagged is queryable in that window.
+                    from state import set_silo_private
+
+                    set_silo_private(_DB_PATH, final_slug, True)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             _logger.exception("add_silo failed path=%s", p)
@@ -1850,6 +1932,46 @@ def add_silo(
             "Call health() to check last_background_reindex status after completion."
         ),
     }
+
+
+@mcp.tool()
+def set_silo_privacy(silo: str, private: bool, confirm: bool = False) -> dict:
+    """
+    Use when: marking a corpus local-only, or lifting that mark.
+    Do not use when: you only need to read the current state — `list_silos` reports private per silo.
+    Pairs with: `list_silos` before and after.
+
+    Set or clear a silo's private flag. Private silos are excluded from every
+    unscoped `query_personal_knowledge`, `multi_query_knowledge`, and `find_files`,
+    and from automatic scope binding; they are reachable only when a caller passes
+    that exact slug as silo=.
+
+    Pass confirm=True to apply. Clearing the flag (private=False) widens what an
+    unscoped query can return, so confirm that with the user first.
+    """
+    from state import is_silo_private, resolve_silo_to_slug, set_silo_private
+
+    if not Path(_DB_PATH).is_dir():
+        return _db_missing_error()
+    slug = resolve_silo_to_slug(_DB_PATH, silo)
+    if not slug:
+        return {"status": "error", "error": f"silo not found: {silo}"}
+    current = is_silo_private(_DB_PATH, slug)
+    if current == private:
+        return {"status": "unchanged", "silo": slug, "private": current}
+    if not confirm:
+        return {
+            "status": "not_applied",
+            "silo": slug,
+            "private": current,
+            "would_set": private,
+            "message": (
+                f"Pass confirm=True to set private={private} on {slug}."
+                + ("" if private else " This exposes the silo to unscoped queries.")
+            ),
+        }
+    set_silo_private(_DB_PATH, slug, private)
+    return {"status": "ok", "silo": slug, "private": private}
 
 
 @mcp.tool()
@@ -2101,14 +2223,15 @@ def _resolve_indexed_image(file: str, silo: str | None) -> tuple[str | None, lis
     disk, so an unindexed path must never reach it — that would turn a retrieval
     tool into arbitrary local file read.
     """
-    from silo_audit import load_manifest
+    from file_registry import read_visible_manifest
 
     wanted = (file or "").strip()
     if not wanted:
         return None, [], "file is required"
-    manifest = load_manifest(_DB_PATH) or {}
-    silos = manifest.get("silos") or {}
     target_slug = (silo or "").strip()
+    # Private silos resolve only when named; an unscoped call must not reach one.
+    manifest = read_visible_manifest(_DB_PATH, silo=target_slug or None) or {}
+    silos = manifest.get("silos") or {}
 
     matches: list[str] = []
     for slug, entry in silos.items():
@@ -2186,6 +2309,7 @@ _FULL_TOOL_NAMES = (
     "repair_silo",
     "update_file",
     "remove_file",
+    "set_silo_privacy",
     "mcp_runtime_status",
     "health",
     "capabilities",
