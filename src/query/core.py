@@ -23,6 +23,7 @@ except ImportError:
     get_silo_image_vision_enabled = None  # type: ignore[misc, assignment]
 
 from query.core_reexports import *  # noqa: F403
+from state import is_silo_private
 
 _DETERMINISTIC_INTENTS = frozenset({
     INTENT_CAPABILITIES,
@@ -112,6 +113,20 @@ def run_retrieve(
     silo_slug: str | None = None
     if silo:
         silo_slug = resolve_silo_to_slug(db, silo) or silo
+        if silo_slug != silo and is_silo_private(db, silo_slug):
+            # Naming the exact slug is the consent signal for a private silo. A
+            # display name ("Tax") is too easy to produce by accident or by a
+            # model guessing, so it does not open one.
+            return {
+                "query": query,
+                "intent": intent,
+                "silo_filter": silo,
+                "error": (
+                    f"Silo {silo!r} is private and is only reachable by its exact slug. "
+                    "Ask the user for the slug rather than guessing."
+                ),
+                "chunks": [],
+            }
 
     use_reranker = is_reranker_enabled()
     n_effective = effective_k(intent, n_results)

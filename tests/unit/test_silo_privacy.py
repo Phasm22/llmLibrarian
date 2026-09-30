@@ -53,7 +53,7 @@ def test_flag_on_missing_silo_reports_failure(db: str) -> None:
 
 def test_filter_clause_excludes_only_private(db: str) -> None:
     set_silo_private(db, "tax-abc", True)
-    assert private_filter_clause(db) == {"silo": {"$nin": ["tax-abc"]}}
+    assert private_filter_clause(db) == {"silo": {"$nin": ["tax-abc", "tax-abc-artifacts"]}}
     assert [s["slug"] for s in list_visible_silos(db)] == ["recipes-def"]
     # The full roster still shows it: knowing the corpus exists is allowed.
     assert {s["slug"] for s in list_silos(db)} == {"tax-abc", "recipes-def"}
@@ -133,7 +133,7 @@ def test_unscoped_retrieval_where_clause_excludes_private(db: str, monkeypatch: 
     )
     assert captured, "expected a Chroma query"
     where = captured[0].get("where")
-    assert where == {"silo": {"$nin": ["tax-abc"]}}, where
+    assert where == {"silo": {"$nin": ["tax-abc", "tax-abc-artifacts"]}}, where
 
 
 def test_explicit_silo_still_reaches_private(db: str, monkeypatch: object) -> None:

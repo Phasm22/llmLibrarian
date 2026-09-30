@@ -9,7 +9,7 @@ paths:
   - "src/operations_find.py"
   - "mcp_server.py"
 type: rule
-updated: 2026-09-14
+updated: 2026-09-30
 ---
 
 # Private silos
@@ -22,7 +22,9 @@ unasked.
 ## The rule
 
 **Naming the silo is the consent signal.** An explicit `silo=<slug>` / `--in
-<slug>` reaches a private silo. Everything else must not.
+<slug>` reaches a private silo. Everything else must not — including a display
+name (`silo="Tax"`), which `run_retrieve` refuses for a private silo because a
+model can produce it by guessing.
 
 ## What that means when you write code here
 
@@ -37,6 +39,11 @@ unasked.
   not `state.list_silos`.
 - `state.list_silos` stays the full roster for status, diagnostics, and the UI.
   Knowing a private corpus exists is allowed; pulling from it unasked is not.
+  The exception is the lite profile's `silo_roster`: it is that profile's only
+  discovery tool, so it omits private slugs entirely and reports a count.
+- `private_filter_clause` also excludes `<slug>-artifacts`, where artifact
+  compilation writes a silo's derived chunks. A new derived-silo naming scheme
+  needs the same treatment.
 - `private_silo_slugs` **raises** when the registry is unreadable rather than
   returning `[]`. Do not "fix" that by swallowing the error — an empty list means
   "no private silos", and guessing that on a read failure is the leak.
@@ -53,4 +60,14 @@ unasked.
 ## When you add a new retrieval or enumeration path
 
 Add a case to `tests/unit/test_silo_privacy.py`. The two that matter are: the
-unscoped path carries the `$nin`, and the explicit path does not.
+unscoped path carries the `$nin`, and the explicit path does not. A new MCP tool
+(either profile) also gets a case in
+`tests/integration/test_silo_privacy_mcp_tools.py`, which drives the tool
+functions over a real private + public index.
+
+## Deployment note
+
+The macOS app bundle's launcher shims exec this checkout's working tree, so the
+resident MCP serves whatever branch is checked out. The flag first shipped on
+`main` only; the server ran `dev` for two weeks without it. Keep privacy commits
+on every branch that can be checked out here.

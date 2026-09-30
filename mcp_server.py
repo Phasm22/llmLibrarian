@@ -993,7 +993,8 @@ def query_personal_knowledge(
     decisions, reflections, or domain knowledge. Returns semantically ranked
     chunks from indexed silos.
 
-    Specify silo to scope retrieval by slug or display name; call list_silos first
+    Specify silo to scope retrieval by slug or display name (a private silo opens only
+    by its exact slug); call list_silos first
     rather than inferring a silo's domain from its slug. Returns chunks with text, score (0–1),
     confidence, section heading, source path, date, doc_type, and position. Image chunks also
     include embedded capture, camera, exposure, dimensions, and GPS data under photo_metadata
@@ -2124,21 +2125,33 @@ def silo_roster() -> dict:
 
     from state import list_silos as _list_silos
 
+    registered = [entry for entry in _list_silos(_DB_PATH) if entry.get("slug")]
+    # Private silos are left off the roster entirely, slug included: on the lite
+    # profile this is the only discovery tool, so listing a private slug would
+    # hand the model the exact key retrieve_knowledge accepts as consent.
     silos = [
         {
             "slug": str(entry.get("slug") or ""),
             "display_name": str(entry.get("display_name") or entry.get("slug") or ""),
             "chunks_count": int(entry.get("chunks_count") or 0),
         }
-        for entry in _list_silos(_DB_PATH)
-        if entry.get("slug")
+        for entry in registered
+        if not entry.get("private")
     ]
     silos.sort(key=lambda entry: entry["slug"])
-    return {
+    out: dict = {
         "db_exists": True,
         "silo_count": len(silos),
         "silos": silos,
     }
+    hidden = len(registered) - len(silos)
+    if hidden:
+        out["private_silos_hidden"] = hidden
+        out["privacy_note"] = (
+            f"{hidden} private silo(s) are not listed. If the user's question is about "
+            "one of them, ask the user for its exact slug."
+        )
+    return out
 
 
 def _compact_lite_chunk(chunk: dict) -> dict:
@@ -2275,14 +2288,21 @@ def _resolve_indexed_image(file: str, silo: str | None) -> tuple[str | None, lis
     wanted = (file or "").strip()
     if not wanted:
         return None, [], "file is required"
+    from state import private_silo_slugs
+
     target_slug = (silo or "").strip()
     # Private silos resolve only when named; an unscoped call must not reach one.
     manifest = read_visible_manifest(_DB_PATH, silo=target_slug or None) or {}
     silos = manifest.get("silos") or {}
+    # Naming means the exact slug: silo= may also be a path, and a path is not
+    # consent for a private silo.
+    private = set(private_silo_slugs(_DB_PATH))
 
     matches: list[str] = []
     for slug, entry in silos.items():
         if target_slug and slug != target_slug and (entry or {}).get("path") != target_slug:
+            continue
+        if slug in private and slug != target_slug:
             continue
         for path in ((entry or {}).get("files") or {}):
             if Path(path).suffix.lower() not in _IMAGE_SUFFIXES:
