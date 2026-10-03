@@ -946,6 +946,54 @@ def _emit_query_audit(**kwargs) -> None:
         _logger.debug("query audit emit failed", exc_info=True)
 
 
+from mcp_result_cache import ResultCache, repeat_fields  # noqa: E402
+
+_RESULT_CACHE = ResultCache()
+
+
+def _cache_window_seconds() -> float:
+    """LLMLIBRARIAN_MCP_RESULT_CACHE_SECONDS (default 30; 0 disables)."""
+    raw = os.environ.get("LLMLIBRARIAN_MCP_RESULT_CACHE_SECONDS", "30").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 30.0
+
+
+def _index_state_stamp() -> tuple[int, ...]:
+    """Changes whenever an ingest commits or a silo's privacy flag flips.
+
+    bump_generation is a no-op in HTTP mode, so the registry, manifest and tax
+    ledger mtimes are the write signal a cache key can use.
+    """
+    stamps: list[int] = []
+    for name in ("llmli_registry.json", "llmli_file_manifest.json", "tax_ledger.json"):
+        try:
+            stamps.append(os.stat(Path(_DB_PATH) / name).st_mtime_ns)
+        except OSError:
+            stamps.append(0)
+    return tuple(stamps)
+
+
+def _cached_retrieval(tool: str, key_parts: tuple, compute) -> dict:
+    """Run ``compute`` (returning (response, audit_kwargs | None)) through the
+    single-flight cache; audit every call, mark repeats on the response."""
+    window = _cache_window_seconds()
+    key = (tool, _DB_PATH, _index_state_stamp(), key_parts)
+    (response, audit), meta = _RESULT_CACHE.get_or_compute(key, compute, ttl_seconds=window)
+    if audit:
+        outcome = dict(audit.get("outcome") or {})
+        if meta["cached"]:
+            outcome["cached"] = True
+        _emit_query_audit(**{**audit, "outcome": outcome})
+    response.update(repeat_fields(meta, window_seconds=window))
+    return response
+
+
+def _query_key(query: str) -> str:
+    return " ".join((query or "").split())
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -1044,7 +1092,17 @@ def query_personal_knowledge(
                 **({"candidates": candidates[:20]} if candidates else {}),
                 "chunks": [],
             }
-    try:
+    def _compute() -> tuple[dict, dict | None]:
+        try:
+            return _query_personal_knowledge_uncached()
+        except Exception as e:
+            if _is_lock_timeout(e):
+                return {**_busy_error(e, "query_personal_knowledge"), "chunks": []}, None
+            return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}, None
+        finally:
+            _release_chroma()
+
+    def _query_personal_knowledge_uncached() -> tuple[dict, dict]:
         with _mcp_chroma_lock("query_personal_knowledge"):
             result = run_retrieve(
                 query=query,
@@ -1082,9 +1140,10 @@ def query_personal_knowledge(
                 result["silo_counts"] = mcp_contract.silo_counts(chunks)
             result["chunks"] = mcp_contract.slim_chunks(chunks)
 
-        # Audit outside the lock — the append is small, but this lock is on the
-        # hot path for every reader and has been a contention source before.
-        _emit_query_audit(
+        # Audited by _cached_retrieval outside the lock, once per call (cached
+        # repeats included) — the append is small, but this lock is on the hot
+        # path for every reader and has been a contention source before.
+        audit = dict(
             tool="query_personal_knowledge",
             queries=[query],
             silo=silo,
@@ -1092,13 +1151,13 @@ def query_personal_knowledge(
             chunks=chunks,
             outcome={"confidence": conf_level, "confidence_score": conf_score},
         )
-        return {"db_path": _DB_PATH, **result}
-    except Exception as e:
-        if _is_lock_timeout(e):
-            return {**_busy_error(e, "query_personal_knowledge"), "chunks": []}
-        return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}
-    finally:
-        _release_chroma()
+        return {"db_path": _DB_PATH, **result}, audit
+
+    return _cached_retrieval(
+        "query_personal_knowledge",
+        (_query_key(query), silo, n_results, section, doc_type, source_path),
+        _compute,
+    )
 
 
 @mcp.tool()
@@ -1134,97 +1193,105 @@ def multi_query_knowledge(
     from query.core import run_retrieve
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "queries": queries, "total_chunks": 0, "chunks": []}
-    seen: set[str] = set()
-    all_chunks: list[dict] = []
-    errors: list[str] = []
-    busy = False
-    write_states: list[dict] = []
-    deterministic_intent: str | None = None
-    for q in queries:
-        try:
-            with _mcp_chroma_lock("multi_query_knowledge"):
-                res = run_retrieve(
-                    query=q,
-                    silo=silo,
-                    n_results=n_results,
-                    section=section,
-                    doc_type=doc_type,
-                    db_path=_DB_PATH,
-                    config_path=_CONFIG_PATH,
-                )
-            if res.get("write_in_progress"):
-                write_states.append(res["write_in_progress"])
-            if res.get("deterministic_intent") and not deterministic_intent:
-                deterministic_intent = res["deterministic_intent"]
-            for chunk in res.get("chunks", []):
-                key = (chunk.get("text") or "")[:200]
-                if key and key not in seen:
-                    seen.add(key)
-                    chunk["query"] = q
-                    all_chunks.append(chunk)
-        except Exception as e:
-            if _is_lock_timeout(e):
-                busy = True
-            errors.append(f"{q!r}: {type(e).__name__}: {e}")
-    all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
-    truncated = len(all_chunks) > max_total_chunks
-    if truncated:
-        all_chunks = all_chunks[:max_total_chunks]
+    def _compute() -> tuple[dict, dict]:
+        seen: set[str] = set()
+        all_chunks: list[dict] = []
+        errors: list[str] = []
+        busy = False
+        write_states: list[dict] = []
+        deterministic_intent: str | None = None
+        for q in queries:
+            try:
+                with _mcp_chroma_lock("multi_query_knowledge"):
+                    res = run_retrieve(
+                        query=q,
+                        silo=silo,
+                        n_results=n_results,
+                        section=section,
+                        doc_type=doc_type,
+                        db_path=_DB_PATH,
+                        config_path=_CONFIG_PATH,
+                    )
+                if res.get("write_in_progress"):
+                    write_states.append(res["write_in_progress"])
+                if res.get("deterministic_intent") and not deterministic_intent:
+                    deterministic_intent = res["deterministic_intent"]
+                for chunk in res.get("chunks", []):
+                    key = (chunk.get("text") or "")[:200]
+                    if key and key not in seen:
+                        seen.add(key)
+                        chunk["query"] = q
+                        all_chunks.append(chunk)
+            except Exception as e:
+                if _is_lock_timeout(e):
+                    busy = True
+                errors.append(f"{q!r}: {type(e).__name__}: {e}")
+        all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
+        truncated = len(all_chunks) > max_total_chunks
+        if truncated:
+            all_chunks = all_chunks[:max_total_chunks]
 
-    # Feature 6: answer-level confidence on merged results
-    conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
+        # Feature 6: answer-level confidence on merged results
+        conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
 
-    # A rebuild seen by any sub-query taints the merged set.
-    from ingest_journal import merge_write_states
+        # A rebuild seen by any sub-query taints the merged set.
+        from ingest_journal import merge_write_states
 
-    merged_write_state = merge_write_states(write_states)
-    coverage_note = _with_rebuild_note(coverage_note, merged_write_state)
+        merged_write_state = merge_write_states(write_states)
+        coverage_note = _with_rebuild_note(coverage_note, merged_write_state)
 
-    _emit_usage_event(
-        "usage.llmlibrarian.query",
-        {"silo": silo or "unscoped", "query_count": len(queries)},
-    )
-    _emit_query_audit(
-        tool="multi_query_knowledge",
-        queries=queries,
-        silo=silo,
-        params={
-            "n_results": n_results,
-            "max_total_chunks": max_total_chunks,
-            "section": section,
-            "doc_type": doc_type,
-        },
-        chunks=all_chunks,
-        outcome={
-            "confidence": conf_level,
-            "confidence_score": conf_score,
+        _emit_usage_event(
+            "usage.llmlibrarian.query",
+            {"silo": silo or "unscoped", "query_count": len(queries)},
+        )
+        audit = dict(
+            tool="multi_query_knowledge",
+            queries=queries,
+            silo=silo,
+            params={
+                "n_results": n_results,
+                "max_total_chunks": max_total_chunks,
+                "section": section,
+                "doc_type": doc_type,
+            },
+            chunks=all_chunks,
+            outcome={
+                "confidence": conf_level,
+                "confidence_score": conf_score,
+                "truncated": truncated,
+                **({"errors": errors} if errors else {}),
+            },
+        )
+
+        _release_chroma()
+        response = {
+            "db_path": _DB_PATH,
+            "queries": queries,
+            "total_chunks": len(all_chunks),
             "truncated": truncated,
+            "answer_confidence": conf_level,
+            "answer_confidence_score": conf_score,
+            "coverage_note": coverage_note,
+            "chunks": mcp_contract.slim_chunks(all_chunks),
+            **_private_scope_note(silo),
+            **({"write_in_progress": merged_write_state} if merged_write_state else {}),
+            **({"retryable": True} if (merged_write_state or {}).get("results_may_be_incomplete") else {}),
             **({"errors": errors} if errors else {}),
-        },
-    )
+            **(
+                {"busy": True, "retryable": True, "retry_after_seconds": _retry_after_seconds()}
+                if busy and not all_chunks
+                else {}
+            ),
+            **({"deterministic_intent": deterministic_intent} if deterministic_intent else {}),
+        }
+        response = mcp_contract.apply_guidance(response, query=" ; ".join(queries), silo=silo)
+        return response, audit
 
-    _release_chroma()
-    response = {
-        "db_path": _DB_PATH,
-        "queries": queries,
-        "total_chunks": len(all_chunks),
-        "truncated": truncated,
-        "answer_confidence": conf_level,
-        "answer_confidence_score": conf_score,
-        "coverage_note": coverage_note,
-        "chunks": mcp_contract.slim_chunks(all_chunks),
-        **_private_scope_note(silo),
-        **({"write_in_progress": merged_write_state} if merged_write_state else {}),
-        **({"retryable": True} if (merged_write_state or {}).get("results_may_be_incomplete") else {}),
-        **({"errors": errors} if errors else {}),
-        **(
-            {"busy": True, "retryable": True, "retry_after_seconds": _retry_after_seconds()}
-            if busy and not all_chunks
-            else {}
-        ),
-        **({"deterministic_intent": deterministic_intent} if deterministic_intent else {}),
-    }
-    return mcp_contract.apply_guidance(response, query=" ; ".join(queries), silo=silo)
+    return _cached_retrieval(
+        "multi_query_knowledge",
+        (tuple(_query_key(q) for q in queries), silo, n_results, section, doc_type, max_total_chunks),
+        _compute,
+    )
 
 
 @mcp.tool()
@@ -2310,39 +2377,44 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | 
         if err:
             return {"error": err, "chunks": []}
 
-    try:
-        with _mcp_chroma_lock("retrieve_knowledge"):
-            result = run_retrieve(
-                query=query,
-                silo=silo,
-                n_results=n_results,
-                source=source_path,
-                db_path=_DB_PATH,
-                config_path=_CONFIG_PATH,
-            )
-            chunks = result.get("chunks", [])
-            _emit_usage_event(
-                "usage.llmlibrarian.query",
-                {"silo": silo, "profile": "lite"},
-            )
+    def _compute() -> tuple[dict, dict | None]:
+        try:
+            with _mcp_chroma_lock("retrieve_knowledge"):
+                result = run_retrieve(
+                    query=query,
+                    silo=silo,
+                    n_results=n_results,
+                    source=source_path,
+                    db_path=_DB_PATH,
+                    config_path=_CONFIG_PATH,
+                )
+                chunks = result.get("chunks", [])
+                _emit_usage_event(
+                    "usage.llmlibrarian.query",
+                    {"silo": silo, "profile": "lite"},
+                )
 
-        mcp_contract.apply_guidance(result, query=query, silo=silo, profile="lite")
-        confidence, confidence_score, _coverage_note = _compute_answer_confidence(chunks)
-        _emit_query_audit(
-            tool="retrieve_knowledge",
-            queries=[query],
-            silo=silo,
-            params={"n_results": n_results},
-            chunks=chunks,
-            outcome={"confidence": confidence, "confidence_score": confidence_score},
-        )
-        return _compact_lite_retrieval(result, silo=silo)
-    except Exception as e:
-        if _is_lock_timeout(e):
-            return {**_busy_error(e, "retrieve_knowledge"), "chunks": []}
-        return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}
-    finally:
-        _release_chroma()
+            mcp_contract.apply_guidance(result, query=query, silo=silo, profile="lite")
+            confidence, confidence_score, _coverage_note = _compute_answer_confidence(chunks)
+            audit = dict(
+                tool="retrieve_knowledge",
+                queries=[query],
+                silo=silo,
+                params={"n_results": n_results, **({"source": source_path} if source_path else {})},
+                chunks=chunks,
+                outcome={"confidence": confidence, "confidence_score": confidence_score},
+            )
+            return _compact_lite_retrieval(result, silo=silo), audit
+        except Exception as e:
+            if _is_lock_timeout(e):
+                return {**_busy_error(e, "retrieve_knowledge"), "chunks": []}, None
+            return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}, None
+        finally:
+            _release_chroma()
+
+    return _cached_retrieval(
+        "retrieve_knowledge", (_query_key(query), silo, n_results, source_path), _compute
+    )
 
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}

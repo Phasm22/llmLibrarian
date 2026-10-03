@@ -25,6 +25,9 @@ os.environ["LLMLIBRARIAN_ENV_BOOTSTRAPPED"] = "1"
 # tool call. Off by default here so tests can't write into the operator's real
 # audit trail; test_query_audit.py re-enables it against tmp paths.
 os.environ["LLMLIBRARIAN_QUERY_AUDIT"] = "0"
+# The MCP result cache would let one test's stubbed retrieval answer another
+# call with the same arguments. Off by default; test_mcp_result_cache.py turns it on.
+os.environ["LLMLIBRARIAN_MCP_RESULT_CACHE_SECONDS"] = "0"
 for _key in (
     "LLMLIBRARIAN_DB",
     "LLMLIBRARIAN_CHROMA_HOST",
