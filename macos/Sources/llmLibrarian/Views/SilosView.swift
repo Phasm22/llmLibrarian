@@ -16,9 +16,13 @@ struct SilosView: View {
     var body: some View {
         Group {
             if store.silos.isEmpty && store.hasLoaded {
-                EmptyState(symbol: "folder",
-                           title: "No silos indexed",
-                           detail: store.registryError ?? "Index a folder with `pal pull <folder>` and it will show up here.")
+                VStack(spacing: 14) {
+                    EmptyState(symbol: "folder",
+                               title: "No silos indexed",
+                               detail: store.registryError ?? "Add a folder and llmLibrarian will index it and keep it in sync.")
+                    Button("Add Silo…") { store.chooseSiloFolder() }
+                        .buttonStyle(.borderedProminent)
+                }
             } else {
                 Table(rows, selection: $store.selectedSilo, sortOrder: $sortOrder, columnCustomization: $columns) {
                     TableColumn("Name", value: \.displayName) { silo in
@@ -73,6 +77,9 @@ struct SilosView: View {
                         Button("Ask Claude") { store.selectedSilo = silo.slug; store.performService("Ask Claude") }
                         Divider()
                         Button(silo.isPrivate ? "Make Shared…" : "Make Private") { store.setPrivate(silo, !silo.isPrivate) }
+                        if !silo.imageVision {
+                            Button("Enable Image Vision…") { store.enableImageVision(silo) }
+                        }
                         if let w = store.watcher(for: silo) {
                             Divider()
                             Button("Show Watcher") { store.show(service: w) }
@@ -86,6 +93,8 @@ struct SilosView: View {
         .searchable(text: $search, placement: .toolbar, prompt: "Filter silos")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button { store.chooseSiloFolder() } label: { Label("Add Silo", systemImage: "plus") }
+                    .help("Choose a folder to index and watch")
                 Button { if let s = selected { store.reindex(s) } } label: { Label("Reindex", systemImage: "arrow.clockwise") }
                     .help("Reindex the selected silo now")
                     .disabled(!(selected.map { $0.pathExists && store.activeJob(for: $0) == nil } ?? false))
@@ -168,6 +177,11 @@ struct SiloDetail: View {
                 DetailRow("Chunks", silo.chunks.grouped)
                 DetailRow("Updated", Dates.absoluteString(silo.updated))
                 DetailRow("Image vision", silo.imageVision ? "On" : "Off")
+                if !silo.imageVision, silo.pathExists {
+                    Button("Enable Image Vision…") { store.enableImageVision(silo) }
+                        .controlSize(.small)
+                        .help("Reindex images with multimodal summaries; requires the optional image dependencies and a vision-capable Ollama model")
+                }
                 if !silo.host.isEmpty { DetailRow("Indexed on", silo.host) }
 
                 InspectorHeading("Folder")

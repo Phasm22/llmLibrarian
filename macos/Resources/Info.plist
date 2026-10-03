@@ -30,5 +30,34 @@
   <false/>
   <key>NSHumanReadableCopyright</key>
   <string>Local-first personal knowledge index.</string>
+  <key>NSServices</key>
+  <array>
+    <dict>
+      <key>NSMenuItem</key>
+      <dict>
+        <key>default</key>
+        <string>Add as llmLibrarian Silo</string>
+      </dict>
+      <key>NSMessage</key>
+      <string>addSiloFromFinder</string>
+      <key>NSPortName</key>
+      <string>llmLibrarian</string>
+      <key>NSRequiredContext</key>
+      <dict>
+        <key>NSTextContent</key>
+        <string>FilePath</string>
+      </dict>
+      <key>NSSendTypes</key>
+      <array>
+        <string>NSFilenamesPboardType</string>
+        <string>public.plain-text</string>
+      </array>
+      <key>NSSendFileTypes</key>
+      <array>
+        <string>public.directory</string>
+        <string>com.apple.resolvable</string>
+      </array>
+    </dict>
+  </array>
 </dict>
 </plist>

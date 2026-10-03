@@ -10,8 +10,14 @@ Everything it shows is read directly from the same sources `pal ls --status`
 uses — `~/.pal/daemon.json`, `<db>/llmli_registry.json`, `~/.pal/watch_locks`,
 `launchctl list`, `/healthz`, Chroma's heartbeat, and
 `~/.pal/logs/query-audit.jsonl` — so opening it never starts Python.
-Actions shell out: launchctl for start/stop/restart, `pal pull` for reindex,
-`pal daemon sync` for reconciling watchers.
+Actions shell out: launchctl for start/stop/restart, `pal pull` for adding and
+reindexing silos, and `pal daemon sync` for reconciling watchers. Add Silo is
+available from the Silos toolbar, the empty state, and File → Add Silo….
+Finder also exposes Add as llmLibrarian Silo when one or more folders are
+selected and the contextual Services menu is opened. Both entry points show an
+image-vision opt-in before indexing. Existing silos with image vision off expose
+Enable Image Vision in their details and context menu; enabling it reindexes
+with `pal pull <folder> --image-vision`.
 
 ## Build and install
 
@@ -24,6 +30,9 @@ Requires the Xcode Command Line Tools (Swift 5.9+, macOS 14 SDK). The bundle
 is ad-hoc signed. `Contents/Resources` keeps the two launcher shims that the
 launchd plists exec (`llmlibrarian-mcp`, `llmlibrarian-chroma`); they point at
 this checkout, so rebuild after moving the repo.
+
+Run the framework-free workflow tests with `macos/test.sh`. They compile the
+cross-platform Add Silo command planner directly, so XCTest is not required.
 
 ## Layout
 

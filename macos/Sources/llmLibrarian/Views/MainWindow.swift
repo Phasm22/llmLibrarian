@@ -45,6 +45,10 @@ struct MainWindow: View {
         .task { await SnapshotMode.run(store: store) }
         .overlay(alignment: .bottom) { toast }
         .modifier(ProblemAlert())
+        .sheet(item: $store.pendingAddRequest) { request in
+            AddSiloSheet(request: request)
+                .environmentObject(store)
+        }
     }
 
     private func badge(for item: SidebarItem) -> Int {

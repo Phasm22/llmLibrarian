@@ -16,7 +16,10 @@ struct LibrarianApp: App {
         .windowToolbarStyle(.unified)
         .defaultSize(width: 1320, height: 820)
         .commands {
-            CommandGroup(replacing: .newItem) {}
+            CommandGroup(replacing: .newItem) {
+                Button("Add Silo…") { store.chooseSiloFolder() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+            }
             SidebarCommands()
             CommandGroup(after: .sidebar) {
                 Divider()
@@ -52,12 +55,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @preconcurrency NSServ
     static var openMainWindow: (() -> Void)?
     var store: LibrarianStore?
     private var statusMenu: StatusMenuController?
+    private var pendingFinderFolders: [URL] = []
 
     /// Called once the SwiftUI scene exists; sets up the AppKit status item.
     func attach(_ store: LibrarianStore) {
         guard self.store == nil else { return }
         self.store = store
         statusMenu = StatusMenuController(store: store)
+        if !pendingFinderFolders.isEmpty {
+            let folders = pendingFinderFolders
+            pendingFinderFolders.removeAll()
+            store.addSilos(at: folders)
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -67,6 +76,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @preconcurrency NSServ
         // Let the Services submenu (e.g. an "Ask Claude" quick action) act on
         // the selected row as text.
         NSApp.registerServicesMenuSendTypes([.string], returnTypes: [])
+        NSApp.servicesProvider = self
+        NSUpdateDynamicServices()
         NotificationCenter.default.addObserver(
             self, selector: #selector(windowWillClose(_:)), name: NSWindow.willCloseNotification, object: nil)
         // ⌘⇧= is what a US keyboard sends for "⌘+"; the menu item itself is ⌘=.
@@ -110,6 +121,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, @preconcurrency NSServ
     }
 
     @objc func readSelection(from pboard: NSPasteboard) -> Bool { false }
+
+    /// Finder contextual Service entry point declared in Info.plist.
+    @objc func addSiloFromFinder(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        let legacyType = NSPasteboard.PasteboardType("NSFilenamesPboardType")
+        var urls = (pboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL]) ?? []
+        if urls.isEmpty, let paths = pboard.propertyList(forType: legacyType) as? [String] {
+            urls = paths.map { URL(fileURLWithPath: $0) }
+        }
+        if urls.isEmpty, let paths = pboard.string(forType: .string) {
+            urls = paths.split(whereSeparator: \.isNewline).map { URL(fileURLWithPath: String($0)) }
+        }
+
+        let folders = urls.filter { url in
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) && isDirectory.boolValue
+        }
+        guard !folders.isEmpty else {
+            error.pointee = "Select one or more folders in Finder, then choose Add as llmLibrarian Silo." as NSString
+            return
+        }
+
+        Self.showMainWindow()
+        if let store {
+            store.addSilos(at: folders)
+        } else {
+            pendingFinderFolders.append(contentsOf: folders)
+        }
+    }
 
     static func isMainWindow(_ w: NSWindow) -> Bool {
         (w.identifier?.rawValue ?? "").contains(mainWindowID)

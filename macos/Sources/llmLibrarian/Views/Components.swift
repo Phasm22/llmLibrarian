@@ -323,10 +323,68 @@ struct ProblemAlert: ViewModifier {
             } message: { silo in
                 Text("Any unscoped query will be able to return chunks from \(silo.tildePath) — including a query issued by a cloud model over MCP. \(silo.chunks.grouped) chunks become reachable without anyone naming the silo.")
             }
+            .confirmationDialog(
+                "Enable image vision for \(store.pendingImageVision?.displayName ?? "silo")?",
+                isPresented: Binding(get: { store.pendingImageVision != nil },
+                                     set: { if !$0 { store.pendingImageVision = nil } }),
+                titleVisibility: .visible,
+                presenting: store.pendingImageVision
+            ) { silo in
+                Button("Enable and Reindex") { store.applyImageVision(silo) }
+                Button("Cancel", role: .cancel) { store.pendingImageVision = nil }
+            } message: { silo in
+                Text("Reindexes images in \(silo.tildePath) with multimodal summaries. This requires `uv sync --extra image` and a vision-capable LLMLIBRARIAN_VISION_MODEL; missing dependencies fail before changing the index.")
+            }
     }
 
     private var pendingSilo: Silo? { lastProblemSilo }
     @State private var lastProblemSilo: Silo?
+}
+
+struct AddSiloSheet: View {
+    @EnvironmentObject private var store: LibrarianStore
+    let request: AddSiloRequest
+    @State private var imageVision = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 30))
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Add \(request.displayName) as a silo?")
+                        .font(.headline)
+                    Text(request.folderURLs.map(\.path).joined(separator: "\n"))
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .truncationMode(.middle)
+                }
+            }
+
+            Toggle("Enable image vision", isOn: $imageVision)
+                .font(.body.weight(.medium))
+            Text(imageVision
+                 ? "Generates multimodal summaries and enables semantic photo search. Requires the optional image dependencies and a vision-capable Ollama model."
+                 : "Images use metadata and OCR only. You can enable multimodal vision later from the silo details.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { store.pendingAddRequest = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button(request.folderURLs.count == 1 ? "Add Silo" : "Add Silos") {
+                    store.confirmAddSilos(imageVision: imageVision)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 500)
+    }
 }
 
 
