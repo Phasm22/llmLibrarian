@@ -41,6 +41,19 @@ def load_tax_ledger_rows(
     rows = _read_all_rows(db_path)
     if silo is not None:
         rows = [r for r in rows if str(r.get("silo") or "") == silo]
+    else:
+        # Unscoped: a private silo's ledger rows are reachable only when the silo is
+        # named, same as its chunks (state.private_filter_clause) and its filenames
+        # (file_registry.read_visible_manifest). An unscoped TAX_QUERY — which any
+        # question with a year and "sold"/"stock"/"federal" routes to — used to
+        # attach every private tax row for that year to the response.
+        # private_silo_slugs raises on an unreadable registry; let it, rather than
+        # guess "nothing is private".
+        from state import private_silo_slugs
+
+        hidden = {s for slug in private_silo_slugs(db_path) for s in (slug, f"{slug}-artifacts")}
+        if hidden:
+            rows = [r for r in rows if str(r.get("silo") or "") not in hidden]
     if tax_year is not None:
         rows = [r for r in rows if int(r.get("tax_year") or 0) == tax_year]
     return rows
