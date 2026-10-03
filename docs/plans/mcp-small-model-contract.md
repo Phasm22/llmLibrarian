@@ -601,8 +601,10 @@ In the meantime, restart Claude Desktop to replace pid 51687.
 
 ## Tests committed
 
-Originally committed red against `dev` @ 13a2855 (b399a15, since folded into the
-branch history); all pass now, alongside the tests each fix added:
+Originally committed red against `dev` @ 13a2855 as b399a15. The branch was then
+rebuilt on `dev` with the privacy fixes first, so b399a15 is no longer in its
+history: its privacy tests landed with 09e645e/5d56fcc, and this plan and the
+contract tests with f56db0a. All pass now, alongside the tests each fix added:
 `test_mcp_payload.py`, `test_mcp_result_cache.py`, `test_read_document.py`,
 `test_image_vision_mode.py`, `test_code_drift.py`, and new cases in
 `test_ask_image.py`, `test_intent_routing.py`, `test_mcp_lite_profile.py`,
