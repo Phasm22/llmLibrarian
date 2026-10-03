@@ -219,3 +219,30 @@ def test_only_photo_requests_replace_text_results(query, explicit):
     from query.core_support import _query_explicitly_requests_image
 
     assert _query_explicitly_requests_image(query) is explicit
+
+
+def test_find_files_accepts_what_small_models_actually_send(monkeypatch, tmp_path):
+    """Overnight 2026-10-03 the Open-WebUI model called find_files with
+    silos="journallinker-3bca8314" (a string) and date_field=None; every call
+    failed schema validation. A one-letter typo in the slug came back empty."""
+    import mcp_server
+    from state import update_silo
+
+    db = tmp_path / "db"
+    db.mkdir()
+    update_silo(str(db), "journallinker-3bca8314", str(tmp_path / "jl"), 1, 1, "2026-01-01T00:00:00+00:00")
+    monkeypatch.setattr(mcp_server, "_DB_PATH", str(db))
+    seen = {}
+    monkeypatch.setattr("operations_find.op_find_files", lambda db, **kw: seen.update(kw) or {"files": []})
+
+    out = mcp_server.find_files(silos="journallinker-3bca8314", date_field=None)
+    assert "error" not in out and seen["silos"] == ["journallinker-3bca8314"] and seen["date_field"] == "either"
+
+    typo = mcp_server.find_files(silos=["journallinker-3bca8314b"])
+    assert "unknown silo" in typo["error"] and typo["recommended_action"]["tool"] == "list_silos"
+
+
+def test_multi_query_accepts_a_single_string(monkeypatch, tmp_path):
+    mcp_server = _stub_server(monkeypatch, tmp_path, [{"text": "t", "score": 0.5, "source": "/a", "silo": "s"}])
+    out = mcp_server.multi_query_knowledge("sourdough timing")
+    assert out["queries"] == ["sourdough timing"] and out["total_chunks"] == 1

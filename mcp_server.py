@@ -1356,7 +1356,7 @@ def query_personal_knowledge(
 
 @mcp.tool()
 def multi_query_knowledge(
-    queries: list[str],
+    queries: list[str] | str,
     silo: str | None = None,
     n_results: int = 10,
     section: str | None = None,
@@ -1385,6 +1385,8 @@ def multi_query_knowledge(
     retry once it finishes.
     """
     from query.core import run_retrieve
+    if isinstance(queries, str):
+        queries = [queries]
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "queries": queries, "total_chunks": 0, "chunks": []}
     refusal = _private_read_refusal(silo)
@@ -1822,11 +1824,11 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
 
 @mcp.tool()
 def find_files(
-    silos: list[str] | None = None,
+    silos: list[str] | str | None = None,
     name_glob: str | None = None,
     date_start: str | None = None,
     date_end: str | None = None,
-    date_field: str = "either",
+    date_field: str | None = "either",
     include_chunk_count: bool = False,
     limit: int = 50,
 ) -> dict:
@@ -1863,8 +1865,28 @@ def find_files(
     except ValueError as e:
         return {"db_path": _DB_PATH, "error": f"invalid date: {e}"}
 
+    # Small models sent silos="journallinker-3bca8314" (a string) and
+    # date_field=None; both failed schema validation nine times on 2026-10-03.
+    if isinstance(silos, str):
+        silos = [silos]
+    date_field = date_field or "either"
     if date_field not in ("name_date", "mtime", "either"):
         return {"db_path": _DB_PATH, "error": f"invalid date_field: {date_field}"}
+    if silos:
+        from state import resolve_silo_to_slug
+
+        unknown = [name for name in silos if not resolve_silo_to_slug(_DB_PATH, name)]
+        if unknown:
+            return {
+                "db_path": _DB_PATH,
+                "error": f"unknown silo(s): {', '.join(unknown)}",
+                "files": [],
+                "recommended_action": {
+                    "tool": "list_silos",
+                    "args": {},
+                    "reason": "Copy the exact slug from list_silos; do not retype or guess it.",
+                },
+            }
     refusal = _private_read_refusal(*(silos or []))
     if refusal:
         return {"db_path": _DB_PATH, "error": refusal, "files": []}
