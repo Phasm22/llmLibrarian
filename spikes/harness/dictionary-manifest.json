@@ -1,0 +1,37 @@
+{
+  "characters_per_chunk": 1000,
+  "schema_version": 1,
+  "seed": "s0-dictionary-v1",
+  "source_words": "/usr/share/dict/words",
+  "statistics": {
+    "at_or_above_384": 0,
+    "at_or_above_384_pct": 0.0,
+    "chunk_count": 512,
+    "fixture_sha256": "04f23db9d35a307f23f95eb02669a5914a2ffdc2d9b013b9e55d671a7394981e",
+    "shape_counts": {
+      "synthetic-dictionary": 512
+    },
+    "token_histogram": {
+      "0-32": 0,
+      "129-192": 0,
+      "193-256": 0,
+      "257-320": 512,
+      "321-383": 0,
+      "33-64": 0,
+      "384+": 0,
+      "65-96": 0,
+      "97-128": 0
+    },
+    "token_percentiles": {
+      "max": 317,
+      "p5": 281.0,
+      "p50": 294.0,
+      "p95": 306.4,
+      "p99": 312.0
+    },
+    "total_tokens_model_input": 150309,
+    "total_tokens_untruncated": 150309
+  },
+  "synthetic": true,
+  "tokenizer": "sentence-transformers/all-mpnet-base-v2"
+}

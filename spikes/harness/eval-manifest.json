@@ -1,0 +1,38 @@
+{
+  "audit_events": 109,
+  "eval_set": "s0-eval-v1",
+  "generated_at": "2026-09-21T00:37:50+00:00",
+  "historical_source_cases": 71,
+  "intent_counts": {
+    "EVIDENCE_PROFILE": 2,
+    "LOOKUP": 119
+  },
+  "known_item_cases": 50,
+  "limitations": [
+    "Audit sources are retrieval outputs, not user clicks or human judgments.",
+    "The observed query mix is dominated by LOOKUP and cannot validate routing intents with sparse or zero coverage.",
+    "Source-level labels cannot distinguish relevant from irrelevant chunks within the same file.",
+    "Known-item rare-term queries are deliberately easier than natural-language queries."
+  ],
+  "private_path": "spikes/private/s0/s0-eval-v1.jsonl",
+  "repeat_source_jaccard_mean": 0.8724489795918368,
+  "repeated_case_pairs": 49,
+  "schema_version": 1,
+  "sha256": "a3564a070e06473e0518bb6884aa4de3b751777ca00de0b083bc807cd740bd6c",
+  "silo_case_counts": {
+    "job-related-stuff-35edf4b2": 1,
+    "llmlibrarian-322853c4": 6,
+    "llmlibrarian-46ad0cbe": 21,
+    "palindrome": 1,
+    "photos": 2,
+    "photos-29e84c3f": 3,
+    "photos_local": 5,
+    "photos_local-9777636e": 22,
+    "recipes": 1,
+    "recipes-55cf8f91": 41,
+    "tax-0c9821db": 4,
+    "unscoped": 13,
+    "vtest-2bc61b3d": 1
+  },
+  "unique_cases": 121
+}

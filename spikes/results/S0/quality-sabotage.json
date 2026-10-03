@@ -1,0 +1,101 @@
+{
+  "spike": "S0",
+  "run_id": "2026-09-21T00:38:04+00:00",
+  "eval_set": "s0-eval-v1",
+  "model": "sentence-transformers/all-mpnet-base-v2",
+  "device": "mps",
+  "corpus_chunks": 9550,
+  "eval_cases": 121,
+  "unresolved_silo_cases": 8,
+  "results": {
+    "full-768": {
+      "cases": 113,
+      "recall_at_12": 0.5551517067003793,
+      "ndcg_at_12": 0.4309251890958133,
+      "recall_at_40": 0.6660977665402444,
+      "ndcg_at_40": 0.4567250456522855,
+      "by_kind": {
+        "historical-source": {
+          "12": {
+            "recall": 0.6465419501133786,
+            "ndcg": 0.5225346114516645
+          },
+          "40": {
+            "recall": 0.7026832955404384,
+            "ndcg": 0.5374990936757587
+          }
+        },
+        "known-item": {
+          "12": {
+            "recall": 0.44,
+            "ndcg": 0.31549731692744076
+          },
+          "40": {
+            "recall": 0.62,
+            "ndcg": 0.3549497451427092
+          }
+        }
+      }
+    },
+    "truncate-64": {
+      "cases": 113,
+      "recall_at_12": 0.4942267172355667,
+      "ndcg_at_12": 0.36447451859278773,
+      "recall_at_40": 0.5844500632111251,
+      "ndcg_at_40": 0.3874374424883227,
+      "by_kind": {
+        "historical-source": {
+          "12": {
+            "recall": 0.6166288737717308,
+            "ndcg": 0.4629645032383756
+          },
+          "40": {
+            "recall": 0.6832199546485261,
+            "ndcg": 0.48308293256028956
+          }
+        },
+        "known-item": {
+          "12": {
+            "recall": 0.34,
+            "ndcg": 0.24037713793934695
+          },
+          "40": {
+            "recall": 0.46,
+            "ndcg": 0.2669241249976444
+          }
+        }
+      }
+    },
+    "random": {
+      "cases": 113,
+      "recall_at_12": 0.271101980615255,
+      "ndcg_at_12": 0.15662742943730618,
+      "recall_at_40": 0.32269279393173195,
+      "ndcg_at_40": 0.1771269611897939,
+      "by_kind": {
+        "historical-source": {
+          "12": {
+            "recall": 0.48626228269085414,
+            "ndcg": 0.2809349131177079
+          },
+          "40": {
+            "recall": 0.5787981859410433,
+            "ndcg": 0.31770391451502705
+          }
+        },
+        "known-item": {
+          "12": {
+            "recall": 0.0,
+            "ndcg": 0.0
+          },
+          "40": {
+            "recall": 0.0,
+            "ndcg": 0.0
+          }
+        }
+      }
+    }
+  },
+  "sabotage_detected": true,
+  "bias_warning": "Historical-source labels came from prior production retrieval; full-768 is advantaged. Known-item queries are easier than natural language."
+}

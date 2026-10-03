@@ -38,6 +38,11 @@ tests/integration/test_income_year_query.py
 .env.mcp
 llmLibrarian.mcpb
 
+# S0 research artifacts contain sampled personal corpus text, audit queries,
+# cached embeddings, and raw power traces.  The reproducible builders and
+# aggregate manifests under spikes/harness remain tracked.
+/spikes/private/
+
 # Open WebUI session secret -- generated locally, never shared
 .webui_secret_key
 
