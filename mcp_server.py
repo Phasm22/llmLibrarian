@@ -2029,6 +2029,21 @@ def add_silo(
     # Pre-derive a key for outcome tracking (best-guess slug; real slug written by thread)
     outcome_key = silo if silo else p.name
 
+    warnings: list[str] = []
+    if image_vision is not True:
+        try:
+            from state import get_silo_image_vision_enabled, resolve_silo_by_path
+            from watch_scan import image_share, vision_off_warning
+
+            existing = resolve_silo_by_path(_DB_PATH, p)
+            stored = get_silo_image_vision_enabled(_DB_PATH, existing) if existing else None
+            if not stored:
+                warning = vision_off_warning(*image_share(p))
+                if warning:
+                    warnings.append(warning)
+        except Exception:
+            _logger.debug("add_silo image pre-check failed", exc_info=True)
+
     def _run_add() -> None:
         err: str | None = None
         files_ok = 0
@@ -2105,6 +2120,7 @@ def add_silo(
             "Call list_silos() after a minute or two to confirm the silo appears. "
             "Call health() to check last_background_reindex status after completion."
         ),
+        **({"warnings": warnings} if warnings else {}),
     }
 
 

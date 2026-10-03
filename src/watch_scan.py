@@ -138,11 +138,56 @@ def _load_limits_config() -> tuple[int, int, int, int, int]:
     return max_file_bytes, max_depth, max_archive_bytes, max_files_per_zip, max_extracted_per_zip
 
 
+def image_share(root: str | Path, *, limit: int = 2000) -> tuple[int, int]:
+    """(image files, indexable files) among the first ``limit`` indexable files.
+
+    Cheap pre-check for add_silo: walks with the default patterns only, stops
+    early, reads no file contents.
+    """
+    root = Path(root)
+    if root.is_file():
+        return (1 if root.suffix.lower() in IMAGE_EXTENSIONS else 0), 1
+    images = total = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if should_descend_into_dir(os.path.join(dirpath, d), ADD_DEFAULT_EXCLUDE)
+        ]
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if not should_index(path, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE):
+                continue
+            total += 1
+            if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
+                images += 1
+            if total >= limit:
+                return images, total
+    return images, total
+
+
+def vision_off_warning(images: int, total: int) -> str | None:
+    """The one-line warning for a mostly-photo silo indexed without vision.
+
+    dad-new-car (9 of 9 photos) was added with vision off; its chunks held only
+    OCR, and "what kind of car did my dad get" scored 0.054.
+    """
+    if images < 3 or images * 2 < total:
+        return None
+    return (
+        f"{images} of {total} files are images and image vision is off: photos are indexed by "
+        "OCR text and EXIF only, so questions about what a photo shows will miss. To describe "
+        "them, add with image vision on (`pal pull <path> --image-vision`, or add_silo "
+        "image_vision=True); expect roughly 20-40 s per image with the local vision model."
+    )
+
+
 __all__ = [
     "ADD_DEFAULT_INCLUDE",
     "ADD_DEFAULT_EXCLUDE",
     "_read_file_manifest",
     "_load_limits_config",
     "collect_files",
+    "image_share",
     "should_index",
+    "vision_off_warning",
 ]

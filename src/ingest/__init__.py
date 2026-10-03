@@ -522,6 +522,32 @@ def _resolve_image_vision_enabled(
     return False
 
 
+def _unchanged_since_manifest(
+    prev: dict | None,
+    *,
+    mtime: float,
+    size: int,
+    file_hash: str,
+    kind: str,
+    image_vision_mode_changed: bool,
+) -> bool:
+    """True when incremental ingest may skip this file.
+
+    Unchanged stat still confirms the content hash: an edit that preserves both
+    mtime and size would otherwise be skipped. An image is never "unchanged" when
+    the silo's vision mode changed: its chunks say "vision off" (or carry a vision
+    summary) and the file itself did not change, so without this, enabling vision
+    flipped the registry flag and re-indexed nothing.
+    """
+    if not prev or prev.get("mtime") != mtime or prev.get("size") != size:
+        return False
+    if file_hash and prev.get("hash") != file_hash:
+        return False
+    if kind == "image" and image_vision_mode_changed:
+        return False
+    return True
+
+
 def _resolve_worker_override(value: int | None, env_name: str, fallback: int, *, cap: int = 32) -> int:
     resolved = fallback
     if value is not None:
@@ -2256,6 +2282,8 @@ def run_add(
         silo_slug=silo_slug,
         requested=image_vision_enabled,
     )
+    previous_image_vision = get_silo_image_vision_enabled(db_path, silo_slug) if silo_slug else None
+    image_vision_mode_changed = bool(previous_image_vision) != bool(effective_image_vision_enabled)
     limits_cfg = {}
     try:
         config = load_config()
@@ -2311,6 +2339,13 @@ def run_add(
         batch_size=_embed_batch_hint,
         device=_ingest_embed_device,
     )
+    if previous_image_vision is None and not effective_image_vision_enabled:
+        # A new silo, vision off. Warn once here rather than on every watcher pull.
+        from watch_scan import vision_off_warning
+
+        _warning = vision_off_warning(sum(1 for _p, kind in file_list if kind == "image"), len(file_list))
+        if _warning:
+            print(f"[llmli][WARN] {_warning}", file=sys.stderr)
     if _requires_standalone_image_enrichment(file_list):
         ensure_image_decoders_ready([p for p, kind in file_list if kind == "image"])
         if effective_image_vision_enabled:
@@ -2403,13 +2438,17 @@ def run_add(
                 h = get_file_hash(p_res)
                 if incremental:
                     prev = manifest_files.get(str(p_res)) if isinstance(manifest_files, dict) else None
-                    if prev and prev.get("mtime") == mtime and prev.get("size") == size:
-                        # Unchanged stat, but still confirm the content hash: an edit
-                        # that preserves both mtime and size would otherwise be skipped.
-                        # The manifest entry is the hash record, so this is a local
-                        # compare rather than a lookup through the derived index.
-                        if not h or prev.get("hash") == h:
-                            continue
+                    # The manifest entry is the hash record, so this is a local
+                    # compare rather than a lookup through the derived index.
+                    if _unchanged_since_manifest(
+                        prev,
+                        mtime=mtime,
+                        size=size,
+                        file_hash=h,
+                        kind=k,
+                        image_vision_mode_changed=image_vision_mode_changed,
+                    ):
+                        continue
                 if h:
                     existing_entries = _file_registry_get(db_path, h)
                     if not incremental:
