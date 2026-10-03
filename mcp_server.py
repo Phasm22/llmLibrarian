@@ -2223,7 +2223,7 @@ def add_silo(
     workers: int | None = None,
     embedding_workers: int | None = None,
     private: bool = False,
-    confirm: bool = True,
+    confirm: bool = False,
 ) -> dict:
     """
     Use when: indexing a new file/folder or refreshing a silo from its source path.
@@ -2231,6 +2231,8 @@ def add_silo(
     Pairs with: `session_context`/`list_silos` before and after indexing.
 
     Index a file or folder as a new silo (or update an existing one). Equivalent to `llmli add <path>`.
+    Requires confirm=True, like every other tool that writes: it is the one that
+    indexes an arbitrary filesystem path. pal passes it explicitly.
     silo: optional slug override (default: basename, slugified).
     display_name: optional human-readable name override.
     allow_cloud: set True to allow OneDrive/iCloud/Dropbox paths (blocked by default).
@@ -3089,15 +3091,31 @@ def get_silo(slug: str) -> str:
 
 @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
 async def healthz(_: Request) -> Response:
-    """Simple liveness check for process supervisors and reverse proxies."""
-    return JSONResponse({
+    """Simple liveness check for process supervisors and reverse proxies.
+
+    /healthz has no auth of its own and may be published (scripts/
+    publish_mcp_funnel.sh), so the DB path — a home-directory layout — is
+    withheld when the server is bound off-loopback without auth.
+    """
+    host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1").strip()
+    exposed = host not in {"127.0.0.1", "localhost", "::1"} and not _env_bool(
+        "LLMLIBRARIAN_MCP_REQUIRE_AUTH", False
+    )
+    body = {
         "ok": True,
         "service": "llmLibrarian-mcp",
         "version": _package_version(),
-        "db_path": _DB_PATH,
+        "transport": _transport_name(),
         "db_exists": Path(_DB_PATH).exists(),
         "started_at": _SERVER_STARTED_AT,
-    })
+    }
+    if exposed:
+        # Said explicitly so chroma_client's embedded-write guard fails closed
+        # instead of reading a missing field as an older server.
+        body["db_path_withheld"] = True
+    else:
+        body["db_path"] = _DB_PATH
+    return JSONResponse(body)
 
 
 def _client_app_name() -> str | None:

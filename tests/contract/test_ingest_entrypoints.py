@@ -108,7 +108,7 @@ def test_mcp_add_silo_file_reaches_run_ingest(monkeypatch, tmp_path):
     f = tmp_path / "solo.txt"
     f.write_text("ok", encoding="utf-8")
 
-    out = mcp_server.add_silo(str(f))
+    out = mcp_server.add_silo(str(f), confirm=True)
     assert out.get("status") == "started"
 
     deadline = time.monotonic() + 10.0

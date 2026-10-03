@@ -61,8 +61,8 @@ def test_add_silo_returns_the_warning(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_server, "_DB_PATH", str(db))
     monkeypatch.setattr("threading.Thread.start", lambda self: None)  # do not ingest
 
-    out = mcp_server.add_silo(str(photos))
+    out = mcp_server.add_silo(str(photos), confirm=True)
     assert out["status"] == "started"
     assert "image vision is off" in out["warnings"][0]
 
-    assert "warnings" not in mcp_server.add_silo(str(photos), image_vision=True)
+    assert "warnings" not in mcp_server.add_silo(str(photos), image_vision=True, confirm=True)

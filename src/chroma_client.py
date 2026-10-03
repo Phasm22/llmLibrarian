@@ -303,7 +303,14 @@ def _mcp_healthz_info(timeout: float = 1.0) -> tuple[bool, str | None, bool]:
     db_raw = payload.get("db_path")
     if isinstance(db_raw, str) and db_raw.strip():
         return True, str(Path(db_raw).expanduser().resolve()), False
+    if payload.get("db_path_withheld"):
+        return True, _DB_PATH_WITHHELD, False
     return True, None, False
+
+
+# /healthz withholds db_path when bound off-loopback without auth; that server
+# may be on this DB, so the guard below must treat it as a block, not as skew.
+_DB_PATH_WITHHELD = "<withheld>"
 
 
 def _mcp_blocks_embedded_write(db_path: str) -> str | None:
@@ -327,6 +334,13 @@ def _mcp_blocks_embedded_write(db_path: str) -> str | None:
             "to the server's token, or set LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT=1 if you "
             "know the MCP server holds a different database"
         )
+    if mcp_db == _DB_PATH_WITHHELD:
+        return (
+            "llmLibrarian MCP HTTP server is running but does not publish its DB path "
+            "(bound off-loopback without auth), so it cannot be confirmed to be on a different "
+            "DB. Enable LLMLIBRARIAN_MCP_REQUIRE_AUTH and set LLMLIBRARIAN_MCP_AUTH_TOKEN, or set "
+            "LLMLIBRARIAN_SKIP_CHROMA_WRITE_PREFLIGHT=1 if you know it holds a different database"
+        )
     if mcp_db is None:
         # Older MCP whose /healthz omits db_path — cannot confirm, stay permissive.
         return None
@@ -343,6 +357,32 @@ def _pid_is_running(pid: int) -> bool:
     return True
 
 
+def _read_watch_lock(lock_path: Path) -> dict | None:
+    """One pal watch lock as a dict, or None if unreadable.
+
+    pal also writes a legacy bare-integer form (the file holds only a pid).
+    json.loads("4242") returns an int, and skipping non-dicts reported a live
+    watcher as absent — the embedded-write guard then let a write through while
+    the watcher held the index. Same parsing as pal._read_watch_lock.
+    """
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    try:
+        return {"pid": int(raw)}
+    except Exception:
+        return None
+
+
 def _active_watch_processes_for_db(db_path: str) -> list[str]:
     """Return human-readable labels for running pal pull --watch processes on db_path."""
     db_resolved = str(Path(db_path).expanduser().resolve())
@@ -352,14 +392,13 @@ def _active_watch_processes_for_db(db_path: str) -> list[str]:
         return []
     active: list[str] = []
     for lock_path in sorted(locks_dir.glob("*.pid")):
-        try:
-            data = json.loads(lock_path.read_text(encoding="utf-8"))
-        except Exception:
+        data = _read_watch_lock(lock_path)
+        if data is None:
             continue
-        if not isinstance(data, dict):
-            continue
+        # Compare resolved paths: a watcher started via ~/llmLibrarian records the
+        # symlinked path, and an unresolved compare treated it as another DB.
         lock_db = str(data.get("db_path") or "").strip()
-        if lock_db and lock_db != db_resolved:
+        if lock_db and str(Path(lock_db).expanduser().resolve()) != db_resolved:
             continue
         pid_val = data.get("pid")
         try:
