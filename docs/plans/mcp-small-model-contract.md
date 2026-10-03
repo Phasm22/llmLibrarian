@@ -1,7 +1,7 @@
 ---
-description: Read before changing what llmLibrarian's MCP tools return to small local models (Open-WebUI on :8766), before touching intent routing over MCP, private-silo visibility on HTTP, image vision defaults, or stdio/HTTP process lifecycle. Verified findings from the 2026-10-02 Open-WebUI session, root causes with file:line, a ranked fix list, and the policy questions TJ must decide.
+description: Read before changing what llmLibrarian's MCP tools return to small local models (Open-WebUI on :8766), before touching intent routing over MCP, private-silo visibility on HTTP, image vision defaults, or stdio/HTTP process lifecycle. Verified findings from the 2026-10-02 Open-WebUI session, root causes with file:line, the ranked fix list and what shipped for each, and the policy switches TJ still has to flip.
 type: plan
-updated: 2026-10-02
+updated: 2026-10-03
 globs:
   - mcp_server.py
   - src/query/intent.py
@@ -15,16 +15,16 @@ globs:
 
 # MCP contract for small local models — findings and plan
 
-**Decision needed first:** two privacy defects are live or one restart away from
-live. Restore a30aebf onto `dev` and filter `tax_ledger` by privacy (fix list
-rank 0 and 1) **before** anything else, and do not restart the :8766 service
-until a30aebf is back — a restart today loads code with three privacy guards
-removed.
+**Status (2026-10-03):** every item in the fix list has shipped on branch
+`claude/infallible-goodall-5949ce`. The two privacy fixes (ranks 0–1) are also
+on local `dev` (fast-forwarded to 5d56fcc; not pushed). The running :8766
+process (pid 95443, started 2026-09-30) still serves its in-memory code — **it
+leaks the tax ledger until it is restarted**. See [What TJ still has to
+do](#what-tj-still-has-to-do).
 
-Analysed code: `dev` @ 13a2855 (what :8766 serves from disk). Branch:
-`claude/infallible-goodall-5949ce`, reset onto `dev`. No fixes applied; failing
-tests that pin each bug are committed alongside this plan (see
-[Tests committed](#tests-committed)).
+Analysed code: `dev` @ 13a2855. The findings below are as investigated on
+2026-10-02; [Status of the fix list](#status-of-the-fix-list) records what
+landed and where it deviated from the plan.
 
 Related: [CLAUDE.md](../../CLAUDE.md) (privacy, registry, Chroma safety),
 [.claude/rules/silo-privacy.md](../../.claude/rules/silo-privacy.md),
@@ -86,7 +86,7 @@ filter (`src/query/retrieve_locked.py:282-309` → `src/tax/ledger.py:35-46`).
 `sell|sold|stock|federal|proceeds|tax…` (`src/query/intent.py:232-237`), e.g.
 *"how much did my dad sell his old car for in 2024"* → `TAX_QUERY`.
 
-Live ledger, counted by `(silo, tax_year)` only — no values read: 296 rows from
+Live ledger, counted by `(silo, tax_year)` only — no values read: 274 rows from
 `tax-0c9821db`, 39 from `chat-archive`, 1 from `lab-history-d8dd1667`, all
 private. The example query would attach the 27 `tax-0c9821db` rows for 2024
 (form, field label, raw and normalized value) to an Open-WebUI context whose
@@ -96,7 +96,11 @@ proves it with fixtures.
 
 Side note: the ledger also holds rows for `llmlibrarian-322853c4`, a silo no
 longer in the roster, and for `chat-archive`, which is not a tax corpus — the
-extractor is running on non-tax silos.
+extractor is running on non-tax silos. (Fixed later: the non-private rows were
+"extracted" from the repo's own tax test files; see N6.)
+
+Correction: an earlier draft said 296 tax rows; the per-year counts sum to 274,
+all from PDFs. Commit 5d56fcc's message, already on `dev`, repeats the 296.
 
 ## Findings from the brief
 
@@ -446,7 +450,91 @@ every empty or misleading result seen in the session for an S-sized change
 each. 5–7 are context and loop economics. 8–9 are image quality. 10–12 are
 hygiene and policy-gated work.
 
+## Status of the fix list
+
+All on `claude/infallible-goodall-5949ce` (base `dev` @ 13a2855). Full suite:
+1,322 unit + 31 integration passing (`test_concurrent_subprocess_hnsw::t1` is
+flaky under full-suite load and passes alone, 3/3).
+
+| # | Commit | What landed | Differs from plan |
+|---|---|---|---|
+| 0 | 09e645e | a30aebf cherry-picked; conflict in `_resolve_indexed_image` resolved keeping `dev`'s `read_visible_manifest` *and* a30aebf's exact-slug guard | Also on local `dev` |
+| 1 | 5d56fcc, faf3b32 | Ledger privacy filter at the single reader `load_tax_ledger_rows` (covers MCP and the CLI tax resolver); a folder path is no longer consent in the image resolver; ledger reads only PDF/scan/office/CSV/TXT sources and skips removed silos | Filter moved from `retrieve_locked` to the choke point. 5d56fcc is also on local `dev` |
+| 2–3 | f56db0a | `run_retrieve` retrieves deterministic intents as LOOKUP and reports `deterministic_intent`; `src/mcp_contract.py` attaches `recommended_action` to every empty result (and `alternative_tool` to non-empty inventory-shaped ones) in all four retrieval tools; lite keeps `note`/`error`/`recommended_action` | — |
+| 12 | f86b416 | Router rules need the question to be about the index; content verbs veto FILE_LIST/STRUCTURE | Done before 4–11 since 2 depended on it for clean tests |
+| 4 | c309c21 | Image L2² → cosine (L2²/2, CLIP vectors verified unit-norm); image-led results get an "image match" coverage note instead of "rephrase" | — |
+| 5 | 5da5c27 | Slim chunks, `silo_counts` instead of `chunks_by_silo`, n_results 40→12 (multi 20→10, cap 50→30), roster hoists `exclude_patterns`, `language_stats` behind `verbose` | Measured: list_silos 10.1→4.7 KB, session_context 13.9→6.0, car query 19.4→9.2, unscoped 19.9→8.5. `structuredContent` untouched (P5) |
+| — | da6060f | See N1, N2 | New |
+| 6 | ade5341 | `read_document` + `source=` (full and lite), `_resolve_indexed_file`, `find_files` `next_step` | — |
+| — | c148440 | See N3 | New |
+| 7 | 072c2c6 | Single-flight + 30 s TTL (`src/mcp_result_cache.py`), `repeat_of` / `repeat_notice`, audit per call with `cached` | — |
+| 9 | d008d0e | `ask_image(question, files=[…])` one vision call for ≤4 images, or best `top_k` (default 2) matches; ranked `recommended_action` with args | Default 2, not 3 (see N7) |
+| 8 | c2cf706 | Vision-mode change re-extracts images on incremental pulls (macOS action fixed with no Swift change); warning on new mostly-photo silos (CLI + `add_silo`) | (b) eager summaries not changed — still `LLMLIBRARIAN_IMAGE_EAGER_SUMMARY` |
+| 10 | 44b7c16 | Light modules eagerly imported; `code_drift` in runtime status/health; ImportError middleware; stdio classified by client liveness; `.mcp.json` DB default; DB fallback requires a real store (N5) | query.core stays lazy (65 MB, chromadb) |
+| 11 + P1 | d31ff58 | `LLMLIBRARIAN_MCP_PRIVATE_READS=none` and `LLMLIBRARIAN_MCP_LITE_PATH` mount (lite read policy default `none`) | Mechanisms only; defaults keep today's behavior |
+| — | fd7f61a, 3512b77 | Server instructions and AGENTS/GUIDE/CLAUDE/rule docs | — |
+
+## Found while fixing
+
+- **N1. "image" replaced the text results.** `_IMAGE_QUERY_PATTERN` (image, ui,
+  screen, dog, face, shown…) decided both "merge image hits" and "replace text
+  hits with image hits", so "README image indexing capabilities" returned two
+  fixture screenshots and no README. The replace path now needs a photo request
+  (photo, picture, screenshot, or "image" not followed by indexing/vision/OCR…).
+- **N2. Placeholder text embedded in every photo chunk.** "Text-forward image
+  indexed with OCR only; multimodal vision disabled." matched every question
+  about image indexing. New placeholders carry no such vocabulary; **each image
+  silo picks this up on its next reindex**.
+- **N3. Agent worktrees indexed.** The `llmlibrarian` silo watches the repo
+  root, so `.claude/worktrees/<name>/…` and `.pytest_cache/README.md` were indexed
+  (find_files listed the cache README first). Now default-excluded; applied on
+  the silo's next pull.
+- **N4. Exclude patterns match as substrings** — "env/" drops
+  `environment-setup.md`, "build" drops `build_notes.md`, "dist" drops
+  `distance.py`. Confirmed; out of scope here and offered as a separate task.
+- **N5. A stray empty DB won the fallback.** Taking the Chroma lock on a missing
+  DB path created `<worktree>/my_brain_db/.llmli_chroma.flock`, and
+  `_resolve_db_path` accepted any existing directory. It now requires
+  `llmli_registry.json` or `chroma.sqlite3`.
+- **N6. The ledger held rows from test code.** `tests/unit/test_tax_resolver.py`
+  and `tests/integration/test_tax_deterministic_qa.py` (indexed as part of the
+  repo silo) produced W-2 rows, so an unscoped "W-2 wages 2025" via `pal ask`
+  would have answered from fixtures. After the fixes, an unscoped ledger read
+  returns no rows; `tax-0c9821db` by exact slug still returns its 274.
+- **N7. `ask_image` latency is GPU contention, not image size.** One image
+  ~21–23 s warm or cold; three in one call 94 s, and 370 s while
+  `qwen3.6:35b-a3b` (24 GB, resident 8 h for Open-WebUI) held the GPU.
+  Downscaling to 1,600 px measured identical (Ollama resizes), so it was
+  reverted. Live: `ask_image(question="What make and model … color?",
+  silo="dad-new-car-d6e890e2")` → "a black BMW … logo on the wheel hubs in
+  DSCN2764/2763/2765".
+
+## What TJ still has to do
+
+These need your hands or your consent; none were done.
+
+1. **Restart :8766** (`pal mcp stop && pal mcp start`, or let launchd restart it).
+   Until then the resident process (pid 95443) attaches private tax-ledger rows
+   to unscoped TAX_QUERY results. After the restart it serves local `dev`
+   (privacy fixes only) — or merge this branch into `dev` first to get the rest.
+2. **Push `dev`** (`git push origin dev`) so a30aebf cannot be lost again, and
+   merge this branch when reviewed.
+3. **Re-pull the affected silos** when convenient: `dad-new-car-d6e890e2` and
+   `photos_local-9777636e` (N2 placeholders; dad-new-car's vision flag is on, so
+   the pull now re-summarizes its 9 images, ~20–40 s each), and
+   `llmlibrarian-46ad0cbe` (N3 worktree excludes, N6 ledger rows).
+4. **Flip the policy switches you choose** (P1/P2 below) in `.env.mcp` and
+   repoint Open-WebUI (client session) — e.g. `LLMLIBRARIAN_MCP_LITE_PATH=/lite`
+   and Open-WebUI at `http://host.docker.internal:8766/lite/mcp` with tools
+   `silo_roster,retrieve_knowledge,read_document,ask_image`.
+5. **Restart Claude Desktop** to replace stdio pid 51687 (started 09-28; still
+   raises the `find_files` ImportError, now with a restart hint once it runs new
+   code — which it will not until restarted).
+
 ## Policy questions for TJ
+
+The mechanisms for P1 and P2 shipped (d31ff58) with defaults that keep today's
+behavior; P3's warning shipped (c2cf706) with the default still off.
 
 ### P1. Private-silo visibility on HTTP
 
@@ -478,7 +566,7 @@ documented rule for HTTP, which is why it's your call.
 
 **Recommendation: (b)**, with lite = `silo_roster`, `retrieve_knowledge`
 (+ `source=`), `read_document`, `ask_image`, and Open-WebUI pointed at
-`/mcp/lite`. Don't make lite the default for every non-watcher HTTP client;
+`/lite/mcp`. Don't make lite the default for every non-watcher HTTP client;
 choosing by path keeps it explicit. Lite must get fixes 0, 2, 3 and 7 first, or
 it inherits the empty-and-silent failure.
 
@@ -513,9 +601,12 @@ In the meantime, restart Claude Desktop to replace pid 51687.
 
 ## Tests committed
 
-All fail on `dev` @ 13a2855 and pass once the corresponding fix lands. They are
-deliberately red; switch them to `xfail(strict=True)` if this branch merges
-before the fixes.
+Originally committed red against `dev` @ 13a2855 (b399a15, since folded into the
+branch history); all pass now, alongside the tests each fix added:
+`test_mcp_payload.py`, `test_mcp_result_cache.py`, `test_read_document.py`,
+`test_image_vision_mode.py`, `test_code_drift.py`, and new cases in
+`test_ask_image.py`, `test_intent_routing.py`, `test_mcp_lite_profile.py`,
+`test_silo_privacy.py` and `test_silo_privacy_mcp_tools.py`.
 
 | Test | Pins |
 |---|---|
@@ -524,7 +615,7 @@ before the fixes.
 | `tests/integration/test_silo_privacy_mcp_tools.py` (restored from a30aebf; 3 of 7 failing) | S1 end-to-end through the tool functions |
 | `tests/integration/test_silo_privacy_retrieval.py` (1 assertion restored from a30aebf) | S1 `-artifacts` clause after a real reindex |
 
-Unit suite on this branch: 1,217 passed, 23 failed — exactly the cases above.
+At the time of the investigation: 1,217 passed, 23 failed — exactly these cases.
 
 ## Evidence notes
 
@@ -536,3 +627,7 @@ Unit suite on this branch: 1,217 passed, 23 failed — exactly the cases above.
   unscoped sourdough query, and one `ask_image` on DSCN2763.
 - **Probe scripts** (raw streamable-HTTP and stdio JSON-RPC) lived in the
   session scratchpad. Re-create them from the payload tables above if needed.
+- **Fix-phase live checks** ran the branch code in-process against the live DB
+  (Chroma over HTTP, read-only, `LLMLIBRARIAN_QUERY_AUDIT=0`), plus four local
+  `ask_image` vision calls on `dad-new-car`. Nothing was reindexed, and :8766,
+  the watchers and Chroma were not restarted.
