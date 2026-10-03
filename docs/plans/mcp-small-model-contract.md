@@ -15,12 +15,9 @@ globs:
 
 # MCP contract for small local models — findings and plan
 
-**Status (2026-10-03):** every item in the fix list has shipped on branch
-`claude/infallible-goodall-5949ce`. The two privacy fixes (ranks 0–1) are also
-on local `dev` (fast-forwarded to 5d56fcc; not pushed). The running :8766
-process (pid 95443, started 2026-09-30) still serves its in-memory code — **it
-leaks the tax ledger until it is restarted**. See [What TJ still has to
-do](#what-tj-still-has-to-do).
+**Status (2026-10-03):** every item in the fix list has shipped, been merged to
+`dev` and pushed, and is live on :8766 with the policy switches set. See
+[Rollout](#rollout-2026-10-03).
 
 Analysed code: `dev` @ 13a2855. The findings below are as investigated on
 2026-10-02; [Status of the fix list](#status-of-the-fix-list) records what
@@ -509,32 +506,63 @@ flaky under full-suite load and passes alone, 3/3).
   silo="dad-new-car-d6e890e2")` → "a black BMW … logo on the wheel hubs in
   DSCN2764/2763/2765".
 
-## What TJ still has to do
+## Rollout (2026-10-03)
 
-These need your hands or your consent; none were done.
+Done, at TJ's direction ("decisions are aligned, get it done"):
 
-1. **Restart :8766** (`pal mcp stop && pal mcp start`, or let launchd restart it).
-   Until then the resident process (pid 95443) attaches private tax-ledger rows
-   to unscoped TAX_QUERY results. After the restart it serves local `dev`
-   (privacy fixes only) — or merge this branch into `dev` first to get the rest.
-2. **Push `dev`** (`git push origin dev`) so a30aebf cannot be lost again, and
-   merge this branch when reviewed.
-3. **Re-pull the affected silos** when convenient: `dad-new-car-d6e890e2` and
-   `photos_local-9777636e` (N2 placeholders; dad-new-car's vision flag is on, so
-   the pull now re-summarizes its 9 images, ~20–40 s each), and
-   `llmlibrarian-46ad0cbe` (N3 worktree excludes, N6 ledger rows).
-4. **Flip the policy switches you choose** (P1/P2 below) in `.env.mcp` and
-   repoint Open-WebUI (client session) — e.g. `LLMLIBRARIAN_MCP_LITE_PATH=/lite`
-   and Open-WebUI at `http://host.docker.internal:8766/lite/mcp` with tools
-   `silo_roster,retrieve_knowledge,read_document,ask_image`.
-5. **Restart Claude Desktop** to replace stdio pid 51687 (started 09-28; still
-   raises the `find_files` ImportError, now with a restart hint once it runs new
-   code — which it will not until restarted).
+- **Merged and pushed.** `dev` fast-forwarded to this branch and pushed to
+  `origin/dev`, a30aebf included.
+- **Exclude matching by segment (N4).** f73d8ac; was the separate task. Walked
+  impact before rollout: llmlibrarian 970 → 327 indexable files (650
+  worktree/cache copies out; `env_bootstrap.py`, `build.sh`,
+  `.github/workflows` in), journallinker +3/−1, chat-archive +3; other silos
+  unchanged.
+- **Small-model argument shapes.** 7056fca: `find_files` accepts
+  `silos="slug"` and `date_field=None` (ten overnight validation failures in the
+  :8766 log), and names unknown slugs.
+- **macOS app reinstalled** (`macos/build.sh --install` from the main checkout;
+  shims still exec `scripts/run_mcp_http.sh` there).
+- **:8766 restarted** via launchd on the new code, and **all nine watchers
+  restarted** so they scan with the new excludes; their startup reconcile
+  re-pulled the changed files.
+- **Policy switches set in `.env.mcp`** (gitignored; backup at
+  `~/.pal/.env.mcp.bak-2026-10-03`):
+  - `LLMLIBRARIAN_MCP_PRIVATE_READS=none` (P1). The full endpoint's only
+    readers are Open-WebUI and the watchers' writes; Claude clients use stdio.
+  - `LLMLIBRARIAN_MCP_LITE_PATH=/lite` and `LLMLIBRARIAN_MCP_LITE_PRIVATE_READS=none`
+    (P2).
+  - P3 stays "warn, default off". P4 is "hint only", as shipped. P5 is left
+    until the client confirms which half of the response Open-WebUI feeds the
+    model.
+- **Full rebuilds** of `llmlibrarian-46ad0cbe` (N2 placeholders, N3 worktree
+  copies), `dad-new-car-d6e890e2` and `photos_local-9777636e` (placeholders,
+  vision summaries), run through the server's `add_silo(full=True)` so writes
+  serialize with the watchers.
+
+Left on purpose:
+
+- **Open-WebUI stays on the full `/mcp` endpoint.** Its persona prompts in
+  `local-ai-studio/scripts/configure-open-webui.py` name full-profile tools
+  (`llmlibrarian_query_personal_knowledge`, `…_find_files`, `…_ask_image`) about
+  ten times, and that repo belongs to the client session. With
+  `PRIVATE_READS=none` the endpoint they use can no longer open a private silo,
+  which was the point of P1. **Handoff for the client session:**
+  - `read_document` now exists. `NO_FILE_READ` ("No tool here opens a file by
+    path") is true only while it stays off the allowlist.
+  - `ask_image` takes `files=[…]` in one call; the personas' "call ask_image on
+    up to 3 files" becomes a single call.
+  - The lite catalog is at `/lite/mcp` if the personas move to
+    `retrieve_knowledge`.
+  - The diagnostics connection now sees private silos as a count only.
+- **Claude Desktop not restarted.** Doing so would end the session doing this
+  work. Its stdio server (pid 51687, started 09-28) runs the old code until the
+  app is restarted.
 
 ## Policy questions for TJ
 
-The mechanisms for P1 and P2 shipped (d31ff58) with defaults that keep today's
-behavior; P3's warning shipped (c2cf706) with the default still off.
+Decided and applied on 2026-10-03 (see Rollout): P1 (c)+(b), P2 (b), P3 (b)
+minus the macOS dialog pre-toggle, P4 hint-only. P5 waits on the client. P6 is
+unchanged: Claude clients stay on stdio.
 
 ### P1. Private-silo visibility on HTTP
 
