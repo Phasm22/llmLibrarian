@@ -92,23 +92,23 @@ def run_retrieve(
     Pass section= to post-filter chunks to a specific document section (e.g. 'Item 1A').
     Pass doc_type= to restrict to a specific document type stored in chunk metadata
     (e.g. 'transcript', 'resume', 'pdf', 'code', 'other').
-    Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) bypass
-    vector retrieval and return a note field with the answer.
+    Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) are
+    retrieved as LOOKUP: the handlers that answer them live in run_ask, so here a
+    short-circuit could only ever return nothing. The routed intent is kept as
+    ``deterministic_intent`` so the caller can point at the tool that answers the
+    inventory-style reading of the question.
     """
     db = str(db_path or DB_PATH)
     intent = route_intent(query)
 
+    # These intents match single common words ("capabilities", "inventory",
+    # "history", "language") anywhere in a question. Short-circuiting them here
+    # returned chunks=[] for ordinary content questions — every empty result in the
+    # 2026-10-02 Open-WebUI session — and a small model rephrased in a loop.
+    deterministic_intent: str | None = None
     if intent in _DETERMINISTIC_INTENTS:
-        return {
-            "query": query,
-            "intent": intent,
-            "silo_filter": silo,
-            "note": (
-                f"Intent '{intent}' is deterministic and does not use vector retrieval. "
-                "Try rephrasing as a descriptive question for semantic retrieval."
-            ),
-            "chunks": [],
-        }
+        deterministic_intent = intent
+        intent = INTENT_LOOKUP
 
     silo_slug: str | None = None
     if silo:
@@ -160,6 +160,8 @@ def run_retrieve(
             db_path=str(db_path) if db_path is not None else None,
             get_chroma_client=_gc,
         )
+    if deterministic_intent:
+        result["deterministic_intent"] = deterministic_intent
     return annotate_write_state(result, before, _sample_write_state(db, silo_slug))
 
 

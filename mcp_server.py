@@ -47,6 +47,8 @@ _bootstrap_process_env()
 
 _logger = logging.getLogger("llmLibrarian.mcp")
 
+import mcp_contract  # noqa: E402  (needs src/ on sys.path; stdlib-only)
+
 
 def _looks_like_checkout(path: Path) -> bool:
     return (path / "cli.py").exists() and (path / "src").is_dir()
@@ -1046,6 +1048,7 @@ def query_personal_knowledge(
 
             # Cross-silo grouping (only when unscoped)
             result.update(_private_scope_note(silo))
+            mcp_contract.apply_guidance(result, query=query, silo=silo)
 
             if not silo and chunks:
                 by_silo: dict[str, list] = {}
@@ -1110,6 +1113,7 @@ def multi_query_knowledge(
     errors: list[str] = []
     busy = False
     write_states: list[dict] = []
+    deterministic_intent: str | None = None
     for q in queries:
         try:
             with _mcp_chroma_lock("multi_query_knowledge"):
@@ -1124,6 +1128,8 @@ def multi_query_knowledge(
                 )
             if res.get("write_in_progress"):
                 write_states.append(res["write_in_progress"])
+            if res.get("deterministic_intent") and not deterministic_intent:
+                deterministic_intent = res["deterministic_intent"]
             for chunk in res.get("chunks", []):
                 key = (chunk.get("text") or "")[:200]
                 if key and key not in seen:
@@ -1172,7 +1178,7 @@ def multi_query_knowledge(
     )
 
     _release_chroma()
-    return {
+    response = {
         "db_path": _DB_PATH,
         "queries": queries,
         "total_chunks": len(all_chunks),
@@ -1190,7 +1196,9 @@ def multi_query_knowledge(
             if busy and not all_chunks
             else {}
         ),
+        **({"deterministic_intent": deterministic_intent} if deterministic_intent else {}),
     }
+    return mcp_contract.apply_guidance(response, query=" ; ".join(queries), silo=silo)
 
 
 @mcp.tool()
@@ -1328,10 +1336,22 @@ def explain_retrieval(
                     f"All {len(chunks)} chunk(s) matched semantically."
                 ]
 
+            guidance = mcp_contract.apply_guidance(
+                {
+                    "chunks": chunks,
+                    "deterministic_intent": result.get("deterministic_intent"),
+                    "write_in_progress": result.get("write_in_progress"),
+                    "recommended_action": result.get("recommended_action"),
+                },
+                query=query,
+                silo=silo,
+            )
             return {
                 "db_path": _DB_PATH,
                 "query": query,
                 "intent": result.get("intent"),
+                **({"deterministic_intent": result["deterministic_intent"]} if result.get("deterministic_intent") else {}),
+                **{k: guidance[k] for k in ("recommended_action", "alternative_tool") if guidance.get(k)},
                 "retrieval_method": method,
                 "lexical_hit_count": len(lexical_hits),
                 "vector_only_chunk_count": len(vector_only_hits),
@@ -2201,8 +2221,12 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
         out["retryable"] = True
     if isinstance(result, dict) and result.get("image_search"):
         out["image_search"] = result["image_search"]
-    if isinstance(result, dict) and result.get("recommended_action"):
-        out["recommended_action"] = result["recommended_action"]
+    if isinstance(result, dict):
+        # An empty chunk list with no reason attached is what sent the 2026-10-02
+        # client into a rephrase loop; keep whatever explains it.
+        for field in ("recommended_action", "note", "error"):
+            if result.get(field):
+                out[field] = result[field]
     return out
 
 
@@ -2255,6 +2279,7 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8) -> dict:
                 {"silo": silo, "profile": "lite"},
             )
 
+        mcp_contract.apply_guidance(result, query=query, silo=silo, profile="lite")
         confidence, confidence_score, _coverage_note = _compute_answer_confidence(chunks)
         _emit_query_audit(
             tool="retrieve_knowledge",
