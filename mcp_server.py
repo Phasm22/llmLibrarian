@@ -2699,11 +2699,13 @@ def _resolve_indexed_file(
     private = set(private_silo_slugs(_DB_PATH))
 
     matches: list[tuple[str, str]] = []
+    roots: dict[str, str] = {}
     for slug, entry in silos.items():
         if target_slug and slug != target_slug and (entry or {}).get("path") != target_slug:
             continue
         if slug in private and (slug != target_slug or _private_reads_policy() == "none"):
             continue
+        roots[slug] = str((entry or {}).get("path") or "")
         for path in ((entry or {}).get("files") or {}):
             if suffixes is not None and Path(path).suffix.lower() not in suffixes:
                 continue
@@ -2712,6 +2714,12 @@ def _resolve_indexed_file(
     kind = "indexed image" if suffixes == _IMAGE_SUFFIXES else "indexed file"
     if not matches:
         return None, None, [], f"no {kind} matches {file!r}" + (f" in silo {silo!r}" if silo else "")
+    if len(matches) > 1 and target_slug:
+        # "README.md" in a repo silo means the one at its root, not every
+        # docs/*/README.md beneath it.
+        at_root = [(path, slug) for path, slug in matches if roots.get(slug) and str(Path(path).parent) == roots[slug]]
+        if len(at_root) == 1:
+            return at_root[0][0], at_root[0][1], [], None
     if len(matches) > 1:
         return None, None, sorted(path for path, _slug in matches), f"multiple {kind}s match; pass a full path"
     return matches[0][0], matches[0][1], [], None

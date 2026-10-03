@@ -64,3 +64,19 @@ def test_unknown_file_points_at_find_files(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_server, "_DB_PATH", str(db))
     out = mcp_server.read_document("/nowhere/README.md")
     assert out["error"] and out["recommended_action"]["tool"] == "find_files"
+
+
+def test_bare_filename_in_a_named_silo_prefers_the_root_file(monkeypatch, tmp_path):
+    import mcp_server
+
+    root = tmp_path / "repo"
+    files = {str(root / "README.md"): {}, str(root / "docs" / "spikes" / "README.md"): {}}
+    monkeypatch.setattr("file_registry._read_file_manifest", lambda _db: {"silos": {"repo-1": {"path": str(root), "files": files}}})
+    monkeypatch.setattr("state.private_silo_slugs", lambda _db: [])
+
+    path, slug, _c, err = mcp_server._resolve_indexed_file("README.md", "repo-1")
+    assert err is None and path == str(root / "README.md") and slug == "repo-1"
+
+    # Unscoped there is no root to prefer, so the ambiguity is reported.
+    _p, _s, candidates, err = mcp_server._resolve_indexed_file("README.md", None)
+    assert err and len(candidates) == 2
