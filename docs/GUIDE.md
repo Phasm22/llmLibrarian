@@ -47,15 +47,26 @@ The **host model** (Claude, etc.) reads chunk text and writes the answer. llmLib
 
 ### Small local models / Open WebUI
 
-For a small-context model, run its dedicated MCP process with
-`LLMLIBRARIAN_MCP_PROFILE=lite`. That process exposes only two compact tools:
+Small-context models get a lite catalog (about 1.3 KB of tool schema instead of
+~10 KB):
 
 1. `silo_roster()` — use only when you need an exact, machine-local silo slug.
-2. `retrieve_knowledge(query, silo, n_results=8)` — retrieve from that exact slug; it returns eight compact evidence chunks by default (up to twelve).
+2. `retrieve_knowledge(query, silo, n_results=8, source=None)` — retrieve from that exact slug; eight compact evidence chunks by default (up to twelve); `source=` searches inside one file.
+3. `read_document(path)` — read a file a chunk came from.
+4. `ask_image(question, files=[...])` — look at the photos a result points to.
 
-The lite profile is process-local. It does not change the normal MCP server or
-Claude/Desktop clients. If `results_may_be_incomplete` is true, the index is
-being rebuilt; retry instead of treating an empty result as absence of evidence.
+Two ways to serve it:
+
+- **Mounted beside the full endpoint (recommended).** Start the HTTP service with
+  `LLMLIBRARIAN_MCP_LITE_PATH=/lite`; the lite catalog is then at `/lite/mcp` on
+  the same port, sharing models and locks with the full endpoint the watchers
+  use. It reads no private silo unless `LLMLIBRARIAN_MCP_LITE_PRIVATE_READS=named`.
+- **A separate process** with `LLMLIBRARIAN_MCP_PROFILE=lite` (costs a second
+  server's memory).
+
+If `results_may_be_incomplete` is true, the index is being rebuilt; retry
+instead of treating an empty result as absence of evidence. If a response
+carries `recommended_action`, do that instead of rephrasing.
 
 **What crosses the network:** only what the tool returns (top chunks), plus normal chat context — not your entire disk. Provider training/memory policies are up to **Cursor/your API settings**, not this repo.
 
@@ -66,7 +77,8 @@ being rebuilt; retry instead of treating an empty result as absence of evidence.
 | `session_context` | Start-of-session bootstrap | Deep storage audit (`health`) |
 | `mcp_runtime_status` | Lock/process/runtime troubleshooting | Content retrieval |
 | `query_personal_knowledge` | Content/meaning Q&A | Filename/date lookup (`find_files`) |
-| `ask_image` | Inspect visual details in one indexed image returned by retrieval | Search for the candidate image (`query_personal_knowledge`) |
+| `ask_image` | Visual details of the images retrieval points to (`files=[...]`, one call) | Search for the candidate image (`query_personal_knowledge`) |
+| `read_document` | Read a file found by `find_files` or named in a chunk | Finding which file answers a question |
 | `multi_query_knowledge` | Multi-angle retrieval in one call | Basic single-query retrieval |
 | `find_files` | Path/date discovery | “What does this document say?” |
 | `add_silo` | Index new/updated path | Calling `trigger_reindex` immediately after |

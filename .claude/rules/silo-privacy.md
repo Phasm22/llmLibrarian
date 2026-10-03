@@ -9,7 +9,7 @@ paths:
   - "src/operations_find.py"
   - "mcp_server.py"
 type: rule
-updated: 2026-09-30
+updated: 2026-10-03
 ---
 
 # Private silos
@@ -41,6 +41,16 @@ model can produce it by guessing.
   Knowing a private corpus exists is allowed; pulling from it unasked is not.
   The exception is the lite profile's `silo_roster`: it is that profile's only
   discovery tool, so it omits private slugs entirely and reports a count.
+- The tax ledger is read only through `tax.ledger.load_tax_ledger_rows`, which
+  drops private silos' rows when no silo is named. An unscoped `TAX_QUERY` —
+  which "sold" or "stock" plus a year triggers — used to attach every private
+  tax row for that year.
+- Any new file-reading tool resolves paths with `mcp_server._resolve_indexed_file`:
+  manifest-only, and a private silo opens only by exact slug — not by display
+  name, folder path, or an unscoped call.
+- `LLMLIBRARIAN_MCP_PRIVATE_READS=none` (or the lite mount's default) is a
+  stricter endpoint policy: no read tool opens a private silo even by slug, and
+  rosters report a count. A new read tool must call `_private_read_refusal`.
 - `private_filter_clause` also excludes `<slug>-artifacts`, where artifact
   compilation writes a silo's derived chunks. A new derived-silo naming scheme
   needs the same treatment.

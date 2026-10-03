@@ -31,6 +31,8 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 | `explain_retrieval` | Debug hybrid/vector signals |
 | `recent_queries` | Audit past queries: text, silo scope, per-source-file chunk breakdown |
 | `find_files` | Manifest-only path/date search |
+| `read_document` | Read one indexed file in order, paged (`next_start_chunk`); index-only, never disk |
+| `ask_image` | Re-read photos with the local vision model; `files=[...]` (≤4) in one call, or none to use the best matches |
 | `add_silo` | Index path (`confirm=True`; `private=True` for local-only corpora) |
 | `set_silo_privacy` | Flag a silo local-only, or clear it (`confirm=True`) |
 | `trigger_reindex` | Incremental reindex (`confirm=True`; **not** right after `add_silo`) |
@@ -52,6 +54,13 @@ automatic scope binding. It is reachable only when a caller passes that exact
 `silo=`. Unscoped responses carry `excluded_private_silos` + `privacy_note` —
 read them before reporting an absence. For a private corpus, prefer telling the
 user to run `pal ask --in <slug>` over pulling values into a cloud context.
+The tax ledger obeys the same rule (`tax.ledger.load_tax_ledger_rows`). An
+endpoint started with `LLMLIBRARIAN_MCP_PRIVATE_READS=none` refuses private
+silos even by exact slug and lists only a count; writes are unaffected.
+
+**Empty results name a next step.** Every MCP retrieval response with no chunks
+carries `recommended_action {tool, args, reason}`; follow it rather than
+rephrasing. A repeated identical call returns `repeat_of` / `repeat_notice`.
 
 **Silos are machine-local.** The Mac and the Linux PC keep separate databases
 over separate filesystems; the Obsidian vault syncs, the index does not. Every
