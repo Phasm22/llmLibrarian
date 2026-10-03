@@ -3206,11 +3206,19 @@ def pull_command(
     image_vision: bool = typer.Option(False, "--image-vision", help="Enable multimodal image summaries for this silo (default: off unless previously enabled)."),
     workers: int | None = typer.Option(None, "--workers", help="Override file/extraction worker count for this run."),
     embedding_workers: int | None = typer.Option(None, "--embedding-workers", help="Override embedding worker count for this run."),
+    fast: bool = typer.Option(False, "--fast", help="Auto-tune ingest for this host (device, batch sizes, workers); explicit env vars still win."),
     interval: float = typer.Option(10.0, "--interval", help="Reconcile interval (watch mode).", hidden=True),
     debounce: float = typer.Option(1.0, "--debounce", help="Debounce delay (watch mode).", hidden=True),
     follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks.", hidden=True),
 ) -> None:
     image_vision_requested: bool | None = True if image_vision else None
+    if fast and not (status or stop):
+        # Exported env is inherited by the llmli subprocesses that do the
+        # actual ingest (and by the watcher in --watch mode).
+        _ensure_src_on_path()
+        from perf_profile import apply_fast_profile
+
+        apply_fast_profile()
     mode_count = int(bool(watch)) + int(bool(status)) + int(bool(stop))
     if mode_count > 1:
         print("Use only one operation mode: --watch, --status, or --stop.", file=sys.stderr)

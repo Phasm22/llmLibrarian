@@ -228,6 +228,10 @@ def render_launchd_plist(
         "HardResourceLimits": {"NumberOfFiles": 8192},
         "StandardOutPath": job.log_path,
         "StandardErrorPath": stderr_path or job.log_path,
+        # Group the watchers under the macOS app (com.llmlibrarian.app, built by
+        # macos/build.sh) in System Settings > Login Items instead of
+        # "pal.py — unidentified developer". Harmless if the app is absent.
+        "AssociatedBundleIdentifiers": ["com.llmlibrarian.app"],
     }
     return plistlib.dumps(payload).decode("utf-8")
 
