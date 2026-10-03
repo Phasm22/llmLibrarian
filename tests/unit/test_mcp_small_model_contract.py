@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import pytest
 
-# Ordinary content questions that a deterministic intent currently swallows.
-# Each is answerable from indexed text; none is asking about llmLibrarian itself
-# or for a file inventory.
+# Ordinary content questions a deterministic intent used to swallow (the intent is
+# what route_intent returned on 2026-10-02). Each is answerable from indexed text.
+# Some no longer route there at all; the ones that still do ("history of changes
+# to ...") must still reach retrieval over MCP.
 HIJACKED_CONTENT_QUESTIONS = [
     ("README image indexing capabilities", "CAPABILITIES"),
     ("what are the camera's low-light capabilities", "CAPABILITIES"),
@@ -60,10 +61,8 @@ def test_scoped_content_question_reaches_retrieval(retrieval_calls, query, hijac
     """silo= says "search this corpus". Over MCP no deterministic handler runs, so
     short-circuiting to chunks=[] can never be the right answer for a scoped call."""
     from query.core import run_retrieve
-    from query.intent import route_intent
 
     calls, db = retrieval_calls
-    assert route_intent(query) == hijacking_intent  # documents today's routing
     run_retrieve(query=query, silo="llmlibrarian-46ad0cbe", n_results=5, db_path=db)
     assert calls, f"{query!r} was routed to {hijacking_intent} and never queried the index"
 
@@ -138,7 +137,7 @@ def test_hijacking_word_with_hits_gets_alternative_not_action(monkeypatch, tmp_p
     chunk = {"text": "Image indexing uses OCR and a vision model.", "score": 0.6, "source": "/x/README.md", "silo": "s"}
     mcp_server = _stub_server(monkeypatch, tmp_path, [chunk])
 
-    res = mcp_server.query_personal_knowledge("README image indexing capabilities", silo="s", n_results=5)
+    res = mcp_server.query_personal_knowledge("what file types are supported", silo="s", n_results=5)
 
     assert res["chunks"]
     assert "recommended_action" not in res

@@ -213,3 +213,52 @@ def test_effective_k_lookup_passthrough():
 @pytest.mark.parametrize("query,expected_intent", TOP10_W2_REAL_LIFE_QUERIES_WITH_EXPECTED_INTENT)
 def test_route_intent_top10_real_life_w2_queries(query, expected_intent):
     assert route_intent(query) == expected_intent
+
+
+# Content questions the deterministic rules used to swallow (2026-10-02 Open-WebUI
+# session; docs/plans/mcp-small-model-contract.md). Each asks what something says,
+# not for an inventory of the index.
+@pytest.mark.parametrize(
+    "q",
+    [
+        "README image indexing capabilities",
+        "what are the camera's low-light capabilities",
+        "what formats does the recipe book use for measurements",
+        "what file types does journalLinker's ingest accept",
+        "what did the docs from 2023 say about the warranty",
+        "show me what my files from 2022 say about sourdough",
+        "evolution of my thinking on food tracking in 2025",
+        "what's in my pantry inventory",
+        "inventory of kitchen equipment in my recipes docs",
+        "directory of contacts in the documents",
+        "what language did I study in 2019",
+        "which language is the 2024 cookbook written in",
+        "body language notes from 2023",
+        "what document types does the DMV need",
+    ],
+)
+def test_content_questions_are_not_deterministic(q):
+    assert route_intent(q) not in {
+        INTENT_CAPABILITIES,
+        INTENT_FILE_LIST,
+        INTENT_STRUCTURE,
+        INTENT_CODE_LANGUAGE,
+        "TIMELINE",
+        "METADATA_ONLY",
+    }, q
+
+
+@pytest.mark.parametrize(
+    "q,expected",
+    [
+        ("what file types are supported", INTENT_CAPABILITIES),
+        ("what formats can you read", INTENT_CAPABILITIES),
+        ("what are your capabilities", INTENT_CAPABILITIES),
+        ("describe the folder structure of journalLinker", INTENT_STRUCTURE),
+        ("file type inventory", INTENT_STRUCTURE),
+        ("inventory of my files", INTENT_STRUCTURE),
+        ("which language did i program in during 2022", INTENT_CODE_LANGUAGE),
+    ],
+)
+def test_inventory_questions_still_route_deterministically(q, expected):
+    assert route_intent(q) == expected

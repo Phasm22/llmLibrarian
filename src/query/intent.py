@@ -66,6 +66,50 @@ def _is_filename_date_query(query: str) -> bool:
     from query.filename_dates import query_has_date_phrase
     return query_has_date_phrase(q)
 
+# Deterministic intents answer inventory questions about the index itself. Their
+# triggers used to be single words ("capabilities", "inventory", "history",
+# "language") matched anywhere, which swallowed ordinary content questions —
+# "README image indexing capabilities", "what's in my pantry inventory", "what
+# language did I study in 2019". Each rule below now needs the question to be
+# about llmLibrarian or about files, and content verbs veto the file rules.
+_CAPABILITIES = re.compile(
+    r"\bsupported\s+(?:file\s+)?(?:types?|formats?|extensions?)\b"
+    r"|\b(?:file\s+)?(?:types?|formats?|extensions?)\s+(?:are|is)\s+supported\b"
+    r"|\bwhat\s+(?:file\s+)?(?:types?|formats?|extensions?)\s+(?:can|do|does|will)\s+"
+    r"(?:you|it|llmli|llmlibrarian|the\s+librarian|this\s+tool|pal)\b"
+    r"|\bwhat\s+can\s+you\s+(?:index|read|ingest)\b"
+    r"|\b(?:your|llmli'?s|llmlibrarian'?s|pal'?s|the\s+librarian'?s|this\s+tool'?s)\s+capabilities\b"
+    r"|\bcapabilities\s+of\s+(?:you|llmli|llmlibrarian|pal|the\s+librarian|this\s+tool)\b"
+    r"|\bwhat\s+are\s+your\s+capabilities\b"
+)
+
+# A file-listing rule must not fire on a question about what files *say*.
+_CONTENT_VERBS = re.compile(
+    r"\b(say|says|said|mention|mentions|mentioned|about|regarding|discuss|discusses|discussed|"
+    r"describe|describes|described|explain|explains|explained|contain|contains|wrote|write|written)\b"
+)
+
+# Narrower veto for STRUCTURE: "describe the folder structure" is a structure ask,
+# "what do the files say about X" is not.
+_CONTENT_VERBS_STRICT = re.compile(
+    r"\b(say|says|said|mention|mentions|mentioned|about|regarding|contain|contains|wrote|written)\b"
+)
+
+# "inventory of kitchen equipment" is about a thing, not the files.
+_NON_FILE_INVENTORY = re.compile(
+    r"\binventory\s+of\s+(?!(?:my\s+|the\s+|this\s+|these\s+)?(?:files?|folders?|docs?|documents?|silos?)\b)"
+)
+
+# "what document types does the DMV need" is a content question.
+_REQUIREMENT_WORDS = re.compile(r"\b(need|needs|needed|require|required|requires|bring|accept|accepted|should|must)\b")
+
+# Year-scoped CODE_LANGUAGE needs a coding signal; "what language did I study in
+# 2019" and "body language notes from 2023" are not about code.
+_CODING_CONTEXT = re.compile(
+    r"\b(code|coded|coding|program|programmed|programming|projects?|repos?|repositor(?:y|ies)|"
+    r"scripts?|software|develop|developed|developing)\b"
+)
+
 # EVIDENCE_PROFILE / AGGREGATE: wider retrieval (cap). n_results from CLI is still the final context size.
 K_PROFILE_MIN = 48
 K_PROFILE_MAX = 128
@@ -79,12 +123,9 @@ def route_intent(query: str) -> str:
     if not q:
         return INTENT_LOOKUP
     # CAPABILITIES: supported file types / formats / what can you index (source of truth, no RAG)
-    if re.search(
-        r"\bsupported\s+(?:file\s+)?(?:types?|formats?)\b|\bwhat\s+(?:file\s+)?(?:types?|formats?)\b|"
-        r"\bwhat\s+can\s+you\s+index\b|\bcapabilities\b|\bwhat\s+formats?\b",
-        q,
-    ):
+    if _CAPABILITIES.search(q):
         return INTENT_CAPABILITIES
+    asks_about_content = bool(_CONTENT_VERBS.search(q))
     # FILENAME_DATE_LOOKUP: deterministic filename/date file lookup. Runs before
     # FILE_LIST so day/month-precision asks don't get routed to year-only paths.
     if _is_filename_date_query(q):
@@ -95,6 +136,7 @@ def route_intent(query: str) -> str:
         and re.search(r"\b(20\d{2})(?!\d)\b", q)
         and re.search(r"\b(list|which|what|show|find|from)\b", q)
         and not re.search(r"\b(summary|overview|analy[sz]e|analysis|architecture|design|why|how)\b", q)
+        and not asks_about_content
     ):
         return INTENT_FILE_LIST
     # METADATA_ONLY: pure metadata aggregation queries (check before STRUCTURE to avoid conflicts)
@@ -117,28 +159,37 @@ def route_intent(query: str) -> str:
     if re.search(
         r'\b(file\s+counts?|document\s+(?:types?|counts?)|extension\s+breakdown)\b',
         q
-    ):
+    ) and not _REQUIREMENT_WORDS.search(q):
         return INTENT_METADATA_ONLY
     # TIMELINE: temporal sequence queries (deterministic chronological ordering)
+    # A bare year is not a timeline signal: "evolution of my thinking on food
+    # tracking in 2025" is a content question.
     if (
         re.search(
-            r'\b(timeline|chronolog|sequence|history|evolution|progression)\b',
+            r'\b(timeline|chronolog\w*|sequence|history|evolution|progression)\b',
             q
         )
-        and re.search(r'\b(20\d{2}|events?|milestones?|changes?|updates?)\b', q)
+        and re.search(r'\b(events?|milestones?|changes?|updates?)\b', q)
+        and not re.search(r'\b(my|i)\s+(thinking|thoughts?|views?|feelings?|opinions?)\b', q)
     ):
         return INTENT_TIMELINE
     # STRUCTURE: deterministic catalog snapshots (outline/recent/inventory).
     if (
         re.search(
             r"\b("
-            r"(?:file|folder|directory)\s+structure|folder\s+outline|directory|layout|snapshot|"
+            r"(?:file|folder|directory)\s+structure|folder\s+outline|"
+            r"directory\s+(?:structure|listing|tree|layout)|(?:folder|file|directory)\s+layout|snapshot|"
             r"recent\s+(?:changes?|files?)|what\s+changed\s+recently|"
             r"file\s+types?|file\s+extensions?|inventory"
             r")\b",
             q,
         )
-        and re.search(r"\b(files?|folders?|docs?|documents?|structure|changes?|types?|extensions?|inventory)\b", q)
+        # "inventory" alone no longer satisfies both halves ("what's in my pantry
+        # inventory"); the second half needs a file/folder word.
+        and re.search(r"\b(files?|folders?|docs?|documents?|silo|structure|changes?|types?|extensions?)\b", q)
+        and not _CONTENT_VERBS_STRICT.search(q)
+        and not _REQUIREMENT_WORDS.search(q)
+        and not _NON_FILE_INVENTORY.search(q)
     ):
         return INTENT_STRUCTURE
     # STRUCTURE ext-count: deterministic inventory math (e.g., "how many .docx files").
@@ -167,6 +218,7 @@ def route_intent(query: str) -> str:
             r"\b(?:language|lang)\b|\bwhich\s+language\b",
             q,
         )
+        and _CODING_CONTEXT.search(q)
     ):
         return INTENT_CODE_LANGUAGE
 
