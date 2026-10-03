@@ -392,3 +392,25 @@ def test_endpoint_policy_overrides_process_policy(db: str, monkeypatch: pytest.M
     finally:
         mcp_server._PRIVATE_READS.reset(token)
     assert mcp_server._private_reads_policy() == "named"
+
+
+def test_ledger_ignores_code_and_notes() -> None:
+    """The repo silo indexed tests/unit/test_tax_resolver.py; its fixture strings
+    became W-2 ledger rows."""
+    from tax.ledger import extract_tax_rows_from_chunks
+
+    text = "Form W-2 Wage and Tax Statement 2024. Box 1 Wages, tips, other compensation 85,000.00"
+    for source, doc_type in (("/repo/tests/unit/test_tax_resolver.py", "code"), ("/chats/2026-03-04-taxes.md", "other")):
+        rows = extract_tax_rows_from_chunks([("c1", text, {"source": source, "silo": "s", "doc_type": doc_type})])
+        assert rows == [], source
+
+
+def test_unscoped_ledger_drops_rows_from_removed_silos(db: str) -> None:
+    from tax.ledger import _write_all_rows, load_tax_ledger_rows
+
+    _write_all_rows(db, [
+        {"silo": "recipes-def", "tax_year": 2024, "source": "/r/w2.pdf", "raw_value": "kept"},
+        {"silo": "llmlibrarian-322853c4", "tax_year": 2024, "source": "/r/w2.pdf", "raw_value": "orphan"},
+        {"silo": "recipes-def", "tax_year": 2024, "source": "/repo/tests/test_tax.py", "raw_value": "from code"},
+    ])
+    assert [r["raw_value"] for r in load_tax_ledger_rows(db, tax_year=2024)] == ["kept"]

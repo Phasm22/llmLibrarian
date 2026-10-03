@@ -38,7 +38,12 @@ def load_tax_ledger_rows(
     silo: str | None = None,
     tax_year: int | None = None,
 ) -> list[TaxLedgerRow]:
-    rows = _read_all_rows(db_path)
+    # Rows extracted before _is_ledger_source existed stay in the file until their
+    # source is re-ingested, and incremental pulls skip unchanged files.
+    rows = [
+        r for r in _read_all_rows(db_path)
+        if not r.get("source") or _is_ledger_source(str(r.get("source")), None)
+    ]
     if silo is not None:
         rows = [r for r in rows if str(r.get("silo") or "") == silo]
     else:
@@ -49,11 +54,20 @@ def load_tax_ledger_rows(
         # attach every private tax row for that year to the response.
         # private_silo_slugs raises on an unreadable registry; let it, rather than
         # guess "nothing is private".
-        from state import private_silo_slugs
+        from state import list_silos, private_silo_slugs
 
         hidden = {s for slug in private_silo_slugs(db_path) for s in (slug, f"{slug}-artifacts")}
         if hidden:
             rows = [r for r in rows if str(r.get("silo") or "") not in hidden]
+        # Rows outlive a removed silo (the file is only rewritten per silo on
+        # ingest). A read must not mutate, so drop them here instead of pruning.
+        registered = {str(s.get("slug") or "") for s in list_silos(db_path)}
+        if registered:
+            rows = [
+                r for r in rows
+                if str(r.get("silo") or "") in registered
+                or str(r.get("silo") or "").removesuffix("-artifacts") in registered
+            ]
     if tax_year is not None:
         rows = [r for r in rows if int(r.get("tax_year") or 0) == tax_year]
     return rows
@@ -81,6 +95,22 @@ def replace_tax_rows_for_sources(
     _write_all_rows(db_path, merged)
 
 
+# Forms come as PDFs, scans, office files or brokerage exports. The ledger held
+# rows "extracted" from tests/unit/test_tax_resolver.py and friends (the repo is
+# indexed as a silo) and from chat transcripts that discuss taxes; an unscoped
+# "W-2 wages 2025" would have answered from test fixtures.
+_LEDGER_SOURCE_SUFFIXES = frozenset({
+    ".pdf", ".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff",
+    ".docx", ".xlsx", ".csv", ".txt",
+})
+
+
+def _is_ledger_source(source: str, meta: dict[str, Any] | None) -> bool:
+    if str((meta or {}).get("doc_type") or "") == "code":
+        return False
+    return Path(source).suffix.lower() in _LEDGER_SOURCE_SUFFIXES
+
+
 def extract_tax_rows_from_chunks(
     chunks: list[tuple[str, str, dict[str, Any]]],
     *,
@@ -98,6 +128,8 @@ def extract_tax_rows_from_chunks(
         page = int((meta or {}).get("page") or 1)
         doc_hash = str((meta or {}).get("file_hash") or (meta or {}).get("chunk_hash") or chunk_id)
         if not source or not silo or not text:
+            continue
+        if not _is_ledger_source(source, meta):
             continue
         if not is_tax_document(source, text):
             continue
