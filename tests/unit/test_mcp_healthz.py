@@ -33,6 +33,7 @@ def test_healthz_returns_probe_fields(mcp_module, tmp_path):
             "ok": True,
             "service": "llmLibrarian-mcp",
             "version": "0.1.0-test",
+            "transport": "stdio",
             "db_path": expected_db,
             "db_exists": True,
             "started_at": "2026-05-19T12:00:00+00:00",
