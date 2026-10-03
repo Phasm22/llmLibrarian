@@ -788,10 +788,34 @@ def answer_image_question(image_bytes: bytes, source_path: str, question: str) -
     left") cannot be served from the index. This re-runs the vision model
     against the original file with the caller's question.
     """
+    return answer_images_question([(image_bytes, source_path)], question)
+
+
+def answer_images_question(images: list[tuple[bytes, str]], question: str) -> tuple[str, str]:
+    """Answer one question over several images in a single vision call.
+
+    One request, so the model can compare the images and say which one shows the
+    detail. Cost is roughly linear in images (~20 s each for gemma4:12b on the
+    Mac, much more while a large chat model holds the GPU), so callers keep the
+    count small. Downscaling first was measured and does not help: Ollama
+    resizes internally.
+    """
     model = ensure_vision_model_ready()
     asked = (question or "").strip()
     if not asked:
         raise ImageExtractionError("A question is required to inspect an image.")
+    if not images:
+        raise ImageExtractionError("At least one image is required.")
+    names = [Path(path).name for _bytes, path in images]
+    if len(images) == 1:
+        preamble = "Answer the question about this image using only what is visible. "
+    else:
+        listing = "; ".join(f"image {i} is {name}" for i, name in enumerate(names, start=1))
+        preamble = (
+            f"You are given {len(images)} images, in order ({listing}). Answer the question "
+            "using only what is visible in them, and say which image(s) by filename the "
+            "answer comes from. Combine evidence across images when they show the same thing. "
+        )
     try:
         import ollama
 
@@ -801,13 +825,13 @@ def answer_image_question(image_bytes: bytes, source_path: str, question: str) -
                 {
                     "role": "user",
                     "content": (
-                        "Answer the question about this image using only what is visible. "
-                        "Be specific and concrete about the region or item asked about. "
+                        preamble
+                        + "Be specific and concrete about the region or item asked about. "
                         "If the detail is genuinely not discernible, say so plainly rather "
                         "than guessing. Do not invent unreadable text or identities.\n\n"
                         f"Question: {asked}"
                     ),
-                    "images": [image_bytes],
+                    "images": [image_bytes for image_bytes, _path in images],
                 }
             ],
             keep_alive=0,
@@ -815,9 +839,9 @@ def answer_image_question(image_bytes: bytes, source_path: str, question: str) -
         )
         text = ((resp.get("message") or {}).get("content") or "").strip()
     except Exception as e:
-        raise ImageExtractionError(f"Vision image question failed for {source_path}: {e}") from e
+        raise ImageExtractionError(f"Vision image question failed for {', '.join(names)}: {e}") from e
     if not text:
-        raise ImageExtractionError(f"Vision image question returned no content for {source_path}.")
+        raise ImageExtractionError(f"Vision image question returned no content for {', '.join(names)}.")
     return text, model
 
 

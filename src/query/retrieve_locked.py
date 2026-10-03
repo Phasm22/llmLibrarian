@@ -274,10 +274,17 @@ def execute_retrieve_chroma_phase(
         and chunk.get("source")
     ]
     if visual_follow_up:
+        # Ranked best first. On 2026-10-02 the caller got three unranked files,
+        # asked about the third, and gave up; ask_image now takes them together.
+        ranked = list(dict.fromkeys(visual_follow_up))[:3]
         result["recommended_action"] = {
             "tool": "ask_image",
-            "reason": "The matched image has no visual summary; inspect the original pixels before answering visual details.",
-            "files": list(dict.fromkeys(visual_follow_up))[:3],
+            "args": {"files": ranked, "question": query},
+            "reason": (
+                "The matched images have no visual description. Pass all of these files "
+                "(best match first) to ask_image in one call before answering visual details."
+            ),
+            "files": ranked,
         }
     if _silo_warning:
         result["silo_warning"] = _silo_warning

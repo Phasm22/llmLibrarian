@@ -2545,48 +2545,128 @@ def read_document(
         _release_chroma()
 
 
+_ASK_IMAGE_MAX_FILES = 4
+
+
+def _locate_images(question: str, silo: str | None, top_k: int) -> list[str]:
+    """Best-matching indexed images for a question, best first (privacy-filtered
+    by run_retrieve like any query)."""
+    from query.core import run_retrieve
+
+    try:
+        with _mcp_chroma_lock("ask_image"):
+            result = run_retrieve(
+                query=question,
+                silo=silo,
+                n_results=max(8, top_k * 4),
+                db_path=_DB_PATH,
+                config_path=_CONFIG_PATH,
+            )
+    finally:
+        _release_chroma()
+    ranked: list[str] = []
+    for chunk in result.get("chunks") or []:
+        source = str(chunk.get("source") or "")
+        if source and Path(source).suffix.lower() in _IMAGE_SUFFIXES and source not in ranked:
+            ranked.append(source)
+        if len(ranked) >= top_k:
+            break
+    return ranked
+
+
 @mcp.tool()
-def ask_image(file: str, question: str, silo: str | None = None) -> dict:
+def ask_image(
+    file: str | None = None,
+    question: str = "",
+    silo: str | None = None,
+    files: list[str] | None = None,
+    top_k: int = 2,
+) -> dict:
     """
-    Use when: the user asks about a visual detail of one indexed image that the
-    stored summary does not cover ("what is the spongy piece bottom left",
-    "what does the label say", "how many people are in it").
-    Do not use when: a text query over summaries suffices (`query_personal_knowledge`)
-    or you need to find which image to ask about (`find_files` first).
-    Pairs with: `query_personal_knowledge` to locate the image, then this for detail.
+    Use when: the user asks about a visual detail the stored summary/OCR does not
+    cover ("what car is this", "what does the label say", "how many people").
+    Do not use when: a text query over summaries suffices (`query_personal_knowledge`).
+    Pairs with: `query_personal_knowledge`, whose recommended_action lists the
+    best-matching images — pass all of them as files= in one call.
 
-    Re-reads the original image with the local vision model and answers the
-    question. The ingest-time summary is one or two sentences written without
-    knowing what would be asked later, so follow-up detail questions cannot be
-    served from the index — this looks at the pixels again.
-
-    file: filename (e.g. "IMG_9383.jpeg") or absolute path. Must already be indexed.
-    silo: optional slug to disambiguate when the same filename exists in several silos.
+    Re-reads original images with the local vision model and answers the question.
+    - files=[...]: up to 4 indexed images, sent together in one vision call; the
+      answer says which image shows what. Prefer this over one call per image.
+    - file="IMG_9383.jpeg": one image (filename or absolute path).
+    - neither: the top_k (default 2) images best matching the question in silo are
+      found and inspected together.
+    Each image adds ~20 s or more of local vision time; keep the list short.
+    All files must already be indexed. silo disambiguates filenames, and is
+    required (exact slug) to reach a private silo's images.
     Runs locally against LLMLIBRARIAN_VISION_MODEL; nothing leaves the machine.
     """
-    path, candidates, err = _resolve_indexed_image(file, silo)
-    if err:
-        out: dict = {"status": "error", "error": err}
-        if candidates:
-            out["candidates"] = candidates
-        return out
-    try:
-        image_bytes = Path(path).read_bytes()
-    except OSError as e:
-        return {"status": "error", "error": f"cannot read {path}: {e}"}
-    try:
-        from processors import answer_image_question
+    asked = (question or "").strip()
+    if not asked:
+        return {"status": "error", "error": "question is required"}
+    top_k = max(1, min(_ASK_IMAGE_MAX_FILES, int(top_k or 2)))
 
-        answer, model = answer_image_question(image_bytes, path, question)
+    wanted: list[str] = list(files or [])
+    if file:
+        wanted.insert(0, file)
+    located = False
+    if not wanted:
+        if not Path(_DB_PATH).is_dir():
+            return {"status": "error", **_db_missing_error()}
+        try:
+            wanted = _locate_images(asked, silo, top_k)
+        except Exception as e:
+            if _is_lock_timeout(e):
+                return {"status": "error", **_busy_error(e, "ask_image")}
+            return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        located = True
+        if not wanted:
+            return {
+                "status": "error",
+                "error": "no indexed image matches this question" + (f" in silo {silo!r}" if silo else ""),
+                "recommended_action": {
+                    "tool": "find_files",
+                    "args": {"name_glob": "*.jp*g", **({"silos": [silo]} if silo else {})},
+                    "reason": "List the silo's images and pass the right ones as files=.",
+                },
+            }
+
+    paths: list[str] = []
+    for name in list(dict.fromkeys(wanted))[:_ASK_IMAGE_MAX_FILES]:
+        path, candidates, err = _resolve_indexed_image(name, silo)
+        if err:
+            out: dict = {"status": "error", "error": err}
+            if candidates:
+                out["candidates"] = candidates
+            return out
+        paths.append(str(path))
+
+    images: list[tuple[bytes, str]] = []
+    for path in paths:
+        try:
+            images.append((Path(path).read_bytes(), path))
+        except OSError as e:
+            return {"status": "error", "error": f"cannot read {path}: {e}"}
+    try:
+        import processors
+
+        if len(images) == 1:
+            answer, model = processors.answer_image_question(images[0][0], images[0][1], asked)
+        else:
+            answer, model = processors.answer_images_question(images, asked)
     except Exception as e:
-        return {"status": "error", "error": f"{type(e).__name__}: {e}", "source_file": path}
-    return {
+        return {"status": "error", "error": f"{type(e).__name__}: {e}", "source_files": paths}
+    out = {
         "status": "ok",
-        "source_file": path,
-        "question": question,
+        "question": asked,
         "answer": answer,
         "vision_model": model,
+        "source_files": paths,
     }
+    if len(paths) == 1:
+        out["source_file"] = paths[0]
+    if located:
+        out["located_by"] = "best matches for the question"
+    return out
 
 
 _FULL_TOOL_NAMES = (
