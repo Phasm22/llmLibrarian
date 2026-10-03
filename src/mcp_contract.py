@@ -67,10 +67,10 @@ def deterministic_alternative(
     if deterministic_intent == "CODE_LANGUAGE":
         return {
             "tool": "list_silos",
-            "args": {},
+            "args": {"verbose": True},
             "reason": (
                 "If the user is asking which programming language they use most, each "
-                "silo's language_stats counts files by extension."
+                "silo's language_stats (verbose=True) counts files by extension."
             ),
         }
     return None
@@ -158,3 +158,79 @@ def apply_guidance(
         if alternative:
             result["alternative_tool"] = alternative
     return result
+
+
+# --- Payload size -------------------------------------------------------------
+# Measured on :8766 2026-10-02: a 20-chunk photo answer was 19 KB, a 6-chunk
+# unscoped answer 20 KB (chunks_by_silo repeated every chunk), list_silos 10 KB
+# with one 40-entry exclude_patterns list repeated per silo. A 16k-context client
+# pays for every byte on every turn.
+
+# Per-chunk fields a model reads to answer and cite. Everything else (rank,
+# per-chunk confidence, chunk_index, record_type, indexed_at, _signals) is
+# pipeline state; explain_retrieval still returns the signals.
+_CHUNK_FIELDS = ("text", "score", "source", "silo", "doc_type", "section", "page", "line_start", "mtime_iso", "query")
+_IMAGE_FIELDS = ("source_modality", "summary_status")
+
+
+def slim_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project retrieval chunks to what a model uses; drop empty fields.
+
+    photo_metadata is kept once per source: every OCR region of a photo carried
+    the same capture/camera/GPS block.
+    """
+    out: list[dict[str, Any]] = []
+    photo_seen: set[str] = set()
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        slim = {k: chunk[k] for k in _CHUNK_FIELDS if chunk.get(k) not in (None, "")}
+        if chunk.get("source_modality") == "image":
+            for k in _IMAGE_FIELDS:
+                if chunk.get(k):
+                    slim[k] = chunk[k]
+            if chunk.get("needs_vision_enrichment"):
+                slim["needs_vision_enrichment"] = True
+        photo = chunk.get("photo_metadata")
+        source = str(chunk.get("source") or "")
+        if isinstance(photo, dict) and photo and source not in photo_seen:
+            slim["photo_metadata"] = photo
+            photo_seen.add(source)
+        out.append(slim)
+    return out
+
+
+def silo_counts(chunks: list[dict[str, Any]]) -> dict[str, int]:
+    """Chunks per silo — the grouping chunks_by_silo gave, without the copy."""
+    counts: dict[str, int] = {}
+    for chunk in chunks:
+        silo = str(chunk.get("silo") or "")
+        counts[silo] = counts.get(silo, 0) + 1
+    return counts
+
+
+def slim_roster(result: dict[str, Any], *, verbose: bool = False) -> dict[str, Any]:
+    """list_silos/session_context roster without per-silo repetition.
+
+    exclude_patterns is hoisted to one default_exclude_patterns list and kept on a
+    silo only where it differs; language_stats appears only when verbose.
+    """
+    silos = result.get("silos")
+    if not isinstance(silos, list) or verbose:
+        return result
+    pattern_sets: dict[str, int] = {}
+    for silo in silos:
+        key = repr(silo.get("exclude_patterns"))
+        pattern_sets[key] = pattern_sets.get(key, 0) + 1
+    common_key = max(pattern_sets, key=pattern_sets.get) if pattern_sets else None
+    common = next((s.get("exclude_patterns") for s in silos if repr(s.get("exclude_patterns")) == common_key), None)
+    slimmed = []
+    for silo in silos:
+        row = {k: v for k, v in silo.items() if k not in ("language_stats", "exclude_patterns")}
+        if repr(silo.get("exclude_patterns")) != common_key and silo.get("exclude_patterns") is not None:
+            row["exclude_patterns"] = silo["exclude_patterns"]
+        slimmed.append(row)
+    out = {**result, "silos": slimmed}
+    if common:
+        out["default_exclude_patterns"] = common
+    return out

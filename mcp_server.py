@@ -285,7 +285,7 @@ mcp = FastMCP(
         "call query_personal_knowledge before responding. Use multi_query_knowledge when "
         "a task needs multiple angles of context simultaneously. "
         ""
-        "multi_query_knowledge caps merged output at max_total_chunks (default 50) — if "
+        "multi_query_knowledge caps merged output at max_total_chunks (default 30) — if "
         "truncated=True is returned, lower n_results or reduce the number of queries. "
         "Pass section= to scope retrieval to a document section. Pass doc_type= to "
         "restrict by file type (e.g. 'transcript', 'resume', 'tax_return', 'code'). "
@@ -989,7 +989,7 @@ def _private_scope_note(silo: str | None) -> dict:
 def query_personal_knowledge(
     query: str,
     silo: str | None = None,
-    n_results: int = 40,
+    n_results: int = 12,
     section: str | None = None,
     doc_type: str | None = None,
 ) -> dict:
@@ -1005,16 +1005,21 @@ def query_personal_knowledge(
     Specify silo to scope retrieval by slug or display name (a private silo opens only
     by its exact slug); call list_silos first
     rather than inferring a silo's domain from its slug. Returns chunks with text, score (0–1),
-    confidence, section heading, source path, date, doc_type, and position. Image chunks also
-    include embedded capture, camera, exposure, dimensions, and GPS data under photo_metadata
-    when present.
+    source path, silo, doc_type, and section/page/date when known. Image chunks also carry
+    source_modality and, once per photo, capture/camera/GPS data under photo_metadata.
+    n_results defaults to 12; raise it only when a broad survey needs more.
 
     Pass section= to restrict to a document section.
     Pass doc_type= to restrict by file type.
     Intent routing is applied automatically.
     For tax queries, also returns a tax_ledger field with structured extracted values.
     Response includes answer_confidence and coverage_note to calibrate hedging.
-    When no silo filter is passed, also returns chunks_by_silo grouped by silo.
+    When no silo filter is passed, also returns silo_counts (chunks per silo).
+
+    When chunks is empty the response carries recommended_action {tool, args,
+    reason}: follow it rather than rephrasing the same words. alternative_tool
+    names a tool for the inventory-style reading of the question ("which file
+    types", "list my files") when the chunks may not be what the user meant.
 
     If an index write was running during retrieval, the response carries
     write_in_progress. When results_may_be_incomplete is true a silo was being
@@ -1058,10 +1063,8 @@ def query_personal_knowledge(
             mcp_contract.apply_guidance(result, query=query, silo=silo)
 
             if not silo and chunks:
-                by_silo: dict[str, list] = {}
-                for c in chunks:
-                    by_silo.setdefault(c.get("silo", ""), []).append(c)
-                result["chunks_by_silo"] = by_silo
+                result["silo_counts"] = mcp_contract.silo_counts(chunks)
+            result["chunks"] = mcp_contract.slim_chunks(chunks)
 
         # Audit outside the lock — the append is small, but this lock is on the
         # hot path for every reader and has been a contention source before.
@@ -1086,10 +1089,10 @@ def query_personal_knowledge(
 def multi_query_knowledge(
     queries: list[str],
     silo: str | None = None,
-    n_results: int = 20,
+    n_results: int = 10,
     section: str | None = None,
     doc_type: str | None = None,
-    max_total_chunks: int = 50,
+    max_total_chunks: int = 30,
 ) -> dict:
     """
     Use when: one task needs multiple retrieval angles merged in one response.
@@ -1103,7 +1106,7 @@ def multi_query_knowledge(
     Each chunk is tagged with the query that retrieved it. Pass section= to restrict
     all queries to a document section. Pass doc_type= to restrict by file type
     (e.g. 'transcript', 'resume', 'tax_return', 'code', 'other').
-    max_total_chunks caps the merged output (default 50) to avoid context overflow.
+    max_total_chunks caps the merged output (default 30) to avoid context overflow.
     If the cap is hit, response includes truncated=True — lower n_results or reduce queries.
     Response includes answer_confidence, answer_confidence_score, and coverage_note.
 
@@ -1193,7 +1196,7 @@ def multi_query_knowledge(
         "answer_confidence": conf_level,
         "answer_confidence_score": conf_score,
         "coverage_note": coverage_note,
-        "chunks": all_chunks,
+        "chunks": mcp_contract.slim_chunks(all_chunks),
         **_private_scope_note(silo),
         **({"write_in_progress": merged_write_state} if merged_write_state else {}),
         **({"retryable": True} if (merged_write_state or {}).get("results_may_be_incomplete") else {}),
@@ -1394,7 +1397,7 @@ def watch_coverage() -> dict:
 
 
 @mcp.tool()
-def list_silos(check_staleness: bool = False) -> dict:
+def list_silos(check_staleness: bool = False, verbose: bool = False) -> dict:
     """
     Use when: you need a live roster of registered silos before retrieval.
     Do not use when: you also need health diagnostics/action guidance — use `session_context`.
@@ -1407,6 +1410,8 @@ def list_silos(check_staleness: bool = False) -> dict:
     Use slugs with `query_personal_knowledge`/`multi_query_knowledge` to scope queries.
     Pass check_staleness=True to also get is_stale, stale_file_count, and
     newest_source_mtime_iso per silo (walks source directory — may be slow for large silos).
+    exclude_patterns shared by most silos is listed once as default_exclude_patterns;
+    pass verbose=True for per-silo exclude_patterns and language_stats.
 
     Each row carries private and host. private=true means the silo is excluded
     from every unscoped query: it is reachable only by passing that exact slug as
@@ -1421,7 +1426,9 @@ def list_silos(check_staleness: bool = False) -> dict:
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "silo_count": 0, "silos": []}
     from operations import op_list_silos
-    return op_list_silos(_DB_PATH, check_staleness=check_staleness)
+    return mcp_contract.slim_roster(
+        op_list_silos(_DB_PATH, check_staleness=check_staleness), verbose=verbose
+    )
 
 
 @mcp.tool()
@@ -1450,6 +1457,8 @@ def session_context(check_staleness: bool = True, include_audit: bool = False) -
 
     silos_result = op_list_silos(_DB_PATH, check_staleness=check_staleness)
     silos = silos_result.get("silos", []) if isinstance(silos_result, dict) else []
+    if isinstance(silos_result, dict):
+        silos_result = mcp_contract.slim_roster(silos_result, verbose=include_audit)
     summary = _collect_health_summary(include_audit=include_audit)
     actions = _derive_recommended_actions(silos, summary)
     hnsw = summary.get("hnsw_consistency") or {}
