@@ -4,7 +4,7 @@
       "command": "uv",
       "args": ["--directory", "${LLMLIBRARIAN_HOME:-.}", "run", "mcp_server.py"],
       "env": {
-        "LLMLIBRARIAN_DB": "${LLMLIBRARIAN_DB:-./my_brain_db}",
+        "LLMLIBRARIAN_DB": "${LLMLIBRARIAN_DB:-}",
         "LLMLIBRARIAN_CHROMA_HOST": "127.0.0.1",
         "LLMLIBRARIAN_CHROMA_PORT": "8000",
         "LLMLIBRARIAN_MODEL": "llama3.2:latest",

@@ -102,7 +102,12 @@ def _resolve_db_path() -> str:
         Path.home() / "llmLibrarian" / "my_brain_db",
     ]
     for candidate in fallback_candidates:
-        if candidate is not None and candidate.exists():
+        # Require a real store, not just a directory: taking the Chroma lock on a
+        # missing DB path creates <path>/.llmli_chroma.flock, and that empty
+        # directory then won this search in every later session from a worktree.
+        if candidate is not None and (
+            (candidate / "llmli_registry.json").is_file() or (candidate / "chroma.sqlite3").is_file()
+        ):
             return str(candidate.resolve())
 
     cwd = Path.cwd().resolve()
@@ -118,6 +123,38 @@ _DB_PATH = _resolve_db_path()
 _CONFIG_PATH = str(Path(os.environ.get("LLMLIBRARIAN_CONFIG", str(_ROOT / "archetypes.yaml"))).resolve())
 
 import threading
+
+import code_drift  # noqa: E402
+
+# Tools import their modules lazily to keep idle memory down (f46826a). These
+# light ones (~8 MB together, no chromadb/torch) are imported now so a long-lived
+# process holds one consistent copy of them instead of mixing a startup-time copy
+# with a newer one from disk — the 2026-10-02 find_files ImportError. Heavy
+# modules stay lazy; code_drift reports when the disk has moved on.
+import document_read  # noqa: E402,F401
+import file_registry  # noqa: E402,F401
+import ingest_journal  # noqa: E402,F401
+import operations_find  # noqa: E402,F401
+import query_audit  # noqa: E402,F401
+import state  # noqa: E402,F401
+import watch_scan  # noqa: E402,F401
+
+_PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+_CODE_AT_START = code_drift.snapshot(_ROOT)
+
+
+def _transport_name() -> str:
+    return os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower() or "stdio"
+
+
+def _code_drift_report() -> dict:
+    report = code_drift.drift(_CODE_AT_START, _ROOT)
+    report["process_started_at"] = _PROCESS_STARTED_AT
+    if report["changed_since_start"]:
+        report["hint"] = code_drift.restart_hint(
+            transport=_transport_name(), pid=os.getpid(), started_at=_PROCESS_STARTED_AT
+        )
+    return report
 
 # Serializes concurrent trigger_reindex calls in-process (no subprocess races).
 _reindex_lock = threading.Lock()
@@ -302,6 +339,36 @@ mcp = FastMCP(
         "file types."
     ),
 )
+
+
+from fastmcp.exceptions import ToolError  # noqa: E402
+from fastmcp.server.middleware import Middleware  # noqa: E402
+
+
+class _ImportErrorExplainer(Middleware):
+    """Turn an ImportError inside a tool into "restart me", not a bare traceback.
+
+    The only way a shipped module fails to import a name it was written against is
+    a process holding an older copy of one side (see src/code_drift.py). The raw
+    message ("cannot import name 'read_visible_manifest' from 'file_registry'")
+    sent the 2026-10-02 investigation looking for shadowing modules and stale
+    bytecode.
+    """
+
+    async def on_call_tool(self, context, call_next):
+        try:
+            return await call_next(context)
+        except Exception as e:
+            cause = e if isinstance(e, ImportError) else e.__cause__
+            if not isinstance(cause, ImportError):
+                raise
+            hint = code_drift.restart_hint(
+                transport=_transport_name(), pid=os.getpid(), started_at=_PROCESS_STARTED_AT
+            )
+            raise ToolError(f"{type(cause).__name__}: {cause}. {hint}") from e
+
+
+mcp.add_middleware(_ImportErrorExplainer())
 
 
 _MCP_PROFILE = os.environ.get("LLMLIBRARIAN_MCP_PROFILE", "full").strip().lower() or "full"
@@ -792,6 +859,44 @@ def _mcp_rows_from_ps() -> list[dict]:
     return rows
 
 
+_LAUNCHER_NAMES = {
+    "disclaimer", "uv", "sh", "bash", "zsh", "fish", "login", "env",
+    "python", "python3", "Python", "node", "llmLibrarian",
+}
+
+
+def _parent_map() -> dict[int, tuple[int, str]]:
+    """pid -> (ppid, command name), from ps. Empty on failure."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return {}
+    table: dict[int, tuple[int, str]] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), Path(parts[2]).name)
+    return table
+
+
+def _client_of(pid: int, parents: dict[int, tuple[int, str]]) -> str | None:
+    """Name of the first non-launcher ancestor, or None when the chain reaches
+    init/launchd (the client is gone)."""
+    seen = 0
+    current = parents.get(pid, (0, ""))[0]
+    while current > 1 and seen < 8:
+        ppid, name = parents.get(current, (0, ""))
+        if not name:
+            return None
+        if name not in _LAUNCHER_NAMES and not name.startswith("llmLibrarian-mcp"):
+            return name
+        current = ppid
+        seen += 1
+    return None
+
+
 def _mcp_process_snapshot(*, verbose: bool = False) -> dict:
     """Count live mcp_server.py processes: /proc on Linux, ps elsewhere."""
     out: dict = {"mcp_process_count": 0, "multiple_mcp_processes": False}
@@ -819,6 +924,18 @@ def _mcp_process_snapshot(*, verbose: bool = False) -> dict:
     stdio = [r for r in rows if r.get("transport") == "stdio"]
     out["mcp_stdio_count"] = len(stdio)
     out["multiple_stdio_processes"] = len(stdio) > 1
+    # A stdio server lives as long as its client. Claude Code/Desktop keep idle
+    # sessions resident for days, so "several stdio servers" is normal; only one
+    # whose client is gone is a leak.
+    parents = _parent_map()
+    if parents:
+        orphaned = []
+        for row in stdio:
+            client = _client_of(int(row["pid"]), parents)
+            row["client"] = client or "none"
+            if client is None:
+                orphaned.append(int(row["pid"]))
+        out["mcp_stdio_orphaned_pids"] = orphaned
     if verbose:
         out["processes"] = rows
     else:
@@ -2203,11 +2320,20 @@ def mcp_runtime_status(verbose: bool = False) -> dict:
     # warning on the total fires on a healthy stack. Two stdio servers is the
     # shape that means a client spawned a duplicate or a stale one was never
     # reaped.
-    if bool(mcp_http.get("multiple_stdio_processes")):
+    orphaned = mcp_http.get("mcp_stdio_orphaned_pids") or []
+    if orphaned:
         actions.append(
-            "Multiple stdio MCP servers detected; a stale one was likely never reaped. "
-            "Stop the orphans, or point clients at the shared http service."
+            f"{len(orphaned)} stdio MCP server(s) lost their client and were never reaped "
+            f"(pids {', '.join(map(str, orphaned))}); stop them."
         )
+    elif bool(mcp_http.get("multiple_stdio_processes")) and "mcp_stdio_orphaned_pids" not in mcp_http:
+        actions.append(
+            "Multiple stdio MCP servers detected and their clients could not be checked; "
+            "stop any orphans, or point clients at the shared http service."
+        )
+    drift = _code_drift_report()
+    if drift["changed_since_start"]:
+        actions.append(drift["hint"])
     if bool(mcp_http.get("lock_file_exists")) and mcp_http.get("lock_holder_pid") and not bool(mcp_http.get("lock_holder_alive")):
         actions.append("MCP PID lock file points to a dead process; restart MCP service to refresh lock state.")
     actions = _dedupe_lines(actions)
@@ -2219,6 +2345,7 @@ def mcp_runtime_status(verbose: bool = False) -> dict:
         "chroma": chroma,
         "jobs": jobs,
         "health_counts": health_counts,
+        "code_drift": drift,
         "recommended_actions": actions,
     }
     if verbose:
@@ -2236,8 +2363,12 @@ def health() -> dict:
     Diagnostic check. Returns db_path, db_exists, embedding model, Python version,
     and on-disk Chroma layout stats (including HNSW link_lists.bin bloat detection).
     Call this first if tools are failing, the disk is filling, or Python keeps spawning.
+    code_drift.changed_since_start=true means the code on disk moved after this
+    process started; restart it before debugging anything else.
     """
-    return _collect_health_summary(include_audit=True)
+    summary = _collect_health_summary(include_audit=True)
+    summary["code_drift"] = _code_drift_report()
+    return summary
 
 
 @mcp.tool()
