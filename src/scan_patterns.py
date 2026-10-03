@@ -34,4 +34,8 @@ ADD_DEFAULT_EXCLUDE = [
     # manifest, which the watcher then sees as a change to re-ingest. Matched
     # by name so the location does not matter.
     "llmli_*.json", "image_artifacts/",
+    # Agent worktrees are full copies of a repo living inside it; a silo on the
+    # repo indexed each one again (and every in-progress edit). Tool caches are
+    # never content. Leading slash keeps these to whole path segments.
+    "/.claude/worktrees/", "/.pytest_cache/", "/.mypy_cache/", "/.ruff_cache/",
 ]

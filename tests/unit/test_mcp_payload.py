@@ -120,3 +120,16 @@ def test_unscoped_query_does_not_repeat_chunks(monkeypatch, tmp_path):
     assert "chunks_by_silo" not in res
     assert res["silo_counts"] == {"recipes-1": 1}
     assert "_signals" not in res["chunks"][0]
+
+
+def test_agent_worktrees_and_tool_caches_are_not_indexed():
+    """The llmlibrarian silo indexed .claude/worktrees/<name>/... copies of the repo
+    and .pytest_cache/README.md; find_files("README*") listed them first."""
+    from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE
+    from watch_scan import should_descend_into_dir, should_index
+
+    repo = "/Users/x/llmLibrarian"
+    assert not should_descend_into_dir(f"{repo}/.claude/worktrees/feature-1", ADD_DEFAULT_EXCLUDE)
+    assert not should_index(f"{repo}/.pytest_cache/README.md", ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE)
+    assert should_index(f"{repo}/README.md", ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE)
+    assert should_index(f"{repo}/.claude/rules/silo-privacy.md", ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE)
