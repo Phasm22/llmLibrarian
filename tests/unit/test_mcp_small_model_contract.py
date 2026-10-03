@@ -199,3 +199,23 @@ def test_image_hits_do_not_say_rephrase():
     )
     assert "rephrase" not in note
     assert "ask_image" in note
+
+
+@pytest.mark.parametrize(
+    "query,explicit",
+    [
+        ("What restaurant did I take that Bento box picture at?", True),
+        ("black dog photo", True),
+        ("show me the images from the beach", True),
+        ("README image indexing capabilities", False),
+        ("UI design notes in journalLinker", False),
+        ("dog training notes", False),
+        ("how does image vision summarization work", False),
+    ],
+)
+def test_only_photo_requests_replace_text_results(query, explicit):
+    """An explicit image query swaps the text results for image-vector hits, so it
+    must mean "show me a photo", not mention image technology or a UI."""
+    from query.core_support import _query_explicitly_requests_image
+
+    assert _query_explicitly_requests_image(query) is explicit

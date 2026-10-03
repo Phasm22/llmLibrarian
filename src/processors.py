@@ -201,7 +201,7 @@ def _eager_image_summary_enabled() -> bool:
     ingest, and text-free photos store a placeholder to be filled in lazily at
     query time. That lazy path only runs in the image-collection branch of
     run_ask, so MCP retrieval (run_retrieve) never fills it in and a photo silo
-    answers with "deferred visual summary". Turn this on to pay one vision call
+    answers with "Description deferred". Turn this on to pay one vision call
     per image at ingest and have real descriptions in every retrieval path.
     """
     val = (os.environ.get("LLMLIBRARIAN_IMAGE_EAGER_SUMMARY") or "0").strip().lower()
@@ -343,18 +343,24 @@ def _ocr_quality_assessment(text: str) -> tuple[bool, tuple[str, ...], dict[str,
     return (not reasons, tuple(reasons), stats)
 
 
+# Placeholders are embedded with the chunk, so they must not carry vocabulary a
+# real question uses. The old "Text-forward image indexed with OCR only;
+# multimodal vision disabled." matched every question about image indexing, and
+# in a silo with screenshots it pushed README.md out of the results entirely.
+# summary_status in the metadata is what code branches on; this text is for the
+# reader.
 def _image_summary_placeholder(visible_text: str) -> str:
     cleaned = (visible_text or "").strip()
     if cleaned:
-        return "Text-forward image with deferred visual summary."
-    return "Photo image with deferred visual summary; no reliable OCR text."
+        return "Description deferred; visible text below."
+    return "Description deferred; no readable text."
 
 
 def _image_summary_disabled_placeholder(visible_text: str) -> str:
     cleaned = (visible_text or "").strip()
     if cleaned:
-        return "Text-forward image indexed with OCR only; multimodal vision disabled."
-    return "Photo image indexed with OCR only; multimodal vision disabled."
+        return "No description (vision off for this silo); visible text below."
+    return "No description (vision off for this silo); no readable text."
 
 
 def _image_ocr_signal_assessment(ocr_result: _OCRResult | None) -> dict[str, Any]:

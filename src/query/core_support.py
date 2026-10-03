@@ -254,13 +254,27 @@ def _safe_query(
 
 
 def _query_is_image_relevant(query: str, docs: list[str], metas: list[dict | None]) -> bool:
-    if _query_explicitly_requests_image(query):
+    """Search the image collection too and merge its hits with the text hits."""
+    if _IMAGE_QUERY_PATTERN.search(query or ""):
         return True
     return any(str((meta or {}).get("source_modality") or "") == "image" for meta in metas[:4]) or not docs
 
 
+# Asking *for* a photo. Unlike _IMAGE_QUERY_PATTERN (which only merges image hits
+# in), a match here replaces the text results with image-vector results, so it
+# must not fire on "README image indexing capabilities", "UI design notes", or
+# "dog training notes" — each of which lost every text chunk to photos.
+_EXPLICIT_IMAGE_PATTERN = re.compile(
+    r"\b(photo|photos|picture|pictures|pic|pics|screenshot|screenshots|selfie|selfies)\b"
+    r"|\bimages?\b(?!\s+(?:index\w*|process\w*|vision|embedding\w*|search\w*|support\w*|ocr|"
+    r"ingest\w*|pipeline\w*|models?|summar\w*|caption\w*|metadata|retrieval|capabilit\w*|"
+    r"format\w*|types?|files?\s+types?|handling|extraction|features?|generation|quality|size|resolution))",
+    re.IGNORECASE,
+)
+
+
 def _query_explicitly_requests_image(query: str) -> bool:
-    return bool(_IMAGE_QUERY_PATTERN.search(query or ""))
+    return bool(_EXPLICIT_IMAGE_PATTERN.search(query or ""))
 
 
 def _meta_allows_image_vision(db_path: str, meta: dict[str, Any] | None) -> bool:
