@@ -361,6 +361,40 @@ def _hydrate_image_summary_docs(
     return out_docs, out_metas, lazy_used
 
 
+def _collection_space(collection: Any) -> str:
+    """Distance space of a Chroma collection; Chroma's default is squared L2."""
+    try:
+        config = getattr(collection, "configuration_json", None) or {}
+        space = ((config.get("hnsw") or {}).get("space") if isinstance(config, dict) else None)
+        if space:
+            return str(space)
+    except Exception:
+        pass
+    try:
+        meta = getattr(collection, "metadata", None) or {}
+        space = meta.get("hnsw:space") if isinstance(meta, dict) else None
+        if space:
+            return str(space)
+    except Exception:
+        pass
+    return "l2"
+
+
+def image_distance_as_cosine(distance: float | None, space: str) -> float | None:
+    """Put an image-collection distance on the text collection's cosine scale.
+
+    llmli_image was created without hnsw:space, so Chroma stores squared L2, while
+    llmli is cosine. Averaging the two and scoring 1 - dist clamped every image hit
+    to 0.0, which read as "sparse match — rephrase". CLIP vectors are unit-norm, so
+    squared L2 = 2 - 2cos and cosine distance = L2² / 2.
+    """
+    if distance is None:
+        return None
+    if space == "l2":
+        return float(distance) / 2.0
+    return float(distance)
+
+
 def _query_image_collection(
     *,
     collection: Any,
@@ -383,7 +417,11 @@ def _query_image_collection(
     except Exception:
         return [], [], []
     image_metas = (image_results.get("metadatas") or [[]])[0] or []
-    image_dists = (image_results.get("distances") or [[]])[0] or []
+    image_space = _collection_space(image_collection)
+    image_dists = [
+        image_distance_as_cosine(d, image_space)
+        for d in ((image_results.get("distances") or [[]])[0] or [])
+    ]
     out_docs: list[str] = []
     out_metas: list[dict | None] = []
     out_dists: list[float | None] = []

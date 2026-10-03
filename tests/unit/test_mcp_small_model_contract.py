@@ -178,3 +178,24 @@ def test_lite_profile_keeps_the_reason_for_an_empty_result():
 
     assert out["chunks"] == []
     assert out.get("note") or out.get("recommended_action"), out
+
+
+def test_image_l2_distance_is_put_on_the_cosine_scale():
+    """llmli_image stores squared L2; averaging that with text cosine distance and
+    scoring 1 - dist clamped every image hit to 0.0."""
+    from query.core_support import image_distance_as_cosine
+
+    # A typical CLIP text->image match: cosine similarity ~0.3 -> squared L2 = 1.4.
+    assert image_distance_as_cosine(1.4, "l2") == pytest.approx(0.7)
+    assert image_distance_as_cosine(0.7, "cosine") == pytest.approx(0.7)
+    assert image_distance_as_cosine(None, "l2") is None
+
+
+def test_image_hits_do_not_say_rephrase():
+    import mcp_server
+
+    level, _score, note = mcp_server._compute_answer_confidence(
+        [{"score": 0.26, "source": "/p/DSCN2763.jpg", "source_modality": "image"}]
+    )
+    assert "rephrase" not in note
+    assert "ask_image" in note

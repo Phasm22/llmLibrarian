@@ -519,6 +519,13 @@ def _compute_answer_confidence(chunks: list[dict]) -> tuple[str, float, str]:
     else:
         level = "low"
         note = "sparse match — consider a broader or rephrased query"
+    if chunks and chunks[0].get("source_modality") == "image":
+        # Text-to-photo similarity runs low (0.1–0.3 is typical for a real match),
+        # so "rephrase" here only sends a model round in circles.
+        note = (
+            f"image match — top score {top:.2f}; text-to-photo scores run low, so this is "
+            "not a weak match. Answer from the OCR/summary text; call ask_image for visual detail."
+        )
     return level, round(mean, 4), note
 
 
