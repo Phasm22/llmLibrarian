@@ -62,7 +62,7 @@ asyncio.run(main())
         text=True,
     )
 
-    assert json.loads(proc.stdout) == ["retrieve_knowledge", "silo_roster"]
+    assert json.loads(proc.stdout) == ["ask_image", "read_document", "retrieve_knowledge", "silo_roster"]
 
 
 def test_silo_roster_is_sorted_and_compact(mcp_module):

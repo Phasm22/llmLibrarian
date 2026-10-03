@@ -318,7 +318,9 @@ if _MCP_PROFILE == "lite":
     mcp.instructions = (
         "Use silo_roster only when you need an exact silo slug. "
         "Use retrieve_knowledge with that slug to answer from the user's indexed files. "
-        "If results_may_be_incomplete is true, retry after the index rebuild finishes."
+        "Use read_document to read a file a chunk came from, and ask_image for what a "
+        "photo shows. If a result carries recommended_action, follow it instead of "
+        "rephrasing. If results_may_be_incomplete is true, retry after the index rebuild finishes."
     )
 
 
@@ -992,6 +994,7 @@ def query_personal_knowledge(
     n_results: int = 12,
     section: str | None = None,
     doc_type: str | None = None,
+    source: str | None = None,
 ) -> dict:
     """
     Use when: answering a content/meaning question from indexed files.
@@ -1011,6 +1014,8 @@ def query_personal_knowledge(
 
     Pass section= to restrict to a document section.
     Pass doc_type= to restrict by file type.
+    Pass source= (a path or unique filename from `find_files`) to search inside one
+    file; use `read_document` to read it start to finish instead.
     Intent routing is applied automatically.
     For tax queries, also returns a tax_ledger field with structured extracted values.
     Response includes answer_confidence and coverage_note to calibrate hedging.
@@ -1029,6 +1034,16 @@ def query_personal_knowledge(
     from query.core import run_retrieve
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "chunks": []}
+    source_path: str | None = None
+    if source:
+        source_path, _slug, candidates, err = _resolve_indexed_file(source, silo)
+        if err:
+            return {
+                "db_path": _DB_PATH,
+                "error": err,
+                **({"candidates": candidates[:20]} if candidates else {}),
+                "chunks": [],
+            }
     try:
         with _mcp_chroma_lock("query_personal_knowledge"):
             result = run_retrieve(
@@ -1037,6 +1052,7 @@ def query_personal_knowledge(
                 n_results=n_results,
                 section=section,
                 doc_type=doc_type,
+                source=source_path,
                 db_path=_DB_PATH,
                 config_path=_CONFIG_PATH,
             )
@@ -1072,7 +1088,7 @@ def query_personal_knowledge(
             tool="query_personal_knowledge",
             queries=[query],
             silo=silo,
-            params={"n_results": n_results, "section": section, "doc_type": doc_type},
+            params={"n_results": n_results, "section": section, "doc_type": doc_type, "source": source_path},
             chunks=chunks,
             outcome={"confidence": conf_level, "confidence_score": conf_score},
         )
@@ -1538,7 +1554,7 @@ def find_files(
     """
     Use when: the user asks for files by filename/date rather than document meaning.
     Do not use when: you need content-based answers (`query_personal_knowledge`/`multi_query_knowledge`).
-    Pairs with: `query_personal_knowledge` after selecting a target file/silo.
+    Pairs with: `read_document(path)` to read a hit; `query_personal_knowledge(query, source=path)` to search inside one.
 
     Find files by name and/or date against the manifest — no embeddings, no LLM.
     Use this for filename/date lookups like "today's journal entry" or "files from May 2026"
@@ -1594,6 +1610,13 @@ def find_files(
                 date_field=date_field,  # type: ignore[arg-type]
                 include_chunk_count=False,
                 limit=int(limit),
+            )
+        if isinstance(result, dict) and result.get("files"):
+            # find_files used to end here; with no tool that takes a path, the
+            # 2026-10-02 client reached for Open-WebUI's own KB tools instead.
+            result["next_step"] = (
+                "read_document(path) reads a file; "
+                "query_personal_knowledge(query, source=path) searches inside one."
             )
         return result
     except Exception as e:
@@ -2246,14 +2269,15 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
     return out
 
 
-def retrieve_knowledge(query: str, silo: str, n_results: int = 8) -> dict:
+def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | None = None) -> dict:
     """Use when: answering from one known silo on a small-context client.
     Do not use when: you need diagnostics, broad discovery, or more than twelve chunks.
     Pairs with: `silo_roster`.
 
     Retrieve compact source chunks for the exact silo slug. Defaults to eight
     chunks so a one-file cookbook can still surface a hybrid-ranked hit;
-    request up to twelve when needed.
+    request up to twelve when needed. Pass source= (a path or filename in that
+    silo) to search inside one file.
     """
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "chunks": []}
@@ -2280,12 +2304,19 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8) -> dict:
 
     from query.core import run_retrieve
 
+    source_path: str | None = None
+    if source:
+        source_path, _slug, _candidates, err = _resolve_indexed_file(source, silo)
+        if err:
+            return {"error": err, "chunks": []}
+
     try:
         with _mcp_chroma_lock("retrieve_knowledge"):
             result = run_retrieve(
                 query=query,
                 silo=silo,
                 n_results=n_results,
+                source=source_path,
                 db_path=_DB_PATH,
                 config_path=_CONFIG_PATH,
             )
@@ -2317,44 +2348,129 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8) -> dict:
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}
 
 
-def _resolve_indexed_image(file: str, silo: str | None) -> tuple[str | None, list[str], str | None]:
-    """Map a filename or path to an indexed image. Returns (path, candidates, error).
+def _resolve_indexed_file(
+    file: str,
+    silo: str | None,
+    *,
+    suffixes: set[str] | None = None,
+) -> tuple[str | None, str | None, list[str], str | None]:
+    """Map a filename or path to an indexed file. Returns (path, slug, candidates, error).
 
-    Only files present in the manifest resolve. The vision call reads bytes off
-    disk, so an unindexed path must never reach it — that would turn a retrieval
-    tool into arbitrary local file read.
+    Only files present in the manifest resolve, so a caller can never reach a file
+    the index does not already hold. Private silos resolve only by exact slug: an
+    unscoped call, a display name, or a folder path does not open one.
     """
     from file_registry import read_visible_manifest
+    from state import private_silo_slugs
 
     wanted = (file or "").strip()
     if not wanted:
-        return None, [], "file is required"
-    from state import private_silo_slugs
-
+        return None, None, [], "file is required"
     target_slug = (silo or "").strip()
-    # Private silos resolve only when named; an unscoped call must not reach one.
     manifest = read_visible_manifest(_DB_PATH, silo=target_slug or None) or {}
     silos = manifest.get("silos") or {}
     # Naming means the exact slug: silo= may also be a path, and a path is not
     # consent for a private silo.
     private = set(private_silo_slugs(_DB_PATH))
 
-    matches: list[str] = []
+    matches: list[tuple[str, str]] = []
     for slug, entry in silos.items():
         if target_slug and slug != target_slug and (entry or {}).get("path") != target_slug:
             continue
         if slug in private and slug != target_slug:
             continue
         for path in ((entry or {}).get("files") or {}):
-            if Path(path).suffix.lower() not in _IMAGE_SUFFIXES:
+            if suffixes is not None and Path(path).suffix.lower() not in suffixes:
                 continue
             if path == wanted or Path(path).name == wanted or Path(path).name.lower() == wanted.lower():
-                matches.append(path)
+                matches.append((path, slug))
+    kind = "indexed image" if suffixes == _IMAGE_SUFFIXES else "indexed file"
     if not matches:
-        return None, [], f"no indexed image matches {file!r}" + (f" in silo {silo!r}" if silo else "")
+        return None, None, [], f"no {kind} matches {file!r}" + (f" in silo {silo!r}" if silo else "")
     if len(matches) > 1:
-        return None, sorted(matches), "multiple indexed images match; pass a full path"
-    return matches[0], [], None
+        return None, None, sorted(path for path, _slug in matches), f"multiple {kind}s match; pass a full path"
+    return matches[0][0], matches[0][1], [], None
+
+
+def _resolve_indexed_image(file: str, silo: str | None) -> tuple[str | None, list[str], str | None]:
+    """Map a filename or path to an indexed image. Returns (path, candidates, error).
+
+    The vision call reads bytes off disk, so an unindexed path must never reach
+    it — that would turn a retrieval tool into arbitrary local file read.
+    """
+    path, _slug, candidates, err = _resolve_indexed_file(file, silo, suffixes=_IMAGE_SUFFIXES)
+    return path, candidates, err
+
+
+@mcp.tool()
+def read_document(
+    path: str,
+    silo: str | None = None,
+    start_chunk: int = 0,
+    max_chars: int = 6000,
+) -> dict:
+    """
+    Use when: you have a file path (from `find_files`, a chunk's source, or the user) and need to read that file, not search for an answer.
+    Do not use when: you are looking for which file answers a question (`query_personal_knowledge`), or searching inside one file for a passage (`query_personal_knowledge` with source=).
+    Pairs with: `find_files` before it; call again with next_start_chunk to keep reading.
+
+    Returns the file's indexed text in document order, up to max_chars (default
+    6000, max 20000), with overlapping chunk seams removed. path may be a full path
+    or a bare filename if it is unique. When more remains, next_start_chunk is set:
+    pass it as start_chunk to continue. Reads the index, not the disk, so PDFs and
+    images come back as their extracted text. A private silo's file opens only when
+    its exact slug is passed as silo.
+    """
+    from document_read import read_indexed_document
+
+    if not Path(_DB_PATH).is_dir():
+        return {**_db_missing_error(), "text": ""}
+    resolved, slug, candidates, err = _resolve_indexed_file(path, silo)
+    if err:
+        out: dict = {"error": err, "text": ""}
+        if candidates:
+            out["candidates"] = candidates[:20]
+        else:
+            out["recommended_action"] = {
+                "tool": "find_files",
+                "args": {"name_glob": f"*{Path(path).name}*"},
+                "reason": "The path is not in the index. Find the indexed file name first.",
+            }
+        return out
+    try:
+        from chroma_client import get_client
+        from constants import LLMLI_COLLECTION
+
+        with _mcp_chroma_lock("read_document"):
+            collection = get_client(_DB_PATH).get_or_create_collection(name=LLMLI_COLLECTION)
+            result = read_indexed_document(
+                collection,
+                silo=str(slug),
+                source=str(resolved),
+                start_chunk=start_chunk,
+                max_chars=max_chars,
+            )
+        _emit_query_audit(
+            tool="read_document",
+            queries=[str(resolved)],
+            silo=slug,
+            params={"start_chunk": start_chunk, "max_chars": max_chars},
+            chunks=[{"source": resolved, "silo": slug}] * max(0, result["end_chunk"] - result["start_chunk"]),
+            outcome={},
+        )
+        if not result["total_chunks"]:
+            result["recommended_action"] = {
+                "tool": "inspect_silo",
+                "args": {"silo": slug},
+                "reason": "The file is in the manifest but has no indexed chunks (likely failed to parse).",
+            }
+        return result
+    except Exception as e:
+        if _is_lock_timeout(e):
+            return {**_busy_error(e, "read_document"), "text": ""}
+        return {"error": f"{type(e).__name__}: {e}", "text": ""}
+    finally:
+        _release_chroma()
 
 
 @mcp.tool()
@@ -2405,6 +2521,7 @@ _FULL_TOOL_NAMES = (
     "query_personal_knowledge",
     "multi_query_knowledge",
     "ask_image",
+    "read_document",
     "recent_queries",
     "find_files",
     "explain_retrieval",
@@ -2432,6 +2549,10 @@ def _apply_mcp_profile() -> None:
         mcp.local_provider.remove_tool(name)
     mcp.tool(name="silo_roster")(silo_roster)
     mcp.tool(name="retrieve_knowledge")(retrieve_knowledge)
+    # Reading a found file and looking at a photo were the two dead ends the
+    # 2026-10-02 small-model session hit; both resolve privacy themselves.
+    mcp.tool(name="read_document")(read_document)
+    mcp.tool(name="ask_image")(ask_image)
 
 
 _apply_mcp_profile()

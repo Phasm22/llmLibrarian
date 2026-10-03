@@ -58,6 +58,7 @@ def execute_retrieve_chroma_phase(
     doc_type: str | None,
     db_path: str | None,
     get_chroma_client: Callable[[str], Any] | None = None,
+    source: str | None = None,
 ) -> dict:
     _gc = get_chroma_client or get_client
     ef = get_embedding_function(batch_size=1)
@@ -79,6 +80,8 @@ def execute_retrieve_chroma_phase(
             parts.append(private_clause)
         if doc_type:
             parts.append({"doc_type": doc_type})
+        if source:
+            parts.append({"source": source})
         if len(parts) == 1:
             return parts[0]
         if len(parts) > 1:

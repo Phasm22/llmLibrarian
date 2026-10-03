@@ -83,6 +83,7 @@ def run_retrieve(
     db_path: str | Path | None = None,
     config_path: str | Path | None = None,
     get_chroma_client: Any | None = None,
+    source: str | None = None,
 ) -> dict:
     """
     Return raw retrieved chunks with metadata — no LLM synthesis.
@@ -92,6 +93,7 @@ def run_retrieve(
     Pass section= to post-filter chunks to a specific document section (e.g. 'Item 1A').
     Pass doc_type= to restrict to a specific document type stored in chunk metadata
     (e.g. 'transcript', 'resume', 'pdf', 'code', 'other').
+    Pass source= (an indexed file's full path) to rank chunks within that file only.
     Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) are
     retrieved as LOOKUP: the handlers that answer them live in run_ask, so here a
     short-circuit could only ever return nothing. The routed intent is kept as
@@ -159,6 +161,7 @@ def run_retrieve(
             doc_type=doc_type,
             db_path=str(db_path) if db_path is not None else None,
             get_chroma_client=_gc,
+            source=source,
         )
     if deterministic_intent:
         result["deterministic_intent"] = deterministic_intent

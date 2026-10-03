@@ -148,3 +148,31 @@ def test_private_artifact_stream_is_excluded(indexed) -> None:
     )
     out = mcp.query_personal_knowledge(_PROBE, n_results=20)
     _assert_no_private(out.get("chunks", []), private_slug)
+
+
+def test_read_document_opens_private_file_only_by_exact_slug(indexed) -> None:
+    """read_document returns a whole file, so it is the widest read there is. A bare
+    filename, the folder path, or no silo at all must not reach a private file."""
+    mcp, db, private_slug, public_slug = indexed
+    from state import list_silos
+
+    private_path = next(s["path"] for s in list_silos(db) if s["slug"] == private_slug)
+
+    for silo in (None, "Tax", private_path):
+        out = mcp.read_document("return.txt", silo=silo)
+        assert out.get("error") and "PRIVATE-MARKER-7f3a" not in out.get("text", ""), silo
+
+    exact = mcp.read_document("return.txt", silo=private_slug)
+    assert "PRIVATE-MARKER-7f3a" in exact["text"]
+
+    public = mcp.read_document("bread.txt")
+    assert "Sourdough" in public["text"] and public["silo"] == public_slug
+
+
+def test_source_filter_respects_privacy(indexed) -> None:
+    mcp, _db, private_slug, public_slug = indexed
+    blocked = mcp.query_personal_knowledge(_PROBE, source="return.txt")
+    assert blocked.get("chunks") == [] and blocked.get("error")
+
+    scoped = mcp.query_personal_knowledge("bulk ferment", source="bread.txt")
+    assert scoped["chunks"] and {c["silo"] for c in scoped["chunks"]} == {public_slug}
