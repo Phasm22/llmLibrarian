@@ -90,8 +90,5 @@ def test_db_fallback_ignores_a_directory_that_only_holds_a_lock(monkeypatch, tmp
     monkeypatch.chdir(checkout)
     monkeypatch.setattr(mcp_server, "_ROOT", checkout)
     monkeypatch.setattr(mcp_server.Path, "home", classmethod(lambda cls: home))
-    monkeypatch.setattr(
-        mcp_server, "_resolve_db_path", mcp_server._resolve_db_path
-    )  # explicit: exercising the real function
 
     assert mcp_server._resolve_db_path() == str(real.resolve())

@@ -192,3 +192,42 @@ def test_retrieve_knowledge_turns_lock_timeout_into_retryable_response(monkeypat
     assert out["busy"] is True
     assert out["retryable"] is True
     assert out["chunks"] == []
+
+
+def test_lite_mount_serves_both_catalogs_and_pins_its_privacy_policy(monkeypatch, tmp_path):
+    """LLMLIBRARIAN_MCP_LITE_PATH serves the lite catalog beside the full one in
+    the same process; the lite endpoint reads no private silo by default."""
+    import json
+
+    from starlette.testclient import TestClient
+
+    import mcp_server
+    from state import set_silo_private, update_silo
+
+    db = tmp_path / "db"
+    db.mkdir()
+    update_silo(str(db), "tax-abc", str(tmp_path / "Tax"), 1, 1, "2026-01-01T00:00:00+00:00", display_name="Tax")
+    set_silo_private(str(db), "tax-abc", True)
+    monkeypatch.setattr(mcp_server, "_DB_PATH", str(db))
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS", raising=False)
+
+    app = mcp_server._http_app_with_lite(path="/mcp", lite_mount="/lite", stateless_http=True, transport="streamable-http")
+    headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+
+    def rpc(client, url, method, params):
+        client.post(url, headers=headers, json={"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}})
+        raw = client.post(url, headers=headers, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).text
+        data = "\n".join(line[5:] for line in raw.splitlines() if line.startswith("data:")) or raw
+        return json.loads(data)["result"]
+
+    with TestClient(app) as client:
+        full = {t["name"] for t in rpc(client, "/mcp", "tools/list", {})["tools"]}
+        lite = {t["name"] for t in rpc(client, "/lite/mcp", "tools/list", {})["tools"]}
+        refused = rpc(client, "/lite/mcp", "tools/call", {"name": "retrieve_knowledge", "arguments": {"query": "q", "silo": "tax-abc"}})
+        healthz = client.get("/healthz").status_code
+
+    assert lite == {"silo_roster", "retrieve_knowledge", "read_document", "ask_image"}
+    assert {"query_personal_knowledge", "update_file", "list_silos"} <= full
+    assert "does not read private silos" in json.dumps(refused)
+    assert healthz == 200

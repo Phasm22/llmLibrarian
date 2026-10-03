@@ -378,17 +378,19 @@ if _MCP_PROFILE not in {"full", "lite"}:
         f"(got {_MCP_PROFILE!r})."
     )
 
+_LITE_INSTRUCTIONS = (
+    "Use silo_roster only when you need an exact silo slug. "
+    "Use retrieve_knowledge with that slug to answer from the user's indexed files. "
+    "Use read_document to read a file a chunk came from, and ask_image for what a "
+    "photo shows. If a result carries recommended_action, follow it instead of "
+    "rephrasing. If results_may_be_incomplete is true, retry after the index rebuild finishes."
+)
+
 if _MCP_PROFILE == "lite":
     # Open WebUI's small local models should not spend their context budget on
     # the full diagnostic playbook. The profile is process-local: the regular
     # HTTP service and stdio clients retain the full instructions and tools.
-    mcp.instructions = (
-        "Use silo_roster only when you need an exact silo slug. "
-        "Use retrieve_knowledge with that slug to answer from the user's indexed files. "
-        "Use read_document to read a file a chunk came from, and ask_image for what a "
-        "photo shows. If a result carries recommended_action, follow it instead of "
-        "rephrasing. If results_may_be_incomplete is true, retry after the index rebuild finishes."
-    )
+    mcp.instructions = _LITE_INSTRUCTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -1124,6 +1126,63 @@ def _current_host() -> str:
         return ""
 
 
+import contextvars  # noqa: E402
+
+_PRIVATE_READS: contextvars.ContextVar[str | None] = contextvars.ContextVar("llmli_private_reads", default=None)
+
+
+def _private_reads_policy() -> str:
+    """Whether read tools on this endpoint may open a private silo.
+
+    "named" (default): a private silo opens when its exact slug is passed — naming
+    it is the consent signal. "none": no read tool opens one, and rosters and
+    unscoped responses report a count instead of slugs, so the endpoint never
+    hands out the key. Writes (update_file/remove_file from watchers, add_silo,
+    reindex, repair) are unaffected. Set per process with
+    LLMLIBRARIAN_MCP_PRIVATE_READS, or per mounted endpoint (_PrivateReadsPolicy).
+    """
+    raw = _PRIVATE_READS.get() or os.environ.get("LLMLIBRARIAN_MCP_PRIVATE_READS", "named")
+    return "none" if str(raw).strip().lower() == "none" else "named"
+
+
+_PRIVATE_READ_REFUSAL = (
+    "That silo is private, and this endpoint does not read private silos. Tell the user "
+    "to ask it locally with `pal ask --in <slug>`."
+)
+
+
+def _private_read_refusal(*silos: str | None) -> str | None:
+    """Error text when the policy is "none" and any named silo is private."""
+    if _private_reads_policy() != "none":
+        return None
+    from state import private_silo_slugs, resolve_silo_by_path, resolve_silo_to_slug
+
+    private = set(private_silo_slugs(_DB_PATH))
+    if not private:
+        return None
+    for name in silos:
+        if not name:
+            continue
+        slug = resolve_silo_to_slug(_DB_PATH, name)
+        if slug is None and "/" in name:
+            slug = resolve_silo_by_path(_DB_PATH, name)
+        if (slug or name) in private:
+            return _PRIVATE_READ_REFUSAL
+    return None
+
+
+def _roster_for_policy(result: dict) -> dict:
+    """Drop private rows from a roster when this endpoint cannot read them."""
+    if _private_reads_policy() != "none" or not isinstance(result.get("silos"), list):
+        return result
+    visible = [row for row in result["silos"] if not row.get("private")]
+    hidden = len(result["silos"]) - len(visible)
+    out = {**result, "silos": visible, "silo_count": len(visible)}
+    if hidden:
+        out["private_silo_count"] = hidden
+    return out
+
+
 def _private_scope_note(silo: str | None) -> dict:
     """Describe which silos an unscoped query deliberately skipped.
 
@@ -1140,6 +1199,15 @@ def _private_scope_note(silo: str | None) -> dict:
         return {}
     if not skipped:
         return {}
+    if _private_reads_policy() == "none":
+        return {
+            "excluded_private_silo_count": len(skipped),
+            "privacy_note": (
+                f"Unscoped query: {len(skipped)} private silo(s) were not searched and are not "
+                "readable from this endpoint. If the question is about one of them, tell the "
+                "user to run `pal ask --in <slug>` locally."
+            ),
+        }
     return {
         "excluded_private_silos": skipped,
         "privacy_note": (
@@ -1199,6 +1267,9 @@ def query_personal_knowledge(
     from query.core import run_retrieve
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "chunks": []}
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"db_path": _DB_PATH, "error": refusal, "chunks": []}
     source_path: str | None = None
     if source:
         source_path, _slug, candidates, err = _resolve_indexed_file(source, silo)
@@ -1310,6 +1381,9 @@ def multi_query_knowledge(
     from query.core import run_retrieve
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "queries": queries, "total_chunks": 0, "chunks": []}
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"db_path": _DB_PATH, "queries": queries, "error": refusal, "total_chunks": 0, "chunks": []}
     def _compute() -> tuple[dict, dict]:
         seen: set[str] = set()
         all_chunks: list[dict] = []
@@ -1495,6 +1569,9 @@ def explain_retrieval(
     from query.core import run_retrieve
     if not Path(_DB_PATH).is_dir():
         return {**_db_missing_error(), "query": query, "ranked_chunks": []}
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"db_path": _DB_PATH, "query": query, "error": refusal, "ranked_chunks": []}
     try:
         with _mcp_chroma_lock("explain_retrieval"):
             result = run_retrieve(
@@ -1627,7 +1704,7 @@ def list_silos(check_staleness: bool = False, verbose: bool = False) -> dict:
         return {**_db_missing_error(), "silo_count": 0, "silos": []}
     from operations import op_list_silos
     return mcp_contract.slim_roster(
-        op_list_silos(_DB_PATH, check_staleness=check_staleness), verbose=verbose
+        _roster_for_policy(op_list_silos(_DB_PATH, check_staleness=check_staleness)), verbose=verbose
     )
 
 
@@ -1656,6 +1733,10 @@ def session_context(check_staleness: bool = True, include_audit: bool = False) -
     from operations import op_list_silos
 
     silos_result = op_list_silos(_DB_PATH, check_staleness=check_staleness)
+    hidden_private = 0
+    if isinstance(silos_result, dict):
+        silos_result = _roster_for_policy(silos_result)
+        hidden_private = int(silos_result.get("private_silo_count") or 0)
     silos = silos_result.get("silos", []) if isinstance(silos_result, dict) else []
     if isinstance(silos_result, dict):
         silos_result = mcp_contract.slim_roster(silos_result, verbose=include_audit)
@@ -1692,7 +1773,12 @@ def session_context(check_staleness: bool = True, include_audit: bool = False) -
                 + ") are skipped by every unscoped query and require an explicit "
                 "silo=; prefer sending the user to `pal ask --in <slug>` for them."
                 if private_silos
-                else "No silos are marked private."
+                else (
+                    f"{hidden_private} private silo(s) exist on this machine and are not "
+                    "readable from this endpoint; send the user to `pal ask --in <slug>`."
+                    if hidden_private
+                    else "No silos are marked private."
+                )
             )
         ),
     }
@@ -1712,6 +1798,9 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
     """
     if not Path(_DB_PATH).is_dir():
         return _db_missing_error()
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"db_path": _DB_PATH, "error": refusal}
     from operations import op_inspect_silo
     try:
         with _mcp_chroma_lock("inspect_silo"):
@@ -1770,6 +1859,9 @@ def find_files(
 
     if date_field not in ("name_date", "mtime", "either"):
         return {"db_path": _DB_PATH, "error": f"invalid date_field: {date_field}"}
+    refusal = _private_read_refusal(*(silos or []))
+    if refusal:
+        return {"db_path": _DB_PATH, "error": refusal, "files": []}
 
     try:
         if include_chunk_count:
@@ -2422,7 +2514,12 @@ def silo_roster() -> dict:
         out["private_silos_hidden"] = hidden
         out["privacy_note"] = (
             f"{hidden} private silo(s) are not listed. If the user's question is about "
-            "one of them, ask the user for its exact slug."
+            + (
+                "one of them, ask the user for its exact slug."
+                if _private_reads_policy() == "named"
+                else "one of them, tell the user to run `pal ask --in <slug>` locally; "
+                "this endpoint does not read private silos."
+            )
         )
     return out
 
@@ -2515,6 +2612,9 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | 
             ),
             "chunks": [],
         }
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"error": refusal, "chunks": []}
 
     from query.core import run_retrieve
 
@@ -2596,7 +2696,7 @@ def _resolve_indexed_file(
     for slug, entry in silos.items():
         if target_slug and slug != target_slug and (entry or {}).get("path") != target_slug:
             continue
-        if slug in private and slug != target_slug:
+        if slug in private and (slug != target_slug or _private_reads_policy() == "none"):
             continue
         for path in ((entry or {}).get("files") or {}):
             if suffixes is not None and Path(path).suffix.lower() not in suffixes:
@@ -2840,18 +2940,80 @@ _FULL_TOOL_NAMES = (
 )
 
 
+def _lite_tools() -> tuple:
+    # Reading a found file and looking at a photo were the two dead ends the
+    # 2026-10-02 small-model session hit; both resolve privacy themselves.
+    return (
+        ("silo_roster", silo_roster),
+        ("retrieve_knowledge", retrieve_knowledge),
+        ("read_document", read_document),
+        ("ask_image", ask_image),
+    )
+
+
 def _apply_mcp_profile() -> None:
     """Replace the public tool catalog for the process-local lite profile."""
     if _MCP_PROFILE != "lite":
         return
     for name in _FULL_TOOL_NAMES:
         mcp.local_provider.remove_tool(name)
-    mcp.tool(name="silo_roster")(silo_roster)
-    mcp.tool(name="retrieve_knowledge")(retrieve_knowledge)
-    # Reading a found file and looking at a photo were the two dead ends the
-    # 2026-10-02 small-model session hit; both resolve privacy themselves.
-    mcp.tool(name="read_document")(read_document)
-    mcp.tool(name="ask_image")(ask_image)
+    for name, fn in _lite_tools():
+        mcp.tool(name=name)(fn)
+
+
+class _PrivateReadsPolicy(Middleware):
+    """Pin the private-reads policy for every tool call on one endpoint."""
+
+    def __init__(self, policy: str) -> None:
+        self.policy = policy
+
+    async def on_call_tool(self, context, call_next):
+        token = _PRIVATE_READS.set(self.policy)
+        try:
+            return await call_next(context)
+        finally:
+            _PRIVATE_READS.reset(token)
+
+
+def _build_lite_server() -> FastMCP:
+    """A second, lite catalog served from this process (LLMLIBRARIAN_MCP_LITE_PATH).
+
+    Shares models, locks and the result cache with the full endpoint, so a small
+    client gets the 1.3 KB catalog without a second ~400 MB-1.3 GB process, and
+    the watchers keep the full endpoint they write through. Its private-reads
+    policy defaults to "none" (LLMLIBRARIAN_MCP_LITE_PRIVATE_READS): this is the
+    endpoint meant for Open-WebUI, which is told in prose not to ask about tax.
+    """
+    lite = FastMCP("llmLibrarian-lite", instructions=_LITE_INSTRUCTIONS)
+    lite.add_middleware(_ImportErrorExplainer())
+    policy = os.environ.get("LLMLIBRARIAN_MCP_LITE_PRIVATE_READS", "none").strip().lower() or "none"
+    lite.add_middleware(_PrivateReadsPolicy("none" if policy == "none" else "named"))
+    for name, fn in _lite_tools():
+        lite.tool(name=name)(fn)
+    if mcp.auth is not None:
+        lite.auth = mcp.auth
+    return lite
+
+
+def _http_app_with_lite(*, path: str, lite_mount: str, stateless_http: bool, transport: str):
+    """The full app at ``path`` plus the lite app at ``lite_mount + path``."""
+    from contextlib import asynccontextmanager
+
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    http_transport = "http" if transport in {"http", "streamable-http"} else transport
+    main_app = mcp.http_app(path=path, stateless_http=stateless_http, transport=http_transport)
+    lite_app = _build_lite_server().http_app(path=path, stateless_http=stateless_http, transport=http_transport)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with main_app.lifespan(app):
+            async with lite_app.lifespan(app):
+                yield
+
+    mount = "/" + lite_mount.strip("/")
+    return Starlette(routes=[Mount(mount, app=lite_app), Mount("/", app=main_app)], lifespan=lifespan)
 
 
 _apply_mcp_profile()
@@ -2864,9 +3026,10 @@ def resource_silos() -> str:
     if not Path(_DB_PATH).is_dir():
         return json.dumps({**_db_missing_error(), "silos": []}, indent=2)
     from state import list_silos as _list_silos
+    roster = _roster_for_policy({"silos": _list_silos(_DB_PATH)})
     return json.dumps({
         "last_updated": datetime.now(timezone.utc).isoformat(),
-        "silos": _list_silos(_DB_PATH),
+        **roster,
     }, indent=2)
 
 
@@ -2883,7 +3046,7 @@ def get_silo(slug: str) -> str:
     from state import list_silos as _list_silos
     all_silos = _list_silos(_DB_PATH)
     silo_info = next((s for s in all_silos if s.get("slug") == slug), None)
-    if silo_info is None:
+    if silo_info is None or (silo_info.get("private") and _private_reads_policy() == "none"):
         raise ValueError(f"silo not found: {slug}")
     return json.dumps(silo_info, indent=2)
 
@@ -2980,11 +3143,24 @@ if __name__ == "__main__":
         path = os.environ.get("LLMLIBRARIAN_MCP_PATH", "/mcp")
         log_level = os.environ.get("LLMLIBRARIAN_MCP_LOG_LEVEL", "warning")
         stateless_http = _env_bool("LLMLIBRARIAN_MCP_STATELESS_HTTP", True)
-        mcp.run(
-            transport=transport,
-            host=host,
-            port=port,
-            path=path,
-            log_level=log_level,
-            stateless_http=stateless_http,
-        )
+        lite_mount = os.environ.get("LLMLIBRARIAN_MCP_LITE_PATH", "").strip()
+        if lite_mount and transport in {"http", "streamable-http"}:
+            import uvicorn
+
+            uvicorn.run(
+                _http_app_with_lite(
+                    path=path, lite_mount=lite_mount, stateless_http=stateless_http, transport=transport
+                ),
+                host=host,
+                port=port,
+                log_level=log_level,
+            )
+        else:
+            mcp.run(
+                transport=transport,
+                host=host,
+                port=port,
+                path=path,
+                log_level=log_level,
+                stateless_http=stateless_http,
+            )

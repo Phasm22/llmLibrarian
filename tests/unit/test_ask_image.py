@@ -131,11 +131,8 @@ def test_no_file_locates_best_matches(monkeypatch, tmp_path):
     db.mkdir()
     monkeypatch.setattr(mcp_server, "_DB_PATH", str(db))
     monkeypatch.setattr(mcp_server, "_release_chroma", lambda: None)
-    import query.retrieve_locked as retrieve_locked
-
     monkeypatch.setattr(
-        retrieve_locked,
-        "execute_retrieve_chroma_phase",
+        "query.core.run_retrieve",
         lambda **kw: {"chunks": [
             {"source": str(imgs[1]), "text": "t"},
             {"source": "/notes/car.md", "text": "t"},

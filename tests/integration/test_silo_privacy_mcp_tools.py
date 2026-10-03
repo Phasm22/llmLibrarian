@@ -176,3 +176,22 @@ def test_source_filter_respects_privacy(indexed) -> None:
 
     scoped = mcp.query_personal_knowledge("bulk ferment", source="bread.txt")
     assert scoped["chunks"] and {c["silo"] for c in scoped["chunks"]} == {public_slug}
+
+
+def test_none_policy_endpoint_never_reads_private(indexed, monkeypatch) -> None:
+    """LLMLIBRARIAN_MCP_PRIVATE_READS=none: even the exact slug is refused, and no
+    roster or unscoped response names the private silo."""
+    mcp, _db, private_slug, public_slug = indexed
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_PRIVATE_READS", "none")
+
+    assert mcp.query_personal_knowledge(_PROBE, silo=private_slug)["chunks"] == []
+    assert mcp.retrieve_knowledge(_PROBE, silo=private_slug)["chunks"] == []
+    assert "PRIVATE-MARKER-7f3a" not in mcp.read_document("return.txt", silo=private_slug).get("text", "")
+
+    unscoped = mcp.query_personal_knowledge(_PROBE, n_results=20)
+    _assert_no_private(unscoped.get("chunks", []), private_slug)
+    assert private_slug not in str(unscoped)
+    assert private_slug not in str(mcp.list_silos())
+    assert private_slug not in str(mcp.session_context(check_staleness=False))
+
+    assert mcp.query_personal_knowledge("bulk ferment", silo=public_slug)["chunks"]

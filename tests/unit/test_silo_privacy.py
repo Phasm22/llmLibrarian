@@ -323,3 +323,72 @@ def test_ask_image_path_is_not_consent_for_a_private_silo(db: str, tmp_path: Pat
 
     path, _candidates, err = mcp_server._resolve_indexed_image("W2_scan.jpeg", str(tax_dir))
     assert path is None and "no indexed image" in err
+
+
+# --- LLMLIBRARIAN_MCP_PRIVATE_READS=none: an endpoint that never reads private ---
+
+
+@pytest.fixture()
+def none_policy(db: str, monkeypatch: pytest.MonkeyPatch):
+    import mcp_server
+
+    set_silo_private(db, "tax-abc", True)
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_PRIVATE_READS", "none")
+    monkeypatch.setattr(mcp_server, "_DB_PATH", db)
+    return mcp_server
+
+
+def test_default_policy_is_named(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_server
+
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS", raising=False)
+    monkeypatch.setattr(mcp_server, "_DB_PATH", db)
+    set_silo_private(db, "tax-abc", True)
+    assert mcp_server._private_reads_policy() == "named"
+    assert mcp_server._private_read_refusal("tax-abc") is None
+
+
+@pytest.mark.parametrize("name", ["tax-abc", "Tax"])
+def test_none_policy_refuses_private_reads_by_slug_or_name(none_policy, name: str) -> None:
+    mcp = none_policy
+    assert mcp._private_read_refusal(name)
+    assert mcp.query_personal_knowledge("agi", silo=name)["error"]
+    assert mcp.multi_query_knowledge(["agi"], silo=name)["error"]
+    assert mcp.explain_retrieval("agi", silo=name)["error"]
+    assert mcp.inspect_silo(name)["error"]
+    assert mcp.find_files(silos=[name])["error"]
+    assert mcp._private_read_refusal("recipes-def") is None
+
+
+def test_none_policy_rosters_give_a_count_not_slugs(none_policy) -> None:
+    mcp = none_policy
+    roster = mcp.list_silos()
+    assert [s["slug"] for s in roster["silos"]] == ["recipes-def"]
+    assert roster["private_silo_count"] == 1
+    assert "tax-abc" not in str(roster)
+
+    note = mcp._private_scope_note(None)
+    assert note["excluded_private_silo_count"] == 1 and "tax-abc" not in str(note)
+
+    assert "tax-abc" not in str(mcp.silo_roster())
+
+
+def test_none_policy_resolver_never_opens_private_files(none_policy, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mcp = none_policy
+    img = tmp_path / "Tax" / "W2_scan.jpeg"
+    monkeypatch.setattr("file_registry._read_file_manifest", lambda _db: {"silos": {"tax-abc": {"files": {str(img): {}}}}})
+    path, _slug, _c, err = mcp._resolve_indexed_file("W2_scan.jpeg", "tax-abc")
+    assert path is None and err
+
+
+def test_endpoint_policy_overrides_process_policy(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lite mount sets its own policy per call; the process default stays named."""
+    import mcp_server
+
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS", raising=False)
+    token = mcp_server._PRIVATE_READS.set("none")
+    try:
+        assert mcp_server._private_reads_policy() == "none"
+    finally:
+        mcp_server._PRIVATE_READS.reset(token)
+    assert mcp_server._private_reads_policy() == "named"
