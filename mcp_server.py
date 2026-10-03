@@ -310,9 +310,15 @@ mcp = FastMCP(
     name="llmLibrarian",
     instructions=(
         "Use these tools when a task requires context from the user's personal knowledge base. "
-        "At session start, call session_context(check_staleness=True) for roster + health summary + actions. "
-        "If you only need a quick roster, call list_silos. Do not assume a silo's topic from its slug alone; names "
-        "can drift or be reused, so verify with list_silos metadata and retrieved sources. "
+        "At session start, call list_silos for the roster; call session_context(check_staleness=True) "
+        "only when you also need health and staleness (it walks every source folder). Do not assume a "
+        "silo's topic from its slug alone; verify with list_silos metadata and retrieved sources. "
+        ""
+        "When a response carries recommended_action {tool, args, reason}, do that next instead of "
+        "rephrasing the same words; repeat_notice means an identical call already returned this result. "
+        "To read a file a chunk or find_files named, call read_document(path); to search inside one "
+        "file, pass source= to query_personal_knowledge. For what photos show, call ask_image with the "
+        "files= that recommended_action lists, in one call. "
         ""
         "If retrieval returns zero chunks with no error, cross-check list_silos before treating "
         "that as evidence of absence: chunks_count > 0, has_index_errors, or has_ingest_failures "
