@@ -3,7 +3,7 @@
 test_silo_privacy_retrieval.py proves run_retrieve honors the flag. This goes one
 layer up, through the tool functions a client actually calls, because the leak
 that motivated it was observed there: an unscoped query_personal_knowledge on
-the resident server returned tax and chat-archive chunks. That server was
+the resident server returned tax and chat-history chunks. That server was
 running a branch whose tools never consulted the flag, so a run_retrieve-only
 test would not have caught a tool that bypasses it, or a merge that drops it.
 

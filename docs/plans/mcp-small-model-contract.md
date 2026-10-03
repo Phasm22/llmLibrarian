@@ -84,15 +84,15 @@ filter (`src/query/retrieve_locked.py:282-309` → `src/tax/ledger.py:35-46`).
 *"how much did my dad sell his old car for in 2024"* → `TAX_QUERY`.
 
 Live ledger, counted by `(silo, tax_year)` only — no values read: 274 rows from
-`tax-0c9821db`, 39 from `chat-archive`, 1 from `lab-history-d8dd1667`, all
-private. The example query would attach the 27 `tax-0c9821db` rows for 2024
+the private tax silo, 39 from the private chat archive, 1 from the private lab
+silo. The example query would attach the tax silo's 27 rows for 2024
 (form, field label, raw and normalized value) to an Open-WebUI context whose
 tool description says "Do not query Tax". a30aebf never covered this path, so
 :8766 leaks today. I did not trigger it live; `test_unscoped_tax_query_does_not_attach_private_ledger_rows`
 proves it with fixtures.
 
 Side note: the ledger also holds rows for `llmlibrarian-322853c4`, a silo no
-longer in the roster, and for `chat-archive`, which is not a tax corpus — the
+longer in the roster, and for the chat archive, which is not a tax corpus — the
 extractor is running on non-tax silos. (Fixed later: the non-private rows were
 "extracted" from the repo's own tax test files; see N6.)
 
@@ -236,8 +236,8 @@ run`. That's safe for HNSW, since the server orders its own I/O and the
 
 ### 5. Private silos leak through the roster — CONFIRMED as designed; two more channels found
 
-`list_silos` returns slug, path and `private: true` for `tax-0c9821db`,
-`lab-history-d8dd1667` and `chat-archive` (`mcp_server.py:1368-1396` →
+`list_silos` returns slug, path and `private: true` for all three private silos
+(tax, lab results, chat archive) (`mcp_server.py:1368-1396` →
 `state.list_silos`). That follows the written rule ("Knowing a private corpus
 exists is allowed", `.claude/rules/silo-privacy.md`), and the exact slug is the
 consent key. The roster therefore hands any caller the key.
@@ -256,7 +256,7 @@ Two more channels hand it out:
 |---|---|---|
 | `pal` CLI (`pal ls`, `pal ask --in`) | `state.list_silos` directly | no — local process |
 | macOS app | reads `llmli_registry.json` directly (`macos/Sources/llmLibrarian/Services/Collector.swift:76`) | no |
-| `pal pull --watch` watchers | none; call `update_file`/`remove_file` on :8766 with their slug (`pal.py:1610`) | **write** path only — tax, lab-history and chat-archive all have watchers |
+| `pal pull --watch` watchers | none; call `update_file`/`remove_file` on :8766 with their slug (`pal.py:1610`) | **write** path only — all three private silos have watchers |
 | Claude Code / Desktop | stdio processes, own `list_silos` | yes, by design ("naming is consent") |
 | Open-WebUI | :8766, 7-tool allowlist | yes, technically — told "Do not query Tax" in prose only |
 
@@ -390,7 +390,7 @@ Measured over stdio from `dev` against the live DB:
 | Finding 1 (hijack) | **Worse.** `retrieve_knowledge` uses the same `run_retrieve`; `_compact_lite_retrieval` (`mcp_server.py:2167-2193`) drops `intent` and `note`, so the caller gets `{"chunks": [], "results_may_be_incomplete": false}` and nothing else |
 | Finding 2 (read a file) | Same gap; lite has no `find_files` either |
 | Finding 4 (duplicates) | Same |
-| Finding 5 (roster) | **Regressed on `dev`** — `silo_roster` lists `chat-archive`, `lab-history-d8dd1667` (and tax) again (S1) |
+| Finding 5 (roster) | **Regressed on `dev`** — `silo_roster` lists all three private slugs again (S1) |
 | S2 (ledger) | Not affected — `retrieve_knowledge` requires `silo` |
 | RAM for a second process | Idle ≈400 MB (f46826a); :8766 measured 567 MB idle, **1,353 MB** right after queries (embedding model loaded, reaped after idle) |
 
@@ -497,7 +497,7 @@ flaky under full-suite load and passes alone, 3/3).
   and `tests/integration/test_tax_deterministic_qa.py` (indexed as part of the
   repo silo) produced W-2 rows, so an unscoped "W-2 wages 2025" via `pal ask`
   would have answered from fixtures. After the fixes, an unscoped ledger read
-  returns no rows; `tax-0c9821db` by exact slug still returns its 274.
+  returns no rows; the tax silo by exact slug still returns its 274.
 - **N7. `ask_image` latency is GPU contention, not image size.** One image
   ~21–23 s warm or cold; three in one call 94 s, and 370 s while
   `qwen3.6:35b-a3b` (24 GB, resident 8 h for Open-WebUI) held the GPU.
@@ -515,7 +515,7 @@ Done, at TJ's direction ("decisions are aligned, get it done"):
 - **Exclude matching by segment (N4).** f73d8ac; was the separate task. Walked
   impact before rollout: llmlibrarian 970 → 327 indexable files (650
   worktree/cache copies out; `env_bootstrap.py`, `build.sh`,
-  `.github/workflows` in), journallinker +3/−1, chat-archive +3; other silos
+  `.github/workflows` in), journallinker +3/−1, the chat archive +3; other silos
   unchanged.
 - **Small-model argument shapes.** 7056fca: `find_files` accepts
   `silos="slug"` and `date_field=None` (ten overnight validation failures in the
