@@ -72,7 +72,7 @@ DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP = 50 * 1024 * 1024  # 50 MB
 # Default include/exclude for llmli add. First-class: text + code + pdf/docx + xlsx/pptx (no silent ignore).
 # Defined in scan_patterns so the watch daemons' lightweight scanner shares
 # exactly one copy; re-exported here for existing callers.
-from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE  # noqa: F401,E402
+from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE, exclude_matches  # noqa: F401,E402
 
 
 def _normalize_patterns(patterns: list[str] | tuple[str, ...] | None) -> list[str]:
@@ -320,7 +320,7 @@ def should_index(file_path: str | Path, include_patterns: list[str], exclude_pat
     if base.startswith("~$"):
         return False
     for pattern in exclude_patterns:
-        if pattern.rstrip("/") in path_str or _path_matches(path_str, pattern):
+        if exclude_matches(path_str, pattern):
             return False
     for pattern in include_patterns:
         if _path_matches(path_str, pattern):
@@ -330,9 +330,8 @@ def should_index(file_path: str | Path, include_patterns: list[str], exclude_pat
 
 def should_descend_into_dir(dir_path: str | Path, exclude_patterns: list[str]) -> bool:
     """Return False if directory is excluded (e.g. node_modules), True otherwise. We descend unless excluded."""
-    path_str = str(dir_path).rstrip("/") + "/"
     for pattern in exclude_patterns:
-        if pattern.rstrip("/") in path_str or fnmatch.fnmatch(path_str, pattern):
+        if exclude_matches(dir_path, pattern):
             return False
     return True
 

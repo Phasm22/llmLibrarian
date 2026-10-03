@@ -13,7 +13,7 @@ DEFAULT_MAX_DEPTH = 10
 DEFAULT_MAX_FILES_PER_ZIP = 500
 DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP = 50 * 1024 * 1024
 
-from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE  # noqa: F401  (re-exported)
+from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE, exclude_matches  # noqa: F401  (re-exported)
 
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"})
 _PREVIEW_SKIPPED_EXTENSIONS = frozenset({".mp4", ".mov", ".avi", ".mkv", ".webm", ".wav", ".mp3", ".aac"})
@@ -39,7 +39,7 @@ def should_index(file_path: str | Path, include_patterns: list[str], exclude_pat
     if base.startswith("~$"):
         return False
     for pattern in exclude_patterns:
-        if pattern.rstrip("/") in path_str or _path_matches(path_str, pattern):
+        if exclude_matches(path_str, pattern):
             return False
     for pattern in include_patterns:
         if _path_matches(path_str, pattern):
@@ -48,9 +48,8 @@ def should_index(file_path: str | Path, include_patterns: list[str], exclude_pat
 
 
 def should_descend_into_dir(dir_path: str | Path, exclude_patterns: list[str]) -> bool:
-    path_str = str(dir_path).rstrip("/") + "/"
     for pattern in exclude_patterns:
-        if pattern.rstrip("/") in path_str or fnmatch.fnmatch(path_str, pattern):
+        if exclude_matches(dir_path, pattern):
             return False
     return True
 
