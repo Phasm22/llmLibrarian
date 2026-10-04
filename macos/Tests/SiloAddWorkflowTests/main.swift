@@ -36,4 +36,11 @@ expect(vision[0].arguments == ["pull", "/tmp/Research Notes", "--image-vision"],
 expect(vision[1].arguments == ["daemon", "sync"],
        "Image vision must not change watcher reconciliation")
 
+expect(SiloAddWorkflow.pullTarget(of: ["pull", "/tmp/Research Notes/", "--image-vision"]) ==
+       SiloAddWorkflow.pullTarget(of: ["pull", "/tmp/Research Notes"]),
+       "Reindex and image-vision pulls of one folder must count as the same index job")
+expect(SiloAddWorkflow.pullTarget(of: ["daemon", "sync"]) == nil, "Only pulls are deduplicated")
+expect(SiloAddWorkflow.pullTarget(of: ["pull", "/tmp/a", "--watch"]) == nil, "Watchers are not one-shot pulls")
+expect(SiloAddWorkflow.pullTarget(of: ["pull"]) == nil, "A bare pull (all sources) names no folder")
+
 print("SiloAddWorkflowTests: passed")

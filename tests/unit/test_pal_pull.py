@@ -593,3 +593,49 @@ def test_run_watcher_handles_sigterm_and_releases_lock(monkeypatch):
     assert rc == 0
     assert watcher.stop_calls >= 1
     assert released == [Path("/tmp/lock")]
+
+
+def test_pull_lock_refuses_a_second_pull_of_the_same_folder(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("pal.PULL_LOCKS_DIR", tmp_path / "ingest_locks")
+    folder = tmp_path / "Christmas 2011"
+    folder.mkdir()
+    db = tmp_path / "db"
+
+    first, err = pal._acquire_pull_lock(db, folder)
+    assert first is not None and err is None
+    try:
+        second, busy = pal._acquire_pull_lock(db, folder)
+        assert second is None
+        assert str(folder) in busy and f"pid {os.getpid()}" in busy
+
+        # A different folder is not blocked.
+        other, other_err = pal._acquire_pull_lock(db, tmp_path)
+        assert other is not None and other_err is None
+        pal._release_pull_lock(other)
+    finally:
+        pal._release_pull_lock(first)
+
+    again, again_err = pal._acquire_pull_lock(db, folder)
+    assert again is not None and again_err is None
+    pal._release_pull_lock(again)
+
+
+def test_pull_path_mode_exits_75_without_indexing_while_folder_is_locked(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("pal.PULL_LOCKS_DIR", tmp_path / "ingest_locks")
+    monkeypatch.setenv("LLMLIBRARIAN_DB", str(tmp_path / "db"))
+    folder = tmp_path / "photos"
+    folder.mkdir()
+    ran = []
+    monkeypatch.setattr("orchestration.ingest.run_add", lambda *_a, **_k: ran.append(1) or (5, 0))
+    monkeypatch.setattr("pal._record_source_path", lambda _path: None)
+    monkeypatch.setattr("pal._sync_daemon_if_installed", lambda: None)
+
+    held, _ = pal._acquire_pull_lock(str(tmp_path / "db"), folder.resolve())
+    try:
+        assert pal._pull_path_mode(str(folder)) == pal.PULL_ALREADY_RUNNING_EXIT
+        assert ran == []
+    finally:
+        pal._release_pull_lock(held)
+
+    assert pal._pull_path_mode(str(folder)) == 0
+    assert ran == [1]

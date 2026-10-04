@@ -9,14 +9,16 @@ final class Job: ObservableObject, Identifiable {
     let id = UUID()
     let title: String
     let siloSlug: String?
+    let arguments: [String]
     @Published var output = ""
     @Published var isRunning = true
     @Published var exitCode: Int32?
     let startedAt = Date()
 
-    init(title: String, siloSlug: String?) {
+    init(title: String, siloSlug: String?, arguments: [String]) {
         self.title = title
         self.siloSlug = siloSlug
+        self.arguments = arguments
     }
 }
 
@@ -508,7 +510,17 @@ final class LibrarianStore: ObservableObject {
     }
 
     private func runPal(title: String, siloSlug: String?, args: [String], completion: ((Int32) -> Void)? = nil) {
-        let job = Job(title: title, siloSlug: siloSlug)
+        // One index job per folder. pal also refuses (exit 75) via a folder lock,
+        // which covers pulls this app instance did not start, e.g. one orphaned
+        // when the app was relaunched; this check just avoids spawning at all.
+        if let target = SiloAddWorkflow.pullTarget(of: args),
+           jobs.contains(where: { $0.isRunning && SiloAddWorkflow.pullTarget(of: $0.arguments) == target }) {
+            problem = ActionProblem(title: "Already being indexed",
+                                    message: "\(target) is already being indexed by a job in this window. Wait for it to finish.")
+            completion?(SiloAddWorkflow.alreadyIndexingExit)
+            return
+        }
+        let job = Job(title: title, siloSlug: siloSlug, arguments: args)
         jobs.insert(job, at: 0)
         if jobs.count > 20 { jobs.removeLast(jobs.count - 20) }
         let cfg = config
@@ -536,6 +548,10 @@ final class LibrarianStore: ObservableObject {
                 job.exitCode = code
                 if code == 0 {
                     self?.lastActionMessage = "\(title) finished"
+                } else if code == SiloAddWorkflow.alreadyIndexingExit {
+                    let detail = job.output.split(whereSeparator: \.isNewline).last.map(String.init)
+                    self?.problem = ActionProblem(title: "Already being indexed",
+                                                  message: detail ?? "Another pal pull is indexing this folder.")
                 } else {
                     let tail = job.output.split(whereSeparator: \.isNewline).suffix(6).joined(separator: "\n")
                     self?.problem = ActionProblem(title: "\(title) failed (exit \(code))",
@@ -558,7 +574,9 @@ final class LibrarianStore: ObservableObject {
     private func runPalJobs(_ pending: ArraySlice<PalJobSpec>, completion: @escaping (Bool) -> Void) {
         guard let next = pending.first else { completion(true); return }
         runPal(title: next.title, siloSlug: next.siloSlug, args: next.arguments) { [weak self] code in
-            guard code == 0, let self else { completion(false); return }
+            // A folder another pull is already indexing is skipped, not fatal:
+            // that pull finishes it and syncs the watchers itself.
+            guard code == 0 || code == SiloAddWorkflow.alreadyIndexingExit, let self else { completion(false); return }
             self.runPalJobs(pending.dropFirst(), completion: completion)
         }
     }

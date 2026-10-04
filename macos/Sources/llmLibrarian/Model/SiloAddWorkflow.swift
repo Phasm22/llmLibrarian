@@ -10,8 +10,20 @@ struct PalJobSpec: Equatable, Sendable {
 }
 
 enum SiloAddWorkflow {
+    /// `pal pull` exits with this (EX_TEMPFAIL) when another pull already holds
+    /// the folder's lock; see pal._acquire_pull_lock.
+    static let alreadyIndexingExit: Int32 = 75
+
     static func normalizedPath(for folderURL: URL) -> String {
         folderURL.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    /// The folder a one-shot `pal pull <folder>` indexes, normalized so two
+    /// jobs for the same folder compare equal; nil for any other command.
+    static func pullTarget(of arguments: [String]) -> String? {
+        guard arguments.count >= 2, arguments[0] == "pull", !arguments.contains("--watch"),
+              !arguments[1].hasPrefix("-") else { return nil }
+        return normalizedPath(for: URL(fileURLWithPath: arguments[1]))
     }
 
     static func jobs(for folderURL: URL, imageVision: Bool = false) -> [PalJobSpec] {

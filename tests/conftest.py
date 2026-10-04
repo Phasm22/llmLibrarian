@@ -105,6 +105,14 @@ def _reset_embedding_function_cache() -> Any:
     _reset_ef_cache_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_pull_locks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep `pal pull` folder locks out of the operator's real ~/.pal/ingest_locks."""
+    pal = sys.modules.get("pal")
+    if pal is not None:
+        monkeypatch.setattr(pal, "PULL_LOCKS_DIR", tmp_path / "ingest_locks")
+
+
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
     """Consistent temp DB path fixture for tests that need a Chroma path."""

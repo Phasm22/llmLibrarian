@@ -23,6 +23,7 @@ from pathlib import Path
 PAL_HOME = Path(os.environ.get("PAL_HOME", os.path.expanduser("~/.pal")))
 REGISTRY_PATH = PAL_HOME / "registry.json"
 WATCH_LOCKS_DIR = PAL_HOME / "watch_locks"
+PULL_LOCKS_DIR = PAL_HOME / "ingest_locks"
 
 _PAL_ROOT = Path(__file__).resolve().parent
 
@@ -361,6 +362,71 @@ def _acquire_silo_pid_lock(
     if pid is not None and _pid_is_running(pid):
         return None, f"Error: watcher already running for silo '{silo_slug}' (pid {pid})."
     return None, f"Error: unable to acquire watcher lock for silo '{silo_slug}'."
+
+
+# Exit status for "this folder is already being indexed": EX_TEMPFAIL, so the
+# macOS app can say so instead of reporting a failed index.
+PULL_ALREADY_RUNNING_EXIT = 75
+
+
+def _pull_lock_path(db_path: str | Path, folder: Path) -> Path:
+    key = f"{Path(db_path).resolve()}::{folder}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    return PULL_LOCKS_DIR / f"{digest}.lock"
+
+
+def _acquire_pull_lock(db_path: str | Path, folder: Path):
+    """Hold an exclusive flock on ``folder`` for the length of one ``pal pull``.
+
+    Two pulls of the same folder used to run side by side (an app job orphaned
+    by an app restart plus the retry), each summarizing every image through the
+    same Ollama queue, so both looked hung. A flock dies with its process, so a
+    crashed pull never leaves a stale lock behind. Returns (handle, None) when
+    acquired, or (None, message) naming the pid that holds it.
+    """
+    import fcntl
+
+    lock_path = _pull_lock_path(db_path, folder)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.seek(0)
+        try:
+            holder = json.loads(fh.read() or "{}")
+        except ValueError:
+            holder = {}
+        fh.close()
+        detail = ", ".join(
+            part
+            for part in (
+                f"pid {holder['pid']}" if holder.get("pid") else "",
+                f"started {holder['started_at']}" if holder.get("started_at") else "",
+            )
+            if part
+        )
+        return None, (
+            f"Error: {folder} is already being indexed{f' ({detail})' if detail else ''}. "
+            "Wait for that run to finish, or stop it first."
+        )
+    fh.seek(0)
+    fh.truncate()
+    json.dump(
+        {"pid": os.getpid(), "folder": str(folder), "started_at": datetime.now().isoformat(timespec="seconds")},
+        fh,
+    )
+    fh.flush()
+    return fh, None
+
+
+def _release_pull_lock(fh) -> None:
+    import fcntl
+
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 def _release_silo_pid_lock(lock_path: Path | None) -> None:
@@ -2215,8 +2281,46 @@ def _pull_path_mode(
         print(f"Error: not a file or directory: {path}", file=sys.stderr)
         return 1
 
-    _ensure_src_on_path()
     db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
+    lock, busy = _acquire_pull_lock(db_path, path)
+    if lock is None:
+        print(busy, file=sys.stderr)
+        return PULL_ALREADY_RUNNING_EXIT
+    try:
+        return _pull_path_mode_locked(
+            path,
+            db_path,
+            allow_cloud=allow_cloud,
+            follow_symlinks=follow_symlinks,
+            full=full,
+            exclude_patterns=exclude_patterns,
+            prompt=prompt,
+            clear_prompt=clear_prompt,
+            image_vision=image_vision,
+            workers=workers,
+            embedding_workers=embedding_workers,
+            extra_env=extra_env,
+        )
+    finally:
+        _release_pull_lock(lock)
+
+
+def _pull_path_mode_locked(
+    path: Path,
+    db_path: str,
+    *,
+    allow_cloud: bool,
+    follow_symlinks: bool,
+    full: bool,
+    exclude_patterns: list[str] | None,
+    prompt: str | None,
+    clear_prompt: bool,
+    image_vision: bool | None,
+    workers: int | None,
+    embedding_workers: int | None,
+    extra_env: dict[str, str] | None,
+) -> int:
+    _ensure_src_on_path()
     try:
         from chroma_client import preflight_embedded_write
 
