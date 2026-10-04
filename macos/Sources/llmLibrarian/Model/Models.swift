@@ -97,6 +97,8 @@ struct MCPHealth: Hashable, Sendable {
     let version: String?
     let startedAt: Date?
     let dbPath: String?
+    /// URL path of the lite catalog this server is serving ("/lite/mcp"), nil if none.
+    var litePath: String?
 }
 
 struct Snapshot: Sendable {

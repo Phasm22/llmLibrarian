@@ -11,6 +11,9 @@ struct PalConfig: Sendable, Equatable {
     var mcpHost = "127.0.0.1"
     var mcpPort = 8765
     var mcpPath = "/mcp"
+    /// LLMLIBRARIAN_MCP_LITE_PATH: mount of the lite catalog beside the full one
+    /// (e.g. "/lite" serves "/lite/mcp"). nil when not configured.
+    var mcpLiteMount: String?
     var chromaHost = "127.0.0.1"
     var chromaPort = 8000
 
@@ -20,7 +23,10 @@ struct PalConfig: Sendable, Equatable {
     var bookmarksPath: String { palHome + "/registry.json" }
     var queryAuditPath: String { logsDir + "/query-audit.jsonl" }
     var launchAgentsDir: String { NSHomeDirectory() + "/Library/LaunchAgents" }
-    var mcpURL: String { "http://\(mcpHost):\(mcpPort)\(mcpPath)" }
+    var mcpURL: String { mcpURL(path: mcpPath) }
+    /// URL path the lite catalog would be served at, per the env file.
+    var mcpLitePath: String? { mcpLiteMount.map { "/" + $0.trimmingCharacters(in: .init(charactersIn: "/")) + mcpPath } }
+    func mcpURL(path: String) -> String { "http://\(mcpHost):\(mcpPort)\(path)" }
     var mcpHealthURL: URL { URL(string: "http://\(mcpHost):\(mcpPort)/healthz")! }
     var chromaHeartbeatURL: URL { URL(string: "http://\(chromaHost):\(chromaPort)/api/v2/heartbeat")! }
 
@@ -45,12 +51,22 @@ struct PalConfig: Sendable, Equatable {
             if let s = obj["pal_path"] as? String { cfg.palPath = s }
             if let s = obj["pal_home"] as? String { cfg.palHome = s }
         }
+        // For a package install the daemon workdir is site-packages, which has no
+        // .env.mcp; the checkout is the directory holding the venv we run.
+        if !FileManager.default.fileExists(atPath: cfg.workdir + "/.env.mcp") {
+            let venvRoot = (((cfg.python as NSString).deletingLastPathComponent as NSString)
+                .deletingLastPathComponent as NSString).deletingLastPathComponent
+            if FileManager.default.fileExists(atPath: venvRoot + "/.env.mcp") { cfg.workdir = venvRoot }
+        }
         if let db = env["LLMLIBRARIAN_DB"] { cfg.dbPath = db }
         let dotenv = Self.parseDotEnv(at: cfg.workdir + "/.env.mcp")
         func pick(_ key: String) -> String? { env[key] ?? dotenv[key] }
         if let s = pick("LLMLIBRARIAN_MCP_HOST"), !s.isEmpty { cfg.mcpHost = s }
         if let s = pick("LLMLIBRARIAN_MCP_PORT"), let p = Int(s) { cfg.mcpPort = p }
         if let s = pick("LLMLIBRARIAN_MCP_PATH"), !s.isEmpty { cfg.mcpPath = s }
+        if let s = pick("LLMLIBRARIAN_MCP_LITE_PATH"), !s.trimmingCharacters(in: .init(charactersIn: "/ ")).isEmpty {
+            cfg.mcpLiteMount = s.trimmingCharacters(in: .whitespaces)
+        }
         if let s = pick("LLMLIBRARIAN_CHROMA_HOST"), !s.isEmpty { cfg.chromaHost = s }
         if let s = pick("LLMLIBRARIAN_CHROMA_PORT"), let p = Int(s) { cfg.chromaPort = p }
         return cfg

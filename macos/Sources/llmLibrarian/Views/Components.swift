@@ -157,6 +157,32 @@ struct KeyValueRow: View {
     }
 }
 
+/// KeyValueRow whose value is styled as a link; clicking it copies the value.
+struct CopyableValueRow: View {
+    let key: String
+    let value: String
+    let onCopy: () -> Void
+    var width: CGFloat = 110
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(key).foregroundStyle(.secondary).frame(width: width, alignment: .trailing)
+            Button(action: onCopy) {
+                Text(value)
+                    .zfont(.callout, design: .monospaced)
+                    .underline()
+                    .foregroundStyle(Color.accentColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .buttonStyle(.plain)
+            .help("Click to copy")
+            .onHover { inside in if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
+            Spacer(minLength: 0)
+        }
+        .zfont(.callout)
+    }
+}
+
 /// Inspector-style field: label left, value right-aligned.
 struct DetailRow: View {
     let key: String

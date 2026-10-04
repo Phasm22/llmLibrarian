@@ -3123,8 +3123,15 @@ def _build_lite_server() -> FastMCP:
     return lite
 
 
+# URL path the lite catalog is served at ("/lite/mcp"), set only once it is
+# mounted, so /healthz reports what this process serves rather than what the
+# env file says now.
+_LITE_URL_PATH: str | None = None
+
+
 def _http_app_with_lite(*, path: str, lite_mount: str, stateless_http: bool, transport: str):
     """The full app at ``path`` plus the lite app at ``lite_mount + path``."""
+    global _LITE_URL_PATH
     from contextlib import asynccontextmanager
 
     from starlette.applications import Starlette
@@ -3141,6 +3148,7 @@ def _http_app_with_lite(*, path: str, lite_mount: str, stateless_http: bool, tra
                 yield
 
     mount = "/" + lite_mount.strip("/")
+    _LITE_URL_PATH = mount + "/" + path.lstrip("/")
     return Starlette(routes=[Mount(mount, app=lite_app), Mount("/", app=main_app)], lifespan=lifespan)
 
 
@@ -3199,6 +3207,8 @@ async def healthz(_: Request) -> Response:
         "db_exists": Path(_DB_PATH).exists(),
         "started_at": _SERVER_STARTED_AT,
     }
+    if _LITE_URL_PATH:
+        body["lite_path"] = _LITE_URL_PATH
     if exposed:
         # Said explicitly so chroma_client's embedded-write guard fails closed
         # instead of reading a missing field as an older server.

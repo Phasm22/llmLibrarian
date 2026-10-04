@@ -17,6 +17,7 @@ def mcp_module(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_server, "_DB_PATH", str(db))
     monkeypatch.setattr(mcp_server, "_SERVER_STARTED_AT", "2026-05-19T12:00:00+00:00")
     monkeypatch.setattr(mcp_server, "_package_version", lambda: "0.1.0-test")
+    monkeypatch.setattr(mcp_server, "_LITE_URL_PATH", None)
     return mcp_server
 
 

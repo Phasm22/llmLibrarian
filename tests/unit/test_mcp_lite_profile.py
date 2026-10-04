@@ -210,6 +210,7 @@ def test_lite_mount_serves_both_catalogs_and_pins_its_privacy_policy(monkeypatch
     set_silo_private(str(db), "tax-abc", True)
     monkeypatch.setattr(mcp_server, "_DB_PATH", str(db))
     monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS", raising=False)
+    monkeypatch.setattr(mcp_server, "_LITE_URL_PATH", None)
 
     app = mcp_server._http_app_with_lite(path="/mcp", lite_mount="/lite", stateless_http=True, transport="streamable-http")
     headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
@@ -225,9 +226,11 @@ def test_lite_mount_serves_both_catalogs_and_pins_its_privacy_policy(monkeypatch
         full = {t["name"] for t in rpc(client, "/mcp", "tools/list", {})["tools"]}
         lite = {t["name"] for t in rpc(client, "/lite/mcp", "tools/list", {})["tools"]}
         refused = rpc(client, "/lite/mcp", "tools/call", {"name": "retrieve_knowledge", "arguments": {"query": "q", "silo": "tax-abc"}})
-        healthz = client.get("/healthz").status_code
+        healthz = client.get("/healthz")
 
     assert lite == {"silo_roster", "retrieve_knowledge", "read_document", "ask_image"}
     assert {"query_personal_knowledge", "update_file", "list_silos"} <= full
     assert "does not read private silos" in json.dumps(refused)
-    assert healthz == 200
+    assert healthz.status_code == 200
+    # The macOS app shows the lite endpoint from this field.
+    assert healthz.json()["lite_path"] == "/lite/mcp"
