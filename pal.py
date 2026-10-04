@@ -28,7 +28,10 @@ _PAL_ROOT = Path(__file__).resolve().parent
 
 
 def _looks_like_checkout(path: Path) -> bool:
-    return (path / "cli.py").exists() and (path / "src").is_dir()
+    # pyproject.toml is what tells a checkout from site-packages: the wheel's
+    # force-include drops cli.py and src/ there too (even for editable installs),
+    # and taking site-packages for the checkout hid .env.mcp from every watcher.
+    return (path / "cli.py").exists() and (path / "src").is_dir() and (path / "pyproject.toml").is_file()
 
 
 def _iter_editable_roots_early(site_root: Path) -> list[Path]:
@@ -2555,10 +2558,20 @@ def pull_all_sources(
 
 
 def _daemon_workdir() -> str:
-    cwd = Path.cwd().resolve()
-    if (cwd / "pal.py").exists() and (cwd / "cli.py").exists():
-        return str(cwd)
-    return str(Path(__file__).resolve().parent)
+    return str(_default_project_root())
+
+
+def _daemon_pal_path() -> str:
+    """The pal.py the services run: the checkout's when there is one.
+
+    An editable install still leaves a force-included copy of pal.py in
+    site-packages, frozen at install time; a service pointed at it runs stale
+    code no matter what the checkout holds.
+    """
+    root = _default_project_root()
+    if _looks_like_checkout(root) and (root / "pal.py").is_file():
+        return str(root / "pal.py")
+    return str(Path(__file__).resolve())
 
 
 def _resolve_daemon_python_executable() -> str:
@@ -2581,7 +2594,7 @@ def _daemon_runtime_metadata(manager: str | None = None) -> dict[str, object]:
         "version": 1,
         "manager": detected_manager,
         "python_executable": _resolve_daemon_python_executable(),
-        "pal_path": str(Path(__file__).resolve()),
+        "pal_path": _daemon_pal_path(),
         "workdir": _daemon_workdir(),
         "db_path": str(db_path),
         "pal_home": str(PAL_HOME.resolve()),
