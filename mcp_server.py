@@ -495,12 +495,14 @@ def _mcp_chroma_lock(operation: str, write: bool = False, *, writer_wait: bool =
     """
     if not write and _mcp_read_lock_disabled():
         yield
+        _HEALTH.recover(_HEALTH_CHROMA_BUSY, "queries succeeding")
         return
     _acquire_chroma_lock(operation, write=writer_wait)
     try:
         yield
     finally:
         _chroma_lock.release()
+    _HEALTH.recover(_HEALTH_CHROMA_BUSY, "queries succeeding")
 
 # Last background reindex outcome per silo (for health / debugging).
 _reindex_outcome_lock = threading.Lock()
@@ -551,6 +553,7 @@ def _busy_error(exc: BaseException, operation: str, *, write: bool = False) -> d
     a stable field without parsing the error string.
     """
     retry_after = _retry_after_seconds(write=write)
+    _HEALTH.set("degraded", _HEALTH_CHROMA_BUSY)
     return {
         "status": "busy",
         "db_path": _DB_PATH,
@@ -630,7 +633,7 @@ def _collect_health_summary(*, include_audit: bool = False) -> dict:
 
     out: dict = {
         "db_path": _DB_PATH,
-        "db_exists": Path(_DB_PATH).exists(),
+        "db_exists": _db_present(),
         **chroma_mode_info(),
         "embedding_model": os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2"),
         "embedding_kind": os.environ.get("LLMLIBRARIAN_EMBEDDING", "") or "sentence_transformer",
@@ -1043,6 +1046,82 @@ def _emit_usage_event(event: str, metrics: dict) -> None:
         _logger.debug("usage event emit failed", exc_info=True)
 
 
+class HealthState:
+    """Current service health; prints a ``service.state`` line only on change.
+
+    The monitor tails this unit's journal for JSON lines with an ``"event"``
+    key, so health is pushed as transitions instead of polled from /healthz.
+    There is deliberately no timer: a server that stays healthy emits once.
+
+    Disabled by default. Over stdio, stdout is the JSON-RPC stream and a stray
+    line would corrupt it, so ``__main__`` enables this for HTTP transports only.
+    """
+
+    def __init__(self, *, enabled: bool = False, out=None) -> None:
+        self.enabled = enabled
+        self.status: str | None = None
+        self.reason: str | None = None
+        self._out = out
+        self._lock = threading.Lock()
+
+    def set(self, status: str, reason: str, **metrics) -> bool:
+        """Record ``status``/``reason``; emit and return True if either changed."""
+        try:
+            with self._lock:
+                if (status, reason) == (self.status, self.reason):
+                    return False
+                self.status, self.reason = status, reason
+                if not self.enabled:
+                    return False
+                line = _json.dumps({
+                    "event": "service.state",
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "status": status,
+                    "reason": reason,
+                    "metrics": metrics,
+                }, default=str)
+                print(line, file=self._out or sys.stdout, flush=True)
+            return True
+        except Exception:
+            _logger.debug("service.state emit failed", exc_info=True)
+            return False
+
+    def recover(self, reason: str, recovered_reason: str, **metrics) -> bool:
+        """Emit ``recovered`` if the current degradation is ``reason``."""
+        if self.status != "degraded" or self.reason != reason:
+            return False
+        return self.set("recovered", recovered_reason, **metrics)
+
+
+_HEALTH = HealthState()
+_HEALTH_DB_MISSING = "db missing"
+_HEALTH_CHROMA_BUSY = "chroma busy: lock held or index rebuild in progress"
+_db_present_last: bool | None = None
+
+
+def _db_present() -> bool:
+    """True when LLMLIBRARIAN_DB is a directory; reports changes to ``_HEALTH``."""
+    global _db_present_last
+    present = Path(_DB_PATH).is_dir()
+    try:
+        previous, _db_present_last = _db_present_last, present
+        if present != previous:
+            if not present:
+                _HEALTH.set("degraded", _HEALTH_DB_MISSING, db_exists=False)
+            elif previous is False:
+                _HEALTH.recover(_HEALTH_DB_MISSING, "db present", db_exists=True)
+    except Exception:
+        _logger.debug("db presence tracking failed", exc_info=True)
+    return present
+
+
+def _health_startup() -> None:
+    """First state line, once the HTTP server is listening."""
+    if _db_present():
+        _HEALTH.set("ready", "listening; db present", db_exists=True)
+    # A missing DB has already set degraded via _db_present.
+
+
 def _rebuild_note(write_state: dict | None) -> str | None:
     """Warning text for a result set taken while a silo was being rebuilt."""
     if not write_state or not write_state.get("results_may_be_incomplete"):
@@ -1286,7 +1365,7 @@ def query_personal_knowledge(
     retry once it finishes.
     """
     from query.core import run_retrieve
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "chunks": []}
     refusal = _private_read_refusal(silo)
     if refusal:
@@ -1449,7 +1528,7 @@ def multi_query_knowledge(
     from query.core import run_retrieve
     if isinstance(queries, str):
         queries = [queries]
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "queries": queries, "total_chunks": 0, "chunks": []}
     refusal = _private_read_refusal(silo)
     if refusal:
@@ -1498,6 +1577,7 @@ def multi_query_knowledge(
             except Exception as e:
                 if _is_lock_timeout(e):
                     busy = True
+                    _HEALTH.set("degraded", _HEALTH_CHROMA_BUSY)
                 errors.append(f"{q!r}: {type(e).__name__}: {e}")
         all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
         truncated = len(all_chunks) > max_total_chunks
@@ -1665,7 +1745,7 @@ def explain_retrieval(
     - signal_summary: plain-text explanation of what signals fired and why
     """
     from query.core import run_retrieve
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "query": query, "ranked_chunks": []}
     refusal = _private_read_refusal(silo)
     if refusal:
@@ -1798,7 +1878,7 @@ def list_silos(check_staleness: bool = False, verbose: bool = False) -> dict:
     roster is the only authority on what exists here. A silo named in notes,
     logs, or memory but absent from this list does not exist on this machine.
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "silo_count": 0, "silos": []}
     from operations import op_list_silos
     return mcp_contract.slim_roster(
@@ -1819,7 +1899,7 @@ def session_context(check_staleness: bool = True, include_audit: bool = False) -
     - recommended_actions derived from stale/index/error signals
     - ready_for_retrieval boolean to help agents gate first query
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {
             **_db_missing_error(),
             "silo_count": 0,
@@ -1894,7 +1974,7 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
     Useful to diagnose zero-chunk files (likely failed to parse), detect duplicate content,
     or verify coverage after indexing. top= limits how many files are returned (default 50).
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return _db_missing_error()
     refusal = _private_read_refusal(silo)
     if refusal:
@@ -1941,7 +2021,7 @@ def find_files(
 
     from operations_find import op_find_files
 
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return _db_missing_error()
 
     def _parse(raw: str | None) -> _date | None:
@@ -2042,7 +2122,7 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     reindex that can corrupt the HNSW index and cause lock contention.
     Only call when list_silos shows a stale timestamp AND source files have changed.
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {"status": "error", **_db_missing_error()}
     if not confirm:
         return {
@@ -2140,7 +2220,7 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
     This is synchronous — it blocks until complete (may take a few minutes for large silos).
     Unrelated to pal auto-watch: for bookmarks/daemon job coverage use `watch_coverage` (read-only).
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {"status": "error", **_db_missing_error()}
     if not confirm:
         return {
@@ -2178,7 +2258,7 @@ def _resolve_silo_under_path(silo: str, path: str) -> tuple[str | None, str | No
     from pathlib import Path as _Path
     from state import list_silos as _list_silos, resolve_silo_to_slug
 
-    if not _Path(_DB_PATH).is_dir():
+    if not _db_present():
         return (None, None, {"status": "error", **_db_missing_error()})
     slug = resolve_silo_to_slug(_DB_PATH, silo)
     if slug is None:
@@ -2470,7 +2550,7 @@ def set_silo_privacy(silo: str, private: bool, confirm: bool = False) -> dict:
     """
     from state import is_silo_private, resolve_silo_to_slug, set_silo_private
 
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return _db_missing_error()
     slug = resolve_silo_to_slug(_DB_PATH, silo)
     if not slug:
@@ -2605,7 +2685,7 @@ def silo_roster() -> dict:
     Return the compact, machine-local silo roster: exact slug, display name,
     and indexed chunk count. Entries are sorted by slug for stable output.
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "silo_count": 0, "silos": []}
 
     from state import list_silos as _list_silos
@@ -2710,7 +2790,7 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | 
     request up to twelve when needed. Pass source= (a path or filename in that
     silo) to search inside one file.
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "chunks": []}
     if isinstance(n_results, bool) or not isinstance(n_results, int) or not 1 <= n_results <= 12:
         return {
@@ -2870,7 +2950,7 @@ def read_document(
     """
     from document_read import read_indexed_document
 
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "text": ""}
     resolved, slug, candidates, err = _resolve_indexed_file(path, silo)
     if err:
@@ -2985,7 +3065,7 @@ def ask_image(
         wanted.insert(0, file)
     located = False
     if not wanted:
-        if not Path(_DB_PATH).is_dir():
+        if not _db_present():
             return {"status": "error", **_db_missing_error()}
         try:
             wanted = _locate_images(asked, silo, top_k)
@@ -3151,7 +3231,7 @@ _apply_mcp_profile()
 def resource_silos() -> str:
     """Read-only JSON snapshot of all registered silos. May be stale — call list_silos tool for live data."""
     import json
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return json.dumps({**_db_missing_error(), "silos": []}, indent=2)
     from state import list_silos as _list_silos
     roster = _roster_for_policy({"silos": _list_silos(_DB_PATH)})
@@ -3169,7 +3249,7 @@ def get_silo(slug: str) -> str:
     last_indexed, and doc_type_breakdown. Resolved dynamically at request time.
     """
     import json
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return json.dumps(_db_missing_error(), indent=2)
     from state import list_silos as _list_silos
     all_silos = _list_silos(_DB_PATH)
@@ -3196,7 +3276,7 @@ async def healthz(_: Request) -> Response:
         "service": "llmLibrarian-mcp",
         "version": _package_version(),
         "transport": _transport_name(),
-        "db_exists": Path(_DB_PATH).exists(),
+        "db_exists": _db_present(),
         "started_at": _SERVER_STARTED_AT,
     }
     if exposed:
@@ -3238,6 +3318,74 @@ def _client_app_name() -> str | None:
         if name and name not in wrappers:
             return name
     return None
+
+
+
+def _serve_http(transport: str) -> None:
+    """Run an HTTP transport, reporting health transitions on stdout."""
+    # Off stdio, stdout is free for health events; see HealthState.
+    _HEALTH.enabled = True
+    host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1")
+    port = int(os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765"))
+    path = os.environ.get("LLMLIBRARIAN_MCP_PATH", "/mcp")
+    log_level = os.environ.get("LLMLIBRARIAN_MCP_LOG_LEVEL", "warning")
+    stateless_http = _env_bool("LLMLIBRARIAN_MCP_STATELESS_HTTP", True)
+    lite_mount = os.environ.get("LLMLIBRARIAN_MCP_LITE_PATH", "").strip()
+    try:
+        import uvicorn
+
+        if lite_mount and transport in {"http", "streamable-http"}:
+            app = _http_app_with_lite(
+                path=path, lite_mount=lite_mount, stateless_http=stateless_http, transport=transport
+            )
+        else:
+            app = mcp.http_app(
+                path=path,
+                stateless_http=stateless_http,
+                transport="http" if transport in {"http", "streamable-http"} else transport,
+            )
+
+        class _HealthReportingServer(uvicorn.Server):
+            """uvicorn binds after the app lifespan starts, so ``ready``
+            waits for ``started`` rather than going in the lifespan."""
+
+            async def startup(self, sockets=None) -> None:
+                await super().startup(sockets=sockets)
+                if self.started:
+                    _health_startup()
+
+            async def shutdown(self, sockets=None) -> None:
+                _HEALTH.set("stopping", "graceful shutdown")
+                await super().shutdown(sockets=sockets)
+
+        # Same server settings FastMCP.run applies on the HTTP path.
+        server = _HealthReportingServer(uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level=log_level,
+            lifespan="on",
+            timeout_graceful_shutdown=0,
+        ))
+        server.run()
+        if not server.started:
+            _HEALTH.set("error", "startup failed")
+            sys.exit(3)
+        _HEALTH.set("stopping", "graceful shutdown")
+    except SystemExit as e:
+        if _HEALTH.status == "error":
+            pass  # already reported, e.g. "startup failed"
+        elif e.code in (0, None):
+            _HEALTH.set("stopping", "graceful shutdown")
+        else:
+            _HEALTH.set("error", f"exited with status {e.code}")
+        raise
+    except KeyboardInterrupt:
+        _HEALTH.set("stopping", "graceful shutdown")
+        raise
+    except BaseException as e:
+        _HEALTH.set("error", f"fatal: {type(e).__name__}")
+        raise
 
 
 if __name__ == "__main__":
@@ -3282,29 +3430,4 @@ if __name__ == "__main__":
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:
-        host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1")
-        port = int(os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765"))
-        path = os.environ.get("LLMLIBRARIAN_MCP_PATH", "/mcp")
-        log_level = os.environ.get("LLMLIBRARIAN_MCP_LOG_LEVEL", "warning")
-        stateless_http = _env_bool("LLMLIBRARIAN_MCP_STATELESS_HTTP", True)
-        lite_mount = os.environ.get("LLMLIBRARIAN_MCP_LITE_PATH", "").strip()
-        if lite_mount and transport in {"http", "streamable-http"}:
-            import uvicorn
-
-            uvicorn.run(
-                _http_app_with_lite(
-                    path=path, lite_mount=lite_mount, stateless_http=stateless_http, transport=transport
-                ),
-                host=host,
-                port=port,
-                log_level=log_level,
-            )
-        else:
-            mcp.run(
-                transport=transport,
-                host=host,
-                port=port,
-                path=path,
-                log_level=log_level,
-                stateless_http=stateless_http,
-            )
+        _serve_http(transport)
