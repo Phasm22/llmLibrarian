@@ -9,6 +9,23 @@ The system is organized around a few stable ideas:
 - `llmli` is the direct engine CLI for lower-level actions and automation.
 - most behavior is deterministic and driven by the index, not by ad hoc prompts.
 
+## Markdown and frontmatter
+
+- `.md` / `.markdown` / `.mdx` files parse leading YAML frontmatter into Chroma
+  chunk metadata (scalars only; lists become comma-delimited strings). The YAML
+  block is stripped from the embedded text and replaced by a short one-line
+  preamble. Malformed frontmatter is ignored — ingest continues on the raw body.
+- Markdown at or under `MD_SINGLE_CHUNK_MAX` (default 4000 chars, override with
+  `LLMLIBRARIAN_MD_SINGLE_CHUNK_MAX`) is one chunk. Larger files split on ATX
+  headings, then fall back to size-based chunking. Other file types keep the
+  existing `CHUNK_SIZE` / `CHUNK_OVERLAP` path.
+- MCP `query_personal_knowledge` / `multi_query_knowledge` accept metadata
+  filters (`category`, `main_protein`, `min_servings`, `max_servings`,
+  `max_total_time`, `tags`, `course`, `era`) and return a per-chunk `metadata`
+  object when frontmatter was present. **Reindex the silo** after upgrading so
+  existing chunks pick up frontmatter metadata
+  (`pal pull --full <folder>` or `repair_silo` / `llmli repair <silo>`).
+
 ## Query Contract
 
 `run_ask` follows this order:

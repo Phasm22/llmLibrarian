@@ -84,6 +84,14 @@ def run_retrieve(
     config_path: str | Path | None = None,
     get_chroma_client: Any | None = None,
     source: str | None = None,
+    category: str | None = None,
+    main_protein: str | None = None,
+    min_servings: int | None = None,
+    max_servings: int | None = None,
+    max_total_time: int | None = None,
+    tags: str | list[str] | None = None,
+    course: str | None = None,
+    era: str | None = None,
 ) -> dict:
     """
     Return raw retrieved chunks with metadata — no LLM synthesis.
@@ -94,6 +102,9 @@ def run_retrieve(
     Pass doc_type= to restrict to a specific document type stored in chunk metadata
     (e.g. 'transcript', 'resume', 'pdf', 'code', 'other').
     Pass source= (an indexed file's full path) to rank chunks within that file only.
+    Pass category / main_protein / course / era for exact metadata matches; min_servings /
+    max_servings / max_total_time for numeric ranges; tags for membership against the
+    flattened tags/dietary_flags fields written at ingest from YAML frontmatter.
     Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) are
     retrieved as LOOKUP: the handlers that answer them live in run_ask, so here a
     short-circuit could only ever return nothing. The routed intent is kept as
@@ -162,6 +173,14 @@ def run_retrieve(
             db_path=str(db_path) if db_path is not None else None,
             get_chroma_client=_gc,
             source=source,
+            category=category,
+            main_protein=main_protein,
+            min_servings=min_servings,
+            max_servings=max_servings,
+            max_total_time=max_total_time,
+            tags=tags,
+            course=course,
+            era=era,
         )
     if deterministic_intent:
         result["deterministic_intent"] = deterministic_intent

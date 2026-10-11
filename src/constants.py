@@ -54,6 +54,9 @@ LLMLI_IMAGE_COLLECTION = "llmli_image"
 CHUNK_SIZE = 1000
 # ~15% of CHUNK_SIZE; reduces boundary splits vs 10% (100) for sentence/code continuity.
 CHUNK_OVERLAP = 150
+# Markdown files at or under this size (chars, after frontmatter strip) become one chunk.
+# Override with LLMLIBRARIAN_MD_SINGLE_CHUNK_MAX. Larger .md splits on headings first.
+MD_SINGLE_CHUNK_MAX = 4000
 
 # Ingestion
 ADD_BATCH_SIZE = 256
