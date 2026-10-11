@@ -413,9 +413,41 @@ using them as a regression gate.
   module at startup. Restart it to pick up the fix.
 - **Carrot-cake cap.** The `source_diversity_cap` silo-scoped widening was not
   re-tested. Re-run that case and drop the workaround if the fix covers it.
-- **Secondary findings.** Format duplication, chunking across recipes, OCR
-  fractions, long-s, junk chunks, and catalog drift are unchanged. Junk chunks
+- **Secondary findings.** Format duplication is fixed (see below). Chunking
+  across recipes, OCR fractions, long-s, junk chunks, and catalog drift are
+  unchanged. Junk chunks
   now cost the most: in `lefse`, a vector-#1 plate caption sits above the real
   recipe.
 - **Option A.** Still the durable path if per-query BM25 over up to 2000
   fetched documents becomes slow on large unscoped indexes.
+
+## Recipes dedupe (2026-10-10)
+
+One copy per book is indexed now. No source files were deleted: the other
+copies are kept out by the silo's `exclude_patterns`, which `llmli add
+--exclude` persisted to the registry and which the watcher reads at startup.
+The silo went from 5,401 to 3,114 chunks and from 44 to 35 files.
+
+| Book | Indexed copy | Why |
+|---|---|---|
+| Nelson Family Recipe Book | root PDF | One page per recipe, so one chunk per recipe, with page numbers |
+| Boston Cooking-School | PDF | Both copies are the same scan OCR; the PDF chunks by page |
+| USDA Harvest of Recipes | PDF | Clean extraction, page-aligned |
+| Book of American Baking | `02-baking/*.txt` | The original Gutenberg text; the PDF is a local rendering of it |
+| The Ideal Bartender | `03-drinks/*.txt` | Same reason |
+| UMaine Make Your Own | `05-extracted-text/*.txt` | The PDF extraction splits words ("Cauliflo wer") |
+| UT-Houston mocktails | PDF | Same content, one chunk |
+| Hannah Glasse | `05-extracted-text/*.txt` | The PDF (51 MB) is over the 20 MB ingest limit; also excluded explicitly |
+
+To restore a copy, remove its pattern from `exclude_patterns` in the registry
+entry and re-run `llmli add`. `Vitamix-100th-Anniversary-Cookbook.pdf` (27 MB)
+is also over the size limit and has never been indexed.
+
+After the dedupe, the Mint Julep top 10 has no repeated passages. Before, three
+slots held the same editorial from three Bullock copies. The other evidence
+queries kept their pass results. `lefse` now has the p.95 recipe at #3.
+
+The corpus-meta files (`README.md`, `RELATIONAL-RETRIEVAL.md`, `CATALOG.csv`,
+`03-drinks/smoothies/WISHLIST.md`) are excluded the same way. The README held
+the silo's test prompts verbatim, so it matched them lexically. Final state:
+3,097 chunks in 31 files.
