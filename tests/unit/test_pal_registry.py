@@ -46,7 +46,7 @@ def test_cleanup_keeps_two_real_silos_that_share_a_path(tmp_path: Path):
     """The 2026-09-14 data loss, as a regression test.
 
     Both slugs carry a hash suffix, so both are real silos — this is a duplicate
-    for a human to resolve with `llmli rm`, not something to delete silently.
+    for a human to resolve with `llmli rm <silo> --yes`, not something to delete silently.
     Before the guard, canonicalizing silo paths through symlinks made these two
     report one path, and cleanup deleted `llmlibrarian-46ad0cbe`, orphaning 2467
     chunks in Chroma with nothing pointing at them.

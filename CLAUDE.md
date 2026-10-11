@@ -24,9 +24,9 @@ ollama pull llama3.2:latest   # DEFAULT_MODEL; only needed for `pal ask` / `llml
 llmli add <folder>
 llmli ask --in <silo> "query"
 llmli ls                       # Scope column marks private silos
-llmli private <silo> [--off]   # exclude a silo from unscoped retrieval
+llmli private <silo> --yes [--off]   # exclude a silo from unscoped retrieval (--yes required)
 llmli inspect <silo>
-llmli repair <silo>
+llmli repair <silo> --yes            # wipe + re-index; --dry-run to preview
 llmli repair-ladder
 llmli rehydrate [--dry-run]
 llmli capabilities
@@ -35,7 +35,7 @@ llmli capabilities
 pal pull <folder>              # --watch for daemon
 pal ask --in <silo> "query"
 pal ls --status
-pal private <silo> [--off]     # same flag, operator-side
+pal private <silo> --yes [--off]  # same flag, operator-side (--yes required)
 pal queries                    # audit past MCP queries (--grep/--silo/--since/--summary)
 pal chroma install|start|stop|status|logs|uninstall
 pal mcp install|start|stop|status|logs|uninstall
@@ -133,7 +133,7 @@ follows the same rule at its one reader, `load_tax_ledger_rows`. For an endpoint
 that should never open a private silo (Open-WebUI), start it with
 `LLMLIBRARIAN_MCP_PRIVATE_READS=none` or serve it through the lite mount.
 
-Set it with `llmli private <slug>` / `pal private <slug>`, the `set_silo_privacy`
+Set it with `llmli private <slug> --yes` / `pal private <slug> --yes`, the `set_silo_privacy`
 MCP tool, `add_silo(private=True)`, or the lock toggle in the macOS app. Clearing
 the flag is the direction that widens exposure, so CLI, MCP, and UI all require
 an explicit confirmation for `--off`.

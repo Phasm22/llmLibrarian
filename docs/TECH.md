@@ -33,7 +33,7 @@ The system is organized around a few stable ideas:
   `max_total_time`, `tags`, `course`, `era`) and return a per-chunk `metadata`
   object when frontmatter was present. **Reindex the silo** after upgrading so
   existing chunks pick up frontmatter metadata
-  (`pal pull --full <folder>` or `repair_silo` / `llmli repair <silo>`).
+  (`pal pull --full <folder>` or `repair_silo` / `llmli repair <silo> --yes`).
 
 ## Query Contract
 
@@ -105,7 +105,7 @@ Watcher locks live in `~/.pal/watch_locks/*.pid`.
 The broader maintenance and inspection surfaces are intentionally thin wrappers around the same index state: use them when you need to confirm freshness, support, or cleanup, not as separate product modes.
 
 Repair/recovery surfaces:
-- `llmli repair` (L1) for per-silo wipe + full re-index
+- `llmli repair <silo> --yes` (L1) for per-silo wipe + full re-index (`--dry-run` to preview)
 - `llmli repair-ladder` (L2 diagnostics) for sqlite integrity + segment scan
 - `llmli rehydrate` (L3 helper) for registry-driven rebuild
 

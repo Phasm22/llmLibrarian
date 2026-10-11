@@ -172,7 +172,7 @@ def format_report(
         lines.append("Orphaned sources (source folder deleted):")
         for o in orphans:
             lines.append(f"  {o.get('slug')}: {o.get('path')}")
-            lines.append("    fix: llmli rm <silo>")
+            lines.append("    fix: llmli rm <silo> --yes  # or --dry-run to preview")
 
     if not dupes and not overlaps and not mismatches and not orphans:
         lines.append("All clean.")

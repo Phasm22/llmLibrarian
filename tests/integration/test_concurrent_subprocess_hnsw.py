@@ -17,10 +17,10 @@ through a fresh PersistentClient after each scenario.
 Scenarios:
   t1 — two `llmli add` subprocesses on different folders sharing one DB.
   t2 — long-lived "MCP-like" reader subprocess hammering the collection while
-       another subprocess runs `llmli repair`.
+       another subprocess runs `llmli repair --yes`.
   t3 — long-running "watcher-like" subprocess that keeps re-running
        `llmli add` on a churning folder while another subprocess runs
-       `llmli add --full` against the same path.
+       `llmli add --full --yes` against the same path.
 
 Notes on faithfulness to production:
 - We do NOT spin up a real fastmcp HTTP server or a real systemd/launchd
@@ -310,7 +310,7 @@ def test_t1_two_concurrent_llmli_add_subprocesses(scratch_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# t2: long-lived reader subprocess (MCP-like) concurrently with `llmli repair`.
+# t2: long-lived reader subprocess (MCP-like) concurrently with `llmli repair --yes`.
 # ---------------------------------------------------------------------------
 
 
@@ -322,7 +322,7 @@ def test_t1_two_concurrent_llmli_add_subprocesses(scratch_dir: Path) -> None:
 def test_t2_reader_subprocess_vs_repair(scratch_dir: Path) -> None:
     """
     Cross-process race coverage. With LLMLIBRARIAN_EXIT_ON_STALE_GENERATION=1
-    in the reader, `llmli repair` bumps the write generation file, and the
+    in the reader, `llmli repair --yes` bumps the write generation file, and the
     reader self-exits (rc=99) on its next get_client() rather than SIGSEGV'ing
     against ChromaDB's stale process-global Rust state.
     """
@@ -346,7 +346,7 @@ def test_t2_reader_subprocess_vs_repair(scratch_dir: Path) -> None:
                 f"{_read_log_tail(logs / 't2_reader.log')}"
             )
 
-        repair = _spawn(_llmli_cmd("repair", slug), env, logs / "t2_repair.log")
+        repair = _spawn(_llmli_cmd("repair", slug, "--yes"), env, logs / "t2_repair.log")
         rc_repair = _wait(repair, timeout=600)
         assert rc_repair == 0, (
             f"repair failed (rc={rc_repair}):\n{_read_log_tail(logs / 't2_repair.log')}"
@@ -372,7 +372,7 @@ def test_t2_reader_subprocess_vs_repair(scratch_dir: Path) -> None:
 
     # Final consistency check runs in a fresh subprocess: the pytest process's
     # ChromaDB global runtime has cached state from prior test_t1, and the
-    # on-disk segments have been rebuilt by `llmli repair` since then.
+    # on-disk segments have been rebuilt by `llmli repair --yes` since then.
     # Opening a "fresh" PersistentClient in this process still reuses that
     # tainted runtime and SIGSEGVs. A subprocess starts cold.
     _subprocess_assert_consistent(db_path, slug)
@@ -416,7 +416,7 @@ if not report.get("consistent"):
 
 # ---------------------------------------------------------------------------
 # t3: long-running watcher-like subprocess re-indexing on a churning folder,
-#     concurrent with a `llmli add --full` subprocess on the same silo path.
+#     concurrent with a `llmli add --full --yes` subprocess on the same silo path.
 # ---------------------------------------------------------------------------
 
 
@@ -458,7 +458,7 @@ def test_t3_watcher_loop_vs_full_reindex(scratch_dir: Path) -> None:
                 encoding="utf-8",
             )
 
-        full = _spawn(_llmli_cmd("add", "--full", str(folder)), env, logs / "t3_full.log")
+        full = _spawn(_llmli_cmd("add", "--full", "--yes", str(folder)), env, logs / "t3_full.log")
         rc_full = _wait(full, timeout=900)
         assert rc_full == 0, (
             f"full reindex failed (rc={rc_full}):\n{_read_log_tail(logs / 't3_full.log')}"

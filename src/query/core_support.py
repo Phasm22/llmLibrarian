@@ -223,7 +223,8 @@ def _safe_query(
         warning = (
             f"Silo '{silo_slug}' has a ChromaDB index inconsistency ({type(exc).__name__}: {exc}). "
             "Results were retrieved globally and filtered to this silo in Python. "
-            "Fix: run `llmli repair <silo>` or `llmli add --full <folder>` to re-index."
+            "Fix: run `llmli repair <silo> --yes` or `llmli add --full <folder> --yes` "
+            "(preview with `--dry-run` first)."
         )
         print(f"[llmli WARNING] {warning}", file=sys.stderr)
         if db_path:

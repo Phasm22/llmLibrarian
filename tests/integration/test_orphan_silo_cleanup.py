@@ -1,7 +1,7 @@
 """Removing a silo that is no longer in the registry must still delete its chunks.
 
 This is the recovery path for the 2026-09-14 incident: `llmlibrarian-46ad0cbe`
-lost its registry entry while 2467 chunks stayed in Chroma. `llmli rm <slug>` is
+lost its registry entry while 2467 chunks stayed in Chroma. `llmli rm <slug> --yes` is
 what should clear those, and it could not — the fallback re-slugified an
 already-hashed slug ("alpha-deb12c9c" -> "alpha-deb12c9c-9b411e47"), so the
 delete matched nothing and reported success.
@@ -50,7 +50,7 @@ def test_remove_registered_silo_deletes_chunks(tmp_path: Path) -> None:
 
 
 def test_remove_orphaned_slug_deletes_chunks(tmp_path: Path) -> None:
-    """The registry entry is gone; the chunks are not. `llmli rm <slug>` must clear them."""
+    """The registry entry is gone; the chunks are not. `llmli rm <slug> --yes` must clear them."""
     db, slug = _ingest(tmp_path)
 
     # Reproduce the incident: drop only the registry entry.

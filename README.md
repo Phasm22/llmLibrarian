@@ -59,7 +59,7 @@ There is **no** built-in “the AI remembers you forever.” Each question uses 
 
 **Privacy in one line:** the **full corpus** stays local; **only retrieved chunks** go to a cloud model when you use MCP with a cloud host. `pal ask` keeps retrieval and answer on your machine.
 
-**Private silos.** Some folders should not be reachable by a broad question at all. Mark one with `llmli private <silo>` (or `pal private <silo>`, or the lock toggle in the macOS app) and it is excluded from every unscoped query — it only answers when a caller names it with `--in <silo>` / `silo=<silo>`. The filter is applied in the query itself, not left to the calling model's judgement.
+**Private silos.** Some folders should not be reachable by a broad question at all. Mark one with `llmli private <silo> --yes` (or `pal private <silo> --yes`, or the lock toggle in the macOS app) and it is excluded from every unscoped query — it only answers when a caller names it with `--in <silo>` / `silo=<silo>`. The filter is applied in the query itself, not left to the calling model's judgement.
 
 ---
 
@@ -132,7 +132,7 @@ More examples: [docs/GUIDE.md](docs/GUIDE.md#asking-good-questions).
 ```bash
 pal ls --status
 llmli repair-ladder              # read-only diagnostics
-llmli repair <silo>              # wipe + re-index one silo if Chroma errors
+llmli repair <silo> --yes        # wipe + re-index one silo if Chroma errors (--dry-run to preview)
 ```
 
 If MCP and CLI both run, use **Chroma server mode** (one `chroma run`, everyone else HTTP) — [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).
@@ -167,7 +167,7 @@ Details: [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md#local-runtime-on-de
 | Symptom | Try |
 |---------|-----|
 | Vague or empty answers | `pal inspect <silo>`; narrow with `--in`; reindex if stale (`pal ls --status`) |
-| `Error finding id` / Chroma weirdness | `llmli repair <silo>` |
+| `Error finding id` / Chroma weirdness | `llmli repair <silo> --yes` (or `--dry-run` first) |
 | MCP returns 0 chunks but silo has chunks | `health()` + `list_silos` — index/tool issue, not “no data” |
 | Scan PDFs with no text | OCR path depends on OS; see [docs/GUIDE.md](docs/GUIDE.md#troubleshooting) |
 
