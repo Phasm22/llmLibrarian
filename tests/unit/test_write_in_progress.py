@@ -170,10 +170,30 @@ def test_mcp_reads_do_not_queue_behind_a_background_write_in_http_mode(monkeypat
         mcp_server._chroma_lock.release()
 
 
-def test_mcp_writes_still_serialize_in_http_mode(monkeypatch):
+def test_mcp_writes_do_not_queue_behind_a_background_write_in_http_mode(monkeypatch):
+    """A background reindex used to hold the mutex for its whole write phase, and
+    every watcher update_file died after 5s. chroma run orders those writes."""
     import mcp_server
 
     monkeypatch.setenv("LLMLIBRARIAN_CHROMA_HOST", "127.0.0.1")
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_WRITE_LOCK", raising=False)
+    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
+
+    assert mcp_server._chroma_lock.acquire(timeout=1)
+    try:
+        with mcp_server._mcp_chroma_lock("update_file", write=True):
+            pass
+    finally:
+        mcp_server._chroma_lock.release()
+
+
+def test_mcp_writes_still_serialize_in_embedded_mode(monkeypatch):
+    import chroma_client
+    import mcp_server
+
+    monkeypatch.setattr(chroma_client, "_auto_transport", None)
+    monkeypatch.delenv("LLMLIBRARIAN_CHROMA_HOST", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_CHROMA_AUTODETECT", "0")
     monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
 
     assert mcp_server._chroma_lock.acquire(timeout=1)
@@ -185,12 +205,31 @@ def test_mcp_writes_still_serialize_in_http_mode(monkeypatch):
         mcp_server._chroma_lock.release()
 
 
+def test_mcp_write_lock_override_restores_serialization(monkeypatch):
+    import mcp_server
+
+    monkeypatch.setenv("LLMLIBRARIAN_CHROMA_HOST", "127.0.0.1")
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_WRITE_LOCK", "1")
+    monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
+
+    assert mcp_server._chroma_lock.acquire(timeout=1)
+    try:
+        with pytest.raises(TimeoutError):
+            with mcp_server._mcp_chroma_lock("update_file", write=True):
+                pass
+    finally:
+        mcp_server._chroma_lock.release()
+
+
 def test_mcp_reads_still_serialize_in_embedded_mode(monkeypatch):
     """Embedded mode is where concurrent HNSW access actually corrupts — the
     mutex must not be skipped there."""
+    import chroma_client
     import mcp_server
 
+    monkeypatch.setattr(chroma_client, "_auto_transport", None)
     monkeypatch.delenv("LLMLIBRARIAN_CHROMA_HOST", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_CHROMA_AUTODETECT", "0")
     monkeypatch.setattr(mcp_server, "_mcp_lock_timeout_seconds", lambda **_: 0.01)
 
     assert mcp_server._chroma_lock.acquire(timeout=1)
