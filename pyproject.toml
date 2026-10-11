@@ -77,68 +77,31 @@ build-backend = "hatchling.build"
 dev-mode-dirs = [".", "src"]
 
 [tool.hatch.build.targets.wheel]
-# Do not ship a top-level `src` package. Modules live at the wheel root so an
-# installed `llmli` can `import state` without depending on cwd or path hacks.
-# (A stale system install that only dropped cli.py fails with
-# ModuleNotFoundError: No module named 'state' — reinstall this wheel to fix.)
-packages = []
-
-[tool.hatch.build.targets.wheel.force-include]
-"pal.py"          = "pal.py"
-"cli.py"          = "cli.py"
-"pal_registry.py" = "pal_registry.py"
-"pal_daemon.py"   = "pal_daemon.py"
-"pal_pull.py"     = "pal_pull.py"
-"pal_watch.py"    = "pal_watch.py"
-"mcp_server.py"   = "mcp_server.py"
-"archetypes.yaml" = "archetypes.yaml"
-"src/artifacts.py" = "artifacts.py"
-"src/chroma_backend.py" = "chroma_backend.py"
-"src/chroma_client.py" = "chroma_client.py"
-"src/chroma_lock.py" = "chroma_lock.py"
-"src/code_drift.py" = "code_drift.py"
-"src/constants.py" = "constants.py"
-"src/doc_type_taxonomy.py" = "doc_type_taxonomy.py"
-"src/document_read.py" = "document_read.py"
-"src/embeddings.py" = "embeddings.py"
-"src/env_bootstrap.py" = "env_bootstrap.py"
-"src/file_registry.py" = "file_registry.py"
-"src/floor.py" = "floor.py"
-"src/frontmatter.py" = "frontmatter.py"
-"src/geocode.py" = "geocode.py"
-"src/image_embeddings.py" = "image_embeddings.py"
-"src/ingest_journal.py" = "ingest_journal.py"
-"src/jobs_runtime.py" = "jobs_runtime.py"
-"src/load_config.py" = "load_config.py"
-"src/mcp_contract.py" = "mcp_contract.py"
-"src/mcp_result_cache.py" = "mcp_result_cache.py"
-"src/model_idle.py" = "model_idle.py"
-"src/operations.py" = "operations.py"
-"src/operations_find.py" = "operations_find.py"
-"src/perf_profile.py" = "perf_profile.py"
-"src/processors.py" = "processors.py"
-"src/proctitle.py" = "proctitle.py"
-"src/query_audit.py" = "query_audit.py"
-"src/registry_lock.py" = "registry_lock.py"
-"src/reranker.py" = "reranker.py"
-"src/scan_patterns.py" = "scan_patterns.py"
-"src/silo_audit.py" = "silo_audit.py"
-"src/state.py" = "state.py"
-"src/style.py" = "style.py"
-"src/watch_scan.py" = "watch_scan.py"
-"src/watch_telemetry.py" = "watch_telemetry.py"
-"src/ingest" = "ingest"
-"src/query" = "query"
-"src/tax" = "tax"
-"src/orchestration" = "orchestration"
-"src/llmli_evals" = "llmli_evals"
-"src/vision_ocr.swift" = "vision_ocr.swift"
-"deploy/systemd/llmlibrarian-mcp@.service" = "deploy/systemd/llmlibrarian-mcp@.service"
-"deploy/systemd/llmlibrarian-chroma@.service" = "deploy/systemd/llmlibrarian-chroma@.service"
-"deploy/launchd/com.tjm4.llmlibrarian-mcp.plist" = "deploy/launchd/com.tjm4.llmlibrarian-mcp.plist"
-"deploy/launchd/com.llmlibrarian.chroma.plist" = "deploy/launchd/com.llmlibrarian.chroma.plist"
-"scripts/run_mcp_http.sh" = "scripts/run_mcp_http.sh"
-"scripts/run_chroma_server.sh" = "scripts/run_chroma_server.sh"
+# Selected, never force-included: hatchling copies force-include entries into
+# editable wheels too, and those frozen copies in site-packages shadow the
+# checkout that the dev-mode-dirs .pth points at.  An editable wheel carries
+# only that .pth; a regular wheel ships exactly this list.
+# `sources = ["src"]` strips the src/ prefix so a regular (non-editable) install
+# puts state.py, query/, ingest/ ... at the wheel root and `llmli` can
+# `import state` without a checkout.
+sources = ["src"]
+only-include = [
+    "src",
+    "pal.py",
+    "cli.py",
+    "pal_registry.py",
+    "pal_daemon.py",
+    "pal_pull.py",
+    "pal_watch.py",
+    "mcp_server.py",
+    "archetypes.yaml",
+    "deploy/systemd/llmlibrarian-mcp@.service",
+    "deploy/systemd/llmlibrarian-chroma@.service",
+    "deploy/launchd/com.tjm4.llmlibrarian-mcp.plist",
+    "deploy/launchd/com.llmlibrarian.chroma.plist",
+    "scripts/run_mcp_http.sh",
+    "scripts/run_chroma_server.sh",
+]
 
 [dependency-groups]
 dev = [
