@@ -195,7 +195,7 @@ def test_run_add_uses_and_persists_saved_excludes(monkeypatch, tmp_path):
     excludes = get_silo_exclude_patterns(db_path, slug)
     assert "vendor/" in excludes
     assert "*.tmp" in excludes
-    assert "/cortex/" in excludes
+    assert "/much thinks/cortex/" in excludes
 
 
 def test_run_add_persists_default_excludes_for_new_silo(monkeypatch, tmp_path):
@@ -220,7 +220,7 @@ def test_run_add_persists_default_excludes_for_new_silo(monkeypatch, tmp_path):
     assert failures == 0
     assert files_indexed == 0
     excludes = get_silo_exclude_patterns(db_path, slug)
-    assert "/cortex/" in excludes
+    assert "/much thinks/cortex/" in excludes
 
 
 def test_run_add_writes_status_file(monkeypatch, tmp_path):

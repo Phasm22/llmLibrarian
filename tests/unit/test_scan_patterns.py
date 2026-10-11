@@ -96,6 +96,11 @@ def test_scan_patterns_stays_import_light():
     assert out.stdout.strip() == "[]", f"scan_patterns pulled in {out.stdout.strip()}"
 
 
+def test_only_the_intent_cortex_is_excluded():
+    assert not should_index("/vault/much thinks/cortex/plan/a.md", ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE)
+    assert should_index("/vault/cortex/resumes/a.md", ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE)
+
+
 def test_watch_daemon_imports_stay_light():
     """A watcher is resident for days per silo; every heavy import is paid x N.
 

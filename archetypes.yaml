@@ -12,7 +12,7 @@ archetypes:
       - "*.md"
       - "*.txt"
     exclude:
-      - "/cortex/"
+      - "/much thinks/cortex/"
     prompt: |
       You are reading someone's private journal entries and answering their questions about themselves.
       Speak directly to them as "you."
