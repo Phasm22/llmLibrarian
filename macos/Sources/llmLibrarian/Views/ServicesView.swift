@@ -180,6 +180,15 @@ struct ServiceDetail: View {
                     .controlSize(.small)
                 }
 
+                if service.kind == .watcher {
+                    InspectorHeading("Recent changes")
+                    if service.recentChanges.isEmpty {
+                        Text("Nothing pushed recently").zfont(.callout).foregroundStyle(.secondary)
+                    } else {
+                        ForEach(service.recentChanges) { WatchChangeRow(change: $0) }
+                    }
+                }
+
                 InspectorHeading("Files")
                 DetailRow("Label", service.label)
                 HStack {
@@ -192,5 +201,25 @@ struct ServiceDetail: View {
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+}
+
+struct WatchChangeRow: View {
+    let change: WatchChange
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(change.removed ? "−" : "+")
+                .zfont(.callout, weight: .semibold, design: .monospaced)
+                .foregroundStyle(change.removed ? Color.red : Color.green)
+                .frame(width: 10)
+            Text(change.name)
+                .foregroundStyle(change.isCount ? .secondary : .primary)
+                .lineLimit(1).truncationMode(.middle)
+                .help(change.path)
+            Spacer(minLength: 8)
+            Text(Dates.relativeString(change.at)).foregroundStyle(.secondary).monospacedDigit()
+        }
+        .zfont(.callout)
     }
 }

@@ -16,6 +16,16 @@ enum SnapshotMode {
             NSApp.appearance = NSAppearance(named: appearance)
             for item in SidebarItem.allCases {
                 store.page = item
+                if item == .silos {
+                    store.selectedSilo = store.silos.first { store.watcher(for: $0)?.recentChanges.isEmpty == false }?.slug
+                    store.showInspector = store.selectedSilo != nil
+                }
+                if item == .services {
+                    // Show a watcher's details so the inspector is in the shot too.
+                    let watcher = store.watchers.first { !$0.recentChanges.isEmpty } ?? store.watchers.first
+                    store.selectedService = watcher?.label
+                    store.showInspector = watcher != nil
+                }
                 try? await Task.sleep(for: .seconds(1.2))
                 capture(to: "\(dir)/\(item.rawValue)-\(appearance == .aqua ? "light" : "dark").png")
             }

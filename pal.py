@@ -1840,6 +1840,10 @@ class _SiloEventHandler(FileSystemEventHandler):
         self._watcher.enqueue_update(event.dest_path)
 
 
+# How many changed paths a batch_drain event names (counts stay exact).
+WATCH_EVENT_PATH_SAMPLE = 5
+
+
 class SiloWatcher:
     def __init__(
         self,
@@ -1972,6 +1976,12 @@ class SiloWatcher:
             return
         self._queue_action(str(p), "delete")
 
+    def _relative(self, path: str) -> str:
+        try:
+            return str(Path(path).relative_to(self.root))
+        except ValueError:
+            return path
+
     def _drain_due(self, now: float | None = None) -> int:
         if now is None:
             now = time.time()
@@ -1991,6 +2001,8 @@ class SiloWatcher:
         removed = 0
         skipped = 0
         errors: list[tuple[str, str]] = []
+        updated_paths: list[str] = []
+        removed_paths: list[str] = []
         with self._lock:
             for path, action, attempts in due:
                 tool = "remove_file" if action == "delete" else "update_file"
@@ -2002,10 +2014,12 @@ class SiloWatcher:
                 if status in ("updated", "removed", "unchanged", "skipped"):
                     if action == "delete":
                         removed += 1
+                        removed_paths.append(path)
                     elif status in ("unchanged", "skipped"):
                         skipped += 1
                     else:
                         updated += 1
+                        updated_paths.append(path)
                 elif res.get("busy") or res.get("retryable") or status == "busy":
                     # Lock contention is transient: retry without treating it as a
                     # hard failure (which used to flood llmli_last_failures.json).
@@ -2054,6 +2068,9 @@ class SiloWatcher:
             updated=updated,
             removed=removed,
             skipped=skipped,
+            # Capped samples, root-relative, so the status app can show what changed.
+            updated_paths=[self._relative(p) for p in updated_paths[:WATCH_EVENT_PATH_SAMPLE]],
+            removed_paths=[self._relative(p) for p in removed_paths[:WATCH_EVENT_PATH_SAMPLE]],
             errors=[{"path": p, "error": e} for p, e in errors[:10]],
             duration_ms=duration_ms,
             last_failures_path=str(failures_path(self.db_path)),

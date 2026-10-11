@@ -202,8 +202,12 @@ struct InspectorHeading: View {
     let text: String
     init(_ text: String) { self.text = text }
     var body: some View {
-        Text(text).zfont(.caption, weight: .semibold).foregroundStyle(.secondary).textCase(.uppercase)
-            .padding(.top, 6)
+        // A hairline above each section keeps stacked inspector sections apart.
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            Text(text).zfont(.caption, weight: .semibold).foregroundStyle(.secondary).textCase(.uppercase)
+        }
+        .padding(.top, 8)
     }
 }
 

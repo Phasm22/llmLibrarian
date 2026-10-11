@@ -57,6 +57,7 @@ enum Collector {
                                  probeOK: nil, probeDetail: nil,
                                  jobs: jobs, plists: plists, config: config)
             s.siloSlug = slug
+            s.recentChanges = WatchActivity.recentChanges(logPath: s.logPath, limit: 4)
             if let lock = locks[slug] {
                 // Lock claims a pid that is not the one launchd is running → stale.
                 if let jobPid = s.pid, lock.pid != jobPid { s.lockStale = true }

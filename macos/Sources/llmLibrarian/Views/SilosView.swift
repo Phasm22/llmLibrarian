@@ -199,6 +199,7 @@ struct SiloDetail: View {
                         DetailRow("Process", "pid \(pid)" + (w.uptime.map { " · up \($0)" } ?? ""))
                     }
                     if let e = w.lastExit, e != 0 { DetailRow("Last exit code", String(e)) }
+                    ForEach(w.recentChanges.prefix(3)) { WatchChangeRow(change: $0) }
                     HStack {
                         Button("Show service") { store.show(service: w) }
                         Button("Log") { store.openLog(w.logPath) }
