@@ -79,7 +79,7 @@ This intake process determines whether a service is ready to be monitored. The g
 #### Identity
 
 - **One sentence:** Exposes llmLibrarian MCP tools over HTTP/SSE so `pal pull --watch` and remote agents can call `add_silo`, `query_personal_knowledge`, `health`, etc., without spawning a new Python process per request.
-- **Triggers:** systemd user unit `llmlibrarian-mcp@<user>.service` or launchd `com.llmlibrarian.mcp`; `ExecStart` → `scripts/run_mcp_http.sh` → `mcp_server.py` with `LLMLIBRARIAN_MCP_TRANSPORT=streamable-http` (from `.env.mcp`).
+- **Triggers:** systemd user unit `llmlibrarian-mcp.service` (rendered from `deploy/systemd/llmlibrarian-mcp@.service` by `pal mcp install`) or launchd `com.llmlibrarian.mcp`; `ExecStart` → `scripts/run_mcp_http.sh` → `mcp_server.py` with `LLMLIBRARIAN_MCP_TRANSPORT=streamable-http` (from `.env.mcp`).
 
 #### Execution
 
@@ -100,7 +100,7 @@ This intake process determines whether a service is ready to be monitored. The g
 
 #### Logging current state
 
-- **Where / format:** Linux: `journalctl -u llmlibrarian-mcp@$USER`; macOS: `deploy/launchd` stdout/stderr paths; app log level `LLMLIBRARIAN_MCP_LOG_LEVEL` (default `warning`).
+- **Where / format:** Linux: `journalctl --user -u llmlibrarian-mcp`; macOS: `deploy/launchd` stdout/stderr paths; app log level `LLMLIBRARIAN_MCP_LOG_LEVEL` (default `warning`).
 - **Tells what happened?** Partially — startup/errors and HTTP stack; tool-level failures are in MCP tool responses, not always stderr.
 - **How you know it's broken:** `curl -sS http://127.0.0.1:8765/healthz` fails; `pal pull --watch` prints MCP unreachable; `pal install --mcp` unit inactive.
 

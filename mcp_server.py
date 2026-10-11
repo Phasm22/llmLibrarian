@@ -400,10 +400,10 @@ if _MCP_PROFILE == "lite":
 
 
 # ---------------------------------------------------------------------------
-# Serializes ALL ChromaDB client use across concurrent MCP tool calls (in-process).
-# Cross-process safety uses flock in src/chroma_lock.py (shared reads, exclusive writes).
-# ChromaDB's Rust HNSW writer is not safe for concurrent use — simultaneous
-# reads and background reindex writes corrupted link_lists.bin to 680 GB.
+# In-process mutex for embedded Chroma only. Two threads driving one
+# PersistentClient corrupted link_lists.bin to 680 GB. Under chroma run the
+# server orders HTTP access, so this mutex is skipped (see _mcp_chroma_lock).
+# Cross-process flock lives in src/chroma_lock.py and is also skipped in HTTP mode.
 _chroma_lock = threading.Lock()
 
 
@@ -467,10 +467,7 @@ def _mcp_read_lock_disabled() -> bool:
     queue behind this process's own background reindex, which is why a query
     returns ``busy`` for the whole duration of a watcher-triggered index.
 
-    Writes keep taking it in both modes: they are rare, and serializing our own
-    ingest against itself is cheap insurance.
-
-    Escape hatch: ``LLMLIBRARIAN_MCP_READ_LOCK=1`` restores the old behavior.
+    Escape hatch: ``LLMLIBRARIAN_MCP_READ_LOCK=1`` restores the read mutex.
     """
     if (os.environ.get("LLMLIBRARIAN_MCP_READ_LOCK", "").strip().lower()
             in {"1", "true", "yes", "force"}):
@@ -483,17 +480,43 @@ def _mcp_read_lock_disabled() -> bool:
         return False
 
 
+def _mcp_write_lock_disabled() -> bool:
+    """True when MCP writes should not take the in-process Chroma mutex.
+
+    Same reason as reads. This mutex does not span the stdio and HTTP MCP
+    processes, and under ``chroma run`` it does not protect HNSW. Holding it
+    across a background reindex makes watcher ``update_file`` calls time out
+    and land in ``llmli_last_failures``. The server orders concurrent HTTP writes.
+
+    Embedded mode still takes it. Escape hatch: ``LLMLIBRARIAN_MCP_WRITE_LOCK=1``.
+    """
+    if (os.environ.get("LLMLIBRARIAN_MCP_WRITE_LOCK", "").strip().lower()
+            in {"1", "true", "yes", "force"}):
+        return False
+    try:
+        from chroma_client import is_http_mode
+
+        return is_http_mode()
+    except Exception:
+        return False
+
+
 @contextmanager
 def _mcp_chroma_lock(operation: str, write: bool = False, *, writer_wait: bool = False):
-    """Serialize Chroma use inside this MCP process.
+    """Serialize Chroma use inside this MCP process when that is load-bearing.
 
-    ``write=True`` keeps the lock even in HTTP/server mode (writers must still
-    serialize against each other). ``writer_wait=True`` additionally uses the
-    long writer timeout budget — for background ingest hooks and rare sync
-    repairs, not for watcher ``update_file`` traffic (those should return
-    ``busy`` quickly rather than hang the HTTP request for up to 120s).
+    In HTTP/server mode neither reads nor writes take the mutex. Embedded mode
+    still serializes both. ``writer_wait=True`` uses the long writer budget
+    when the mutex is actually taken (background ingest hooks, ``repair_silo``).
+    Sync high-frequency tools (``update_file`` / ``remove_file``) keep the short
+    budget and return ``busy`` quickly rather than hang the HTTP request.
     """
-    if not write and _mcp_read_lock_disabled():
+    if write:
+        if _mcp_write_lock_disabled():
+            yield
+            _HEALTH.recover(_HEALTH_CHROMA_BUSY, "queries succeeding")
+            return
+    elif _mcp_read_lock_disabled():
         yield
         _HEALTH.recover(_HEALTH_CHROMA_BUSY, "queries succeeding")
         return
@@ -2184,6 +2207,8 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
         try:
             def _acquire_for_write() -> None:
                 nonlocal _write_lock_held
+                if _mcp_write_lock_disabled():
+                    return
                 _acquire_chroma_lock("trigger_reindex", write=True)
                 _write_lock_held = True
 
@@ -2492,6 +2517,8 @@ def add_silo(
         try:
             def _acquire_for_write() -> None:
                 nonlocal _write_lock_held
+                if _mcp_write_lock_disabled():
+                    return
                 _acquire_chroma_lock("add_silo", write=True)
                 _write_lock_held = True
 
