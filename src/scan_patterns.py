@@ -49,6 +49,37 @@ ADD_DEFAULT_EXCLUDE = [
 ]
 
 
+def normalize_patterns(patterns: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Return unique non-empty patterns in first-seen order."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in patterns or []:
+        pattern = str(raw).strip()
+        if not pattern or pattern in seen:
+            continue
+        seen.add(pattern)
+        out.append(pattern)
+    return out
+
+
+def merge_exclude_patterns(*pattern_groups: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Merge exclude pattern lists, preserving order and dropping duplicates.
+
+    An omitted or empty group is a no-op — it never clears patterns from other
+    groups. Callers that mean "no extras this run" pass ``None`` or ``[]`` and
+    still keep persisted / default patterns from the other arguments.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in pattern_groups:
+        for pattern in normalize_patterns(list(group) if isinstance(group, tuple) else group):
+            if pattern in seen:
+                continue
+            seen.add(pattern)
+            merged.append(pattern)
+    return merged
+
+
 def exclude_matches(path: str | PurePath, pattern: str) -> bool:
     """True when ``pattern`` excludes ``path``, matching whole path segments.
 

@@ -69,8 +69,6 @@ from file_registry import (
 )
 from load_config import load_config, get_archetype
 from style import bold, dim, label_style, success_style, warn_style, status_line, clear_status_line
-from state import get_silo_exclude_patterns
-
 # --- Default limits (overridden by config) ---
 DEFAULT_MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
 DEFAULT_MAX_DEPTH = 10
@@ -80,43 +78,18 @@ DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP = 50 * 1024 * 1024  # 50 MB
 # Default include/exclude for llmli add. First-class: text + code + pdf/docx + xlsx/pptx (no silent ignore).
 # Defined in scan_patterns so the watch daemons' lightweight scanner shares
 # exactly one copy; re-exported here for existing callers.
-from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE, exclude_matches  # noqa: F401,E402
+from scan_patterns import (  # noqa: F401,E402
+    ADD_DEFAULT_EXCLUDE,
+    ADD_DEFAULT_INCLUDE,
+    exclude_matches,
+    merge_exclude_patterns,
+    normalize_patterns,
+)
+from exclude_enforcement import effective_excludes as _effective_add_excludes  # noqa: E402
 
-
-def _normalize_patterns(patterns: list[str] | tuple[str, ...] | None) -> list[str]:
-    """Return unique non-empty patterns in first-seen order."""
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in patterns or []:
-        pattern = str(raw).strip()
-        if not pattern or pattern in seen:
-            continue
-        seen.add(pattern)
-        out.append(pattern)
-    return out
-
-
-def _merge_exclude_patterns(*pattern_groups: list[str] | tuple[str, ...] | None) -> list[str]:
-    """Merge multiple exclude pattern lists while preserving order and removing duplicates."""
-    merged: list[str] = []
-    seen: set[str] = set()
-    for group in pattern_groups:
-        for pattern in _normalize_patterns(list(group) if isinstance(group, tuple) else group):
-            if pattern in seen:
-                continue
-            seen.add(pattern)
-            merged.append(pattern)
-    return merged
-
-
-def _effective_add_excludes(
-    db_path: str | Path,
-    silo_slug: str,
-    requested_excludes: list[str] | tuple[str, ...] | None = None,
-) -> list[str]:
-    """Return built-in excludes plus persisted silo excludes plus per-run overrides."""
-    saved = get_silo_exclude_patterns(db_path, silo_slug)
-    return _merge_exclude_patterns(ADD_DEFAULT_EXCLUDE, saved, requested_excludes)
+# Back-compat aliases for tests / callers that imported the private helpers.
+_normalize_patterns = normalize_patterns
+_merge_exclude_patterns = merge_exclude_patterns
 
 # Code-file extensions for language_stats (CODE_LANGUAGE pipeline). Excludes .md, .txt, .pdf, .docx.
 from doc_type_taxonomy import CODE_EXTENSIONS as ADD_CODE_EXTENSIONS, doc_type_bucket_for_extension
@@ -2236,10 +2209,14 @@ def run_add(
     else:
         existing_slug = resolve_silo_by_path(db_path, path)
         silo_slug = existing_slug if existing_slug else slugify(display_name, str(path))
-    requested_excludes = _normalize_patterns(exclude_patterns)
-    saved_excludes = get_silo_exclude_patterns(db_path, silo_slug)
-    effective_excludes = _effective_add_excludes(db_path, silo_slug, requested_excludes)
-    persisted_excludes = _merge_exclude_patterns(saved_excludes, requested_excludes)
+    from exclude_enforcement import effective_excludes as _resolve_excludes
+    from exclude_enforcement import persistable_excludes
+
+    requested_excludes = normalize_patterns(exclude_patterns)
+    # Single choke point: defaults ∪ persisted ∪ requested. Empty requested
+    # never clears what the silo already stored.
+    effective_excludes = _resolve_excludes(db_path, silo_slug, requested_excludes)
+    persisted_excludes = persistable_excludes(db_path, silo_slug, requested_excludes)
     # Self-healing: if a previous ingest for this silo was interrupted mid-write,
     # force a full re-index so we don't end up with a partial state.
     from ingest_journal import check_pending
@@ -2826,7 +2803,8 @@ def run_add(
             display_name=display_name,
             language_stats=language_stats,
             image_vision_enabled=effective_image_vision_enabled,
-            exclude_patterns=effective_excludes if effective_excludes else None,
+            # Persist the merged effective set (never a replace that drops customs).
+            exclude_patterns=persisted_excludes if persisted_excludes else None,
         )
         set_last_failures(db_path, failures)
         # Hold the in-progress marker until the silo is actually queryable. Chroma
@@ -2871,14 +2849,38 @@ def run_add(
                 pass
         return (files_indexed, len(failures))
 
+    def _purge_exclude_violations_after_write() -> None:
+        # Run outside writer_client: purge opens its own write session.
+        try:
+            from exclude_enforcement import purge_exclude_violations
+
+            purge_result = purge_exclude_violations(
+                db_path, silo_slug, exclude_patterns=effective_excludes
+            )
+            purged_n = len(purge_result.get("purged") or [])
+            if purged_n and not quiet:
+                print(
+                    warn_style(
+                        no_color,
+                        f"Purged {purged_n} indexed file(s) that matched silo exclude patterns.",
+                    ),
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
+
     if get_chroma_client is not None:
         # Test/operator override: use the provided client factory directly (no flock).
         try:
-            return _run_add_chroma_phase(get_chroma_client(str(db_path)))
+            result = _run_add_chroma_phase(get_chroma_client(str(db_path)))
+            _purge_exclude_violations_after_write()
+            return result
         finally:
             release_chroma_client()
     with writer_client(str(Path(db_path).resolve())) as client:
-        return _run_add_chroma_phase(client)
+        result = _run_add_chroma_phase(client)
+    _purge_exclude_violations_after_write()
+    return result
 
 
 def _load_limits_config() -> tuple[int, int, int, int, int]:
@@ -3061,6 +3063,8 @@ def update_single_file(
         requested=image_vision_enabled,
     )
     effective_excludes = _effective_add_excludes(db_path, silo_slug, exclude_patterns)
+    # Choke point for single-file / watcher / MCP update_file: never index a
+    # path that matches persisted or default excludes.
     if not should_index(path_str, ADD_DEFAULT_INCLUDE, effective_excludes):
         return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
     if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}:

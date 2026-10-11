@@ -1868,7 +1868,6 @@ class SiloWatcher:
             ADD_DEFAULT_INCLUDE,
             ADD_DEFAULT_EXCLUDE,
         )
-        from state import get_silo_exclude_patterns
 
         self.root = root.resolve()
         self.db_path = str(db_path)
@@ -1888,11 +1887,12 @@ class SiloWatcher:
         self._collect_files = collect_files
         self._should_index = should_index
         self._include = ADD_DEFAULT_INCLUDE
-        self._exclude = _merge_path_patterns(
-            ADD_DEFAULT_EXCLUDE,
-            get_silo_exclude_patterns(self.db_path, self.silo_slug),
-            exclude_patterns,
-        )
+        self._default_exclude = ADD_DEFAULT_EXCLUDE
+        # Per-run extras only; persisted silo excludes are re-read on refresh so a
+        # watcher never freezes a stale empty list across registry updates.
+        self._requested_excludes = list(exclude_patterns or [])
+        self._exclude: list[str] = []
+        self._refresh_excludes()
         self._observer = Observer()
         self._handler = _SiloEventHandler(self)
         self._queue: dict[str, dict[str, object]] = {}
@@ -1926,6 +1926,41 @@ class SiloWatcher:
         self._logger.info(message)
         print(message)
 
+    def _refresh_excludes(self) -> None:
+        """Re-merge defaults ∪ persisted ∪ requested. Never drop persisted customs."""
+        _ensure_src_on_path()
+        from exclude_enforcement import effective_excludes
+
+        self._exclude = effective_excludes(
+            self.db_path, self.silo_slug, self._requested_excludes or None
+        )
+
+    def _verify_and_purge_excludes(self) -> int:
+        """Warn and purge any indexed sources that match the silo's excludes."""
+        _ensure_src_on_path()
+        self._refresh_excludes()
+        from exclude_enforcement import find_exclude_violations, purge_exclude_violations
+
+        violations = find_exclude_violations(
+            self.db_path, self.silo_slug, exclude_patterns=self._exclude
+        )
+        if not violations:
+            return 0
+        sample = Path(str(violations[0].get("source") or "")).name or "?"
+        self._log(
+            f"{self.label}: WARNING exclude violation — {len(violations)} indexed "
+            f"file(s) match silo excludes (e.g. {sample}); purging"
+        )
+        result = purge_exclude_violations(
+            self.db_path, self.silo_slug, exclude_patterns=self._exclude
+        )
+        purged = len(result.get("purged") or [])
+        if purged:
+            self._log(f"{self.label}: purged {purged} exclude-violating file(s)")
+        for err in (result.get("errors") or [])[:5]:
+            self._log(f"{self.label}: exclude purge error: {err}")
+        return purged
+
     def stop(self) -> None:
         self._stop.set()
         self._wake.set()
@@ -1955,6 +1990,7 @@ class SiloWatcher:
                 return
         except Exception:
             return
+        # Client-side gate (MCP update_file re-checks persisted excludes).
         if not self._should_index(str(p), self._include, self._exclude):
             return
         self._queue_action(str(p), "update")
@@ -1985,6 +2021,7 @@ class SiloWatcher:
     def _drain_due(self, now: float | None = None) -> int:
         if now is None:
             now = time.time()
+        self._refresh_excludes()
         due: list[tuple[str, str, int]] = []
         with self._queue_lock:
             for path, meta in list(self._queue.items()):
@@ -2105,6 +2142,7 @@ class SiloWatcher:
         return max(next_due - time.time(), 0.0)
 
     def _reconcile_once(self) -> tuple[int, int, int]:
+        self._refresh_excludes()
         max_file_bytes, max_depth, _max_archive_bytes, _max_files_per_zip, _max_extracted = self._load_limits_config()
         file_list = self._collect_files(
             self.root,
@@ -2175,6 +2213,10 @@ class SiloWatcher:
                     f"Check for missed changes: +{queued_updates} queued, -{queued_removes} queued, {skipped} skipped"
                 )
             self._emit_reconcile_event(queued_updates, queued_removes, skipped, duration_ms)
+            try:
+                self._verify_and_purge_excludes()
+            except Exception as exc:
+                self._log(f"{self.label}: exclude verify failed: {exc}")
 
     def run(self) -> None:
         if self.startup_message:
@@ -2209,6 +2251,10 @@ class SiloWatcher:
                 f"Check for missed changes: +{queued_updates} queued, -{queued_removes} queued, {skipped} skipped"
             )
         self._emit_reconcile_event(queued_updates, queued_removes, skipped, duration_ms)
+        try:
+            self._verify_and_purge_excludes()
+        except Exception as exc:
+            self._log(f"{self.label}: exclude verify failed: {exc}")
         try:
             self._stop.wait()
         finally:
@@ -2434,7 +2480,9 @@ def _pull_watch_path_mode(
                 "add_silo",
                 path=str(path),
                 allow_cloud=allow_cloud,
-                exclude_patterns=exclude_patterns or [],
+                # None (not []): omit means "use persisted"; [] used to wipe
+                # customs when an older ingest path replaced instead of merging.
+                exclude_patterns=exclude_patterns,
                 image_vision=image_vision,
                 workers=workers,
                 embedding_workers=embedding_workers,

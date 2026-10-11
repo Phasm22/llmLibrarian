@@ -223,6 +223,45 @@ def test_run_add_persists_default_excludes_for_new_silo(monkeypatch, tmp_path):
     assert "/much thinks/cortex/" in excludes
 
 
+def test_run_add_without_exclude_flag_keeps_persisted_glob(monkeypatch, tmp_path):
+    """Re-add that omits --exclude must keep persisted customs like '*.pdf'."""
+    root = tmp_path / "recipes"
+    root.mkdir()
+    file_path = root / "keep.md"
+    file_path.write_text("hello", encoding="utf-8")
+    db_path = tmp_path / "db"
+    db_path.mkdir(parents=True, exist_ok=True)
+    slug = "recipes-silo"
+    update_silo(
+        db_path,
+        slug,
+        str(root.resolve()),
+        0,
+        0,
+        "2024-01-01T00:00:00+00:00",
+        exclude_patterns=["*.pdf", "pipeline/"],
+    )
+    coll = _FakeCollection()
+    _patch_runtime(monkeypatch, coll)
+    captured: dict[str, list[str]] = {}
+
+    def _fake_collect_files(_root, include, exclude, max_depth, max_file_bytes, follow_symlinks=False, stats=None):
+        captured["exclude"] = list(exclude)
+        return [(file_path.resolve(), "code")]
+
+    monkeypatch.setattr("ingest.collect_files", _fake_collect_files)
+    monkeypatch.setattr("ingest.process_one_file", lambda *a, **k: [])
+    monkeypatch.setattr("state.resolve_silo_by_path", lambda _db, _path: slug)
+
+    run_add(root, db_path=db_path, allow_cloud=True, exclude_patterns=None)
+
+    assert "*.pdf" in captured["exclude"]
+    assert "pipeline/" in captured["exclude"]
+    excludes = get_silo_exclude_patterns(db_path, slug)
+    assert "*.pdf" in excludes
+    assert "pipeline/" in excludes
+
+
 def test_run_add_writes_status_file(monkeypatch, tmp_path):
     root = tmp_path / "docs"
     root.mkdir()

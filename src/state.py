@@ -154,8 +154,18 @@ def update_silo(
         if image_vision_enabled is not None:
             entry["image_vision_enabled"] = bool(image_vision_enabled)
         if exclude_patterns is not None:
-            cleaned = [str(p).strip() for p in exclude_patterns if str(p).strip()]
-            entry["exclude_patterns"] = cleaned
+            # Merge, never replace: an empty/partial write must not silently
+            # drop persisted custom excludes (watcher add_silo used to pass []).
+            from scan_patterns import merge_exclude_patterns, normalize_patterns
+
+            cleaned = normalize_patterns(exclude_patterns)
+            existing = entry.get("exclude_patterns")
+            existing_list = existing if isinstance(existing, list) else []
+            if cleaned:
+                entry["exclude_patterns"] = merge_exclude_patterns(existing_list, cleaned)
+            elif not existing_list:
+                entry["exclude_patterns"] = []
+            # else: cleaned is empty and existing is non-empty → keep existing
         reg[slug] = entry
         _write_registry(db_path, reg)
 

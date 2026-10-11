@@ -2527,6 +2527,9 @@ def add_silo(
                 from state import resolve_silo_by_path, resolve_silo_to_slug
 
                 _release_chroma()
+                # [] means "no extras this run", not "clear persisted excludes".
+                # Normalize so older clients that send [] cannot widen a silo.
+                requested_excludes = exclude_patterns or None
                 result = run_ingest(
                     IngestRequest(
                         path=str(p),
@@ -2535,7 +2538,7 @@ def add_silo(
                         display_name=display_name,
                         allow_cloud=allow_cloud,
                         incremental=not full,
-                        exclude_patterns=exclude_patterns,
+                        exclude_patterns=requested_excludes,
                         image_vision_enabled=image_vision,
                         workers=workers,
                         embedding_workers=embedding_workers,
