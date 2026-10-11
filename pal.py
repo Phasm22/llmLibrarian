@@ -3566,6 +3566,60 @@ def find_command(
     _exit(_run_llmli(args))
 
 
+@app.command("query", help="Retrieve chunks (no LLM) — MCP query_personal_knowledge parity.")
+def query_command(
+    query: list[str] = typer.Argument(..., metavar="QUERY"),
+    in_silo: str | None = typer.Option(None, "--in", help="Limit to one silo (exact slug for private).", autocompletion=_complete_silo),
+    n_results: int = typer.Option(12, "--n-results", help="Retrieval count."),
+    category: str | None = typer.Option(None, "--category"),
+    main_protein: str | None = typer.Option(None, "--main-protein"),
+    course: str | None = typer.Option(None, "--course"),
+    era: str | None = typer.Option(None, "--era"),
+    tags: str | None = typer.Option(None, "--tags", help="Comma-separated tags."),
+    min_servings: int | None = typer.Option(None, "--min-servings"),
+    max_servings: int | None = typer.Option(None, "--max-servings"),
+    max_total_time: int | None = typer.Option(None, "--max-total-time"),
+    section: str | None = typer.Option(None, "--section"),
+    doc_type: str | None = typer.Option(None, "--doc-type"),
+    source: str | None = typer.Option(None, "--source"),
+    text: bool = typer.Option(False, "--text", help="Human chunk dump instead of JSON."),
+) -> None:
+    args: list[str] = ["query"]
+    if in_silo:
+        args.extend(["--in", in_silo])
+    if n_results != 12:
+        args.extend(["--n-results", str(n_results)])
+    for flag, val in (
+        ("--category", category),
+        ("--main-protein", main_protein),
+        ("--course", course),
+        ("--era", era),
+        ("--tags", tags),
+        ("--min-servings", None if min_servings is None else str(min_servings)),
+        ("--max-servings", None if max_servings is None else str(max_servings)),
+        ("--max-total-time", None if max_total_time is None else str(max_total_time)),
+        ("--section", section),
+        ("--doc-type", doc_type),
+        ("--source", source),
+    ):
+        if val is not None:
+            args.extend([flag, val])
+    if text:
+        args.append("--text")
+    args.extend(query)
+    _exit(_run_llmli(args))
+
+
+@app.command("status", help="Write-in-progress markers and Chroma lock holders.")
+def status_command(
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    args = ["status"]
+    if json_out:
+        args.append("--json")
+    _exit(_run_llmli(args))
+
+
 def _ls_status() -> None:
     """Show silo health summary + daemon status table + recommended actions."""
     _ensure_src_on_path()
@@ -3668,13 +3722,17 @@ def _ls_status() -> None:
 def ls_command(
     status: bool = typer.Option(False, "--status", help="Show silo and daemon health with recommended actions."),
     jobs: bool = typer.Option(False, "--jobs", help="Show daemon jobs and log paths."),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON (roster only)."),
 ) -> None:
     if status:
         _ls_status()
     elif jobs:
         _jobs_ls_impl()
     else:
-        _exit(_run_llmli(["ls"]))
+        args = ["ls"]
+        if json_out:
+            args.append("--json")
+        _exit(_run_llmli(args))
 
 
 
@@ -3690,10 +3748,21 @@ def private_command(
         "--off",
         help="Clear the flag. The silo becomes reachable from unscoped queries again.",
     ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirm the privacy change (required)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview without changing the registry."),
+    json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
 ) -> None:
     """Private silos are skipped by every unscoped query and by automatic scope
     binding; only an explicit `--in <slug>` / `silo=<slug>` reaches them."""
-    args = ["private", silo] + (["--off"] if off else [])
+    args = ["private", silo]
+    if off:
+        args.append("--off")
+    if yes:
+        args.append("--yes")
+    if dry_run:
+        args.append("--dry-run")
+    if json_out:
+        args.append("--json")
     _exit(_run_llmli(args))
 
 

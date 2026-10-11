@@ -21,7 +21,12 @@ def test_llmli_root_help_lists_all_subcommands(monkeypatch, capsys):
     for cmd in (
         "add",
         "ask",
+        "query",
+        "multi-query",
+        "read",
         "ls",
+        "status",
+        "schema",
         "inspect",
         "verify",
         "index",
@@ -34,15 +39,19 @@ def test_llmli_root_help_lists_all_subcommands(monkeypatch, capsys):
         "eval-adversarial",
     ):
         assert cmd in out
+    assert "--json" in out
 
 
 @pytest.mark.parametrize(
     ("subcmd", "tokens"),
     [
-        ("add", ["--allow-cloud", "--follow-symlinks", "--full", "--exclude", "--image-vision", "--workers", "--embedding-workers"]),
+        ("add", ["--allow-cloud", "--follow-symlinks", "--full", "--exclude", "--image-vision", "--workers", "--embedding-workers", "--yes", "--dry-run"]),
         ("ask", ["--in", "--unified", "--strict", "--quiet", "--explain", "--force", "--model", "--n-results"]),
-        ("inspect", ["--top", "--filter"]),
-        ("verify", ["--purge"]),
+        ("query", ["--in", "--main-protein", "--max-total-time", "--tags", "--n-results"]),
+        ("inspect", ["--top", "--filter", "--json"]),
+        ("verify", ["--purge", "--yes", "--dry-run"]),
+        ("rm", ["--yes", "--dry-run"]),
+        ("repair", ["--yes", "--dry-run"]),
         ("index", ["--archetype", "--mode", "--follow-symlinks"]),
         ("log", ["--last"]),
         ("repair-ladder", ["--json"]),
@@ -202,8 +211,8 @@ def test_llmli_other_subcommands_parse_and_dispatch(monkeypatch):
     assert _run_cli(monkeypatch, ["ls"]) == 0
     assert _run_cli(monkeypatch, ["inspect", "stuff", "--top", "9", "--filter", "pdf"]) == 0
     assert _run_cli(monkeypatch, ["index", "--archetype", "tax", "--log", "/tmp/log.txt", "--mode", "deep", "--follow-symlinks"]) == 0
-    assert _run_cli(monkeypatch, ["rm", "Stuff"]) == 0
-    assert _run_cli(monkeypatch, ["repair", "Stuff"]) == 0
+    assert _run_cli(monkeypatch, ["rm", "Stuff", "--yes"]) == 0
+    assert _run_cli(monkeypatch, ["repair", "Stuff", "--yes"]) == 0
     assert _run_cli(monkeypatch, ["repair-ladder", "--json"]) == 0
     assert _run_cli(monkeypatch, ["rehydrate", "--dry-run", "--quiet", "stuff"]) == 0
     assert _run_cli(monkeypatch, ["capabilities"]) == 0

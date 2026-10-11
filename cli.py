@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 # PYTHON_ARGCOMPLETE_OK
 """
-llmLibrarian (llmli) CLI: add, ask, ls, index, rm, log.
+llmLibrarian (llmli) CLI: add, ask, ls, query, read, index, rm, log, …
 Deterministic, locally-hosted context engine for high-stakes personal data.
 Run from project root; uses archetypes.yaml and ./my_brain_db by default.
+
+Agents: prefer `llmli --json …`, `llmli schema`, and `docs/cli-for-agents.md`.
+Human text output remains the default unless `--json` is set (query/read/schema
+default to JSON).
 """
 import argparse
 import json
@@ -14,6 +18,53 @@ from pathlib import Path
 from typing import Any
 
 _ROOT = Path(__file__).resolve().parent
+
+_EPILOG = """\
+examples (agents — always prefer --json):
+  llmli --version
+  llmli schema
+  llmli --json ls
+  llmli status --json
+  llmli query --in recipes-xxxx --main-protein chicken "weeknight dinner"
+  llmli multi-query --q "sourdough" --q "starter feeding" --in recipes-xxxx
+  llmli read README.md --in my-silo
+  llmli find --name "*.pdf" --date 2024-01-01:2024-12-31 --json
+  llmli verify my-silo --json
+  llmli rm my-silo --dry-run
+  llmli repair my-silo --yes
+
+Private silos are excluded from unscoped query/find; pass the exact slug via --in.
+Destructive apply paths require --yes (use --dry-run to preview).
+"""
+
+
+class _LlmliArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser with 'did you mean' hints for bad subcommands."""
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        from cli_agent import suggest_close_matches
+
+        hint = ""
+        # argparse messages look like: invalid choice: 'verfy' (choose from ...)
+        m = re.search(r"invalid choice: '([^']+)'", message)
+        if m and hasattr(self, "_llmli_subcommands"):
+            suggestions = suggest_close_matches(m.group(1), self._llmli_subcommands)
+            if suggestions:
+                hint = f"\nDid you mean: {', '.join(suggestions)}?"
+        self.print_usage(sys.stderr)
+        self.exit(2, f"error: {message}{hint}\n")
+
+
+class _VersionAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):  # noqa: ANN001
+        from cli_agent import emit_json, format_version_line, version_info
+
+        info = version_info(repo_root=_ROOT, cli_file=Path(__file__))
+        if getattr(namespace, "json", False) or "--json" in sys.argv:
+            emit_json(info)
+        else:
+            print(format_version_line(info))
+        parser.exit(0)
 
 
 def _silo_completer(prefix, **kwargs):
@@ -131,25 +182,85 @@ def _truncate_mid(text: str, max_len: int) -> str:
     right = max(1, keep - left)
     return text[:left] + "..." + text[-right:]
 
+
+def _wants_json(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "json", False))
+
+
+def _emit_result(args: argparse.Namespace, payload: dict[str, Any], *, human: str | None = None) -> int:
+    from cli_agent import emit_json
+
+    if _wants_json(args):
+        emit_json(payload)
+        if payload.get("ok") is False:
+            return int(payload.get("exit_code") or 1)
+        return 0
+    if human is not None:
+        print(human, end="" if human.endswith("\n") else "\n")
+    if payload.get("ok") is False:
+        msg = (payload.get("error") or {}).get("message") or "error"
+        print(f"Error: {msg}", file=sys.stderr)
+        return int(payload.get("exit_code") or 1)
+    return 0
+
+
+def _handle_busy(args: argparse.Namespace, exc: BaseException, operation: str) -> int:
+    from cli_agent import busy_payload, emit_json, is_lock_timeout
+
+    if not is_lock_timeout(exc):
+        return -1
+    payload = busy_payload(exc, operation)
+    if _wants_json(args):
+        emit_json(payload)
+    else:
+        print(f"Error: {payload['error']['message']}", file=sys.stderr)
+        print("Hint: llmli status --json  # see write-in-progress / lock holders", file=sys.stderr)
+    return int(payload.get("exit_code") or 3)
+
+
 def cmd_add(args: argparse.Namespace) -> int:
     """Index a folder into the unified llmli collection; silo name = basename(path)."""
+    from cli_agent import error_payload, ok_payload, require_yes
     from ingest import CloudSyncPathError
     from orchestration.ingest import IngestRequest, run_ingest
 
     path = Path(args.path).resolve()
     db = _db_path(args)
     if not path.is_dir() and not path.is_file():
-        print(f"Error: not a file or directory: {path}", file=sys.stderr)
-        return 1
+        return _emit_result(args, error_payload(f"not a file or directory: {path}", code="not_found"))
+    full = bool(getattr(args, "full", False))
+    if full:
+        blocked = require_yes(
+            args,
+            action="add --full",
+            detail="Full reindex deletes existing chunks for the silo before rewriting them.",
+        )
+        if blocked:
+            return _emit_result(args, blocked)
+    if getattr(args, "dry_run", False):
+        excludes = getattr(args, "exclude_patterns", None) or []
+        plan = ok_payload(
+            {
+                "dry_run": True,
+                "would": "full_reindex" if full else "incremental_ingest",
+                "path": str(path),
+                "db_path": str(db),
+                "exclude_patterns": excludes,
+            }
+        )
+        human = f"Would {'full reindex' if full else 'incrementally index'} {path} into {db}"
+        if excludes:
+            human += f" (excludes: {excludes})"
+        return _emit_result(args, plan, human=human)
     try:
-        run_ingest(
+        result = run_ingest(
             IngestRequest(
                 path=path,
                 db_path=db,
-                no_color=args.no_color,
+                no_color=args.no_color or _wants_json(args),
                 allow_cloud=getattr(args, "allow_cloud", False),
                 follow_symlinks=getattr(args, "follow_symlinks", False),
-                incremental=not getattr(args, "full", False),
+                incremental=not full,
                 forced_silo_slug=getattr(args, "silo", None),
                 display_name=getattr(args, "display_name", None),
                 exclude_patterns=getattr(args, "exclude_patterns", None),
@@ -158,37 +269,56 @@ def cmd_add(args: argparse.Namespace) -> int:
                 embedding_workers=getattr(args, "embedding_workers", None),
             )
         )
+        if _wants_json(args):
+            return _emit_result(
+                args,
+                ok_payload(
+                    {
+                        "files_indexed": getattr(result, "files_indexed", None),
+                        "failures": getattr(result, "failures", None),
+                        "silo_slug": getattr(result, "silo_slug", None),
+                        "path": str(path),
+                    }
+                ),
+            )
         return 0
     except CloudSyncPathError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        return _emit_result(args, error_payload(str(e), code="cloud_path"))
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        busy_rc = _handle_busy(args, e, "add")
+        if busy_rc >= 0:
+            return busy_rc
+        return _emit_result(args, error_payload(str(e)))
 
 def cmd_ask(args: argparse.Namespace) -> int:
     """Query an archetype's collection or unified llmli collection (default) via Ollama."""
+    from cli_agent import error_payload, ok_payload
     from query.core import run_ask, QueryPolicyError
     from state import resolve_silo_to_slug, resolve_silo_prefix
+
     config = _config_path(args)
     archetype = getattr(args, "archetype", None)
     in_silo = getattr(args, "in_silo", None)
     if archetype and in_silo:
-        print("Error: use either --archetype or --in, not both.", file=sys.stderr)
-        return 1
+        return _emit_result(
+            args,
+            error_payload("use either --archetype or --in, not both", code="usage", exit_code=2),
+        )
     unified = getattr(args, "unified", False)
     if in_silo and not unified:
         db = _db_path(args)
         silo_slug = resolve_silo_to_slug(db, in_silo) or resolve_silo_prefix(db, in_silo) or in_silo
-        archetype = None  # unified collection, filter by silo
+        archetype = None
     else:
-        silo_slug = None  # query all silos (unified)
+        silo_slug = None
         if not archetype:
             archetype = None
     query = _sanitize_query(args.query)
     if query is None:
-        print("Error: empty or invalid query (or too long).", file=sys.stderr)
-        return 1
+        return _emit_result(
+            args,
+            error_payload("empty or invalid query (or too long)", code="usage", exit_code=2),
+        )
     try:
         out = run_ask(
             archetype,
@@ -196,27 +326,61 @@ def cmd_ask(args: argparse.Namespace) -> int:
             config_path=config,
             n_results=getattr(args, "n_results", 12),
             model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.2:latest"),
-            no_color=args.no_color or getattr(args, "quiet", False),
+            no_color=args.no_color or getattr(args, "quiet", False) or _wants_json(args),
             silo=silo_slug,
             db_path=_db_path(args),
             strict=getattr(args, "strict", False),
-            quiet=getattr(args, "quiet", False),
-            explain=getattr(args, "explain", False),
+            quiet=getattr(args, "quiet", False) or _wants_json(args),
+            explain=getattr(args, "explain", False) and not _wants_json(args),
             force=getattr(args, "force", False),
             explicit_unified=bool(getattr(args, "unified", False)),
         )
     except QueryPolicyError as e:
-        print(str(e), file=sys.stderr)
-        return int(getattr(e, "exit_code", 2) or 2)
+        return _emit_result(
+            args,
+            error_payload(str(e), code="policy", exit_code=int(getattr(e, "exit_code", 2) or 2)),
+        )
+    except Exception as e:
+        busy_rc = _handle_busy(args, e, "ask")
+        if busy_rc >= 0:
+            return busy_rc
+        return _emit_result(args, error_payload(str(e)))
+    if _wants_json(args):
+        return _emit_result(args, ok_payload({"answer": out, "silo": silo_slug, "query": query}))
     print(out)
     return 0
 
 def cmd_ls(args: argparse.Namespace) -> int:
     """List silos in the llmli registry."""
+    from cli_agent import ok_payload
     from state import list_silos
     from style import dim, link_style
+
     db = _db_path(args)
     silos = list_silos(db)
+    if _wants_json(args):
+        return _emit_result(
+            args,
+            ok_payload(
+                {
+                    "db_path": str(db),
+                    "silo_count": len(silos),
+                    "silos": [
+                        {
+                            "slug": s.get("slug"),
+                            "display_name": s.get("display_name", s.get("slug")),
+                            "path": s.get("path"),
+                            "files_indexed": int(s.get("files_indexed", 0) or 0),
+                            "chunks_count": int(s.get("chunks_count", 0) or 0),
+                            "updated": s.get("updated"),
+                            "private": bool(s.get("private")),
+                            "host": s.get("host"),
+                        }
+                        for s in silos
+                    ],
+                }
+            ),
+        )
     if not silos:
         print(dim(args.no_color, "No silos. Use: llmli add <path>"))
         return 0
@@ -257,32 +421,215 @@ def cmd_ls(args: argparse.Namespace) -> int:
         )))
     return 0
 
-
 def cmd_private(args: argparse.Namespace) -> int:
     """Set or clear a silo's private flag."""
+    from cli_agent import error_payload, ok_payload, require_yes
     from state import is_silo_private, list_silos, resolve_silo_to_slug, resolve_silo_prefix, set_silo_private
+
     db = _db_path(args)
     raw = args.silo
     slug = resolve_silo_to_slug(db, raw) or resolve_silo_prefix(db, raw)
     if not slug:
-        print(f"Error: silo not found: {raw}", file=sys.stderr)
-        known = ", ".join(sorted(s.get("slug", "") for s in list_silos(db)))
-        if known:
-            print(f"Known silos: {known}", file=sys.stderr)
-        return 1
-    if args.off:
-        if not is_silo_private(db, slug):
-            print(f"{slug} is already not private.")
-            return 0
-        set_silo_private(db, slug, False)
-        print(f"{slug}: private cleared — it can now be returned by unscoped queries.")
-        return 0
-    if is_silo_private(db, slug):
-        print(f"{slug} is already private.")
-        return 0
-    set_silo_private(db, slug, True)
-    print(f"{slug}: private set — excluded from unscoped retrieval; use --in {slug} to query it.")
+        known = sorted(s.get("slug", "") for s in list_silos(db) if s.get("slug"))
+        return _emit_result(
+            args,
+            error_payload(f"silo not found: {raw}", code="not_found", known_silos=known),
+        )
+    want_private = not bool(args.off)
+    currently = is_silo_private(db, slug)
+    blocked = require_yes(
+        args,
+        action="private --off" if args.off else "private",
+        detail=(
+            "Clearing private widens unscoped retrieval exposure."
+            if args.off
+            else "Marks the silo local-only (excluded from unscoped retrieval)."
+        ),
+    )
+    if blocked:
+        return _emit_result(args, blocked)
+    if currently == want_private:
+        msg = f"{slug} is already {'private' if want_private else 'not private'}."
+        return _emit_result(
+            args,
+            ok_payload({"slug": slug, "private": currently, "unchanged": True}),
+            human=msg,
+        )
+    if getattr(args, "dry_run", False):
+        plan = ok_payload({"dry_run": True, "slug": slug, "would_set_private": want_private})
+        return _emit_result(args, plan, human=f"Would set private={want_private} on {slug}")
+    set_silo_private(db, slug, want_private)
+    if want_private:
+        human = f"{slug}: private set — excluded from unscoped retrieval; use --in {slug} to query it."
+    else:
+        human = f"{slug}: private cleared — it can now be returned by unscoped queries."
+    return _emit_result(args, ok_payload({"slug": slug, "private": want_private}), human=human)
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    """Retrieve chunks without LLM synthesis (MCP query_personal_knowledge parity)."""
+    from cli_agent import error_payload, meta_filter_kwargs, ok_payload
+    from query.core import run_retrieve
+
+    if not getattr(args, "text", False):
+        args.json = True
+    query = _sanitize_query(getattr(args, "query", None) or [])
+    if query is None:
+        return _emit_result(
+            args,
+            error_payload("empty or invalid query (or too long)", code="usage", exit_code=2),
+        )
+    try:
+        result = run_retrieve(
+            query=query,
+            silo=getattr(args, "in_silo", None),
+            n_results=getattr(args, "n_results", 12),
+            db_path=_db_path(args),
+            config_path=_config_path(args),
+            **meta_filter_kwargs(args),
+        )
+    except Exception as e:
+        busy_rc = _handle_busy(args, e, "query")
+        if busy_rc >= 0:
+            return busy_rc
+        return _emit_result(args, error_payload(str(e)))
+    if result.get("error"):
+        extra = {k: result[k] for k in ("chunks", "query", "intent", "silo_filter") if k in result}
+        return _emit_result(args, error_payload(str(result["error"]), code="retrieve", **extra))
+    payload = ok_payload(result)
+    if getattr(args, "text", False):
+        args.json = False
+        lines = [
+            f"[{c.get('score', '?')}] {c.get('source', '?')}\n{(c.get('text') or '')[:400]}"
+            for c in result.get("chunks") or []
+        ]
+        return _emit_result(args, payload, human="\n\n".join(lines) if lines else "(no chunks)")
+    return _emit_result(args, payload)
+
+
+def cmd_multi_query(args: argparse.Namespace) -> int:
+    """Parallel retrieve + merge (MCP multi_query_knowledge parity)."""
+    from cli_agent import error_payload, meta_filter_kwargs, run_multi_query
+
+    if not getattr(args, "text", False):
+        args.json = True
+    queries = list(getattr(args, "q", None) or [])
+    for item in getattr(args, "query", None) or []:
+        s = _sanitize_query([item])
+        if s:
+            queries.append(s)
+    cleaned: list[str] = []
+    for q in queries:
+        if isinstance(q, str):
+            s = _sanitize_query([q])
+            if s:
+                cleaned.append(s)
+    if not cleaned:
+        return _emit_result(
+            args,
+            error_payload("provide one or more queries via --q or positional args", code="usage", exit_code=2),
+        )
+    try:
+        result = run_multi_query(
+            cleaned,
+            db_path=_db_path(args),
+            silo=getattr(args, "in_silo", None),
+            n_results=getattr(args, "n_results", 10),
+            max_total_chunks=getattr(args, "max_total_chunks", 30),
+            **meta_filter_kwargs(args),
+        )
+    except Exception as e:
+        busy_rc = _handle_busy(args, e, "multi-query")
+        if busy_rc >= 0:
+            return busy_rc
+        return _emit_result(args, error_payload(str(e)))
+    if result.get("ok") is False and result.get("busy"):
+        return _emit_result(args, result)
+    result.setdefault("ok", True)
+    return _emit_result(args, result)
+
+
+def cmd_read(args: argparse.Namespace) -> int:
+    """Read one indexed file from the index (MCP read_document parity)."""
+    from cli_agent import error_payload, ok_payload, resolve_indexed_file
+    from chroma_client import get_client, release
+    from chroma_lock import chroma_shared_lock
+    from constants import LLMLI_COLLECTION
+    from document_read import read_indexed_document
+
+    if not getattr(args, "text", False):
+        args.json = True
+    db = _db_path(args)
+    path = getattr(args, "path", None) or ""
+    silo = getattr(args, "in_silo", None)
+    resolved, slug, candidates, err = resolve_indexed_file(db, path, silo)
+    if err:
+        return _emit_result(
+            args,
+            error_payload(err, code="not_found", candidates=candidates[:20] if candidates else []),
+        )
+    try:
+        with chroma_shared_lock(str(db)):
+            collection = get_client(str(db)).get_or_create_collection(name=LLMLI_COLLECTION)
+            result = read_indexed_document(
+                collection,
+                silo=str(slug),
+                source=str(resolved),
+                start_chunk=int(getattr(args, "start_chunk", 0) or 0),
+                max_chars=int(getattr(args, "max_chars", 6000) or 6000),
+            )
+    except Exception as e:
+        busy_rc = _handle_busy(args, e, "read")
+        if busy_rc >= 0:
+            return busy_rc
+        return _emit_result(args, error_payload(str(e)))
+    finally:
+        release()
+    if getattr(args, "text", False):
+        args.json = False
+        return _emit_result(args, ok_payload(result), human=result.get("text") or "")
+    return _emit_result(args, ok_payload(result))
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show write-in-progress markers and Chroma lock holders."""
+    from cli_agent import status_payload
+
+    payload = status_payload(_db_path(args))
+    if _wants_json(args):
+        return _emit_result(args, payload)
+    writes = payload.get("write_in_progress") or {}
+    lock = payload.get("lock") or {}
+    print(f"DB: {payload.get('db_path')}")
+    if writes:
+        print("Write in progress:")
+        for slug, info in writes.items():
+            print(f"  {slug}: kind={info.get('kind')} pid={info.get('pid')} started={info.get('started_at')}")
+    else:
+        print("Write in progress: (none)")
+    holders = lock.get("holder_pids") or []
+    print(f"Chroma lock: {lock.get('path')} holders={holders or 'none'}")
     return 0
+
+
+def cmd_schema(args: argparse.Namespace) -> int:
+    """Emit the agent-facing command schema (always JSON)."""
+    from cli_agent import command_schema, emit_json
+
+    emit_json(command_schema())
+    return 0
+
+
+def cmd_version(args: argparse.Namespace) -> int:
+    from cli_agent import emit_json, format_version_line, version_info
+
+    info = version_info(repo_root=_ROOT, cli_file=Path(__file__))
+    if _wants_json(args):
+        emit_json(info)
+    else:
+        print(format_version_line(info))
+    return 0
+
 
 def cmd_index(args: argparse.Namespace) -> int:
     """Rebuild an archetype's collection from config folders."""
@@ -310,40 +657,113 @@ def cmd_index(args: argparse.Namespace) -> int:
         return 1
 
 def cmd_rm(args: argparse.Namespace) -> int:
-    """Remove a silo from the registry and delete its chunks. Accepts slug or display name.
-    If the silo is not in the silo list, still removes Chroma chunks and file-registry entries
-    for that slug (fixes orphaned 'desktop' etc.)."""
+    """Remove a silo from the registry and delete its chunks. Accepts slug or display name."""
+    from cli_agent import error_payload, ok_payload, require_yes
+    from operations import op_remove_silo
+    from state import list_silos, resolve_silo_by_path, resolve_silo_prefix, resolve_silo_to_slug
+
     silo = getattr(args, "silo", None)
     if not silo:
-        print("Error: remove requires silo name. Example: llmli remove \"Tax\"", file=sys.stderr)
-        return 1
-    from operations import op_remove_silo
+        return _emit_result(
+            args,
+            error_payload('remove requires silo name. Example: llmli rm "Tax" --yes', code="usage", exit_code=2),
+        )
     db = _db_path(args)
     raw = " ".join(silo) if isinstance(silo, list) else str(silo)
-    result = op_remove_silo(str(db), raw)
-    if result.get("chroma_warning"):
+    blocked = require_yes(
+        args,
+        action="rm",
+        detail=f"Would remove registry entry + Chroma chunks for {raw!r}.",
+    )
+    if blocked:
+        # Enrich dry-run-style preview even on confirm failure
+        return _emit_result(args, blocked)
+    slug = (
+        resolve_silo_to_slug(db, raw)
+        or resolve_silo_prefix(db, raw)
+        or (resolve_silo_by_path(db, raw) if Path(raw).exists() else None)
+    )
+    if getattr(args, "dry_run", False):
+        info = next((s for s in list_silos(db) if s.get("slug") == slug), None) if slug else None
+        plan = ok_payload(
+            {
+                "dry_run": True,
+                "would": "remove_silo",
+                "target": raw,
+                "resolved_slug": slug,
+                "path": (info or {}).get("path"),
+                "chunks_count": (info or {}).get("chunks_count"),
+            }
+        )
+        return _emit_result(
+            args,
+            plan,
+            human=f"Would remove silo {slug or raw}" + (f" ({plan['path']})" if plan.get("path") else ""),
+        )
+    try:
+        result = op_remove_silo(str(db), raw)
+    except Exception as e:
+        busy_rc = _handle_busy(args, e, "rm")
+        if busy_rc >= 0:
+            return busy_rc
+        return _emit_result(args, error_payload(str(e)))
+    payload = ok_payload(result)
+    if result.get("chroma_warning") and not _wants_json(args):
         print(f"Warning: could not delete chunks from DB: {result['chroma_warning']}", file=sys.stderr)
     if not result["not_found"]:
-        print(f"Removed silo: {result['removed_slug']}")
+        human = f"Removed silo: {result['removed_slug']}"
     else:
-        print(f"Removed chunks and file manifest for silo: {result['cleaned_slug']} (was not in silo list)")
-    return 0
+        human = f"Removed chunks and file manifest for silo: {result['cleaned_slug']} (was not in silo list)"
+    return _emit_result(args, payload, human=human)
 
 def cmd_repair(args: argparse.Namespace) -> int:
     """Wipe and re-index a silo to fix ChromaDB index inconsistencies ('Error finding id')."""
+    from cli_agent import error_payload, ok_payload, require_yes
+    from operations import op_repair_silo
+    from state import list_silos, resolve_silo_prefix, resolve_silo_to_slug
+
     silo_arg = getattr(args, "silo", None)
     if not silo_arg:
-        print("Error: repair requires a silo slug or display name.", file=sys.stderr)
-        return 1
-    from operations import op_repair_silo
+        return _emit_result(
+            args,
+            error_payload("repair requires a silo slug or display name", code="usage", exit_code=2),
+        )
     db = _db_path(args)
     raw = " ".join(silo_arg) if isinstance(silo_arg, list) else str(silo_arg)
-    result = op_repair_silo(str(db), raw, verbose=True)
+    blocked = require_yes(
+        args,
+        action="repair",
+        detail="Wipes all chunks for the silo then fully re-indexes from its source path.",
+    )
+    if blocked:
+        return _emit_result(args, blocked)
+    slug = resolve_silo_to_slug(db, raw) or resolve_silo_prefix(db, raw)
+    info = next((s for s in list_silos(db) if s.get("slug") == slug), None) if slug else None
+    if getattr(args, "dry_run", False):
+        plan = ok_payload(
+            {
+                "dry_run": True,
+                "would": "wipe_and_reindex",
+                "target": raw,
+                "resolved_slug": slug,
+                "path": (info or {}).get("path"),
+            }
+        )
+        return _emit_result(
+            args,
+            plan,
+            human=f"Would wipe + re-index {slug or raw}" + (f" from {plan['path']}" if plan.get("path") else ""),
+        )
+    try:
+        result = op_repair_silo(str(db), raw, verbose=not _wants_json(args))
+    except Exception as e:
+        busy_rc = _handle_busy(args, e, "repair")
+        if busy_rc >= 0:
+            return busy_rc
+        return _emit_result(args, error_payload(str(e)))
     if result.get("status") == "error":
-        print(f"Error: {result['error']}", file=sys.stderr)
-        return 1
-    return 0
-
+        return _emit_result(args, error_payload(result.get("error", "repair failed"), code="repair"))
+    return _emit_result(args, ok_payload(result), human=None if _wants_json(args) else f"Repair completed: {result.get('slug')}")
 
 def cmd_repair_ladder(args: argparse.Namespace) -> int:
     """Read-only L2 diagnostics for Chroma + suggested L1/L3 next steps."""
@@ -417,16 +837,24 @@ def cmd_rehydrate(args: argparse.Namespace) -> int:
 
 def cmd_capabilities(args: argparse.Namespace) -> int:
     """Print supported file types and extractors (source of truth). No LLM, no retrieval."""
+    from cli_agent import ok_payload
     from ingest import get_capabilities_text
-    print(get_capabilities_text())
-    return 0
 
+    text = get_capabilities_text()
+    if _wants_json(args):
+        return _emit_result(args, ok_payload({"text": text}))
+    print(text)
+    return 0
 
 def cmd_log(args: argparse.Namespace) -> int:
     """Show last index/add failures (from llmli add)."""
+    from cli_agent import ok_payload
     from state import get_last_failures
+
     db = _db_path(args)
     failures = get_last_failures(db)
+    if _wants_json(args):
+        return _emit_result(args, ok_payload({"failures": failures or []}))
     if not failures:
         print("No recent failures.")
         return 0
@@ -434,23 +862,59 @@ def cmd_log(args: argparse.Namespace) -> int:
         print(f"  {f.get('path', '?')}: {f.get('error', '?')}")
     return 0
 
-
 def cmd_verify(args: argparse.Namespace) -> int:
     """Report (and optionally purge) indexed files that match a silo's exclude patterns."""
+    from cli_agent import error_payload, ok_payload, require_yes
     from operations import op_verify_silo
 
     db = _db_path(args)
     silo_arg = getattr(args, "silo", None)
     if not silo_arg:
-        print("Error: verify requires silo name. Example: llmli verify recipes-55cf8f91", file=sys.stderr)
-        return 1
-    result = op_verify_silo(str(db), silo_arg, purge=bool(getattr(args, "purge", False)))
+        return _emit_result(
+            args,
+            error_payload("verify requires silo name. Example: llmli verify recipes-55cf8f91", code="usage", exit_code=2),
+        )
+    purge = bool(getattr(args, "purge", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    if purge and not dry_run:
+        blocked = require_yes(
+            args,
+            action="verify --purge",
+            detail="Removes violating files from the index (manifest + chunks).",
+        )
+        if blocked:
+            return _emit_result(args, blocked)
+    try:
+        result = op_verify_silo(str(db), silo_arg, purge=purge and not dry_run)
+    except Exception as e:
+        busy_rc = _handle_busy(args, e, "verify")
+        if busy_rc >= 0:
+            return busy_rc
+        return _emit_result(args, error_payload(str(e)))
     if result.get("status") == "error":
-        print(f"Error: {result.get('error')}", file=sys.stderr)
-        return 1
+        return _emit_result(args, error_payload(result.get("error", "verify failed"), code="verify"))
+    if dry_run and purge:
+        result = dict(result)
+        result["dry_run"] = True
+        result["would_purge"] = [v.get("source") for v in (result.get("violations") or [])]
     slug = result["slug"]
     display = result.get("display_name", slug)
     viol_n = int(result.get("violation_count") or 0)
+    payload = ok_payload(result) if viol_n == 0 and not (result.get("purge") or {}).get("errors") else dict(result)
+    if "ok" not in payload:
+        # violations are a successful report with non-zero exit for agents when not purged
+        payload = {"ok": True, **result} if (purge and result.get("purge")) or viol_n == 0 else {"ok": True, **result}
+    if _wants_json(args):
+        # Exit 1 when violations remain unpurged (same as human mode)
+        emit_rc = 0
+        if viol_n and not (purge and not dry_run):
+            emit_rc = 1
+        errors = ((result.get("purge") or {}).get("errors")) or []
+        if errors and not (result.get("purge") or {}).get("purged"):
+            emit_rc = 1
+        from cli_agent import emit_json
+        emit_json(payload)
+        return emit_rc
     print(f"Silo: {display} ({slug})")
     print(f"Effective excludes: {result.get('effective_exclude_count', 0)} "
           f"(persisted {result.get('persisted_exclude_count', 0)})")
@@ -462,6 +926,9 @@ def cmd_verify(args: argparse.Namespace) -> int:
         src = str(hit.get("source") or "")
         short = src if len(src) <= 72 else "..." + src[-69:]
         print(f"  matched {hit.get('matched_pattern')!r}: {short}")
+    if dry_run and purge:
+        print(f"Dry-run: would purge {viol_n} file(s). Pass --yes with --purge to apply.")
+        return 1
     purge_info = result.get("purge")
     if purge_info is not None:
         purged = purge_info.get("purged") or []
@@ -470,9 +937,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
         for err in errors[:10]:
             print(f"  purge error: {err}", file=sys.stderr)
         return 1 if errors and not purged else 0
-    print(f"Run `llmli verify {slug} --purge` to remove them.")
+    print(f"Run `llmli verify {slug} --purge --yes` to remove them.")
     return 1
-
 
 def cmd_inspect(args: argparse.Namespace) -> int:
     """Show silo details: path, total chunks, and per-file chunk counts (from indexed data)."""
@@ -485,8 +951,11 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     top_n = max(1, getattr(args, "top", 20))
     result = op_inspect_silo(str(db), silo_arg, top=top_n)
     if "error" in result:
-        print(f"Error: {result['error']}", file=sys.stderr)
-        return 1
+        from cli_agent import error_payload
+        return _emit_result(args, error_payload(result["error"], code="inspect"))
+    if _wants_json(args):
+        from cli_agent import ok_payload
+        return _emit_result(args, ok_payload(result))
 
     slug = result["slug"]
     display = result["display_name"]
@@ -583,8 +1052,8 @@ def cmd_find(args: argparse.Namespace) -> int:
     try:
         date_start, date_end = _parse_find_date(getattr(args, "date", None))
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        from cli_agent import error_payload
+        return _emit_result(args, error_payload(str(e), code="usage", exit_code=2))
 
     try:
         result = op_find_files(
@@ -598,12 +1067,15 @@ def cmd_find(args: argparse.Namespace) -> int:
             limit=int(getattr(args, "limit", 50) or 50),
         )
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        busy_rc = _handle_busy(args, e, "find")
+        if busy_rc >= 0:
+            return busy_rc
+        from cli_agent import error_payload
+        return _emit_result(args, error_payload(str(e)))
 
     if getattr(args, "json", False):
-        print(json.dumps(result, indent=2, default=str))
-        return 0
+        from cli_agent import ok_payload
+        return _emit_result(args, ok_payload(result))
 
     from query.find_format import (
         format_filename_lookup,
@@ -718,18 +1190,40 @@ def cmd_eval_adversarial(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="llmli", description="llmLibrarian CLI: add, ask, ls, inspect, index, rm, capabilities, log")
+    from cli_agent import add_meta_filter_arguments, quiet_machine_noise
+
+    parser = _LlmliArgumentParser(
+        prog="llmli",
+        description=(
+            "llmLibrarian CLI for humans and agents. "
+            "Prefer --json for automation; see `llmli schema` and docs/cli-for-agents.md."
+        ),
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--db", default=os.environ.get("LLMLIBRARIAN_DB", str(_ROOT / "my_brain_db")), help="DB path")
     parser.add_argument("--config", help="Path to archetypes.yaml")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Machine-readable JSON on stdout (stable envelopes; errors are objects; non-zero exit on failure)",
+    )
+    parser.add_argument("-V", "--version", action=_VersionAction, nargs=0, help="Show version, git commit, and install path")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # add <path> [--allow-cloud]
+    def _json_flag(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+
+    def _yes_dry(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--yes", "-y", action="store_true", help="Confirm a destructive apply")
+        p.add_argument("--dry-run", action="store_true", help="Preview what would change without applying")
+
     p_add = sub.add_parser("add", help="Index folder (or single file) into llmli (silo = basename); cloud-sync paths blocked unless --allow-cloud")
     p_add.add_argument("path", help="Folder or file path to index (single files bypass include/exclude filters)")
     p_add.add_argument("--allow-cloud", action="store_true", help="Allow OneDrive/iCloud/Dropbox/Google Drive (ingestion may be unreliable)")
     p_add.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks inside the target folder")
-    p_add.add_argument("--full", action="store_true", help="Full reindex (delete + add) instead of incremental")
+    p_add.add_argument("--full", action="store_true", help="Full reindex (delete + add) instead of incremental; requires --yes")
     p_add.add_argument("--exclude", action="append", dest="exclude_patterns", help="Extra path exclusion pattern (repeatable)")
     p_add.add_argument("--image-vision", action="store_true", default=None, help="Enable multimodal image summaries for this silo (default: off unless previously enabled)")
     p_add.add_argument("--workers", type=int, help="Override file/extraction worker count for this run")
@@ -737,11 +1231,12 @@ def main() -> int:
     p_add.add_argument("--fast", action="store_true", help="Auto-tune ingest for this host (device, batch sizes, workers); explicit env vars still win")
     p_add.add_argument("--silo", dest="silo", help=argparse.SUPPRESS)
     p_add.add_argument("--display-name", dest="display_name", help=argparse.SUPPRESS)
+    _yes_dry(p_add)
+    _json_flag(p_add)
     p_add.set_defaults(db=None)
     p_add.set_defaults(_run=cmd_add)
 
-    # ask [--archetype X | --in <silo>] [--strict] <query...>  (default: unified llmli collection)
-    p_ask = sub.add_parser("ask", help="Ask (unified llmli by default; or archetype / --in silo)")
+    p_ask = sub.add_parser("ask", help="Ask via local Ollama (unified llmli by default; or archetype / --in silo)")
     p_ask.add_argument("--archetype", "-a", help="Archetype id (e.g. tax, infra)")
     in_silo_arg = p_ask.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to one silo (slug or display name)")
     in_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
@@ -753,11 +1248,61 @@ def main() -> int:
     p_ask.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.2:latest)")
     p_ask.add_argument("--n-results", type=int, default=12, help="Retrieval count")
     p_ask.add_argument("query", nargs="+", help="Question")
+    _json_flag(p_ask)
     p_ask.set_defaults(_run=cmd_ask)
 
-    # ls
+    p_query = sub.add_parser(
+        "query",
+        help="Retrieve chunks (no LLM) — MCP query_personal_knowledge parity; JSON by default",
+    )
+    q_in = p_query.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to one silo (exact slug for private)")
+    q_in.completer = _silo_completer  # type: ignore[attr-defined]
+    p_query.add_argument("--n-results", type=int, default=12, help="Retrieval count")
+    p_query.add_argument("--text", action="store_true", help="Human-readable chunk dump instead of JSON")
+    add_meta_filter_arguments(p_query)
+    p_query.add_argument("query", nargs="+", help="Search query")
+    _json_flag(p_query)
+    p_query.set_defaults(_run=cmd_query)
+
+    p_mq = sub.add_parser(
+        "multi-query",
+        help="Parallel retrieve + merge — MCP multi_query_knowledge parity; JSON by default",
+    )
+    mq_in = p_mq.add_argument("--in", dest="in_silo", metavar="SILO", help="Limit to one silo (exact slug for private)")
+    mq_in.completer = _silo_completer  # type: ignore[attr-defined]
+    p_mq.add_argument("--q", action="append", dest="q", metavar="QUERY", help="Query (repeatable)")
+    p_mq.add_argument("--n-results", type=int, default=10, help="Per-query retrieval count")
+    p_mq.add_argument("--max-total-chunks", type=int, default=30, help="Cap merged chunks")
+    p_mq.add_argument("--text", action="store_true", help="Human-readable output instead of JSON")
+    add_meta_filter_arguments(p_mq)
+    p_mq.add_argument("query", nargs="*", help="Additional queries")
+    _json_flag(p_mq)
+    p_mq.set_defaults(_run=cmd_multi_query)
+
+    p_read = sub.add_parser("read", help="Read one indexed file from the index — MCP read_document parity; JSON by default")
+    p_read.add_argument("path", help="Indexed path or unique filename")
+    r_in = p_read.add_argument("--in", dest="in_silo", metavar="SILO", help="Silo slug (exact slug required for private)")
+    r_in.completer = _silo_completer  # type: ignore[attr-defined]
+    p_read.add_argument("--start-chunk", type=int, default=0, help="Paging offset")
+    p_read.add_argument("--max-chars", type=int, default=6000, help="Page size in characters")
+    p_read.add_argument("--text", action="store_true", help="Print document text only")
+    _json_flag(p_read)
+    p_read.set_defaults(_run=cmd_read)
+
     p_ls = sub.add_parser("ls", help="List silos")
+    _json_flag(p_ls)
     p_ls.set_defaults(_run=cmd_ls)
+
+    p_status = sub.add_parser("status", help="Write-in-progress markers and Chroma lock holders")
+    _json_flag(p_status)
+    p_status.set_defaults(_run=cmd_status)
+
+    p_schema = sub.add_parser("schema", help="Emit agent-facing command/arg/output schema as JSON")
+    p_schema.set_defaults(_run=cmd_schema)
+
+    p_version = sub.add_parser("version", help="Show version, git commit, and install path")
+    _json_flag(p_version)
+    p_version.set_defaults(_run=cmd_version)
 
     p_private = sub.add_parser(
         "private",
@@ -769,17 +1314,18 @@ def main() -> int:
         action="store_true",
         help="Clear the flag — the silo becomes reachable from unscoped queries again",
     )
+    _yes_dry(p_private)
+    _json_flag(p_private)
     p_private.set_defaults(_run=cmd_private)
 
-    # inspect <silo> [--top N] [--filter pdf|docx|code]
     p_inspect = sub.add_parser("inspect", help="Show silo details and top files by chunk count (default: top 20)")
     inspect_silo_arg = p_inspect.add_argument("silo", help="Silo slug or display name")
     inspect_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
     p_inspect.add_argument("--top", type=int, default=20, help="Show top N chunkiest files (default: 20)")
     p_inspect.add_argument("--filter", choices=["pdf", "docx", "code"], help="Show only this type (pdf, docx, or code)")
+    _json_flag(p_inspect)
     p_inspect.set_defaults(_run=cmd_inspect)
 
-    # verify <silo> [--purge]
     p_verify = sub.add_parser(
         "verify",
         help="Report indexed files that match the silo's exclude patterns (optionally purge them)",
@@ -789,11 +1335,12 @@ def main() -> int:
     p_verify.add_argument(
         "--purge",
         action="store_true",
-        help="Remove violating files from the index (manifest + chunks)",
+        help="Remove violating files from the index (manifest + chunks); requires --yes",
     )
+    _yes_dry(p_verify)
+    _json_flag(p_verify)
     p_verify.set_defaults(_run=cmd_verify)
 
-    # index --archetype X
     p_index = sub.add_parser("index", help="Rebuild archetype collection from config folders")
     p_index.add_argument("--archetype", "-a", required=True, help="Archetype id")
     p_index.add_argument("--log", help="Log file path (or set LLMLIBRARIAN_LOG=1)")
@@ -801,27 +1348,27 @@ def main() -> int:
     p_index.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks in config folders")
     p_index.set_defaults(_run=cmd_index)
 
-    # remove <silo>
-    p_rm = sub.add_parser("rm", help="Remove silo (registry + chunks)")
+    p_rm = sub.add_parser("rm", help="Remove silo (registry + chunks); requires --yes")
     rm_silo_arg = p_rm.add_argument("silo", nargs="+", help="Silo slug, display name, or path")
     rm_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
+    _yes_dry(p_rm)
+    _json_flag(p_rm)
     p_rm.set_defaults(_run=cmd_rm)
 
-    # repair <silo>
-    p_repair = sub.add_parser("repair", help="Fix ChromaDB index errors by wiping and re-indexing a silo")
+    p_repair = sub.add_parser("repair", help="Fix ChromaDB index errors by wiping and re-indexing a silo; requires --yes")
     repair_silo_arg = p_repair.add_argument("silo", nargs="+", help="Silo slug or display name")
     repair_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
+    _yes_dry(p_repair)
+    _json_flag(p_repair)
     p_repair.set_defaults(_run=cmd_repair)
 
-    # repair-ladder (L2 diagnostics)
     p_repair_ladder = sub.add_parser(
         "repair-ladder",
         help="Read-only Chroma diagnostics and L1→L3 repair guidance",
     )
-    p_repair_ladder.add_argument("--json", action="store_true", help="Emit diagnostics as JSON")
+    _json_flag(p_repair_ladder)
     p_repair_ladder.set_defaults(_run=cmd_repair_ladder)
 
-    # rehydrate [SILO ...]
     p_rehydrate = sub.add_parser(
         "rehydrate",
         help="Re-index silos from llmli_registry (L3 rebuild helper)",
@@ -835,19 +1382,18 @@ def main() -> int:
     p_rehydrate.add_argument("--dry-run", action="store_true", help="Show what would run without indexing")
     p_rehydrate.add_argument("--fast", action="store_true", help="Auto-tune ingest for this host (device, batch sizes, workers); explicit env vars still win")
     p_rehydrate.add_argument("--quiet", action="store_true", help="Suppress per-silo progress output")
-    p_rehydrate.add_argument("--json", action="store_true", help="Emit result as JSON")
+    _json_flag(p_rehydrate)
     p_rehydrate.set_defaults(_run=cmd_rehydrate)
 
-    # capabilities
     p_capabilities = sub.add_parser("capabilities", help="Supported file types and document extractors (source of truth)")
+    _json_flag(p_capabilities)
     p_capabilities.set_defaults(_run=cmd_capabilities)
 
-    # log [--last]
     p_log = sub.add_parser("log", help="Show last add failures")
     p_log.add_argument("--last", action="store_true", help="Show last add failures (default)")
+    _json_flag(p_log)
     p_log.set_defaults(_run=cmd_log)
 
-    # find [--in SILO ...] [--name GLOB] [--date YYYY-MM-DD | START:END]
     p_find = sub.add_parser("find", help="Find files by name/date (manifest-only; no embeddings)")
     find_in_arg = p_find.add_argument("--in", dest="in_silo", action="append", metavar="SILO", help="Restrict to silo (repeatable)")
     find_in_arg.completer = _silo_completer  # type: ignore[attr-defined]
@@ -856,10 +1402,9 @@ def main() -> int:
     p_find.add_argument("--field", choices=["name_date", "mtime", "either"], default="either", help="Which date signal to filter on (default: either)")
     p_find.add_argument("--with-chunks", action="store_true", help="Include chunk_count per file (touches Chroma)")
     p_find.add_argument("--limit", type=int, default=50, help="Cap result count (default: 50)")
-    p_find.add_argument("--json", action="store_true", help="Emit raw JSON instead of formatted text")
+    _json_flag(p_find)
     p_find.set_defaults(_run=cmd_find)
 
-    # reindex --names [--in SILO ...]
     p_reindex = sub.add_parser("reindex", help="One-shot maintenance commands for the manifest")
     reindex_sub = p_reindex.add_subparsers(dest="reindex_subcommand", required=True)
     p_reindex_names = reindex_sub.add_parser("names", help="Backfill name_date / name_date_precision in the manifest")
@@ -867,7 +1412,6 @@ def main() -> int:
     reindex_in_arg.completer = _silo_completer  # type: ignore[attr-defined]
     p_reindex_names.set_defaults(_run=cmd_reindex_names)
 
-    # eval-adversarial [--model M] [--out report.json] [--limit N]
     p_eval = sub.add_parser("eval-adversarial", help="Run synthetic adversarial trustfulness eval")
     p_eval.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.2:latest)")
     p_eval.add_argument("--out", help="Write JSON report to this path")
@@ -878,12 +1422,17 @@ def main() -> int:
     p_eval.add_argument("--no-direct-decisive-mode", dest="direct_decisive_mode", action="store_false", help="Override config to disable direct decisive mode for this eval run")
     p_eval.set_defaults(_run=cmd_eval_adversarial)
 
+    parser._llmli_subcommands = sorted(sub.choices.keys())  # type: ignore[attr-defined]
+
     try:
         import argcomplete
         argcomplete.autocomplete(parser)
     except ImportError:
         pass
     args = parser.parse_args()
+    if "--json" in sys.argv:
+        args.json = True
+        quiet_machine_noise()
     if getattr(args, "fast", False):
         src = _ROOT / "src"
         if str(src) not in sys.path:
@@ -908,6 +1457,7 @@ def main() -> int:
     except Exception:
         pass
     return args._run(args)
+
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -119,6 +119,10 @@ With MCP + watchers: prefer server mode; writes via `add_silo` / `trigger_reinde
 ```bash
 pal ask --in <silo> "question"
 pal ask --unified "question"
+# Agent/shell retrieve (no Ollama): llmli query / pal query — see docs/cli-for-agents.md
+llmli --json ls
+llmli query --in <silo> "question"
+llmli schema   # self-describing CLI surface
 ```
 
 ### Diagnose
@@ -126,8 +130,10 @@ pal ask --unified "question"
 ```bash
 pal ls --status
 pal inspect <silo> --top 20
+llmli status --json
 llmli repair-ladder
 llmli rehydrate --dry-run
+llmli --version   # commit + install path (stale global installs)
 ```
 
 ### Test
@@ -135,6 +141,8 @@ llmli rehydrate --dry-run
 ```bash
 uv run pytest -q tests/unit tests/contract
 ```
+
+**Agent CLI contract:** [docs/cli-for-agents.md](docs/cli-for-agents.md) — `--json`, confirm/`--dry-run`, MCP-parity `query`/`multi-query`/`read`/`find`, busy exit `3`.
 
 ## Command notes
 
