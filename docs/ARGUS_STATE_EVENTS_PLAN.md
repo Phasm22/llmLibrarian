@@ -1,6 +1,6 @@
 # Plan: push state-change events to the monitor instead of being polled
 
-Status: proposed (2026-10-07). No code changes yet.
+Status: implemented (2026-10-10). See "Implementation notes" at the end.
 
 ## Why
 
@@ -76,3 +76,25 @@ Once these events flow:
 - No periodic emitter exists (grep for timers/sleeps around the emitter).
 - `journalctl --user -u llmlibrarian-mcp -o cat | grep service.state` shows a
   single `ready` line after a restart.
+
+## Implementation notes
+
+- `HealthState` and the emission points live in `mcp_server.py`; tests in
+  `tests/unit/test_mcp_health_state.py`.
+- Emission is enabled for HTTP transports only. Over stdio, stdout is the
+  JSON-RPC stream, so the holder still tracks state but prints nothing.
+- The HTTP path now runs its own `uvicorn.Server` subclass (same settings
+  `FastMCP.run` applied) so `ready` is emitted after the socket is bound —
+  uvicorn starts the app lifespan *before* binding, so the lifespan is too
+  early. Its `shutdown` hook emits `stopping`.
+- Stable reasons: `listening; db present`, `db missing`, `db present`,
+  `chroma busy: lock held or index rebuild in progress`, `queries succeeding`,
+  `graceful shutdown`, `startup failed`, `exited with status <n>`,
+  `fatal: <ExceptionType>`.
+- A rebuild makes queries fail through the same lock timeout, so it shares the
+  `chroma busy` reason. Recovery is emitted on the next Chroma operation that
+  completes without a lock timeout (any tool, not only queries), so a busy
+  `update_file` from a watcher does not leave the service degraded for hours.
+- DB presence is observed wherever a tool or `/healthz` already checked it; a
+  `recovered` for the DB is only emitted if the current degradation is
+  `db missing`.
