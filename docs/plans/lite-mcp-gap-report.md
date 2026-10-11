@@ -19,8 +19,8 @@ Contract: `tests/contract/test_lite_mcp_catalog.py`.
 
 | Profile | Tools (before) | Schema (before) | Tools (after) | Schema (after) |
 |---------|----------------|-----------------|---------------|----------------|
-| full | 20 | 28,402 B (~7100 tok) | 20 (unchanged) | ~28 KB |
-| lite | 4 | 3,972 B (~993 tok) | 5 | ~6–8 KB (budget &lt;12 KB) |
+| full | 20 | 28,402 B (~7100 tok) | 20 (unchanged) | 28,402 B |
+| lite | 4 | 3,972 B (~993 tok) | 5 | 7,096 B (~1774 tok; budget &lt;12 KB) |
 
 Lite tools after: `silo_roster`, `retrieve_knowledge`, `find_files`, `read_document`, `ask_image`.
 
