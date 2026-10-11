@@ -47,26 +47,30 @@ The **host model** (Claude, etc.) reads chunk text and writes the answer. llmLib
 
 ### Small local models / Open WebUI
 
-Small-context models get a lite catalog (about 1.3 KB of tool schema instead of
-~10 KB):
+Small-context models get a lite catalog (about 4–6 KB of tool schema instead of
+~28 KB):
 
-1. `silo_roster()` — use only when you need an exact, machine-local silo slug.
-2. `retrieve_knowledge(query, silo, n_results=8, source=None)` — retrieve from that exact slug; eight compact evidence chunks by default (up to twelve); `source=` searches inside one file.
-3. `read_document(path)` — read a file a chunk came from.
-4. `ask_image(question, files=[...])` — look at the photos a result points to.
+1. `silo_roster()` — exact, machine-local silo slug (+ allow-listed private silos when configured).
+2. `retrieve_knowledge(query, silo, …)` — retrieve from that exact slug; optional frontmatter filters (`main_protein`, `category`, `course`, `tags`, servings, `max_total_time`, `section`, `doc_type`, `era`); `source=` searches inside one file.
+3. `find_files(...)` — filename / date-range listing (meals on a day, notes from last week).
+4. `read_document(path)` — read a file a chunk came from.
+5. `ask_image(question, files=[...])` — look at the photos a result points to.
 
 Two ways to serve it:
 
 - **Mounted beside the full endpoint (recommended).** Start the HTTP service with
   `LLMLIBRARIAN_MCP_LITE_PATH=/lite`; the lite catalog is then at `/lite/mcp` on
   the same port, sharing models and locks with the full endpoint the watchers
-  use. It reads no private silo unless `LLMLIBRARIAN_MCP_LITE_PRIVATE_READS=named`.
+  use. It reads no private silo unless `LLMLIBRARIAN_MCP_LITE_PRIVATE_READS=named`
+  and/or `LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW=slug1,slug2`.
 - **A separate process** with `LLMLIBRARIAN_MCP_PROFILE=lite` (costs a second
   server's memory).
 
 If `results_may_be_incomplete` is true, the index is being rebuilt; retry
 instead of treating an empty result as absence of evidence. If a response
 carries `recommended_action`, do that instead of rephrasing.
+
+Gap audit (before/after tables): [docs/plans/lite-mcp-gap-report.md](plans/lite-mcp-gap-report.md).
 
 **What crosses the network:** only what the tool returns (top chunks), plus normal chat context — not your entire disk. Provider training/memory policies are up to **Cursor/your API settings**, not this repo.
 

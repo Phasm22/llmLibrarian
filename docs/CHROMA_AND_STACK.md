@@ -115,7 +115,8 @@ Boolean variables accept `1`, `true`, `yes`, or `on` (case-insensitive).
 |----------|------|
 | `LLMLIBRARIAN_MCP_TRANSPORT` | `stdio` (default) or `streamable-http` |
 | `LLMLIBRARIAN_MCP_HOST` / `_PORT` / `_PATH` | Bind address and route for the HTTP service |
-| `LLMLIBRARIAN_MCP_PROFILE` | `full` (default) or `lite`; `lite` exposes only compact `silo_roster` and `retrieve_knowledge` tools for small-context clients. Set it only on that client's dedicated MCP process. |
+| `LLMLIBRARIAN_MCP_PROFILE` | `full` (default) or `lite`; `lite` exposes a compact catalog (`silo_roster`, `retrieve_knowledge`, `find_files`, `read_document`, `ask_image`) for small-context clients. Set it only on that client's dedicated MCP process. |
+| `LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW` | Optional comma-separated private silo slugs readable on both endpoints; with `named`, only these private silos open; with `none`, these override the blanket refusal. |
 | `LLMLIBRARIAN_MCP_REQUIRE_AUTH` | Require a static bearer token on HTTP transports |
 | `LLMLIBRARIAN_MCP_AUTH_TOKEN` | The bearer token. Used by the server *and* by the embedded-write guard's `/healthz` probe — without it that guard cannot identify an authenticated server. |
 | `LLMLIBRARIAN_MCP_BEARER_TOKEN` | Older client-side spelling, still written by `pal`; read as a fallback |

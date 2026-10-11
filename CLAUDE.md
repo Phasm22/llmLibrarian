@@ -81,7 +81,8 @@ macos/build.sh --install       # builds macos/build/llmLibrarian.app and replace
 | `LLMLIBRARIAN_MODEL` | Ollama model for ask |
 | `LLMLIBRARIAN_RERANK=1` | Cross-encoder rerank (CLI ask) |
 | `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` | MCP embedded reader restart (default on in mcp_server) |
-| `LLMLIBRARIAN_MCP_PRIVATE_READS` | `named` (default) or `none`: read tools never open a private silo; rosters show a count |
+| `LLMLIBRARIAN_MCP_PRIVATE_READS` | `named` (default) or `none`: when `none`, read tools refuse private silos unless allow-listed; rosters hide unreadable private rows |
+| `LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW` | Comma-separated private slugs readable (and listable) on both full and lite endpoints |
 | `LLMLIBRARIAN_MCP_LITE_PATH` | e.g. `/lite`: serve the lite catalog beside the full one in the same HTTP process |
 | `LLMLIBRARIAN_MCP_LITE_PRIVATE_READS` | Read policy for that lite mount (default `none`) |
 | `LLMLIBRARIAN_MCP_RESULT_CACHE_SECONDS` | Coalesce identical retrieval calls (default 30; 0 disables) |

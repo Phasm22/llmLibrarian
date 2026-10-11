@@ -50,7 +50,10 @@ model can produce it by guessing.
   name, folder path, or an unscoped call.
 - `LLMLIBRARIAN_MCP_PRIVATE_READS=none` (or the lite mount's default) is a
   stricter endpoint policy: no read tool opens a private silo even by slug, and
-  rosters report a count. A new read tool must call `_private_read_refusal`.
+  rosters report a count. `LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW=slug1,slug2`
+  is the per-silo exception on both endpoints (and the only way lite's
+  `silo_roster` lists a private slug). A new read tool must call
+  `_private_read_refusal`.
 - `private_filter_clause` also excludes `<slug>-artifacts`, where artifact
   compilation writes a silo's derived chunks. A new derived-silo naming scheme
   needs the same treatment.
