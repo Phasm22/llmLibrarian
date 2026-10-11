@@ -59,6 +59,13 @@ def watcher_setup(monkeypatch, tmp_path):
     fake_state.get_last_failures = lambda _db: []
     monkeypatch.setitem(__import__("sys").modules, "state", fake_state)
 
+    # exclude_enforcement imports state at call time; keep a lightweight stub for refresh/purge.
+    import exclude_enforcement as ee
+
+    monkeypatch.setattr(ee, "effective_excludes", lambda *_a, **_k: [])
+    monkeypatch.setattr(ee, "find_exclude_violations", lambda *_a, **_k: [])
+    monkeypatch.setattr(ee, "purge_exclude_violations", lambda *_a, **_k: {"purged": [], "errors": [], "violations": []})
+
     watcher = pal.SiloWatcher(
         root=root,
         db_path=str(db),

@@ -441,6 +441,59 @@ def op_rehydrate_registry(
 
 
 # ---------------------------------------------------------------------------
+# op_verify_silo
+# ---------------------------------------------------------------------------
+
+def op_verify_silo(
+    db_path: str,
+    slug_or_name: str,
+    *,
+    purge: bool = False,
+) -> dict:
+    """
+    Cheap audit: report indexed manifest sources that match the silo's excludes.
+
+    Does not open Chroma for the scan (manifest only). When purge=True, removes
+    violating files via remove_single_file.
+    """
+    from exclude_enforcement import (
+        effective_excludes,
+        find_exclude_violations,
+        purge_exclude_violations,
+    )
+    from state import get_silo_exclude_patterns, list_silos, resolve_silo_to_slug
+
+    slug = resolve_silo_to_slug(db_path, slug_or_name)
+    if slug is None:
+        return {"status": "error", "error": f"silo not found: {slug_or_name!r}"}
+
+    info = next((s for s in list_silos(db_path) if s.get("slug") == slug), None)
+    excludes = effective_excludes(db_path, slug)
+    persisted = get_silo_exclude_patterns(db_path, slug)
+    violations = find_exclude_violations(db_path, slug, exclude_patterns=excludes)
+    out: dict[str, Any] = {
+        "status": "ok" if not violations else "violations",
+        "slug": slug,
+        "display_name": (info or {}).get("display_name", slug),
+        "path": (info or {}).get("path", ""),
+        "persisted_exclude_count": len(persisted),
+        "effective_exclude_count": len(excludes),
+        "violation_count": len(violations),
+        "violations": violations[:50],
+    }
+    if purge and violations:
+        purge_result = purge_exclude_violations(
+            db_path, slug, exclude_patterns=excludes
+        )
+        out["purge"] = {
+            "purged": purge_result.get("purged") or [],
+            "errors": purge_result.get("errors") or [],
+        }
+        out["status"] = "purged" if purge_result.get("purged") else "violations"
+    return out
+
+
+# ---------------------------------------------------------------------------
 # op_inspect_silo
 # ---------------------------------------------------------------------------
 
@@ -520,6 +573,14 @@ def op_inspect_silo(db_path: str, slug_or_name: str, top: int = 50) -> dict:
         for src, count in sorted_files
     ]
 
+    exclude_violations: list[dict[str, Any]] = []
+    try:
+        from exclude_enforcement import find_exclude_violations
+
+        exclude_violations = find_exclude_violations(db_path, slug)
+    except Exception:
+        exclude_violations = []
+
     return {
         "slug": slug,
         "display_name": display,
@@ -530,6 +591,8 @@ def op_inspect_silo(db_path: str, slug_or_name: str, top: int = 50) -> dict:
         "total_files": len(by_source),
         "files_shown": len(files),
         "files": files,
+        "exclude_violation_count": len(exclude_violations),
+        "exclude_violations": exclude_violations[:20],
     }
 
 

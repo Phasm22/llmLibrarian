@@ -435,6 +435,45 @@ def cmd_log(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Report (and optionally purge) indexed files that match a silo's exclude patterns."""
+    from operations import op_verify_silo
+
+    db = _db_path(args)
+    silo_arg = getattr(args, "silo", None)
+    if not silo_arg:
+        print("Error: verify requires silo name. Example: llmli verify recipes-55cf8f91", file=sys.stderr)
+        return 1
+    result = op_verify_silo(str(db), silo_arg, purge=bool(getattr(args, "purge", False)))
+    if result.get("status") == "error":
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        return 1
+    slug = result["slug"]
+    display = result.get("display_name", slug)
+    viol_n = int(result.get("violation_count") or 0)
+    print(f"Silo: {display} ({slug})")
+    print(f"Effective excludes: {result.get('effective_exclude_count', 0)} "
+          f"(persisted {result.get('persisted_exclude_count', 0)})")
+    if viol_n == 0:
+        print("No indexed files match this silo's exclude patterns.")
+        return 0
+    print(f"Violations: {viol_n}")
+    for hit in result.get("violations") or []:
+        src = str(hit.get("source") or "")
+        short = src if len(src) <= 72 else "..." + src[-69:]
+        print(f"  matched {hit.get('matched_pattern')!r}: {short}")
+    purge_info = result.get("purge")
+    if purge_info is not None:
+        purged = purge_info.get("purged") or []
+        errors = purge_info.get("errors") or []
+        print(f"Purged: {len(purged)}")
+        for err in errors[:10]:
+            print(f"  purge error: {err}", file=sys.stderr)
+        return 1 if errors and not purged else 0
+    print(f"Run `llmli verify {slug} --purge` to remove them.")
+    return 1
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     """Show silo details: path, total chunks, and per-file chunk counts (from indexed data)."""
     from operations import op_inspect_silo
@@ -463,6 +502,18 @@ def cmd_inspect(args: argparse.Namespace) -> int:
             f"registry says {total_registry}. Re-run add to fix.",
             file=sys.stderr,
         )
+
+    viol_n = int(result.get("exclude_violation_count") or 0)
+    if viol_n:
+        print(
+            f"[llmli] exclude violations: {viol_n} indexed file(s) match this silo's "
+            f"exclude patterns. Run `llmli verify {slug} --purge` to remove them.",
+            file=sys.stderr,
+        )
+        for hit in (result.get("exclude_violations") or [])[:5]:
+            src = str(hit.get("source") or "")
+            short = src if len(src) <= 72 else "..." + src[-69:]
+            print(f"  matched {hit.get('matched_pattern')!r}: {short}", file=sys.stderr)
 
     files = result.get("files", [])
     if not files:
@@ -727,6 +778,20 @@ def main() -> int:
     p_inspect.add_argument("--top", type=int, default=20, help="Show top N chunkiest files (default: 20)")
     p_inspect.add_argument("--filter", choices=["pdf", "docx", "code"], help="Show only this type (pdf, docx, or code)")
     p_inspect.set_defaults(_run=cmd_inspect)
+
+    # verify <silo> [--purge]
+    p_verify = sub.add_parser(
+        "verify",
+        help="Report indexed files that match the silo's exclude patterns (optionally purge them)",
+    )
+    verify_silo_arg = p_verify.add_argument("silo", help="Silo slug or display name")
+    verify_silo_arg.completer = _silo_completer  # type: ignore[attr-defined]
+    p_verify.add_argument(
+        "--purge",
+        action="store_true",
+        help="Remove violating files from the index (manifest + chunks)",
+    )
+    p_verify.set_defaults(_run=cmd_verify)
 
     # index --archetype X
     p_index = sub.add_parser("index", help="Rebuild archetype collection from config folders")
