@@ -1951,7 +1951,7 @@ def execute_run_ask(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            keep_alive=0,
+            keep_alive=qc.query_keep_alive(),
             options={"temperature": 0, "seed": 42},
         )
         _elapsed = _time.perf_counter() - _t0

@@ -67,6 +67,11 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.addItem(ClosureMenuItem(title: "Copy MCP Endpoint") { [store] in
             store.copy(store.config.mcpURL, note: "Copied MCP endpoint")
         })
+        if let lite = store.mcpHealth?.litePath {
+            menu.addItem(ClosureMenuItem(title: "Copy Lite MCP Endpoint") { [store] in
+                store.copy(store.config.mcpURL(path: lite), note: "Copied lite MCP endpoint")
+            })
+        }
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem(title: "Quit llmLibrarian", key: "q") { NSApp.terminate(nil) })
     }

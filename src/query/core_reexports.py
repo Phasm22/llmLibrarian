@@ -8,6 +8,7 @@ from constants import (
     DEFAULT_MODEL,
     DEFAULT_N_RESULTS,
     MAX_CHUNKS_PER_FILE,
+    query_keep_alive,
 )
 from embeddings import get_embedding_function
 from image_embeddings import get_image_embedding_adapter, image_collection_name
@@ -202,6 +203,7 @@ __all__ = [
     "_quiet_text_only",
     "_rank_candidate_silos",
     "_repair_direct_address_answer",
+    "query_keep_alive",
     "_resolve_unified_silo_prompt",
     "_safe_query",
     "_single_year_from_query",

@@ -1,0 +1,133 @@
+{
+  "spike": "S0",
+  "run_id": "2026-09-21T00-36-04Z-production-cpu-fp32",
+  "hypothesis": "Production embedding throughput and energy are reproducible on real corpus text",
+  "verdict": "inconclusive",
+  "confidence": "medium",
+  "machine": {
+    "chip": "Apple M4 Pro",
+    "ram_gb": 48,
+    "os": "15.7.7",
+    "power": "ac",
+    "torch": "2.10.0",
+    "sentence_transformers": "5.3.0"
+  },
+  "config": {
+    "backend": "sentence-transformers",
+    "model": "sentence-transformers/all-mpnet-base-v2",
+    "precision": "fp32",
+    "device": "cpu",
+    "batch": 32,
+    "synthetic": false,
+    "fixture": "s0-mixed-v1"
+  },
+  "throughput": {
+    "unit": "chunks/s",
+    "median": 10.69691204619803,
+    "p5": 9.399852732007105,
+    "p95": 11.467618016947046,
+    "n": 5,
+    "model_input_tokens_per_s_median": 3048.5154711347373
+  },
+  "latency_ms": {
+    "batch1_median": 94.9936460092431,
+    "batch1_p99": 141.694850010972
+  },
+  "quality": {
+    "eval_set": "s0-eval-v1",
+    "recall_at_12": 0.5551517067003793,
+    "ndcg_at_12": 0.4309251890958133,
+    "recall_at_40": 0.6660977665402444,
+    "ndcg_at_40": 0.4567250456522855,
+    "delta_vs_baseline": 0.0
+  },
+  "memory": {
+    "rss_peak_mb": 2196.8125,
+    "gpu_mb": null,
+    "released_after_unload": null
+  },
+  "energy": {
+    "joules_per_1m_tokens": null,
+    "gross_joules_per_1m_tokens": 3214.4671465518118,
+    "idle_mean_mw": 12627.411764705883,
+    "valid_net_runs": 0,
+    "n": 5,
+    "valid": false
+  },
+  "cost": "baseline; existing sentence-transformers and torch dependencies",
+  "notes": {
+    "durations_s": [
+      44.145867875020485,
+      56.290305417001946,
+      47.86428062498453,
+      48.22706866700901,
+      46.77323087499826
+    ],
+    "cycles_per_run": 1,
+    "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "power": [
+      {
+        "mean": {
+          "gpu_idle_pct": 87.02150837988827,
+          "gpu_frequency_mhz": 945.9553072625698,
+          "gpu_active_pct": 12.978491620111733,
+          "cpu_mw": 11017.932960893855,
+          "gpu_mw": 343.06145251396646,
+          "combined_mw": 11361.251396648046,
+          "ane_mw": 0.22905027932960895
+        },
+        "sample_count": 179
+      },
+      {
+        "mean": {
+          "gpu_idle_pct": 59.75076923076923,
+          "gpu_frequency_mhz": 1169.710407239819,
+          "gpu_active_pct": 40.24923076923077,
+          "cpu_mw": 7802.0,
+          "gpu_mw": 2981.6696832579187,
+          "combined_mw": 10783.963800904978,
+          "ane_mw": 0.3076923076923077
+        },
+        "sample_count": 221
+      },
+      {
+        "mean": {
+          "gpu_idle_pct": 86.41645833333334,
+          "gpu_frequency_mhz": 879.6302083333334,
+          "gpu_active_pct": 13.583541666666667,
+          "cpu_mw": 8977.963541666666,
+          "gpu_mw": 339.1302083333333,
+          "combined_mw": 9317.583333333334,
+          "ane_mw": 0.484375
+        },
+        "sample_count": 192
+      },
+      {
+        "mean": {
+          "gpu_idle_pct": 86.87170984455959,
+          "gpu_frequency_mhz": 850.839378238342,
+          "gpu_active_pct": 13.128290155440414,
+          "cpu_mw": 8807.699481865286,
+          "gpu_mw": 328.80829015544043,
+          "combined_mw": 9136.507772020725,
+          "ane_mw": 0.0
+        },
+        "sample_count": 193
+      },
+      {
+        "mean": {
+          "gpu_idle_pct": 86.98526595744681,
+          "gpu_frequency_mhz": 937.7127659574468,
+          "gpu_active_pct": 13.014734042553192,
+          "cpu_mw": 9698.441489361701,
+          "gpu_mw": 329.0585106382979,
+          "combined_mw": 10027.936170212766,
+          "ane_mw": 0.5159574468085106
+        },
+        "sample_count": 188
+      }
+    ],
+    "p95_p5_ratio": 1.219978476673264
+  },
+  "would_change_my_mind": "p95/p5 above 1.5, a representative fixture mismatch, or an independently judged quality regression"
+}

@@ -49,6 +49,8 @@ struct ServiceStatus: Identifiable, Hashable, Sendable {
     var probeDetail: String?
     var siloSlug: String?
     var lockStale = false
+    /// Watchers only: newest-first files the watcher pushed into the silo, from its log.
+    var recentChanges: [WatchChange] = []
     var logPath: String
     var plistPath: String
 
@@ -74,6 +76,18 @@ struct ServiceStatus: Identifiable, Hashable, Sendable {
     }
 }
 
+/// One line of a watcher's recent activity: a file it updated or removed, or,
+/// for log lines written before paths were recorded, a count ("3 files").
+struct WatchChange: Identifiable, Hashable, Sendable {
+    let id: Int
+    let removed: Bool
+    let path: String
+    let isCount: Bool
+    let at: Date?
+
+    var name: String { isCount ? path : (path as NSString).lastPathComponent }
+}
+
 struct QuerySource: Hashable, Sendable {
     let file: String
     let path: String
@@ -97,6 +111,8 @@ struct MCPHealth: Hashable, Sendable {
     let version: String?
     let startedAt: Date?
     let dbPath: String?
+    /// URL path of the lite catalog this server is serving ("/lite/mcp"), nil if none.
+    var litePath: String?
 }
 
 struct Snapshot: Sendable {

@@ -62,7 +62,7 @@ macos/build.sh --install       # builds macos/build/llmLibrarian.app and replace
 
 **Storage:** `LLMLIBRARIAN_DB` (default `./my_brain_db`); collection `llmli`; silo in metadata. Server mode: `chroma run` + `LLMLIBRARIAN_CHROMA_HOST`.
 
-**MCP tools:** `session_context`, `mcp_runtime_status`, `query_personal_knowledge`, `multi_query_knowledge`, `recent_queries`, `list_silos`, `add_silo`, `set_silo_privacy`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md).
+**MCP tools:** `session_context`, `mcp_runtime_status`, `query_personal_knowledge`, `multi_query_knowledge`, `read_document`, `ask_image`, `recent_queries`, `list_silos`, `add_silo`, `set_silo_privacy`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md). Response-shaping rules for small models (empty-result `recommended_action`, slim chunks, repeat coalescing): [docs/plans/mcp-small-model-contract.md](docs/plans/mcp-small-model-contract.md).
 
 **Query audit:** every MCP query appends query text + params + per-source-file chunk breakdown to `~/.pal/logs/query-audit.jsonl` (`src/query_audit.py`; disable with `LLMLIBRARIAN_QUERY_AUDIT=0`). Read it via `pal queries` or the `recent_queries` MCP tool. Separate from `usage.log`, which stays a text-free metrics feed for the Argus dashboard.
 
@@ -81,6 +81,10 @@ macos/build.sh --install       # builds macos/build/llmLibrarian.app and replace
 | `LLMLIBRARIAN_MODEL` | Ollama model for ask |
 | `LLMLIBRARIAN_RERANK=1` | Cross-encoder rerank (CLI ask) |
 | `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` | MCP embedded reader restart (default on in mcp_server) |
+| `LLMLIBRARIAN_MCP_PRIVATE_READS` | `named` (default) or `none`: read tools never open a private silo; rosters show a count |
+| `LLMLIBRARIAN_MCP_LITE_PATH` | e.g. `/lite`: serve the lite catalog beside the full one in the same HTTP process |
+| `LLMLIBRARIAN_MCP_LITE_PRIVATE_READS` | Read policy for that lite mount (default `none`) |
+| `LLMLIBRARIAN_MCP_RESULT_CACHE_SECONDS` | Coalesce identical retrieval calls (default 30; 0 disables) |
 
 Full list: README “Further reading”, [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).
 
@@ -124,7 +128,10 @@ A silo flagged `private` in the registry is:
   on the CLI. Naming it is the consent signal.
 
 Unscoped query responses carry `excluded_private_silos` and `privacy_note` so a
-thin result reads as "scoped away", not "no such evidence".
+thin result reads as "scoped away", not "no such evidence". The tax ledger
+follows the same rule at its one reader, `load_tax_ledger_rows`. For an endpoint
+that should never open a private silo (Open-WebUI), start it with
+`LLMLIBRARIAN_MCP_PRIVATE_READS=none` or serve it through the lite mount.
 
 Set it with `llmli private <slug>` / `pal private <slug>`, the `set_silo_privacy`
 MCP tool, `add_silo(private=True)`, or the lock toggle in the macOS app. Clearing

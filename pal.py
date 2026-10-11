@@ -23,12 +23,16 @@ from pathlib import Path
 PAL_HOME = Path(os.environ.get("PAL_HOME", os.path.expanduser("~/.pal")))
 REGISTRY_PATH = PAL_HOME / "registry.json"
 WATCH_LOCKS_DIR = PAL_HOME / "watch_locks"
+PULL_LOCKS_DIR = PAL_HOME / "ingest_locks"
 
 _PAL_ROOT = Path(__file__).resolve().parent
 
 
 def _looks_like_checkout(path: Path) -> bool:
-    return (path / "cli.py").exists() and (path / "src").is_dir()
+    # pyproject.toml is what tells a checkout from site-packages: the wheel's
+    # force-include drops cli.py and src/ there too (even for editable installs),
+    # and taking site-packages for the checkout hid .env.mcp from every watcher.
+    return (path / "cli.py").exists() and (path / "src").is_dir() and (path / "pyproject.toml").is_file()
 
 
 def _iter_editable_roots_early(site_root: Path) -> list[Path]:
@@ -358,6 +362,71 @@ def _acquire_silo_pid_lock(
     if pid is not None and _pid_is_running(pid):
         return None, f"Error: watcher already running for silo '{silo_slug}' (pid {pid})."
     return None, f"Error: unable to acquire watcher lock for silo '{silo_slug}'."
+
+
+# Exit status for "this folder is already being indexed": EX_TEMPFAIL, so the
+# macOS app can say so instead of reporting a failed index.
+PULL_ALREADY_RUNNING_EXIT = 75
+
+
+def _pull_lock_path(db_path: str | Path, folder: Path) -> Path:
+    key = f"{Path(db_path).resolve()}::{folder}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    return PULL_LOCKS_DIR / f"{digest}.lock"
+
+
+def _acquire_pull_lock(db_path: str | Path, folder: Path):
+    """Hold an exclusive flock on ``folder`` for the length of one ``pal pull``.
+
+    Two pulls of the same folder used to run side by side (an app job orphaned
+    by an app restart plus the retry), each summarizing every image through the
+    same Ollama queue, so both looked hung. A flock dies with its process, so a
+    crashed pull never leaves a stale lock behind. Returns (handle, None) when
+    acquired, or (None, message) naming the pid that holds it.
+    """
+    import fcntl
+
+    lock_path = _pull_lock_path(db_path, folder)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.seek(0)
+        try:
+            holder = json.loads(fh.read() or "{}")
+        except ValueError:
+            holder = {}
+        fh.close()
+        detail = ", ".join(
+            part
+            for part in (
+                f"pid {holder['pid']}" if holder.get("pid") else "",
+                f"started {holder['started_at']}" if holder.get("started_at") else "",
+            )
+            if part
+        )
+        return None, (
+            f"Error: {folder} is already being indexed{f' ({detail})' if detail else ''}. "
+            "Wait for that run to finish, or stop it first."
+        )
+    fh.seek(0)
+    fh.truncate()
+    json.dump(
+        {"pid": os.getpid(), "folder": str(folder), "started_at": datetime.now().isoformat(timespec="seconds")},
+        fh,
+    )
+    fh.flush()
+    return fh, None
+
+
+def _release_pull_lock(fh) -> None:
+    import fcntl
+
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 def _release_silo_pid_lock(lock_path: Path | None) -> None:
@@ -1771,6 +1840,10 @@ class _SiloEventHandler(FileSystemEventHandler):
         self._watcher.enqueue_update(event.dest_path)
 
 
+# How many changed paths a batch_drain event names (counts stay exact).
+WATCH_EVENT_PATH_SAMPLE = 5
+
+
 class SiloWatcher:
     def __init__(
         self,
@@ -1903,6 +1976,12 @@ class SiloWatcher:
             return
         self._queue_action(str(p), "delete")
 
+    def _relative(self, path: str) -> str:
+        try:
+            return str(Path(path).relative_to(self.root))
+        except ValueError:
+            return path
+
     def _drain_due(self, now: float | None = None) -> int:
         if now is None:
             now = time.time()
@@ -1922,6 +2001,8 @@ class SiloWatcher:
         removed = 0
         skipped = 0
         errors: list[tuple[str, str]] = []
+        updated_paths: list[str] = []
+        removed_paths: list[str] = []
         with self._lock:
             for path, action, attempts in due:
                 tool = "remove_file" if action == "delete" else "update_file"
@@ -1933,10 +2014,12 @@ class SiloWatcher:
                 if status in ("updated", "removed", "unchanged", "skipped"):
                     if action == "delete":
                         removed += 1
+                        removed_paths.append(path)
                     elif status in ("unchanged", "skipped"):
                         skipped += 1
                     else:
                         updated += 1
+                        updated_paths.append(path)
                 elif res.get("busy") or res.get("retryable") or status == "busy":
                     # Lock contention is transient: retry without treating it as a
                     # hard failure (which used to flood llmli_last_failures.json).
@@ -1985,6 +2068,9 @@ class SiloWatcher:
             updated=updated,
             removed=removed,
             skipped=skipped,
+            # Capped samples, root-relative, so the status app can show what changed.
+            updated_paths=[self._relative(p) for p in updated_paths[:WATCH_EVENT_PATH_SAMPLE]],
+            removed_paths=[self._relative(p) for p in removed_paths[:WATCH_EVENT_PATH_SAMPLE]],
             errors=[{"path": p, "error": e} for p, e in errors[:10]],
             duration_ms=duration_ms,
             last_failures_path=str(failures_path(self.db_path)),
@@ -2212,8 +2298,46 @@ def _pull_path_mode(
         print(f"Error: not a file or directory: {path}", file=sys.stderr)
         return 1
 
-    _ensure_src_on_path()
     db_path = os.environ.get("LLMLIBRARIAN_DB", _DEFAULT_DB)
+    lock, busy = _acquire_pull_lock(db_path, path)
+    if lock is None:
+        print(busy, file=sys.stderr)
+        return PULL_ALREADY_RUNNING_EXIT
+    try:
+        return _pull_path_mode_locked(
+            path,
+            db_path,
+            allow_cloud=allow_cloud,
+            follow_symlinks=follow_symlinks,
+            full=full,
+            exclude_patterns=exclude_patterns,
+            prompt=prompt,
+            clear_prompt=clear_prompt,
+            image_vision=image_vision,
+            workers=workers,
+            embedding_workers=embedding_workers,
+            extra_env=extra_env,
+        )
+    finally:
+        _release_pull_lock(lock)
+
+
+def _pull_path_mode_locked(
+    path: Path,
+    db_path: str,
+    *,
+    allow_cloud: bool,
+    follow_symlinks: bool,
+    full: bool,
+    exclude_patterns: list[str] | None,
+    prompt: str | None,
+    clear_prompt: bool,
+    image_vision: bool | None,
+    workers: int | None,
+    embedding_workers: int | None,
+    extra_env: dict[str, str] | None,
+) -> int:
+    _ensure_src_on_path()
     try:
         from chroma_client import preflight_embedded_write
 
@@ -2555,10 +2679,20 @@ def pull_all_sources(
 
 
 def _daemon_workdir() -> str:
-    cwd = Path.cwd().resolve()
-    if (cwd / "pal.py").exists() and (cwd / "cli.py").exists():
-        return str(cwd)
-    return str(Path(__file__).resolve().parent)
+    return str(_default_project_root())
+
+
+def _daemon_pal_path() -> str:
+    """The pal.py the services run: the checkout's when there is one.
+
+    An editable install still leaves a force-included copy of pal.py in
+    site-packages, frozen at install time; a service pointed at it runs stale
+    code no matter what the checkout holds.
+    """
+    root = _default_project_root()
+    if _looks_like_checkout(root) and (root / "pal.py").is_file():
+        return str(root / "pal.py")
+    return str(Path(__file__).resolve())
 
 
 def _resolve_daemon_python_executable() -> str:
@@ -2581,7 +2715,7 @@ def _daemon_runtime_metadata(manager: str | None = None) -> dict[str, object]:
         "version": 1,
         "manager": detected_manager,
         "python_executable": _resolve_daemon_python_executable(),
-        "pal_path": str(Path(__file__).resolve()),
+        "pal_path": _daemon_pal_path(),
         "workdir": _daemon_workdir(),
         "db_path": str(db_path),
         "pal_home": str(PAL_HOME.resolve()),
@@ -3206,11 +3340,19 @@ def pull_command(
     image_vision: bool = typer.Option(False, "--image-vision", help="Enable multimodal image summaries for this silo (default: off unless previously enabled)."),
     workers: int | None = typer.Option(None, "--workers", help="Override file/extraction worker count for this run."),
     embedding_workers: int | None = typer.Option(None, "--embedding-workers", help="Override embedding worker count for this run."),
+    fast: bool = typer.Option(False, "--fast", help="Auto-tune ingest for this host (device, batch sizes, workers); explicit env vars still win."),
     interval: float = typer.Option(10.0, "--interval", help="Reconcile interval (watch mode).", hidden=True),
     debounce: float = typer.Option(1.0, "--debounce", help="Debounce delay (watch mode).", hidden=True),
     follow_symlinks: bool = typer.Option(False, "--follow-symlinks", help="Follow symlinks.", hidden=True),
 ) -> None:
     image_vision_requested: bool | None = True if image_vision else None
+    if fast and not (status or stop):
+        # Exported env is inherited by the llmli subprocesses that do the
+        # actual ingest (and by the watcher in --watch mode).
+        _ensure_src_on_path()
+        from perf_profile import apply_fast_profile
+
+        apply_fast_profile()
     mode_count = int(bool(watch)) + int(bool(status)) + int(bool(stop))
     if mode_count > 1:
         print("Use only one operation mode: --watch, --status, or --stop.", file=sys.stderr)

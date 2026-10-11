@@ -1,0 +1,133 @@
+{
+  "spike": "S0",
+  "run_id": "2026-09-21T00-41-17Z-production-mps-fp32-v2",
+  "hypothesis": "Production embedding throughput and energy are reproducible on real corpus text",
+  "verdict": "inconclusive",
+  "confidence": "medium",
+  "machine": {
+    "chip": "Apple M4 Pro",
+    "ram_gb": 48,
+    "os": "15.7.7",
+    "power": "ac",
+    "torch": "2.10.0",
+    "sentence_transformers": "5.3.0"
+  },
+  "config": {
+    "backend": "sentence-transformers",
+    "model": "sentence-transformers/all-mpnet-base-v2",
+    "precision": "fp32",
+    "device": "mps",
+    "batch": 32,
+    "synthetic": false,
+    "fixture": "s0-mixed-v1"
+  },
+  "throughput": {
+    "unit": "chunks/s",
+    "median": 21.636454387831776,
+    "p5": 19.691607091089672,
+    "p95": 24.33880074229415,
+    "n": 5,
+    "model_input_tokens_per_s_median": 6166.178207032175
+  },
+  "latency_ms": {
+    "batch1_median": 47.32599949056748,
+    "batch1_p99": 85.895001940662
+  },
+  "quality": {
+    "eval_set": "s0-eval-v1",
+    "recall_at_12": 0.5551517067003793,
+    "ndcg_at_12": 0.4309251890958133,
+    "recall_at_40": 0.6660977665402444,
+    "ndcg_at_40": 0.4567250456522855,
+    "delta_vs_baseline": 0.0
+  },
+  "memory": {
+    "rss_peak_mb": 664.109375,
+    "gpu_mb": null,
+    "released_after_unload": null
+  },
+  "energy": {
+    "joules_per_1m_tokens": null,
+    "gross_joules_per_1m_tokens": 1489.0909233742957,
+    "idle_mean_mw": 13107.39393939394,
+    "valid_net_runs": 0,
+    "n": 5,
+    "valid": false
+  },
+  "cost": "baseline; existing sentence-transformers and torch dependencies",
+  "notes": {
+    "durations_s": [
+      20.857321916992078,
+      21.78439200000139,
+      23.663766291021602,
+      25.639878582995152,
+      26.092781040992122
+    ],
+    "cycles_per_run": 1,
+    "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "power": [
+      {
+        "mean": {
+          "gpu_idle_pct": 17.73211111111111,
+          "gpu_mw": 4362.977777777778,
+          "cpu_mw": 6537.955555555555,
+          "ane_mw": 0.8,
+          "gpu_active_pct": 82.26788888888889,
+          "gpu_frequency_mhz": 666.3111111111111,
+          "combined_mw": 10901.711111111112
+        },
+        "sample_count": 90
+      },
+      {
+        "mean": {
+          "gpu_idle_pct": 17.2790625,
+          "gpu_mw": 4203.84375,
+          "cpu_mw": 6169.8125,
+          "ane_mw": 0.65625,
+          "gpu_active_pct": 82.7209375,
+          "gpu_frequency_mhz": 624.8125,
+          "combined_mw": 10374.291666666666
+        },
+        "sample_count": 96
+      },
+      {
+        "mean": {
+          "gpu_idle_pct": 16.204117647058823,
+          "gpu_mw": 3884.901960784314,
+          "cpu_mw": 5296.421568627451,
+          "ane_mw": 0.7254901960784313,
+          "gpu_active_pct": 83.79588235294118,
+          "gpu_frequency_mhz": 614.4411764705883,
+          "combined_mw": 9182.0
+        },
+        "sample_count": 102
+      },
+      {
+        "mean": {
+          "gpu_idle_pct": 15.375925925925925,
+          "gpu_mw": 3529.564814814815,
+          "cpu_mw": 4451.361111111111,
+          "ane_mw": 0.0,
+          "gpu_active_pct": 84.62407407407407,
+          "gpu_frequency_mhz": 538.9722222222222,
+          "combined_mw": 7980.916666666667
+        },
+        "sample_count": 108
+      },
+      {
+        "mean": {
+          "gpu_idle_pct": 15.215229357798165,
+          "gpu_mw": 3477.9633027522937,
+          "cpu_mw": 4729.1100917431195,
+          "ane_mw": 0.7155963302752294,
+          "gpu_active_pct": 84.78477064220183,
+          "gpu_frequency_mhz": 552.7155963302753,
+          "combined_mw": 8207.752293577982
+        },
+        "sample_count": 109
+      }
+    ],
+    "p95_p5_ratio": 1.2359986988216571
+  },
+  "would_change_my_mind": "p95/p5 above 1.5, a representative fixture mismatch, or an independently judged quality regression"
+}

@@ -146,9 +146,16 @@ struct OverviewView: View {
     private var connectSection: some View {
         Section("Connect") {
             VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    KeyValueRow(key: "MCP endpoint", value: store.config.mcpURL, mono: true)
-                    Button("Copy") { store.copy(store.config.mcpURL, note: "Copied MCP endpoint") }.controlSize(.small)
+                CopyableValueRow(key: "MCP endpoint", value: store.config.mcpURL) {
+                    store.copy(store.config.mcpURL, note: "Copied MCP endpoint")
+                }
+                if let lite = store.mcpHealth?.litePath {
+                    CopyableValueRow(key: "Lite endpoint", value: store.config.mcpURL(path: lite)) {
+                        store.copy(store.config.mcpURL(path: lite), note: "Copied lite MCP endpoint")
+                    }
+                } else if let lite = store.config.mcpLitePath {
+                    KeyValueRow(key: "Lite endpoint", value: "\(lite) is configured but not being served")
+                        .foregroundStyle(.secondary)
                 }
                 KeyValueRow(key: "Index", value: (store.config.dbPath as NSString).abbreviatingWithTildeInPath, mono: true)
                 KeyValueRow(key: "Checkout", value: (store.config.workdir as NSString).abbreviatingWithTildeInPath, mono: true)

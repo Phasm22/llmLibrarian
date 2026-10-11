@@ -254,13 +254,27 @@ def _safe_query(
 
 
 def _query_is_image_relevant(query: str, docs: list[str], metas: list[dict | None]) -> bool:
-    if _query_explicitly_requests_image(query):
+    """Search the image collection too and merge its hits with the text hits."""
+    if _IMAGE_QUERY_PATTERN.search(query or ""):
         return True
     return any(str((meta or {}).get("source_modality") or "") == "image" for meta in metas[:4]) or not docs
 
 
+# Asking *for* a photo. Unlike _IMAGE_QUERY_PATTERN (which only merges image hits
+# in), a match here replaces the text results with image-vector results, so it
+# must not fire on "README image indexing capabilities", "UI design notes", or
+# "dog training notes" — each of which lost every text chunk to photos.
+_EXPLICIT_IMAGE_PATTERN = re.compile(
+    r"\b(photo|photos|picture|pictures|pic|pics|screenshot|screenshots|selfie|selfies)\b"
+    r"|\bimages?\b(?!\s+(?:index\w*|process\w*|vision|embedding\w*|search\w*|support\w*|ocr|"
+    r"ingest\w*|pipeline\w*|models?|summar\w*|caption\w*|metadata|retrieval|capabilit\w*|"
+    r"format\w*|types?|files?\s+types?|handling|extraction|features?|generation|quality|size|resolution))",
+    re.IGNORECASE,
+)
+
+
 def _query_explicitly_requests_image(query: str) -> bool:
-    return bool(_IMAGE_QUERY_PATTERN.search(query or ""))
+    return bool(_EXPLICIT_IMAGE_PATTERN.search(query or ""))
 
 
 def _meta_allows_image_vision(db_path: str, meta: dict[str, Any] | None) -> bool:
@@ -361,6 +375,40 @@ def _hydrate_image_summary_docs(
     return out_docs, out_metas, lazy_used
 
 
+def _collection_space(collection: Any) -> str:
+    """Distance space of a Chroma collection; Chroma's default is squared L2."""
+    try:
+        config = getattr(collection, "configuration_json", None) or {}
+        space = ((config.get("hnsw") or {}).get("space") if isinstance(config, dict) else None)
+        if space:
+            return str(space)
+    except Exception:
+        pass
+    try:
+        meta = getattr(collection, "metadata", None) or {}
+        space = meta.get("hnsw:space") if isinstance(meta, dict) else None
+        if space:
+            return str(space)
+    except Exception:
+        pass
+    return "l2"
+
+
+def image_distance_as_cosine(distance: float | None, space: str) -> float | None:
+    """Put an image-collection distance on the text collection's cosine scale.
+
+    llmli_image was created without hnsw:space, so Chroma stores squared L2, while
+    llmli is cosine. Averaging the two and scoring 1 - dist clamped every image hit
+    to 0.0, which read as "sparse match — rephrase". CLIP vectors are unit-norm, so
+    squared L2 = 2 - 2cos and cosine distance = L2² / 2.
+    """
+    if distance is None:
+        return None
+    if space == "l2":
+        return float(distance) / 2.0
+    return float(distance)
+
+
 def _query_image_collection(
     *,
     collection: Any,
@@ -383,7 +431,11 @@ def _query_image_collection(
     except Exception:
         return [], [], []
     image_metas = (image_results.get("metadatas") or [[]])[0] or []
-    image_dists = (image_results.get("distances") or [[]])[0] or []
+    image_space = _collection_space(image_collection)
+    image_dists = [
+        image_distance_as_cosine(d, image_space)
+        for d in ((image_results.get("distances") or [[]])[0] or [])
+    ]
     out_docs: list[str] = []
     out_metas: list[dict | None] = []
     out_dists: list[float | None] = []
@@ -904,7 +956,7 @@ def _llm_summarize_structure(
                     ),
                 },
             ],
-            keep_alive=0,
+            keep_alive=_qc().query_keep_alive(),
             options={"temperature": 0, "seed": 42},
         )
         text = ((resp.get("message") or {}).get("content") or "").strip()
@@ -957,7 +1009,7 @@ def _repair_direct_address_answer(
                 {"role": "system", "content": repair_system_prompt},
                 {"role": "user", "content": repair_user_prompt},
             ],
-            keep_alive=0,
+            keep_alive=_qc().query_keep_alive(),
             options={"temperature": 0, "seed": 42},
         )
         repaired = ((response.get("message") or {}).get("content") or "").strip()

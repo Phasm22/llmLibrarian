@@ -72,27 +72,36 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
+# Editable installs put both the checkout root and src/ on sys.path so
+# `import state` / `import cli` work the same as a wheel install.
 dev-mode-dirs = [".", "src"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"pal.py"          = "pal.py"
-"cli.py"          = "cli.py"
-"pal_registry.py" = "pal_registry.py"
-"pal_daemon.py"   = "pal_daemon.py"
-"pal_pull.py"     = "pal_pull.py"
-"pal_watch.py"    = "pal_watch.py"
-"mcp_server.py"   = "mcp_server.py"
-"archetypes.yaml" = "archetypes.yaml"
-"src/vision_ocr.swift" = "src/vision_ocr.swift"
-"deploy/systemd/llmlibrarian-mcp@.service" = "deploy/systemd/llmlibrarian-mcp@.service"
-"deploy/systemd/llmlibrarian-chroma@.service" = "deploy/systemd/llmlibrarian-chroma@.service"
-"deploy/launchd/com.tjm4.llmlibrarian-mcp.plist" = "deploy/launchd/com.tjm4.llmlibrarian-mcp.plist"
-"deploy/launchd/com.llmlibrarian.chroma.plist" = "deploy/launchd/com.llmlibrarian.chroma.plist"
-"scripts/run_mcp_http.sh" = "scripts/run_mcp_http.sh"
-"scripts/run_chroma_server.sh" = "scripts/run_chroma_server.sh"
+# Selected, never force-included: hatchling copies force-include entries into
+# editable wheels too, and those frozen copies in site-packages shadow the
+# checkout that the dev-mode-dirs .pth points at.  An editable wheel carries
+# only that .pth; a regular wheel ships exactly this list.
+# `sources = ["src"]` strips the src/ prefix so a regular (non-editable) install
+# puts state.py, query/, ingest/ ... at the wheel root and `llmli` can
+# `import state` without a checkout.
+sources = ["src"]
+only-include = [
+    "src",
+    "pal.py",
+    "cli.py",
+    "pal_registry.py",
+    "pal_daemon.py",
+    "pal_pull.py",
+    "pal_watch.py",
+    "mcp_server.py",
+    "archetypes.yaml",
+    "deploy/systemd/llmlibrarian-mcp@.service",
+    "deploy/systemd/llmlibrarian-chroma@.service",
+    "deploy/launchd/com.tjm4.llmlibrarian-mcp.plist",
+    "deploy/launchd/com.llmlibrarian.chroma.plist",
+    "scripts/run_mcp_http.sh",
+    "scripts/run_chroma_server.sh",
+]
 
 [dependency-groups]
 dev = [

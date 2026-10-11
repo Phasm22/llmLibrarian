@@ -31,7 +31,9 @@ enum Collector {
                          subtitle: config.mcpURL,
                          logName: "llmlibrarian-mcp.stderr.log",
                          probeOK: mcp.map(\.ok),
-                         probeDetail: mcp.map { "/healthz OK · v\($0.version ?? "?")" } ?? "/healthz not responding",
+                         probeDetail: mcp.map { h in
+                             "/healthz OK · v\(h.version ?? "?")" + (h.litePath.map { " · lite at \($0)" } ?? "")
+                         } ?? "/healthz not responding",
                          jobs: jobs, plists: plists, config: config),
         ]
 
@@ -55,6 +57,7 @@ enum Collector {
                                  probeOK: nil, probeDetail: nil,
                                  jobs: jobs, plists: plists, config: config)
             s.siloSlug = slug
+            s.recentChanges = WatchActivity.recentChanges(logPath: s.logPath, limit: 4)
             if let lock = locks[slug] {
                 // Lock claims a pid that is not the one launchd is running → stale.
                 if let jobPid = s.pid, lock.pid != jobPid { s.lockStale = true }
@@ -152,10 +155,28 @@ enum Collector {
     static func probeMCP(_ config: PalConfig) async -> MCPHealth? {
         guard let data = await fetch(config.mcpHealthURL),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        return MCPHealth(ok: (obj["ok"] as? Bool) ?? false,
-                         version: obj["version"] as? String,
-                         startedAt: Dates.parse(obj["started_at"] as? String),
-                         dbPath: obj["db_path"] as? String)
+        var health = MCPHealth(ok: (obj["ok"] as? Bool) ?? false,
+                               version: obj["version"] as? String,
+                               startedAt: Dates.parse(obj["started_at"] as? String),
+                               dbPath: obj["db_path"] as? String,
+                               litePath: obj["lite_path"] as? String)
+        // A server started before /healthz reported lite_path: ask the mount itself.
+        if health.litePath == nil, let path = config.mcpLitePath,
+           let url = URL(string: config.mcpURL(path: path)), await isRouted(url) {
+            health.litePath = path
+        }
+        return health
+    }
+
+    /// True when the server routes `url` at all. A GET on an MCP endpoint is
+    /// refused (405/406) rather than served, so only 404 means "not mounted".
+    static func isRouted(_ url: URL) async -> Bool {
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 2.5
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { return false }
+        return http.statusCode != 404
     }
 
     static func probeChroma(_ config: PalConfig) async -> Bool? {

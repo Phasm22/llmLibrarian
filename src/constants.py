@@ -54,6 +54,9 @@ LLMLI_IMAGE_COLLECTION = "llmli_image"
 CHUNK_SIZE = 1000
 # ~15% of CHUNK_SIZE; reduces boundary splits vs 10% (100) for sentence/code continuity.
 CHUNK_OVERLAP = 150
+# Markdown files at or under this size (chars, after frontmatter strip) become one chunk.
+# Override with LLMLIBRARIAN_MD_SINGLE_CHUNK_MAX. Larger .md splits on headings first.
+MD_SINGLE_CHUNK_MAX = 4000
 
 # Ingestion
 ADD_BATCH_SIZE = 256
@@ -62,6 +65,14 @@ MAX_WORKERS = 8
 # Query defaults
 DEFAULT_N_RESULTS = 12
 DEFAULT_MODEL = "llama3.2:latest"
+
+
+def query_keep_alive() -> str | int:
+    """Ollama residency for query-time generation; 0 preserves unload-after-use."""
+    value = os.environ.get("LLMLIBRARIAN_KEEP_ALIVE", "").strip()
+    return value or 0
+
+
 # Keep snippets short enough for terminal readability while still showing enough context.
 SNIPPET_MAX_LEN = 180
 # Limit per-source chunks to avoid a single file dominating answers.

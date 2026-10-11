@@ -47,6 +47,8 @@ _bootstrap_process_env()
 
 _logger = logging.getLogger("llmLibrarian.mcp")
 
+import mcp_contract  # noqa: E402  (needs src/ on sys.path; stdlib-only)
+
 
 def _looks_like_checkout(path: Path) -> bool:
     return (path / "cli.py").exists() and (path / "src").is_dir()
@@ -100,7 +102,12 @@ def _resolve_db_path() -> str:
         Path.home() / "llmLibrarian" / "my_brain_db",
     ]
     for candidate in fallback_candidates:
-        if candidate is not None and candidate.exists():
+        # Require a real store, not just a directory: taking the Chroma lock on a
+        # missing DB path creates <path>/.llmli_chroma.flock, and that empty
+        # directory then won this search in every later session from a worktree.
+        if candidate is not None and (
+            (candidate / "llmli_registry.json").is_file() or (candidate / "chroma.sqlite3").is_file()
+        ):
             return str(candidate.resolve())
 
     cwd = Path.cwd().resolve()
@@ -116,6 +123,38 @@ _DB_PATH = _resolve_db_path()
 _CONFIG_PATH = str(Path(os.environ.get("LLMLIBRARIAN_CONFIG", str(_ROOT / "archetypes.yaml"))).resolve())
 
 import threading
+
+import code_drift  # noqa: E402
+
+# Tools import their modules lazily to keep idle memory down (f46826a). These
+# light ones (~8 MB together, no chromadb/torch) are imported now so a long-lived
+# process holds one consistent copy of them instead of mixing a startup-time copy
+# with a newer one from disk — the 2026-10-02 find_files ImportError. Heavy
+# modules stay lazy; code_drift reports when the disk has moved on.
+import document_read  # noqa: E402,F401
+import file_registry  # noqa: E402,F401
+import ingest_journal  # noqa: E402,F401
+import operations_find  # noqa: E402,F401
+import query_audit  # noqa: E402,F401
+import state  # noqa: E402,F401
+import watch_scan  # noqa: E402,F401
+
+_PROCESS_STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
+_CODE_AT_START = code_drift.snapshot(_ROOT)
+
+
+def _transport_name() -> str:
+    return os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower() or "stdio"
+
+
+def _code_drift_report() -> dict:
+    report = code_drift.drift(_CODE_AT_START, _ROOT)
+    report["process_started_at"] = _PROCESS_STARTED_AT
+    if report["changed_since_start"]:
+        report["hint"] = code_drift.restart_hint(
+            transport=_transport_name(), pid=os.getpid(), started_at=_PROCESS_STARTED_AT
+        )
+    return report
 
 # Serializes concurrent trigger_reindex calls in-process (no subprocess races).
 _reindex_lock = threading.Lock()
@@ -271,9 +310,15 @@ mcp = FastMCP(
     name="llmLibrarian",
     instructions=(
         "Use these tools when a task requires context from the user's personal knowledge base. "
-        "At session start, call session_context(check_staleness=True) for roster + health summary + actions. "
-        "If you only need a quick roster, call list_silos. Do not assume a silo's topic from its slug alone; names "
-        "can drift or be reused, so verify with list_silos metadata and retrieved sources. "
+        "At session start, call list_silos for the roster; call session_context(check_staleness=True) "
+        "only when you also need health and staleness (it walks every source folder). Do not assume a "
+        "silo's topic from its slug alone; verify with list_silos metadata and retrieved sources. "
+        ""
+        "When a response carries recommended_action {tool, args, reason}, do that next instead of "
+        "rephrasing the same words; repeat_notice means an identical call already returned this result. "
+        "To read a file a chunk or find_files named, call read_document(path); to search inside one "
+        "file, pass source= to query_personal_knowledge. For what photos show, call ask_image with the "
+        "files= that recommended_action lists, in one call. "
         ""
         "If retrieval returns zero chunks with no error, cross-check list_silos before treating "
         "that as evidence of absence: chunks_count > 0, has_index_errors, or has_ingest_failures "
@@ -283,7 +328,7 @@ mcp = FastMCP(
         "call query_personal_knowledge before responding. Use multi_query_knowledge when "
         "a task needs multiple angles of context simultaneously. "
         ""
-        "multi_query_knowledge caps merged output at max_total_chunks (default 50) — if "
+        "multi_query_knowledge caps merged output at max_total_chunks (default 30) — if "
         "truncated=True is returned, lower n_results or reduce the number of queries. "
         "Pass section= to scope retrieval to a document section. Pass doc_type= to "
         "restrict by file type (e.g. 'transcript', 'resume', 'tax_return', 'code'). "
@@ -302,6 +347,36 @@ mcp = FastMCP(
 )
 
 
+from fastmcp.exceptions import ToolError  # noqa: E402
+from fastmcp.server.middleware import Middleware  # noqa: E402
+
+
+class _ImportErrorExplainer(Middleware):
+    """Turn an ImportError inside a tool into "restart me", not a bare traceback.
+
+    The only way a shipped module fails to import a name it was written against is
+    a process holding an older copy of one side (see src/code_drift.py). The raw
+    message ("cannot import name 'read_visible_manifest' from 'file_registry'")
+    sent the 2026-10-02 investigation looking for shadowing modules and stale
+    bytecode.
+    """
+
+    async def on_call_tool(self, context, call_next):
+        try:
+            return await call_next(context)
+        except Exception as e:
+            cause = e if isinstance(e, ImportError) else e.__cause__
+            if not isinstance(cause, ImportError):
+                raise
+            hint = code_drift.restart_hint(
+                transport=_transport_name(), pid=os.getpid(), started_at=_PROCESS_STARTED_AT
+            )
+            raise ToolError(f"{type(cause).__name__}: {cause}. {hint}") from e
+
+
+mcp.add_middleware(_ImportErrorExplainer())
+
+
 _MCP_PROFILE = os.environ.get("LLMLIBRARIAN_MCP_PROFILE", "full").strip().lower() or "full"
 if _MCP_PROFILE not in {"full", "lite"}:
     raise RuntimeError(
@@ -309,15 +384,19 @@ if _MCP_PROFILE not in {"full", "lite"}:
         f"(got {_MCP_PROFILE!r})."
     )
 
+_LITE_INSTRUCTIONS = (
+    "Use silo_roster only when you need an exact silo slug. "
+    "Use retrieve_knowledge with that slug to answer from the user's indexed files. "
+    "Use read_document to read a file a chunk came from, and ask_image for what a "
+    "photo shows. If a result carries recommended_action, follow it instead of "
+    "rephrasing. If results_may_be_incomplete is true, retry after the index rebuild finishes."
+)
+
 if _MCP_PROFILE == "lite":
     # Open WebUI's small local models should not spend their context budget on
     # the full diagnostic playbook. The profile is process-local: the regular
     # HTTP service and stdio clients retain the full instructions and tools.
-    mcp.instructions = (
-        "Use silo_roster only when you need an exact silo slug. "
-        "Use retrieve_knowledge with that slug to answer from the user's indexed files. "
-        "If results_may_be_incomplete is true, retry after the index rebuild finishes."
-    )
+    mcp.instructions = _LITE_INSTRUCTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -429,19 +508,24 @@ def _mcp_chroma_lock(operation: str, write: bool = False, *, writer_wait: bool =
     In HTTP/server mode neither reads nor writes take the mutex. Embedded mode
     still serializes both. ``writer_wait=True`` uses the long writer budget
     when the mutex is actually taken (background ingest hooks, ``repair_silo``).
+    Sync high-frequency tools (``update_file`` / ``remove_file``) keep the short
+    budget and return ``busy`` quickly rather than hang the HTTP request.
     """
     if write:
         if _mcp_write_lock_disabled():
             yield
+            _HEALTH.recover(_HEALTH_CHROMA_BUSY, "queries succeeding")
             return
     elif _mcp_read_lock_disabled():
         yield
+        _HEALTH.recover(_HEALTH_CHROMA_BUSY, "queries succeeding")
         return
     _acquire_chroma_lock(operation, write=writer_wait)
     try:
         yield
     finally:
         _chroma_lock.release()
+    _HEALTH.recover(_HEALTH_CHROMA_BUSY, "queries succeeding")
 
 # Last background reindex outcome per silo (for health / debugging).
 _reindex_outcome_lock = threading.Lock()
@@ -492,6 +576,7 @@ def _busy_error(exc: BaseException, operation: str, *, write: bool = False) -> d
     a stable field without parsing the error string.
     """
     retry_after = _retry_after_seconds(write=write)
+    _HEALTH.set("degraded", _HEALTH_CHROMA_BUSY)
     return {
         "status": "busy",
         "db_path": _DB_PATH,
@@ -537,6 +622,13 @@ def _compute_answer_confidence(chunks: list[dict]) -> tuple[str, float, str]:
     else:
         level = "low"
         note = "sparse match — consider a broader or rephrased query"
+    if chunks and chunks[0].get("source_modality") == "image":
+        # Text-to-photo similarity runs low (0.1–0.3 is typical for a real match),
+        # so "rephrase" here only sends a model round in circles.
+        note = (
+            f"image match — top score {top:.2f}; text-to-photo scores run low, so this is "
+            "not a weak match. Answer from the OCR/summary text; call ask_image for visual detail."
+        )
     return level, round(mean, 4), note
 
 
@@ -564,7 +656,7 @@ def _collect_health_summary(*, include_audit: bool = False) -> dict:
 
     out: dict = {
         "db_path": _DB_PATH,
-        "db_exists": Path(_DB_PATH).exists(),
+        "db_exists": _db_present(),
         **chroma_mode_info(),
         "embedding_model": os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "all-mpnet-base-v2"),
         "embedding_kind": os.environ.get("LLMLIBRARIAN_EMBEDDING", "") or "sentence_transformer",
@@ -801,6 +893,44 @@ def _mcp_rows_from_ps() -> list[dict]:
     return rows
 
 
+_LAUNCHER_NAMES = {
+    "disclaimer", "uv", "sh", "bash", "zsh", "fish", "login", "env",
+    "python", "python3", "Python", "node", "llmLibrarian",
+}
+
+
+def _parent_map() -> dict[int, tuple[int, str]]:
+    """pid -> (ppid, command name), from ps. Empty on failure."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,comm="], capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return {}
+    table: dict[int, tuple[int, str]] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), Path(parts[2]).name)
+    return table
+
+
+def _client_of(pid: int, parents: dict[int, tuple[int, str]]) -> str | None:
+    """Name of the first non-launcher ancestor, or None when the chain reaches
+    init/launchd (the client is gone)."""
+    seen = 0
+    current = parents.get(pid, (0, ""))[0]
+    while current > 1 and seen < 8:
+        ppid, name = parents.get(current, (0, ""))
+        if not name:
+            return None
+        if name not in _LAUNCHER_NAMES and not name.startswith("llmLibrarian-mcp"):
+            return name
+        current = ppid
+        seen += 1
+    return None
+
+
 def _mcp_process_snapshot(*, verbose: bool = False) -> dict:
     """Count live mcp_server.py processes: /proc on Linux, ps elsewhere."""
     out: dict = {"mcp_process_count": 0, "multiple_mcp_processes": False}
@@ -828,6 +958,18 @@ def _mcp_process_snapshot(*, verbose: bool = False) -> dict:
     stdio = [r for r in rows if r.get("transport") == "stdio"]
     out["mcp_stdio_count"] = len(stdio)
     out["multiple_stdio_processes"] = len(stdio) > 1
+    # A stdio server lives as long as its client. Claude Code/Desktop keep idle
+    # sessions resident for days, so "several stdio servers" is normal; only one
+    # whose client is gone is a leak.
+    parents = _parent_map()
+    if parents:
+        orphaned = []
+        for row in stdio:
+            client = _client_of(int(row["pid"]), parents)
+            row["client"] = client or "none"
+            if client is None:
+                orphaned.append(int(row["pid"]))
+        out["mcp_stdio_orphaned_pids"] = orphaned
     if verbose:
         out["processes"] = rows
     else:
@@ -927,6 +1069,82 @@ def _emit_usage_event(event: str, metrics: dict) -> None:
         _logger.debug("usage event emit failed", exc_info=True)
 
 
+class HealthState:
+    """Current service health; prints a ``service.state`` line only on change.
+
+    The monitor tails this unit's journal for JSON lines with an ``"event"``
+    key, so health is pushed as transitions instead of polled from /healthz.
+    There is deliberately no timer: a server that stays healthy emits once.
+
+    Disabled by default. Over stdio, stdout is the JSON-RPC stream and a stray
+    line would corrupt it, so ``__main__`` enables this for HTTP transports only.
+    """
+
+    def __init__(self, *, enabled: bool = False, out=None) -> None:
+        self.enabled = enabled
+        self.status: str | None = None
+        self.reason: str | None = None
+        self._out = out
+        self._lock = threading.Lock()
+
+    def set(self, status: str, reason: str, **metrics) -> bool:
+        """Record ``status``/``reason``; emit and return True if either changed."""
+        try:
+            with self._lock:
+                if (status, reason) == (self.status, self.reason):
+                    return False
+                self.status, self.reason = status, reason
+                if not self.enabled:
+                    return False
+                line = _json.dumps({
+                    "event": "service.state",
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "status": status,
+                    "reason": reason,
+                    "metrics": metrics,
+                }, default=str)
+                print(line, file=self._out or sys.stdout, flush=True)
+            return True
+        except Exception:
+            _logger.debug("service.state emit failed", exc_info=True)
+            return False
+
+    def recover(self, reason: str, recovered_reason: str, **metrics) -> bool:
+        """Emit ``recovered`` if the current degradation is ``reason``."""
+        if self.status != "degraded" or self.reason != reason:
+            return False
+        return self.set("recovered", recovered_reason, **metrics)
+
+
+_HEALTH = HealthState()
+_HEALTH_DB_MISSING = "db missing"
+_HEALTH_CHROMA_BUSY = "chroma busy: lock held or index rebuild in progress"
+_db_present_last: bool | None = None
+
+
+def _db_present() -> bool:
+    """True when LLMLIBRARIAN_DB is a directory; reports changes to ``_HEALTH``."""
+    global _db_present_last
+    present = Path(_DB_PATH).is_dir()
+    try:
+        previous, _db_present_last = _db_present_last, present
+        if present != previous:
+            if not present:
+                _HEALTH.set("degraded", _HEALTH_DB_MISSING, db_exists=False)
+            elif previous is False:
+                _HEALTH.recover(_HEALTH_DB_MISSING, "db present", db_exists=True)
+    except Exception:
+        _logger.debug("db presence tracking failed", exc_info=True)
+    return present
+
+
+def _health_startup() -> None:
+    """First state line, once the HTTP server is listening."""
+    if _db_present():
+        _HEALTH.set("ready", "listening; db present", db_exists=True)
+    # A missing DB has already set degraded via _db_present.
+
+
 def _rebuild_note(write_state: dict | None) -> str | None:
     """Warning text for a result set taken while a silo was being rebuilt."""
     if not write_state or not write_state.get("results_may_be_incomplete"):
@@ -955,6 +1173,54 @@ def _emit_query_audit(**kwargs) -> None:
         _logger.debug("query audit emit failed", exc_info=True)
 
 
+from mcp_result_cache import ResultCache, repeat_fields  # noqa: E402
+
+_RESULT_CACHE = ResultCache()
+
+
+def _cache_window_seconds() -> float:
+    """LLMLIBRARIAN_MCP_RESULT_CACHE_SECONDS (default 30; 0 disables)."""
+    raw = os.environ.get("LLMLIBRARIAN_MCP_RESULT_CACHE_SECONDS", "30").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 30.0
+
+
+def _index_state_stamp() -> tuple[int, ...]:
+    """Changes whenever an ingest commits or a silo's privacy flag flips.
+
+    bump_generation is a no-op in HTTP mode, so the registry, manifest and tax
+    ledger mtimes are the write signal a cache key can use.
+    """
+    stamps: list[int] = []
+    for name in ("llmli_registry.json", "llmli_file_manifest.json", "tax_ledger.json"):
+        try:
+            stamps.append(os.stat(Path(_DB_PATH) / name).st_mtime_ns)
+        except OSError:
+            stamps.append(0)
+    return tuple(stamps)
+
+
+def _cached_retrieval(tool: str, key_parts: tuple, compute) -> dict:
+    """Run ``compute`` (returning (response, audit_kwargs | None)) through the
+    single-flight cache; audit every call, mark repeats on the response."""
+    window = _cache_window_seconds()
+    key = (tool, _DB_PATH, _index_state_stamp(), key_parts)
+    (response, audit), meta = _RESULT_CACHE.get_or_compute(key, compute, ttl_seconds=window)
+    if audit:
+        outcome = dict(audit.get("outcome") or {})
+        if meta["cached"]:
+            outcome["cached"] = True
+        _emit_query_audit(**{**audit, "outcome": outcome})
+    response.update(repeat_fields(meta, window_seconds=window))
+    return response
+
+
+def _query_key(query: str) -> str:
+    return " ".join((query or "").split())
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -966,6 +1232,63 @@ def _current_host() -> str:
         return current_host()
     except Exception:
         return ""
+
+
+import contextvars  # noqa: E402
+
+_PRIVATE_READS: contextvars.ContextVar[str | None] = contextvars.ContextVar("llmli_private_reads", default=None)
+
+
+def _private_reads_policy() -> str:
+    """Whether read tools on this endpoint may open a private silo.
+
+    "named" (default): a private silo opens when its exact slug is passed — naming
+    it is the consent signal. "none": no read tool opens one, and rosters and
+    unscoped responses report a count instead of slugs, so the endpoint never
+    hands out the key. Writes (update_file/remove_file from watchers, add_silo,
+    reindex, repair) are unaffected. Set per process with
+    LLMLIBRARIAN_MCP_PRIVATE_READS, or per mounted endpoint (_PrivateReadsPolicy).
+    """
+    raw = _PRIVATE_READS.get() or os.environ.get("LLMLIBRARIAN_MCP_PRIVATE_READS", "named")
+    return "none" if str(raw).strip().lower() == "none" else "named"
+
+
+_PRIVATE_READ_REFUSAL = (
+    "That silo is private, and this endpoint does not read private silos. Tell the user "
+    "to ask it locally with `pal ask --in <slug>`."
+)
+
+
+def _private_read_refusal(*silos: str | None) -> str | None:
+    """Error text when the policy is "none" and any named silo is private."""
+    if _private_reads_policy() != "none":
+        return None
+    from state import private_silo_slugs, resolve_silo_by_path, resolve_silo_to_slug
+
+    private = set(private_silo_slugs(_DB_PATH))
+    if not private:
+        return None
+    for name in silos:
+        if not name:
+            continue
+        slug = resolve_silo_to_slug(_DB_PATH, name)
+        if slug is None and "/" in name:
+            slug = resolve_silo_by_path(_DB_PATH, name)
+        if (slug or name) in private:
+            return _PRIVATE_READ_REFUSAL
+    return None
+
+
+def _roster_for_policy(result: dict) -> dict:
+    """Drop private rows from a roster when this endpoint cannot read them."""
+    if _private_reads_policy() != "none" or not isinstance(result.get("silos"), list):
+        return result
+    visible = [row for row in result["silos"] if not row.get("private")]
+    hidden = len(result["silos"]) - len(visible)
+    out = {**result, "silos": visible, "silo_count": len(visible)}
+    if hidden:
+        out["private_silo_count"] = hidden
+    return out
 
 
 def _private_scope_note(silo: str | None) -> dict:
@@ -984,6 +1307,15 @@ def _private_scope_note(silo: str | None) -> dict:
         return {}
     if not skipped:
         return {}
+    if _private_reads_policy() == "none":
+        return {
+            "excluded_private_silo_count": len(skipped),
+            "privacy_note": (
+                f"Unscoped query: {len(skipped)} private silo(s) were not searched and are not "
+                "readable from this endpoint. If the question is about one of them, tell the "
+                "user to run `pal ask --in <slug>` locally."
+            ),
+        }
     return {
         "excluded_private_silos": skipped,
         "privacy_note": (
@@ -1000,9 +1332,18 @@ def _private_scope_note(silo: str | None) -> dict:
 def query_personal_knowledge(
     query: str,
     silo: str | None = None,
-    n_results: int = 40,
+    n_results: int = 12,
     section: str | None = None,
     doc_type: str | None = None,
+    source: str | None = None,
+    category: str | None = None,
+    main_protein: str | None = None,
+    min_servings: int | None = None,
+    max_servings: int | None = None,
+    max_total_time: int | None = None,
+    tags: str | list[str] | None = None,
+    course: str | None = None,
+    era: str | None = None,
 ) -> dict:
     """
     Use when: answering a content/meaning question from indexed files.
@@ -1013,18 +1354,33 @@ def query_personal_knowledge(
     decisions, reflections, or domain knowledge. Returns semantically ranked
     chunks from indexed silos.
 
-    Specify silo to scope retrieval by slug or display name; call list_silos first
+    Specify silo to scope retrieval by slug or display name (a private silo opens only
+    by its exact slug); call list_silos first
     rather than inferring a silo's domain from its slug. Returns chunks with text, score (0–1),
-    confidence, section heading, source path, date, doc_type, and position. Image chunks also
-    include embedded capture, camera, exposure, dimensions, and GPS data under photo_metadata
-    when present.
+    source path, silo, doc_type, section/page/date when known, and a ``metadata`` object
+    when the source had YAML frontmatter (title, category, servings, tags, …). Image chunks
+    also carry source_modality and, once per photo, capture/camera/GPS data under photo_metadata.
+    n_results defaults to 12; raise it only when a broad survey needs more.
 
     Pass section= to restrict to a document section.
     Pass doc_type= to restrict by file type.
+    Pass source= (a path or unique filename from `find_files`) to search inside one
+    file; use `read_document` to read it start to finish instead.
+    Metadata filters (from frontmatter indexed as Chroma metadata — reindex the silo
+    after upgrading for these to take effect):
+      category / main_protein / course / era — exact match
+      min_servings / max_servings — inclusive servings range
+      max_total_time — total_time (minutes) ≤ this value
+      tags — string or list; every listed tag must appear in tags or dietary_flags
     Intent routing is applied automatically.
     For tax queries, also returns a tax_ledger field with structured extracted values.
     Response includes answer_confidence and coverage_note to calibrate hedging.
-    When no silo filter is passed, also returns chunks_by_silo grouped by silo.
+    When no silo filter is passed, also returns silo_counts (chunks per silo).
+
+    When chunks is empty the response carries recommended_action {tool, args,
+    reason}: follow it rather than rephrasing the same words. alternative_tool
+    names a tool for the inventory-style reading of the question ("which file
+    types", "list my files") when the chunks may not be what the user meant.
 
     If an index write was running during retrieval, the response carries
     write_in_progress. When results_may_be_incomplete is true a silo was being
@@ -1032,9 +1388,43 @@ def query_personal_knowledge(
     retry once it finishes.
     """
     from query.core import run_retrieve
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "chunks": []}
-    try:
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"db_path": _DB_PATH, "error": refusal, "chunks": []}
+    source_path: str | None = None
+    if source:
+        source_path, _slug, candidates, err = _resolve_indexed_file(source, silo)
+        if err:
+            return {
+                "db_path": _DB_PATH,
+                "error": err,
+                **({"candidates": candidates[:20]} if candidates else {}),
+                "chunks": [],
+            }
+    meta_params = {
+        "category": category,
+        "main_protein": main_protein,
+        "min_servings": min_servings,
+        "max_servings": max_servings,
+        "max_total_time": max_total_time,
+        "tags": tags,
+        "course": course,
+        "era": era,
+    }
+
+    def _compute() -> tuple[dict, dict | None]:
+        try:
+            return _query_personal_knowledge_uncached()
+        except Exception as e:
+            if _is_lock_timeout(e):
+                return {**_busy_error(e, "query_personal_knowledge"), "chunks": []}, None
+            return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}, None
+        finally:
+            _release_chroma()
+
+    def _query_personal_knowledge_uncached() -> tuple[dict, dict]:
         with _mcp_chroma_lock("query_personal_knowledge"):
             result = run_retrieve(
                 query=query,
@@ -1042,10 +1432,14 @@ def query_personal_knowledge(
                 n_results=n_results,
                 section=section,
                 doc_type=doc_type,
+                source=source_path,
                 db_path=_DB_PATH,
                 config_path=_CONFIG_PATH,
+                **meta_params,
             )
             chunks = result.get("chunks", [])
+            # Lexical-leg diagnostics belong to explain_retrieval; keep this payload slim.
+            result.pop("lexical_retrieval", None)
 
             _emit_usage_event("usage.llmlibrarian.query", {"silo": silo or "unscoped"})
 
@@ -1065,40 +1459,69 @@ def query_personal_knowledge(
 
             # Cross-silo grouping (only when unscoped)
             result.update(_private_scope_note(silo))
+            mcp_contract.apply_guidance(result, query=query, silo=silo)
 
             if not silo and chunks:
-                by_silo: dict[str, list] = {}
-                for c in chunks:
-                    by_silo.setdefault(c.get("silo", ""), []).append(c)
-                result["chunks_by_silo"] = by_silo
+                result["silo_counts"] = mcp_contract.silo_counts(chunks)
+            result["chunks"] = mcp_contract.slim_chunks(chunks)
 
-        # Audit outside the lock — the append is small, but this lock is on the
-        # hot path for every reader and has been a contention source before.
-        _emit_query_audit(
+        # Audited by _cached_retrieval outside the lock, once per call (cached
+        # repeats included) — the append is small, but this lock is on the hot
+        # path for every reader and has been a contention source before.
+        audit = dict(
             tool="query_personal_knowledge",
             queries=[query],
             silo=silo,
-            params={"n_results": n_results, "section": section, "doc_type": doc_type},
+            params={
+                "n_results": n_results,
+                "section": section,
+                "doc_type": doc_type,
+                "source": source_path,
+                **{k: v for k, v in meta_params.items() if v is not None},
+            },
             chunks=chunks,
             outcome={"confidence": conf_level, "confidence_score": conf_score},
         )
-        return {"db_path": _DB_PATH, **result}
-    except Exception as e:
-        if _is_lock_timeout(e):
-            return {**_busy_error(e, "query_personal_knowledge"), "chunks": []}
-        return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}
-    finally:
-        _release_chroma()
+        return {"db_path": _DB_PATH, **result}, audit
+
+    return _cached_retrieval(
+        "query_personal_knowledge",
+        (
+            _query_key(query),
+            silo,
+            n_results,
+            section,
+            doc_type,
+            source_path,
+            category,
+            main_protein,
+            min_servings,
+            max_servings,
+            max_total_time,
+            tuple(tags) if isinstance(tags, list) else tags,
+            course,
+            era,
+        ),
+        _compute,
+    )
 
 
 @mcp.tool()
 def multi_query_knowledge(
-    queries: list[str],
+    queries: list[str] | str,
     silo: str | None = None,
-    n_results: int = 20,
+    n_results: int = 10,
     section: str | None = None,
     doc_type: str | None = None,
-    max_total_chunks: int = 50,
+    max_total_chunks: int = 30,
+    category: str | None = None,
+    main_protein: str | None = None,
+    min_servings: int | None = None,
+    max_servings: int | None = None,
+    max_total_time: int | None = None,
+    tags: str | list[str] | None = None,
+    course: str | None = None,
+    era: str | None = None,
 ) -> dict:
     """
     Use when: one task needs multiple retrieval angles merged in one response.
@@ -1112,7 +1535,13 @@ def multi_query_knowledge(
     Each chunk is tagged with the query that retrieved it. Pass section= to restrict
     all queries to a document section. Pass doc_type= to restrict by file type
     (e.g. 'transcript', 'resume', 'tax_return', 'code', 'other').
-    max_total_chunks caps the merged output (default 50) to avoid context overflow.
+    Metadata filters (same as query_personal_knowledge; applied to every sub-query):
+      category / main_protein / course / era — exact match on frontmatter metadata
+      min_servings / max_servings — inclusive servings range
+      max_total_time — total_time (minutes) ≤ this value
+      tags — string or list; every listed tag must appear in tags or dietary_flags
+    Chunks include a ``metadata`` object when the source had YAML frontmatter.
+    max_total_chunks caps the merged output (default 30) to avoid context overflow.
     If the cap is hit, response includes truncated=True — lower n_results or reduce queries.
     Response includes answer_confidence, answer_confidence_score, and coverage_note.
 
@@ -1122,94 +1551,141 @@ def multi_query_knowledge(
     retry once it finishes.
     """
     from query.core import run_retrieve
-    if not Path(_DB_PATH).is_dir():
+    if isinstance(queries, str):
+        queries = [queries]
+    if not _db_present():
         return {**_db_missing_error(), "queries": queries, "total_chunks": 0, "chunks": []}
-    seen: set[str] = set()
-    all_chunks: list[dict] = []
-    errors: list[str] = []
-    busy = False
-    write_states: list[dict] = []
-    for q in queries:
-        try:
-            with _mcp_chroma_lock("multi_query_knowledge"):
-                res = run_retrieve(
-                    query=q,
-                    silo=silo,
-                    n_results=n_results,
-                    section=section,
-                    doc_type=doc_type,
-                    db_path=_DB_PATH,
-                    config_path=_CONFIG_PATH,
-                )
-            if res.get("write_in_progress"):
-                write_states.append(res["write_in_progress"])
-            for chunk in res.get("chunks", []):
-                key = (chunk.get("text") or "")[:200]
-                if key and key not in seen:
-                    seen.add(key)
-                    chunk["query"] = q
-                    all_chunks.append(chunk)
-        except Exception as e:
-            if _is_lock_timeout(e):
-                busy = True
-            errors.append(f"{q!r}: {type(e).__name__}: {e}")
-    all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
-    truncated = len(all_chunks) > max_total_chunks
-    if truncated:
-        all_chunks = all_chunks[:max_total_chunks]
-
-    # Feature 6: answer-level confidence on merged results
-    conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
-
-    # A rebuild seen by any sub-query taints the merged set.
-    from ingest_journal import merge_write_states
-
-    merged_write_state = merge_write_states(write_states)
-    coverage_note = _with_rebuild_note(coverage_note, merged_write_state)
-
-    _emit_usage_event(
-        "usage.llmlibrarian.query",
-        {"silo": silo or "unscoped", "query_count": len(queries)},
-    )
-    _emit_query_audit(
-        tool="multi_query_knowledge",
-        queries=queries,
-        silo=silo,
-        params={
-            "n_results": n_results,
-            "max_total_chunks": max_total_chunks,
-            "section": section,
-            "doc_type": doc_type,
-        },
-        chunks=all_chunks,
-        outcome={
-            "confidence": conf_level,
-            "confidence_score": conf_score,
-            "truncated": truncated,
-            **({"errors": errors} if errors else {}),
-        },
-    )
-
-    _release_chroma()
-    return {
-        "db_path": _DB_PATH,
-        "queries": queries,
-        "total_chunks": len(all_chunks),
-        "truncated": truncated,
-        "answer_confidence": conf_level,
-        "answer_confidence_score": conf_score,
-        "coverage_note": coverage_note,
-        "chunks": all_chunks,
-        **_private_scope_note(silo),
-        **({"write_in_progress": merged_write_state} if merged_write_state else {}),
-        **({"retryable": True} if (merged_write_state or {}).get("results_may_be_incomplete") else {}),
-        **({"errors": errors} if errors else {}),
-        **(
-            {"busy": True, "retryable": True, "retry_after_seconds": _retry_after_seconds()}
-            if busy and not all_chunks
-            else {}
-        ),
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"db_path": _DB_PATH, "queries": queries, "error": refusal, "total_chunks": 0, "chunks": []}
+    meta_params = {
+        "category": category,
+        "main_protein": main_protein,
+        "min_servings": min_servings,
+        "max_servings": max_servings,
+        "max_total_time": max_total_time,
+        "tags": tags,
+        "course": course,
+        "era": era,
     }
+
+    def _compute() -> tuple[dict, dict]:
+        seen: set[str] = set()
+        all_chunks: list[dict] = []
+        errors: list[str] = []
+        busy = False
+        write_states: list[dict] = []
+        deterministic_intent: str | None = None
+        for q in queries:
+            try:
+                with _mcp_chroma_lock("multi_query_knowledge"):
+                    res = run_retrieve(
+                        query=q,
+                        silo=silo,
+                        n_results=n_results,
+                        section=section,
+                        doc_type=doc_type,
+                        db_path=_DB_PATH,
+                        config_path=_CONFIG_PATH,
+                        **meta_params,
+                    )
+                if res.get("write_in_progress"):
+                    write_states.append(res["write_in_progress"])
+                if res.get("deterministic_intent") and not deterministic_intent:
+                    deterministic_intent = res["deterministic_intent"]
+                for chunk in res.get("chunks", []):
+                    key = (chunk.get("text") or "")[:200]
+                    if key and key not in seen:
+                        seen.add(key)
+                        chunk["query"] = q
+                        all_chunks.append(chunk)
+            except Exception as e:
+                if _is_lock_timeout(e):
+                    busy = True
+                    _HEALTH.set("degraded", _HEALTH_CHROMA_BUSY)
+                errors.append(f"{q!r}: {type(e).__name__}: {e}")
+        all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
+        truncated = len(all_chunks) > max_total_chunks
+        if truncated:
+            all_chunks = all_chunks[:max_total_chunks]
+
+        # Feature 6: answer-level confidence on merged results
+        conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
+
+        # A rebuild seen by any sub-query taints the merged set.
+        from ingest_journal import merge_write_states
+
+        merged_write_state = merge_write_states(write_states)
+        coverage_note = _with_rebuild_note(coverage_note, merged_write_state)
+
+        _emit_usage_event(
+            "usage.llmlibrarian.query",
+            {"silo": silo or "unscoped", "query_count": len(queries)},
+        )
+        audit = dict(
+            tool="multi_query_knowledge",
+            queries=queries,
+            silo=silo,
+            params={
+                "n_results": n_results,
+                "max_total_chunks": max_total_chunks,
+                "section": section,
+                "doc_type": doc_type,
+                **{k: v for k, v in meta_params.items() if v is not None},
+            },
+            chunks=all_chunks,
+            outcome={
+                "confidence": conf_level,
+                "confidence_score": conf_score,
+                "truncated": truncated,
+                **({"errors": errors} if errors else {}),
+            },
+        )
+
+        _release_chroma()
+        response = {
+            "db_path": _DB_PATH,
+            "queries": queries,
+            "total_chunks": len(all_chunks),
+            "truncated": truncated,
+            "answer_confidence": conf_level,
+            "answer_confidence_score": conf_score,
+            "coverage_note": coverage_note,
+            "chunks": mcp_contract.slim_chunks(all_chunks),
+            **_private_scope_note(silo),
+            **({"write_in_progress": merged_write_state} if merged_write_state else {}),
+            **({"retryable": True} if (merged_write_state or {}).get("results_may_be_incomplete") else {}),
+            **({"errors": errors} if errors else {}),
+            **(
+                {"busy": True, "retryable": True, "retry_after_seconds": _retry_after_seconds()}
+                if busy and not all_chunks
+                else {}
+            ),
+            **({"deterministic_intent": deterministic_intent} if deterministic_intent else {}),
+        }
+        response = mcp_contract.apply_guidance(response, query=" ; ".join(queries), silo=silo)
+        return response, audit
+
+    return _cached_retrieval(
+        "multi_query_knowledge",
+        (
+            tuple(_query_key(q) for q in queries),
+            silo,
+            n_results,
+            section,
+            doc_type,
+            max_total_chunks,
+            category,
+            main_protein,
+            min_servings,
+            max_servings,
+            max_total_time,
+            tuple(tags) if isinstance(tags, list) else tags,
+            course,
+            era,
+        ),
+        _compute,
+    )
 
 
 @mcp.tool()
@@ -1284,7 +1760,10 @@ def explain_retrieval(
     before deciding to re-query with different parameters.
 
     Returns:
-    - retrieval_method: 'hybrid' (vector + lexical RRF) or 'vector_only'
+    - retrieval_method: 'hybrid' (vector + BM25 lexical RRF) or 'vector_only'; may carry
+      '+image_rrf', or be 'dual_stream_rrf' / 'image_vector'
+    - lexical_terms: terms the lexical leg searched, terms it dropped and why
+      (no_match, too_common), and its status
     - lexical_hit_count: chunks with lexical_rank set (exact-text match)
     - vector_only_chunk_count: chunks with no lexical_rank (semantic-only in this result set)
     - chunk_with_vector_rank_count: chunks that participated in vector ranking (includes hybrid rows)
@@ -1294,8 +1773,11 @@ def explain_retrieval(
     - signal_summary: plain-text explanation of what signals fired and why
     """
     from query.core import run_retrieve
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "query": query, "ranked_chunks": []}
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"db_path": _DB_PATH, "query": query, "error": refusal, "ranked_chunks": []}
     try:
         with _mcp_chroma_lock("explain_retrieval"):
             result = run_retrieve(
@@ -1328,30 +1810,66 @@ def explain_retrieval(
                     "rrf_score": sig.get("rrf_score"),
                 })
 
-            # Build human-readable signal summary
-            if method == "hybrid":
+            # Build human-readable signal summary from the path actually taken.
+            lexical = result.get("lexical_retrieval") or {}
+            lexical_terms = {
+                k: lexical[k]
+                for k in ("status", "terms_extracted", "terms_used", "terms_dropped", "scope_size", "candidates", "error")
+                if k in lexical
+            }
+            dropped = lexical.get("terms_dropped") or {}
+            dropped_note = (
+                " Dropped terms: " + ", ".join(f"{t} ({why})" for t, why in dropped.items()) + "."
+                if dropped
+                else ""
+            )
+            if lexical_hits:
                 summary_parts = [
-                    f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had exact-text matches (lexical_rank set); "
+                    f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had BM25 lexical matches (lexical_rank set) "
+                    f"on terms {lexical.get('terms_used') or '?'}; "
                     f"{with_vector_rank} chunk(s) have vector_rank (semantic ranking); "
-                    f"{len(vector_only_hits)} chunk(s) are semantic-only in this set (no lexical_rank).",
+                    f"{len(vector_only_hits)} chunk(s) are semantic-only in this set (no lexical_rank).{dropped_note}",
                 ]
-                if lexical_hits:
-                    top_lex = lexical_hits[0]
-                    summary_parts.append(
-                        f"Top lexical hit (rank {top_lex['rank']}): {top_lex.get('source','?')} "
-                        f"— score {top_lex.get('score')}"
-                    )
+                top_lex = lexical_hits[0]
+                summary_parts.append(
+                    f"Top lexical hit (rank {top_lex['rank']}): {top_lex.get('source','?')} "
+                    f"— score {top_lex.get('score')}"
+                )
             else:
+                status = lexical.get("status")
+                if status == "no_terms":
+                    reason = "no lexical terms were extracted from the query (all stopwords or too short)."
+                elif status == "no_discriminative_terms":
+                    reason = "every extracted term matched nothing or was too common to rank on."
+                elif status == "error":
+                    reason = f"the lexical lookup failed ({lexical.get('error')})."
+                elif status == "ranked":
+                    reason = "lexical matches existed but none survived into the final result set."
+                else:
+                    reason = "the lexical leg did not run for this query."
                 summary_parts = [
-                    f"Vector-only retrieval: no exact-text terms were extracted from the query or lexical search returned no results. "
+                    f"No lexical contribution: {reason}{dropped_note} "
                     f"All {len(chunks)} chunk(s) matched semantically."
                 ]
 
+            guidance = mcp_contract.apply_guidance(
+                {
+                    "chunks": chunks,
+                    "deterministic_intent": result.get("deterministic_intent"),
+                    "write_in_progress": result.get("write_in_progress"),
+                    "recommended_action": result.get("recommended_action"),
+                },
+                query=query,
+                silo=silo,
+            )
             return {
                 "db_path": _DB_PATH,
                 "query": query,
                 "intent": result.get("intent"),
+                **({"deterministic_intent": result["deterministic_intent"]} if result.get("deterministic_intent") else {}),
+                **{k: guidance[k] for k in ("recommended_action", "alternative_tool") if guidance.get(k)},
                 "retrieval_method": method,
+                "lexical_terms": lexical_terms,
                 "lexical_hit_count": len(lexical_hits),
                 "vector_only_chunk_count": len(vector_only_hits),
                 "chunk_with_vector_rank_count": with_vector_rank,
@@ -1386,7 +1904,7 @@ def watch_coverage() -> dict:
 
 
 @mcp.tool()
-def list_silos(check_staleness: bool = False) -> dict:
+def list_silos(check_staleness: bool = False, verbose: bool = False) -> dict:
     """
     Use when: you need a live roster of registered silos before retrieval.
     Do not use when: you also need health diagnostics/action guidance — use `session_context`.
@@ -1399,6 +1917,8 @@ def list_silos(check_staleness: bool = False) -> dict:
     Use slugs with `query_personal_knowledge`/`multi_query_knowledge` to scope queries.
     Pass check_staleness=True to also get is_stale, stale_file_count, and
     newest_source_mtime_iso per silo (walks source directory — may be slow for large silos).
+    exclude_patterns shared by most silos is listed once as default_exclude_patterns;
+    pass verbose=True for per-silo exclude_patterns and language_stats.
 
     Each row carries private and host. private=true means the silo is excluded
     from every unscoped query: it is reachable only by passing that exact slug as
@@ -1410,10 +1930,12 @@ def list_silos(check_staleness: bool = False) -> dict:
     roster is the only authority on what exists here. A silo named in notes,
     logs, or memory but absent from this list does not exist on this machine.
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "silo_count": 0, "silos": []}
     from operations import op_list_silos
-    return op_list_silos(_DB_PATH, check_staleness=check_staleness)
+    return mcp_contract.slim_roster(
+        _roster_for_policy(op_list_silos(_DB_PATH, check_staleness=check_staleness)), verbose=verbose
+    )
 
 
 @mcp.tool()
@@ -1429,7 +1951,7 @@ def session_context(check_staleness: bool = True, include_audit: bool = False) -
     - recommended_actions derived from stale/index/error signals
     - ready_for_retrieval boolean to help agents gate first query
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {
             **_db_missing_error(),
             "silo_count": 0,
@@ -1441,7 +1963,13 @@ def session_context(check_staleness: bool = True, include_audit: bool = False) -
     from operations import op_list_silos
 
     silos_result = op_list_silos(_DB_PATH, check_staleness=check_staleness)
+    hidden_private = 0
+    if isinstance(silos_result, dict):
+        silos_result = _roster_for_policy(silos_result)
+        hidden_private = int(silos_result.get("private_silo_count") or 0)
     silos = silos_result.get("silos", []) if isinstance(silos_result, dict) else []
+    if isinstance(silos_result, dict):
+        silos_result = mcp_contract.slim_roster(silos_result, verbose=include_audit)
     summary = _collect_health_summary(include_audit=include_audit)
     actions = _derive_recommended_actions(silos, summary)
     hnsw = summary.get("hnsw_consistency") or {}
@@ -1475,7 +2003,12 @@ def session_context(check_staleness: bool = True, include_audit: bool = False) -
                 + ") are skipped by every unscoped query and require an explicit "
                 "silo=; prefer sending the user to `pal ask --in <slug>` for them."
                 if private_silos
-                else "No silos are marked private."
+                else (
+                    f"{hidden_private} private silo(s) exist on this machine and are not "
+                    "readable from this endpoint; send the user to `pal ask --in <slug>`."
+                    if hidden_private
+                    else "No silos are marked private."
+                )
             )
         ),
     }
@@ -1493,8 +2026,11 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
     Useful to diagnose zero-chunk files (likely failed to parse), detect duplicate content,
     or verify coverage after indexing. top= limits how many files are returned (default 50).
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return _db_missing_error()
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"db_path": _DB_PATH, "error": refusal}
     from operations import op_inspect_silo
     try:
         with _mcp_chroma_lock("inspect_silo"):
@@ -1510,18 +2046,18 @@ def inspect_silo(silo: str, top: int = 50) -> dict:
 
 @mcp.tool()
 def find_files(
-    silos: list[str] | None = None,
+    silos: list[str] | str | None = None,
     name_glob: str | None = None,
     date_start: str | None = None,
     date_end: str | None = None,
-    date_field: str = "either",
+    date_field: str | None = "either",
     include_chunk_count: bool = False,
     limit: int = 50,
 ) -> dict:
     """
     Use when: the user asks for files by filename/date rather than document meaning.
     Do not use when: you need content-based answers (`query_personal_knowledge`/`multi_query_knowledge`).
-    Pairs with: `query_personal_knowledge` after selecting a target file/silo.
+    Pairs with: `read_document(path)` to read a hit; `query_personal_knowledge(query, source=path)` to search inside one.
 
     Find files by name and/or date against the manifest — no embeddings, no LLM.
     Use this for filename/date lookups like "today's journal entry" or "files from May 2026"
@@ -1537,7 +2073,7 @@ def find_files(
 
     from operations_find import op_find_files
 
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return _db_missing_error()
 
     def _parse(raw: str | None) -> _date | None:
@@ -1551,8 +2087,31 @@ def find_files(
     except ValueError as e:
         return {"db_path": _DB_PATH, "error": f"invalid date: {e}"}
 
+    # Small models sent silos="journallinker-3bca8314" (a string) and
+    # date_field=None; both failed schema validation nine times on 2026-10-03.
+    if isinstance(silos, str):
+        silos = [silos]
+    date_field = date_field or "either"
     if date_field not in ("name_date", "mtime", "either"):
         return {"db_path": _DB_PATH, "error": f"invalid date_field: {date_field}"}
+    if silos:
+        from state import resolve_silo_to_slug
+
+        unknown = [name for name in silos if not resolve_silo_to_slug(_DB_PATH, name)]
+        if unknown:
+            return {
+                "db_path": _DB_PATH,
+                "error": f"unknown silo(s): {', '.join(unknown)}",
+                "files": [],
+                "recommended_action": {
+                    "tool": "list_silos",
+                    "args": {},
+                    "reason": "Copy the exact slug from list_silos; do not retype or guess it.",
+                },
+            }
+    refusal = _private_read_refusal(*(silos or []))
+    if refusal:
+        return {"db_path": _DB_PATH, "error": refusal, "files": []}
 
     try:
         if include_chunk_count:
@@ -1577,6 +2136,13 @@ def find_files(
                 date_field=date_field,  # type: ignore[arg-type]
                 include_chunk_count=False,
                 limit=int(limit),
+            )
+        if isinstance(result, dict) and result.get("files"):
+            # find_files used to end here; with no tool that takes a path, the
+            # 2026-10-02 client reached for Open-WebUI's own KB tools instead.
+            result["next_step"] = (
+                "read_document(path) reads a file; "
+                "query_personal_knowledge(query, source=path) searches inside one."
             )
         return result
     except Exception as e:
@@ -1608,7 +2174,7 @@ def trigger_reindex(silo: str, confirm: bool = False) -> dict:
     reindex that can corrupt the HNSW index and cause lock contention.
     Only call when list_silos shows a stale timestamp AND source files have changed.
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {"status": "error", **_db_missing_error()}
     if not confirm:
         return {
@@ -1708,7 +2274,7 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
     This is synchronous — it blocks until complete (may take a few minutes for large silos).
     Unrelated to pal auto-watch: for bookmarks/daemon job coverage use `watch_coverage` (read-only).
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {"status": "error", **_db_missing_error()}
     if not confirm:
         return {
@@ -1746,7 +2312,7 @@ def _resolve_silo_under_path(silo: str, path: str) -> tuple[str | None, str | No
     from pathlib import Path as _Path
     from state import list_silos as _list_silos, resolve_silo_to_slug
 
-    if not _Path(_DB_PATH).is_dir():
+    if not _db_present():
         return (None, None, {"status": "error", **_db_missing_error()})
     slug = resolve_silo_to_slug(_DB_PATH, silo)
     if slug is None:
@@ -1881,7 +2447,7 @@ def add_silo(
     workers: int | None = None,
     embedding_workers: int | None = None,
     private: bool = False,
-    confirm: bool = True,
+    confirm: bool = False,
 ) -> dict:
     """
     Use when: indexing a new file/folder or refreshing a silo from its source path.
@@ -1889,6 +2455,8 @@ def add_silo(
     Pairs with: `session_context`/`list_silos` before and after indexing.
 
     Index a file or folder as a new silo (or update an existing one). Equivalent to `llmli add <path>`.
+    Requires confirm=True, like every other tool that writes: it is the one that
+    indexes an arbitrary filesystem path. pal passes it explicitly.
     silo: optional slug override (default: basename, slugified).
     display_name: optional human-readable name override.
     allow_cloud: set True to allow OneDrive/iCloud/Dropbox paths (blocked by default).
@@ -1923,6 +2491,21 @@ def add_silo(
 
     # Pre-derive a key for outcome tracking (best-guess slug; real slug written by thread)
     outcome_key = silo if silo else p.name
+
+    warnings: list[str] = []
+    if image_vision is not True:
+        try:
+            from state import get_silo_image_vision_enabled, resolve_silo_by_path
+            from watch_scan import image_share, vision_off_warning
+
+            existing = resolve_silo_by_path(_DB_PATH, p)
+            stored = get_silo_image_vision_enabled(_DB_PATH, existing) if existing else None
+            if not stored:
+                warning = vision_off_warning(*image_share(p))
+                if warning:
+                    warnings.append(warning)
+        except Exception:
+            _logger.debug("add_silo image pre-check failed", exc_info=True)
 
     def _run_add() -> None:
         err: str | None = None
@@ -2002,6 +2585,7 @@ def add_silo(
             "Call list_silos() after a minute or two to confirm the silo appears. "
             "Call health() to check last_background_reindex status after completion."
         ),
+        **({"warnings": warnings} if warnings else {}),
     }
 
 
@@ -2022,7 +2606,7 @@ def set_silo_privacy(silo: str, private: bool, confirm: bool = False) -> dict:
     """
     from state import is_silo_private, resolve_silo_to_slug, set_silo_private
 
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return _db_missing_error()
     slug = resolve_silo_to_slug(_DB_PATH, silo)
     if not slug:
@@ -2084,11 +2668,20 @@ def mcp_runtime_status(verbose: bool = False) -> dict:
     # warning on the total fires on a healthy stack. Two stdio servers is the
     # shape that means a client spawned a duplicate or a stale one was never
     # reaped.
-    if bool(mcp_http.get("multiple_stdio_processes")):
+    orphaned = mcp_http.get("mcp_stdio_orphaned_pids") or []
+    if orphaned:
         actions.append(
-            "Multiple stdio MCP servers detected; a stale one was likely never reaped. "
-            "Stop the orphans, or point clients at the shared http service."
+            f"{len(orphaned)} stdio MCP server(s) lost their client and were never reaped "
+            f"(pids {', '.join(map(str, orphaned))}); stop them."
         )
+    elif bool(mcp_http.get("multiple_stdio_processes")) and "mcp_stdio_orphaned_pids" not in mcp_http:
+        actions.append(
+            "Multiple stdio MCP servers detected and their clients could not be checked; "
+            "stop any orphans, or point clients at the shared http service."
+        )
+    drift = _code_drift_report()
+    if drift["changed_since_start"]:
+        actions.append(drift["hint"])
     if bool(mcp_http.get("lock_file_exists")) and mcp_http.get("lock_holder_pid") and not bool(mcp_http.get("lock_holder_alive")):
         actions.append("MCP PID lock file points to a dead process; restart MCP service to refresh lock state.")
     actions = _dedupe_lines(actions)
@@ -2100,6 +2693,7 @@ def mcp_runtime_status(verbose: bool = False) -> dict:
         "chroma": chroma,
         "jobs": jobs,
         "health_counts": health_counts,
+        "code_drift": drift,
         "recommended_actions": actions,
     }
     if verbose:
@@ -2117,8 +2711,12 @@ def health() -> dict:
     Diagnostic check. Returns db_path, db_exists, embedding model, Python version,
     and on-disk Chroma layout stats (including HNSW link_lists.bin bloat detection).
     Call this first if tools are failing, the disk is filling, or Python keeps spawning.
+    code_drift.changed_since_start=true means the code on disk moved after this
+    process started; restart it before debugging anything else.
     """
-    return _collect_health_summary(include_audit=True)
+    summary = _collect_health_summary(include_audit=True)
+    summary["code_drift"] = _code_drift_report()
+    return summary
 
 
 @mcp.tool()
@@ -2143,26 +2741,43 @@ def silo_roster() -> dict:
     Return the compact, machine-local silo roster: exact slug, display name,
     and indexed chunk count. Entries are sorted by slug for stable output.
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "silo_count": 0, "silos": []}
 
     from state import list_silos as _list_silos
 
+    registered = [entry for entry in _list_silos(_DB_PATH) if entry.get("slug")]
+    # Private silos are left off the roster entirely, slug included: on the lite
+    # profile this is the only discovery tool, so listing a private slug would
+    # hand the model the exact key retrieve_knowledge accepts as consent.
     silos = [
         {
             "slug": str(entry.get("slug") or ""),
             "display_name": str(entry.get("display_name") or entry.get("slug") or ""),
             "chunks_count": int(entry.get("chunks_count") or 0),
         }
-        for entry in _list_silos(_DB_PATH)
-        if entry.get("slug")
+        for entry in registered
+        if not entry.get("private")
     ]
     silos.sort(key=lambda entry: entry["slug"])
-    return {
+    out: dict = {
         "db_exists": True,
         "silo_count": len(silos),
         "silos": silos,
     }
+    hidden = len(registered) - len(silos)
+    if hidden:
+        out["private_silos_hidden"] = hidden
+        out["privacy_note"] = (
+            f"{hidden} private silo(s) are not listed. If the user's question is about "
+            + (
+                "one of them, ask the user for its exact slug."
+                if _private_reads_policy() == "named"
+                else "one of them, tell the user to run `pal ask --in <slug>` locally; "
+                "this endpoint does not read private silos."
+            )
+        )
+    return out
 
 
 def _compact_lite_chunk(chunk: dict) -> dict:
@@ -2212,21 +2827,26 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
         out["retryable"] = True
     if isinstance(result, dict) and result.get("image_search"):
         out["image_search"] = result["image_search"]
-    if isinstance(result, dict) and result.get("recommended_action"):
-        out["recommended_action"] = result["recommended_action"]
+    if isinstance(result, dict):
+        # An empty chunk list with no reason attached is what sent the 2026-10-02
+        # client into a rephrase loop; keep whatever explains it.
+        for field in ("recommended_action", "note", "error"):
+            if result.get(field):
+                out[field] = result[field]
     return out
 
 
-def retrieve_knowledge(query: str, silo: str, n_results: int = 8) -> dict:
+def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | None = None) -> dict:
     """Use when: answering from one known silo on a small-context client.
     Do not use when: you need diagnostics, broad discovery, or more than twelve chunks.
     Pairs with: `silo_roster`.
 
     Retrieve compact source chunks for the exact silo slug. Defaults to eight
     chunks so a one-file cookbook can still surface a hybrid-ranked hit;
-    request up to twelve when needed.
+    request up to twelve when needed. Pass source= (a path or filename in that
+    silo) to search inside one file.
     """
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return {**_db_missing_error(), "chunks": []}
     if isinstance(n_results, bool) or not isinstance(n_results, int) or not 1 <= n_results <= 12:
         return {
@@ -2248,126 +2868,323 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8) -> dict:
             ),
             "chunks": [],
         }
+    refusal = _private_read_refusal(silo)
+    if refusal:
+        return {"error": refusal, "chunks": []}
 
     from query.core import run_retrieve
 
-    try:
-        with _mcp_chroma_lock("retrieve_knowledge"):
-            result = run_retrieve(
-                query=query,
-                silo=silo,
-                n_results=n_results,
-                db_path=_DB_PATH,
-                config_path=_CONFIG_PATH,
-            )
-            chunks = result.get("chunks", [])
-            _emit_usage_event(
-                "usage.llmlibrarian.query",
-                {"silo": silo, "profile": "lite"},
-            )
+    source_path: str | None = None
+    if source:
+        source_path, _slug, _candidates, err = _resolve_indexed_file(source, silo)
+        if err:
+            return {"error": err, "chunks": []}
 
-        confidence, confidence_score, _coverage_note = _compute_answer_confidence(chunks)
-        _emit_query_audit(
-            tool="retrieve_knowledge",
-            queries=[query],
-            silo=silo,
-            params={"n_results": n_results},
-            chunks=chunks,
-            outcome={"confidence": confidence, "confidence_score": confidence_score},
-        )
-        return _compact_lite_retrieval(result, silo=silo)
-    except Exception as e:
-        if _is_lock_timeout(e):
-            return {**_busy_error(e, "retrieve_knowledge"), "chunks": []}
-        return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}
-    finally:
-        _release_chroma()
+    def _compute() -> tuple[dict, dict | None]:
+        try:
+            with _mcp_chroma_lock("retrieve_knowledge"):
+                result = run_retrieve(
+                    query=query,
+                    silo=silo,
+                    n_results=n_results,
+                    source=source_path,
+                    db_path=_DB_PATH,
+                    config_path=_CONFIG_PATH,
+                )
+                chunks = result.get("chunks", [])
+                _emit_usage_event(
+                    "usage.llmlibrarian.query",
+                    {"silo": silo, "profile": "lite"},
+                )
+
+            mcp_contract.apply_guidance(result, query=query, silo=silo, profile="lite")
+            confidence, confidence_score, _coverage_note = _compute_answer_confidence(chunks)
+            audit = dict(
+                tool="retrieve_knowledge",
+                queries=[query],
+                silo=silo,
+                params={"n_results": n_results, **({"source": source_path} if source_path else {})},
+                chunks=chunks,
+                outcome={"confidence": confidence, "confidence_score": confidence_score},
+            )
+            return _compact_lite_retrieval(result, silo=silo), audit
+        except Exception as e:
+            if _is_lock_timeout(e):
+                return {**_busy_error(e, "retrieve_knowledge"), "chunks": []}, None
+            return {"db_path": _DB_PATH, "error": f"{type(e).__name__}: {e}", "chunks": []}, None
+        finally:
+            _release_chroma()
+
+    return _cached_retrieval(
+        "retrieve_knowledge", (_query_key(query), silo, n_results, source_path), _compute
+    )
 
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}
 
 
-def _resolve_indexed_image(file: str, silo: str | None) -> tuple[str | None, list[str], str | None]:
-    """Map a filename or path to an indexed image. Returns (path, candidates, error).
+def _resolve_indexed_file(
+    file: str,
+    silo: str | None,
+    *,
+    suffixes: set[str] | None = None,
+) -> tuple[str | None, str | None, list[str], str | None]:
+    """Map a filename or path to an indexed file. Returns (path, slug, candidates, error).
 
-    Only files present in the manifest resolve. The vision call reads bytes off
-    disk, so an unindexed path must never reach it — that would turn a retrieval
-    tool into arbitrary local file read.
+    Only files present in the manifest resolve, so a caller can never reach a file
+    the index does not already hold. Private silos resolve only by exact slug: an
+    unscoped call, a display name, or a folder path does not open one.
     """
     from file_registry import read_visible_manifest
+    from state import private_silo_slugs
 
     wanted = (file or "").strip()
     if not wanted:
-        return None, [], "file is required"
+        return None, None, [], "file is required"
     target_slug = (silo or "").strip()
-    # Private silos resolve only when named; an unscoped call must not reach one.
     manifest = read_visible_manifest(_DB_PATH, silo=target_slug or None) or {}
     silos = manifest.get("silos") or {}
+    # Naming means the exact slug: silo= may also be a path, and a path is not
+    # consent for a private silo.
+    private = set(private_silo_slugs(_DB_PATH))
 
-    matches: list[str] = []
+    matches: list[tuple[str, str]] = []
+    roots: dict[str, str] = {}
     for slug, entry in silos.items():
         if target_slug and slug != target_slug and (entry or {}).get("path") != target_slug:
             continue
+        if slug in private and (slug != target_slug or _private_reads_policy() == "none"):
+            continue
+        roots[slug] = str((entry or {}).get("path") or "")
         for path in ((entry or {}).get("files") or {}):
-            if Path(path).suffix.lower() not in _IMAGE_SUFFIXES:
+            if suffixes is not None and Path(path).suffix.lower() not in suffixes:
                 continue
             if path == wanted or Path(path).name == wanted or Path(path).name.lower() == wanted.lower():
-                matches.append(path)
+                matches.append((path, slug))
+    kind = "indexed image" if suffixes == _IMAGE_SUFFIXES else "indexed file"
     if not matches:
-        return None, [], f"no indexed image matches {file!r}" + (f" in silo {silo!r}" if silo else "")
+        return None, None, [], f"no {kind} matches {file!r}" + (f" in silo {silo!r}" if silo else "")
+    if len(matches) > 1 and target_slug:
+        # "README.md" in a repo silo means the one at its root, not every
+        # docs/*/README.md beneath it.
+        at_root = [(path, slug) for path, slug in matches if roots.get(slug) and str(Path(path).parent) == roots[slug]]
+        if len(at_root) == 1:
+            return at_root[0][0], at_root[0][1], [], None
     if len(matches) > 1:
-        return None, sorted(matches), "multiple indexed images match; pass a full path"
-    return matches[0], [], None
+        return None, None, sorted(path for path, _slug in matches), f"multiple {kind}s match; pass a full path"
+    return matches[0][0], matches[0][1], [], None
+
+
+def _resolve_indexed_image(file: str, silo: str | None) -> tuple[str | None, list[str], str | None]:
+    """Map a filename or path to an indexed image. Returns (path, candidates, error).
+
+    The vision call reads bytes off disk, so an unindexed path must never reach
+    it — that would turn a retrieval tool into arbitrary local file read.
+    """
+    path, _slug, candidates, err = _resolve_indexed_file(file, silo, suffixes=_IMAGE_SUFFIXES)
+    return path, candidates, err
 
 
 @mcp.tool()
-def ask_image(file: str, question: str, silo: str | None = None) -> dict:
+def read_document(
+    path: str,
+    silo: str | None = None,
+    start_chunk: int = 0,
+    max_chars: int = 6000,
+) -> dict:
     """
-    Use when: the user asks about a visual detail of one indexed image that the
-    stored summary does not cover ("what is the spongy piece bottom left",
-    "what does the label say", "how many people are in it").
-    Do not use when: a text query over summaries suffices (`query_personal_knowledge`)
-    or you need to find which image to ask about (`find_files` first).
-    Pairs with: `query_personal_knowledge` to locate the image, then this for detail.
+    Use when: you have a file path (from `find_files`, a chunk's source, or the user) and need to read that file, not search for an answer.
+    Do not use when: you are looking for which file answers a question (`query_personal_knowledge`), or searching inside one file for a passage (`query_personal_knowledge` with source=).
+    Pairs with: `find_files` before it; call again with next_start_chunk to keep reading.
 
-    Re-reads the original image with the local vision model and answers the
-    question. The ingest-time summary is one or two sentences written without
-    knowing what would be asked later, so follow-up detail questions cannot be
-    served from the index — this looks at the pixels again.
-
-    file: filename (e.g. "IMG_9383.jpeg") or absolute path. Must already be indexed.
-    silo: optional slug to disambiguate when the same filename exists in several silos.
-    Runs locally against LLMLIBRARIAN_VISION_MODEL; nothing leaves the machine.
+    Returns the file's indexed text in document order, up to max_chars (default
+    6000, max 20000), with overlapping chunk seams removed. path may be a full path
+    or a bare filename if it is unique. When more remains, next_start_chunk is set:
+    pass it as start_chunk to continue. Reads the index, not the disk, so PDFs and
+    images come back as their extracted text. A private silo's file opens only when
+    its exact slug is passed as silo.
     """
-    path, candidates, err = _resolve_indexed_image(file, silo)
+    from document_read import read_indexed_document
+
+    if not _db_present():
+        return {**_db_missing_error(), "text": ""}
+    resolved, slug, candidates, err = _resolve_indexed_file(path, silo)
     if err:
-        out: dict = {"status": "error", "error": err}
+        out: dict = {"error": err, "text": ""}
         if candidates:
-            out["candidates"] = candidates
+            out["candidates"] = candidates[:20]
+        else:
+            out["recommended_action"] = {
+                "tool": "find_files",
+                "args": {"name_glob": f"*{Path(path).name}*"},
+                "reason": "The path is not in the index. Find the indexed file name first.",
+            }
         return out
     try:
-        image_bytes = Path(path).read_bytes()
-    except OSError as e:
-        return {"status": "error", "error": f"cannot read {path}: {e}"}
-    try:
-        from processors import answer_image_question
+        from chroma_client import get_client
+        from constants import LLMLI_COLLECTION
 
-        answer, model = answer_image_question(image_bytes, path, question)
+        with _mcp_chroma_lock("read_document"):
+            collection = get_client(_DB_PATH).get_or_create_collection(name=LLMLI_COLLECTION)
+            result = read_indexed_document(
+                collection,
+                silo=str(slug),
+                source=str(resolved),
+                start_chunk=start_chunk,
+                max_chars=max_chars,
+            )
+        _emit_query_audit(
+            tool="read_document",
+            queries=[str(resolved)],
+            silo=slug,
+            params={"start_chunk": start_chunk, "max_chars": max_chars},
+            chunks=[{"source": resolved, "silo": slug}] * max(0, result["end_chunk"] - result["start_chunk"]),
+            outcome={},
+        )
+        if not result["total_chunks"]:
+            result["recommended_action"] = {
+                "tool": "inspect_silo",
+                "args": {"silo": slug},
+                "reason": "The file is in the manifest but has no indexed chunks (likely failed to parse).",
+            }
+        return result
     except Exception as e:
-        return {"status": "error", "error": f"{type(e).__name__}: {e}", "source_file": path}
-    return {
+        if _is_lock_timeout(e):
+            return {**_busy_error(e, "read_document"), "text": ""}
+        return {"error": f"{type(e).__name__}: {e}", "text": ""}
+    finally:
+        _release_chroma()
+
+
+_ASK_IMAGE_MAX_FILES = 4
+
+
+def _locate_images(question: str, silo: str | None, top_k: int) -> list[str]:
+    """Best-matching indexed images for a question, best first (privacy-filtered
+    by run_retrieve like any query)."""
+    from query.core import run_retrieve
+
+    try:
+        with _mcp_chroma_lock("ask_image"):
+            result = run_retrieve(
+                query=question,
+                silo=silo,
+                n_results=max(8, top_k * 4),
+                db_path=_DB_PATH,
+                config_path=_CONFIG_PATH,
+            )
+    finally:
+        _release_chroma()
+    ranked: list[str] = []
+    for chunk in result.get("chunks") or []:
+        source = str(chunk.get("source") or "")
+        if source and Path(source).suffix.lower() in _IMAGE_SUFFIXES and source not in ranked:
+            ranked.append(source)
+        if len(ranked) >= top_k:
+            break
+    return ranked
+
+
+@mcp.tool()
+def ask_image(
+    file: str | None = None,
+    question: str = "",
+    silo: str | None = None,
+    files: list[str] | None = None,
+    top_k: int = 2,
+) -> dict:
+    """
+    Use when: the user asks about a visual detail the stored summary/OCR does not
+    cover ("what car is this", "what does the label say", "how many people").
+    Do not use when: a text query over summaries suffices (`query_personal_knowledge`).
+    Pairs with: `query_personal_knowledge`, whose recommended_action lists the
+    best-matching images — pass all of them as files= in one call.
+
+    Re-reads original images with the local vision model and answers the question.
+    - files=[...]: up to 4 indexed images, sent together in one vision call; the
+      answer says which image shows what. Prefer this over one call per image.
+    - file="IMG_9383.jpeg": one image (filename or absolute path).
+    - neither: the top_k (default 2) images best matching the question in silo are
+      found and inspected together.
+    Each image adds ~20 s or more of local vision time; keep the list short.
+    All files must already be indexed. silo disambiguates filenames, and is
+    required (exact slug) to reach a private silo's images.
+    Runs locally against LLMLIBRARIAN_VISION_MODEL; nothing leaves the machine.
+    """
+    asked = (question or "").strip()
+    if not asked:
+        return {"status": "error", "error": "question is required"}
+    top_k = max(1, min(_ASK_IMAGE_MAX_FILES, int(top_k or 2)))
+
+    wanted: list[str] = list(files or [])
+    if file:
+        wanted.insert(0, file)
+    located = False
+    if not wanted:
+        if not _db_present():
+            return {"status": "error", **_db_missing_error()}
+        try:
+            wanted = _locate_images(asked, silo, top_k)
+        except Exception as e:
+            if _is_lock_timeout(e):
+                return {"status": "error", **_busy_error(e, "ask_image")}
+            return {"status": "error", "error": f"{type(e).__name__}: {e}"}
+        located = True
+        if not wanted:
+            return {
+                "status": "error",
+                "error": "no indexed image matches this question" + (f" in silo {silo!r}" if silo else ""),
+                "recommended_action": {
+                    "tool": "find_files",
+                    "args": {"name_glob": "*.jp*g", **({"silos": [silo]} if silo else {})},
+                    "reason": "List the silo's images and pass the right ones as files=.",
+                },
+            }
+
+    paths: list[str] = []
+    for name in list(dict.fromkeys(wanted))[:_ASK_IMAGE_MAX_FILES]:
+        path, candidates, err = _resolve_indexed_image(name, silo)
+        if err:
+            out: dict = {"status": "error", "error": err}
+            if candidates:
+                out["candidates"] = candidates
+            return out
+        paths.append(str(path))
+
+    images: list[tuple[bytes, str]] = []
+    for path in paths:
+        try:
+            images.append((Path(path).read_bytes(), path))
+        except OSError as e:
+            return {"status": "error", "error": f"cannot read {path}: {e}"}
+    try:
+        import processors
+
+        if len(images) == 1:
+            answer, model = processors.answer_image_question(images[0][0], images[0][1], asked)
+        else:
+            answer, model = processors.answer_images_question(images, asked)
+    except Exception as e:
+        return {"status": "error", "error": f"{type(e).__name__}: {e}", "source_files": paths}
+    out = {
         "status": "ok",
-        "source_file": path,
-        "question": question,
+        "question": asked,
         "answer": answer,
         "vision_model": model,
+        "source_files": paths,
     }
+    if len(paths) == 1:
+        out["source_file"] = paths[0]
+    if located:
+        out["located_by"] = "best matches for the question"
+    return out
 
 
 _FULL_TOOL_NAMES = (
     "query_personal_knowledge",
     "multi_query_knowledge",
     "ask_image",
+    "read_document",
     "recent_queries",
     "find_files",
     "explain_retrieval",
@@ -2387,14 +3204,88 @@ _FULL_TOOL_NAMES = (
 )
 
 
+def _lite_tools() -> tuple:
+    # Reading a found file and looking at a photo were the two dead ends the
+    # 2026-10-02 small-model session hit; both resolve privacy themselves.
+    return (
+        ("silo_roster", silo_roster),
+        ("retrieve_knowledge", retrieve_knowledge),
+        ("read_document", read_document),
+        ("ask_image", ask_image),
+    )
+
+
 def _apply_mcp_profile() -> None:
     """Replace the public tool catalog for the process-local lite profile."""
     if _MCP_PROFILE != "lite":
         return
     for name in _FULL_TOOL_NAMES:
         mcp.local_provider.remove_tool(name)
-    mcp.tool(name="silo_roster")(silo_roster)
-    mcp.tool(name="retrieve_knowledge")(retrieve_knowledge)
+    for name, fn in _lite_tools():
+        mcp.tool(name=name)(fn)
+
+
+class _PrivateReadsPolicy(Middleware):
+    """Pin the private-reads policy for every tool call on one endpoint."""
+
+    def __init__(self, policy: str) -> None:
+        self.policy = policy
+
+    async def on_call_tool(self, context, call_next):
+        token = _PRIVATE_READS.set(self.policy)
+        try:
+            return await call_next(context)
+        finally:
+            _PRIVATE_READS.reset(token)
+
+
+def _build_lite_server() -> FastMCP:
+    """A second, lite catalog served from this process (LLMLIBRARIAN_MCP_LITE_PATH).
+
+    Shares models, locks and the result cache with the full endpoint, so a small
+    client gets the 1.3 KB catalog without a second ~400 MB-1.3 GB process, and
+    the watchers keep the full endpoint they write through. Its private-reads
+    policy defaults to "none" (LLMLIBRARIAN_MCP_LITE_PRIVATE_READS): this is the
+    endpoint meant for Open-WebUI, which is told in prose not to ask about tax.
+    """
+    lite = FastMCP("llmLibrarian-lite", instructions=_LITE_INSTRUCTIONS)
+    lite.add_middleware(_ImportErrorExplainer())
+    policy = os.environ.get("LLMLIBRARIAN_MCP_LITE_PRIVATE_READS", "none").strip().lower() or "none"
+    lite.add_middleware(_PrivateReadsPolicy("none" if policy == "none" else "named"))
+    for name, fn in _lite_tools():
+        lite.tool(name=name)(fn)
+    if mcp.auth is not None:
+        lite.auth = mcp.auth
+    return lite
+
+
+# URL path the lite catalog is served at ("/lite/mcp"), set only once it is
+# mounted, so /healthz reports what this process serves rather than what the
+# env file says now.
+_LITE_URL_PATH: str | None = None
+
+
+def _http_app_with_lite(*, path: str, lite_mount: str, stateless_http: bool, transport: str):
+    """The full app at ``path`` plus the lite app at ``lite_mount + path``."""
+    global _LITE_URL_PATH
+    from contextlib import asynccontextmanager
+
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+
+    http_transport = "http" if transport in {"http", "streamable-http"} else transport
+    main_app = mcp.http_app(path=path, stateless_http=stateless_http, transport=http_transport)
+    lite_app = _build_lite_server().http_app(path=path, stateless_http=stateless_http, transport=http_transport)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with main_app.lifespan(app):
+            async with lite_app.lifespan(app):
+                yield
+
+    mount = "/" + lite_mount.strip("/")
+    _LITE_URL_PATH = mount + "/" + path.lstrip("/")
+    return Starlette(routes=[Mount(mount, app=lite_app), Mount("/", app=main_app)], lifespan=lifespan)
 
 
 _apply_mcp_profile()
@@ -2404,12 +3295,13 @@ _apply_mcp_profile()
 def resource_silos() -> str:
     """Read-only JSON snapshot of all registered silos. May be stale — call list_silos tool for live data."""
     import json
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return json.dumps({**_db_missing_error(), "silos": []}, indent=2)
     from state import list_silos as _list_silos
+    roster = _roster_for_policy({"silos": _list_silos(_DB_PATH)})
     return json.dumps({
         "last_updated": datetime.now(timezone.utc).isoformat(),
-        "silos": _list_silos(_DB_PATH),
+        **roster,
     }, indent=2)
 
 
@@ -2421,27 +3313,45 @@ def get_silo(slug: str) -> str:
     last_indexed, and doc_type_breakdown. Resolved dynamically at request time.
     """
     import json
-    if not Path(_DB_PATH).is_dir():
+    if not _db_present():
         return json.dumps(_db_missing_error(), indent=2)
     from state import list_silos as _list_silos
     all_silos = _list_silos(_DB_PATH)
     silo_info = next((s for s in all_silos if s.get("slug") == slug), None)
-    if silo_info is None:
+    if silo_info is None or (silo_info.get("private") and _private_reads_policy() == "none"):
         raise ValueError(f"silo not found: {slug}")
     return json.dumps(silo_info, indent=2)
 
 
 @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
 async def healthz(_: Request) -> Response:
-    """Simple liveness check for process supervisors and reverse proxies."""
-    return JSONResponse({
+    """Simple liveness check for process supervisors and reverse proxies.
+
+    /healthz has no auth of its own and may be published (scripts/
+    publish_mcp_funnel.sh), so the DB path — a home-directory layout — is
+    withheld when the server is bound off-loopback without auth.
+    """
+    host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1").strip()
+    exposed = host not in {"127.0.0.1", "localhost", "::1"} and not _env_bool(
+        "LLMLIBRARIAN_MCP_REQUIRE_AUTH", False
+    )
+    body = {
         "ok": True,
         "service": "llmLibrarian-mcp",
         "version": _package_version(),
-        "db_path": _DB_PATH,
-        "db_exists": Path(_DB_PATH).exists(),
+        "transport": _transport_name(),
+        "db_exists": _db_present(),
         "started_at": _SERVER_STARTED_AT,
-    })
+    }
+    if _LITE_URL_PATH:
+        body["lite_path"] = _LITE_URL_PATH
+    if exposed:
+        # Said explicitly so chroma_client's embedded-write guard fails closed
+        # instead of reading a missing field as an older server.
+        body["db_path_withheld"] = True
+    else:
+        body["db_path"] = _DB_PATH
+    return JSONResponse(body)
 
 
 def _client_app_name() -> str | None:
@@ -2474,6 +3384,74 @@ def _client_app_name() -> str | None:
         if name and name not in wrappers:
             return name
     return None
+
+
+
+def _serve_http(transport: str) -> None:
+    """Run an HTTP transport, reporting health transitions on stdout."""
+    # Off stdio, stdout is free for health events; see HealthState.
+    _HEALTH.enabled = True
+    host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1")
+    port = int(os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765"))
+    path = os.environ.get("LLMLIBRARIAN_MCP_PATH", "/mcp")
+    log_level = os.environ.get("LLMLIBRARIAN_MCP_LOG_LEVEL", "warning")
+    stateless_http = _env_bool("LLMLIBRARIAN_MCP_STATELESS_HTTP", True)
+    lite_mount = os.environ.get("LLMLIBRARIAN_MCP_LITE_PATH", "").strip()
+    try:
+        import uvicorn
+
+        if lite_mount and transport in {"http", "streamable-http"}:
+            app = _http_app_with_lite(
+                path=path, lite_mount=lite_mount, stateless_http=stateless_http, transport=transport
+            )
+        else:
+            app = mcp.http_app(
+                path=path,
+                stateless_http=stateless_http,
+                transport="http" if transport in {"http", "streamable-http"} else transport,
+            )
+
+        class _HealthReportingServer(uvicorn.Server):
+            """uvicorn binds after the app lifespan starts, so ``ready``
+            waits for ``started`` rather than going in the lifespan."""
+
+            async def startup(self, sockets=None) -> None:
+                await super().startup(sockets=sockets)
+                if self.started:
+                    _health_startup()
+
+            async def shutdown(self, sockets=None) -> None:
+                _HEALTH.set("stopping", "graceful shutdown")
+                await super().shutdown(sockets=sockets)
+
+        # Same server settings FastMCP.run applies on the HTTP path.
+        server = _HealthReportingServer(uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level=log_level,
+            lifespan="on",
+            timeout_graceful_shutdown=0,
+        ))
+        server.run()
+        if not server.started:
+            _HEALTH.set("error", "startup failed")
+            sys.exit(3)
+        _HEALTH.set("stopping", "graceful shutdown")
+    except SystemExit as e:
+        if _HEALTH.status == "error":
+            pass  # already reported, e.g. "startup failed"
+        elif e.code in (0, None):
+            _HEALTH.set("stopping", "graceful shutdown")
+        else:
+            _HEALTH.set("error", f"exited with status {e.code}")
+        raise
+    except KeyboardInterrupt:
+        _HEALTH.set("stopping", "graceful shutdown")
+        raise
+    except BaseException as e:
+        _HEALTH.set("error", f"fatal: {type(e).__name__}")
+        raise
 
 
 if __name__ == "__main__":
@@ -2518,16 +3496,4 @@ if __name__ == "__main__":
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:
-        host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1")
-        port = int(os.environ.get("LLMLIBRARIAN_MCP_PORT", "8765"))
-        path = os.environ.get("LLMLIBRARIAN_MCP_PATH", "/mcp")
-        log_level = os.environ.get("LLMLIBRARIAN_MCP_LOG_LEVEL", "warning")
-        stateless_http = _env_bool("LLMLIBRARIAN_MCP_STATELESS_HTTP", True)
-        mcp.run(
-            transport=transport,
-            host=host,
-            port=port,
-            path=path,
-            log_level=log_level,
-            stateless_http=stateless_http,
-        )
+        _serve_http(transport)

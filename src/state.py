@@ -310,7 +310,9 @@ def private_filter_clause(db_path: str | Path) -> dict[str, Any] | None:
     slugs = private_silo_slugs(db_path)
     if not slugs:
         return None
-    return {"silo": {"$nin": slugs}}
+    # Artifact compilation writes a private silo's derived chunks under
+    # "<slug>-artifacts", which a $nin on the parent slug alone would let through.
+    return {"silo": {"$nin": sorted({*slugs, *(f"{s}-artifacts" for s in slugs)})}}
 
 
 def list_silos(db_path: str | Path) -> list[dict[str, Any]]:

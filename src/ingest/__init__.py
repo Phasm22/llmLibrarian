@@ -32,10 +32,18 @@ from constants import (
     DB_PATH,
     LLMLI_COLLECTION,
     LLMLI_IMAGE_COLLECTION,
-    CHUNK_SIZE,
-    CHUNK_OVERLAP,
     ADD_BATCH_SIZE,
     MAX_WORKERS,
+)
+from frontmatter import (
+    chroma_metadata_from_frontmatter,
+    compact_frontmatter_preamble,
+    parse_markdown_frontmatter,
+)
+from ingest.chunking import (
+    chunk_markdown,
+    chunk_text,
+    is_markdown_path,
 )
 
 from chroma_client import get_client, release as release_chroma_client, writer_client
@@ -72,7 +80,7 @@ DEFAULT_MAX_EXTRACTED_BYTES_PER_ZIP = 50 * 1024 * 1024  # 50 MB
 # Default include/exclude for llmli add. First-class: text + code + pdf/docx + xlsx/pptx (no silent ignore).
 # Defined in scan_patterns so the watch daemons' lightweight scanner shares
 # exactly one copy; re-exported here for existing callers.
-from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE  # noqa: F401,E402
+from scan_patterns import ADD_DEFAULT_EXCLUDE, ADD_DEFAULT_INCLUDE, exclude_matches  # noqa: F401,E402
 
 
 def _normalize_patterns(patterns: list[str] | tuple[str, ...] | None) -> list[str]:
@@ -320,7 +328,7 @@ def should_index(file_path: str | Path, include_patterns: list[str], exclude_pat
     if base.startswith("~$"):
         return False
     for pattern in exclude_patterns:
-        if pattern.rstrip("/") in path_str or _path_matches(path_str, pattern):
+        if exclude_matches(path_str, pattern):
             return False
     for pattern in include_patterns:
         if _path_matches(path_str, pattern):
@@ -330,9 +338,8 @@ def should_index(file_path: str | Path, include_patterns: list[str], exclude_pat
 
 def should_descend_into_dir(dir_path: str | Path, exclude_patterns: list[str]) -> bool:
     """Return False if directory is excluded (e.g. node_modules), True otherwise. We descend unless excluded."""
-    path_str = str(dir_path).rstrip("/") + "/"
     for pattern in exclude_patterns:
-        if pattern.rstrip("/") in path_str or fnmatch.fnmatch(path_str, pattern):
+        if exclude_matches(dir_path, pattern):
             return False
     return True
 
@@ -345,76 +352,6 @@ def is_safe_path(base: Path, path: str) -> bool:
         return not Path(path).is_absolute() and target.is_relative_to(base_res)
     except Exception:
         return False
-
-
-def _chunk_params() -> tuple[int, int]:
-    """(chunk_size, overlap) from env or defaults. Used so add/index can be tuned without code change."""
-    size = CHUNK_SIZE
-    overlap = CHUNK_OVERLAP
-    try:
-        if os.environ.get("LLMLIBRARIAN_CHUNK_SIZE"):
-            size = max(100, min(int(os.environ["LLMLIBRARIAN_CHUNK_SIZE"]), 4000))
-        if os.environ.get("LLMLIBRARIAN_CHUNK_OVERLAP"):
-            overlap = max(0, min(int(os.environ["LLMLIBRARIAN_CHUNK_OVERLAP"]), size // 2))
-    except (TypeError, ValueError):
-        pass
-    return (size, overlap)
-
-
-def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -> list[tuple[str, int]]:
-    """Returns list of (chunk_text, line_start). line_start is 1-based approximate. Uses env LLMLIBRARIAN_CHUNK_* when size/overlap not passed."""
-    if size is None or overlap is None:
-        psize, poverlap = _chunk_params()
-        size = size if size is not None else psize
-        overlap = overlap if overlap is not None else poverlap
-    if not text.strip():
-        return []
-    lines = text.split("\n")
-    result: list[tuple[str, int]] = []
-    current: list[str] = []
-    current_len = 0
-    line_start = 1
-    for i, line in enumerate(lines):
-        line_num = i + 1
-        if len(line) > size:
-            if current:
-                result.append(("\n".join(current), line_start))
-                current = []
-                current_len = 0
-            n = len(line)
-            start = 0
-            while start < n:
-                end = min(start + size, n)
-                result.append((line[start:end], line_num))
-                if end >= n:
-                    break
-                next_start = end - overlap
-                if next_start <= start:
-                    next_start = start + 1
-                start = next_start
-            line_start = line_num + 1
-            continue
-        current.append(line)
-        current_len += len(line) + 1
-        if current_len >= size:
-            chunk = "\n".join(current)
-            result.append((chunk, line_start))
-            # overlap: keep last few lines
-            overlap_len = 0
-            overlap_lines: list[str] = []
-            for j in range(len(current) - 1, -1, -1):
-                overlap_lines.insert(0, current[j])
-                overlap_len += len(current[j]) + 1
-                if overlap_len >= overlap and j > 0:
-                    line_start = line_num - len(overlap_lines) + 1
-                    break
-            current = overlap_lines
-            current_len = overlap_len
-            if not current:
-                line_start = line_num + 1
-    if current:
-        result.append(("\n".join(current), line_start))
-    return result
 
 
 # --- Extraction (delegated to processors.py; wrappers kept for ZIP processing) ---
@@ -520,6 +457,32 @@ def _resolve_image_vision_enabled(
         except Exception:
             pass
     return False
+
+
+def _unchanged_since_manifest(
+    prev: dict | None,
+    *,
+    mtime: float,
+    size: int,
+    file_hash: str,
+    kind: str,
+    image_vision_mode_changed: bool,
+) -> bool:
+    """True when incremental ingest may skip this file.
+
+    Unchanged stat still confirms the content hash: an edit that preserves both
+    mtime and size would otherwise be skipped. An image is never "unchanged" when
+    the silo's vision mode changed: its chunks say "vision off" (or carry a vision
+    summary) and the file itself did not change, so without this, enabling vision
+    flipped the registry flag and re-indexed nothing.
+    """
+    if not prev or prev.get("mtime") != mtime or prev.get("size") != size:
+        return False
+    if file_hash and prev.get("hash") != file_hash:
+        return False
+    if kind == "image" and image_vision_mode_changed:
+        return False
+    return True
 
 
 def _resolve_worker_override(value: int | None, env_name: str, fallback: int, *, cap: int = 32) -> int:
@@ -652,27 +615,56 @@ def _chunks_from_content(
     content_extracted: bool = True,
     extra_meta: dict[str, Any] | None = None,
 ) -> list[ChunkTuple]:
-    """Build chunk list (id, doc, meta). doc_type from content (first 500 chars) overrides path when not 'other'."""
-    content_type = _doc_type_from_content(text[:CONTENT_SAMPLE_LEN], Path(source_path).suffix.lower())
+    """Build chunk list (id, doc, meta). doc_type from content (first 500 chars) overrides path when not 'other'.
+
+    Markdown paths: YAML frontmatter becomes Chroma metadata (scalars; lists flattened),
+    and the body is chunked as a single piece when small, else split on headings before
+    falling back to size-based chunking. Malformed frontmatter is ignored.
+    """
+    fm_meta: dict[str, Any] = {}
+    working = text
+    markdown = is_markdown_path(source_path)
+    if markdown:
+        raw_fm, body = parse_markdown_frontmatter(text)
+        fm_meta = chroma_metadata_from_frontmatter(raw_fm)
+        preamble = compact_frontmatter_preamble(fm_meta)
+        if preamble:
+            working = f"{preamble}\n\n{body}" if body.strip() else preamble
+        else:
+            working = body
+
+    sample_src = working if markdown else text
+    content_type = _doc_type_from_content(sample_src[:CONTENT_SAMPLE_LEN], Path(source_path).suffix.lower())
     doc_type = content_type if content_type != "other" else _doc_type_from_path(source_path)
 
     # Build line→section map from §SECTION: ...§ markers before chunking
     section_by_line: dict[int, str] = {}
     current_section = ""
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    for lineno, line in enumerate(working.splitlines(), start=1):
         m = _SECTION_MARKER_RE.match(line.strip())
         if m:
             current_section = m.group(1)
         section_by_line[lineno] = current_section
 
     # Strip markers from text so chunker sees clean content
-    clean_text = _SECTION_MARKER_RE.sub("", text)
-    chunks_with_lines = chunk_text(clean_text)
+    clean_text = _SECTION_MARKER_RE.sub("", working)
+    if markdown:
+        chunks_with_lines = chunk_markdown(clean_text)
+    else:
+        chunks_with_lines = chunk_text(clean_text)
 
     out: list[ChunkTuple] = []
     for i, (chunk, line_s) in enumerate(chunks_with_lines):
+        if prefix:
+            chunk = f"{prefix}{chunk}"
         cid = _stable_chunk_id(source_path, mtime, i)
         section = section_by_line.get(line_s, current_section if not section_by_line else "")
+        # Prefer an ATX heading line as section when markdown and no §SECTION marker.
+        if markdown and not section:
+            for line in chunk.splitlines():
+                if line.startswith("#"):
+                    section = line.lstrip("#").strip()
+                    break
         meta: dict = {
             "source": source_path,
             "source_path": source_path,
@@ -689,7 +681,10 @@ def _chunks_from_content(
             meta["file_hash"] = file_hash
         if page is not None:
             meta["page"] = page
+        if fm_meta:
+            meta.update(fm_meta)
         if extra_meta:
+            # Pipeline extras win over frontmatter on key collision.
             meta.update(extra_meta)
         out.append((cid, chunk, meta))
     return out
@@ -2256,6 +2251,8 @@ def run_add(
         silo_slug=silo_slug,
         requested=image_vision_enabled,
     )
+    previous_image_vision = get_silo_image_vision_enabled(db_path, silo_slug) if silo_slug else None
+    image_vision_mode_changed = bool(previous_image_vision) != bool(effective_image_vision_enabled)
     limits_cfg = {}
     try:
         config = load_config()
@@ -2311,6 +2308,13 @@ def run_add(
         batch_size=_embed_batch_hint,
         device=_ingest_embed_device,
     )
+    if previous_image_vision is None and not effective_image_vision_enabled:
+        # A new silo, vision off. Warn once here rather than on every watcher pull.
+        from watch_scan import vision_off_warning
+
+        _warning = vision_off_warning(sum(1 for _p, kind in file_list if kind == "image"), len(file_list))
+        if _warning:
+            print(f"[llmli][WARN] {_warning}", file=sys.stderr)
     if _requires_standalone_image_enrichment(file_list):
         ensure_image_decoders_ready([p for p, kind in file_list if kind == "image"])
         if effective_image_vision_enabled:
@@ -2403,13 +2407,17 @@ def run_add(
                 h = get_file_hash(p_res)
                 if incremental:
                     prev = manifest_files.get(str(p_res)) if isinstance(manifest_files, dict) else None
-                    if prev and prev.get("mtime") == mtime and prev.get("size") == size:
-                        # Unchanged stat, but still confirm the content hash: an edit
-                        # that preserves both mtime and size would otherwise be skipped.
-                        # The manifest entry is the hash record, so this is a local
-                        # compare rather than a lookup through the derived index.
-                        if not h or prev.get("hash") == h:
-                            continue
+                    # The manifest entry is the hash record, so this is a local
+                    # compare rather than a lookup through the derived index.
+                    if _unchanged_since_manifest(
+                        prev,
+                        mtime=mtime,
+                        size=size,
+                        file_hash=h,
+                        kind=k,
+                        image_vision_mode_changed=image_vision_mode_changed,
+                    ):
+                        continue
                 if h:
                     existing_entries = _file_registry_get(db_path, h)
                     if not incremental:

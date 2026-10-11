@@ -1,0 +1,266 @@
+{
+  "corpus": {
+    "at_or_above_384": 1620,
+    "at_or_above_384_pct": 16.963,
+    "chunk_count": 9550,
+    "fixture_sha256": "18ab3e575cabafe127595dfdb76a6ffda08d61a084a258187973d610a5c94398",
+    "shape_counts": {
+      "pdf-layout": 1179,
+      "prose-notes": 3908,
+      "source-code": 3223,
+      "tax-financial": 1149,
+      "transcripts": 91
+    },
+    "token_histogram": {
+      "0-32": 211,
+      "129-192": 211,
+      "193-256": 1925,
+      "257-320": 3285,
+      "321-383": 1958,
+      "33-64": 68,
+      "384+": 1620,
+      "65-96": 136,
+      "97-128": 136
+    },
+    "token_percentiles": {
+      "max": 5067,
+      "p5": 113.0,
+      "p50": 296.0,
+      "p95": 553.5,
+      "p99": 1789.5
+    },
+    "total_tokens_model_input": 2769758,
+    "total_tokens_untruncated": 3242776
+  },
+  "fixtures": {
+    "s0-mixed-v1": {
+      "at_or_above_384": 73,
+      "at_or_above_384_pct": 14.258,
+      "chunk_count": 512,
+      "fixture_sha256": "a74d8a7a878c3ba99e53b98b0cdafe5af0b666d2bb14acb8a2c39d2cbe1fa55c",
+      "shape_counts": {
+        "pdf-layout": 67,
+        "prose-notes": 195,
+        "source-code": 193,
+        "tax-financial": 54,
+        "transcripts": 3
+      },
+      "token_histogram": {
+        "0-32": 13,
+        "129-192": 10,
+        "193-256": 109,
+        "257-320": 180,
+        "321-383": 108,
+        "33-64": 5,
+        "384+": 73,
+        "65-96": 8,
+        "97-128": 6
+      },
+      "token_percentiles": {
+        "max": 3895,
+        "p5": 97.9,
+        "p50": 288.0,
+        "p95": 468.9,
+        "p99": 1202.7
+      },
+      "total_tokens_model_input": 145915,
+      "total_tokens_untruncated": 160370
+    },
+    "s0-pdf-layout-v1": {
+      "at_or_above_384": 282,
+      "at_or_above_384_pct": 55.078,
+      "chunk_count": 512,
+      "fixture_sha256": "31b44eddb78afd9f9312673f65148c407c9c5f3964afc809cb378cdd2703f20a",
+      "shape_counts": {
+        "pdf-layout": 512
+      },
+      "token_histogram": {
+        "0-32": 40,
+        "129-192": 37,
+        "193-256": 23,
+        "257-320": 31,
+        "321-383": 75,
+        "33-64": 11,
+        "384+": 282,
+        "65-96": 8,
+        "97-128": 5
+      },
+      "token_percentiles": {
+        "max": 1458,
+        "p5": 23.6,
+        "p50": 393.5,
+        "p95": 733.8,
+        "p99": 938.5
+      },
+      "total_tokens_model_input": 157247,
+      "total_tokens_untruncated": 193069
+    },
+    "s0-prose-notes-v1": {
+      "at_or_above_384": 9,
+      "at_or_above_384_pct": 1.758,
+      "chunk_count": 512,
+      "fixture_sha256": "ee52e53d9efd66c0beb37beea1fbaebfb25a87c92ae6512f51757c1651329820",
+      "shape_counts": {
+        "prose-notes": 512
+      },
+      "token_histogram": {
+        "0-32": 14,
+        "129-192": 8,
+        "193-256": 198,
+        "257-320": 242,
+        "321-383": 36,
+        "33-64": 2,
+        "384+": 9,
+        "65-96": 2,
+        "97-128": 1
+      },
+      "token_percentiles": {
+        "max": 517,
+        "p5": 182.7,
+        "p50": 262.0,
+        "p95": 345.4,
+        "p99": 421.2
+      },
+      "total_tokens_model_input": 132975,
+      "total_tokens_untruncated": 133435
+    },
+    "s0-source-code-v1": {
+      "at_or_above_384": 65,
+      "at_or_above_384_pct": 12.695,
+      "chunk_count": 512,
+      "fixture_sha256": "85c3d7e6e3c5ef52a46a3fe2e08c1d7b22a5dfd06658554631aa099be0bc8877",
+      "shape_counts": {
+        "source-code": 512
+      },
+      "token_histogram": {
+        "0-32": 3,
+        "129-192": 11,
+        "193-256": 58,
+        "257-320": 170,
+        "321-383": 185,
+        "33-64": 4,
+        "384+": 65,
+        "65-96": 3,
+        "97-128": 13
+      },
+      "token_percentiles": {
+        "max": 535,
+        "p5": 145.5,
+        "p50": 318.0,
+        "p95": 411.0,
+        "p99": 463.7
+      },
+      "total_tokens_model_input": 155908,
+      "total_tokens_untruncated": 158033
+    },
+    "s0-tail-v1": {
+      "at_or_above_384": 478,
+      "at_or_above_384_pct": 100.0,
+      "chunk_count": 478,
+      "fixture_sha256": "b6fd1fb5a3c7b7320788273c12d5aca00f11733c1d1a06bd2d7834764727b022",
+      "shape_counts": {
+        "pdf-layout": 144,
+        "prose-notes": 15,
+        "tax-financial": 319
+      },
+      "token_histogram": {
+        "0-32": 0,
+        "129-192": 0,
+        "193-256": 0,
+        "257-320": 0,
+        "321-383": 0,
+        "33-64": 0,
+        "384+": 478,
+        "65-96": 0,
+        "97-128": 0
+      },
+      "token_percentiles": {
+        "max": 5067,
+        "p5": 575.9,
+        "p50": 846.5,
+        "p95": 3454.3,
+        "p99": 4256.2
+      },
+      "total_tokens_model_input": 183552,
+      "total_tokens_untruncated": 600404
+    },
+    "s0-tax-financial-v1": {
+      "at_or_above_384": 202,
+      "at_or_above_384_pct": 39.453,
+      "chunk_count": 512,
+      "fixture_sha256": "1e94b32a5b9a0400f1ce6cbfe5cf7660185609a88c264a9fdc3198f95a082f86",
+      "shape_counts": {
+        "tax-financial": 512
+      },
+      "token_histogram": {
+        "0-32": 3,
+        "129-192": 9,
+        "193-256": 70,
+        "257-320": 102,
+        "321-383": 73,
+        "33-64": 4,
+        "384+": 202,
+        "65-96": 23,
+        "97-128": 26
+      },
+      "token_percentiles": {
+        "max": 5067,
+        "p5": 85.7,
+        "p50": 331.0,
+        "p95": 2273.0,
+        "p99": 3894.1
+      },
+      "total_tokens_model_input": 155310,
+      "total_tokens_untruncated": 314875
+    },
+    "s0-transcripts-v1": {
+      "at_or_above_384": 3,
+      "at_or_above_384_pct": 3.297,
+      "chunk_count": 91,
+      "fixture_sha256": "68b8e68779fa1359bae1cf53a7eee28cb2151cfd82f2267237c3d8b49a46fc22",
+      "shape_counts": {
+        "transcripts": 91
+      },
+      "token_histogram": {
+        "0-32": 0,
+        "129-192": 4,
+        "193-256": 31,
+        "257-320": 30,
+        "321-383": 21,
+        "33-64": 0,
+        "384+": 3,
+        "65-96": 2,
+        "97-128": 0
+      },
+      "token_percentiles": {
+        "max": 521,
+        "p5": 189.0,
+        "p50": 271.0,
+        "p95": 373.0,
+        "p99": 437.3
+      },
+      "total_tokens_model_input": 25096,
+      "total_tokens_untruncated": 25321
+    }
+  },
+  "generated_at": "2026-09-21T00:26:35+00:00",
+  "privacy": "Aggregate statistics only. Text lives under gitignored spikes/private/s0.",
+  "schema_version": 1,
+  "selection": {
+    "mixed_size": 512,
+    "seed": "s0-v1",
+    "shape_size": 512,
+    "tail_fraction": 0.05
+  },
+  "source": {
+    "collection": "llmli",
+    "eligible_chunk_count": 9550,
+    "excluded_path_fragments": [
+      "/spikes/"
+    ],
+    "scanned_chunk_count": 9654,
+    "transport": "chroma-http"
+  },
+  "token_ceiling": 384,
+  "tokenizer": "sentence-transformers/all-mpnet-base-v2"
+}

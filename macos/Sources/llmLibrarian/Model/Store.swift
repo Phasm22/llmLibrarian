@@ -9,14 +9,16 @@ final class Job: ObservableObject, Identifiable {
     let id = UUID()
     let title: String
     let siloSlug: String?
+    let arguments: [String]
     @Published var output = ""
     @Published var isRunning = true
     @Published var exitCode: Int32?
     let startedAt = Date()
 
-    init(title: String, siloSlug: String?) {
+    init(title: String, siloSlug: String?, arguments: [String]) {
         self.title = title
         self.siloSlug = siloSlug
+        self.arguments = arguments
     }
 }
 
@@ -30,6 +32,15 @@ struct ActionProblem: Identifiable {
     var logPath: String? = nil
     /// True when the fix is to relocate or remove the silo whose folder is gone.
     var folderMissing: Bool { silo.map { !$0.pathExists } ?? false }
+}
+
+struct AddSiloRequest: Identifiable {
+    let id = UUID()
+    let folderURLs: [URL]
+
+    var displayName: String {
+        folderURLs.count == 1 ? folderURLs[0].lastPathComponent : "\(folderURLs.count) folders"
+    }
 }
 
 @MainActor
@@ -52,6 +63,8 @@ final class LibrarianStore: ObservableObject {
     /// Set when the user asks to un-private a silo. Widening exposure is confirmed;
     /// narrowing it is not — the safe direction should not need a dialog.
     @Published var pendingUnprivate: Silo?
+    @Published var pendingAddRequest: AddSiloRequest?
+    @Published var pendingImageVision: Silo?
 
     // Navigation (single window, so it lives here; the View menu and the
     // menu bar item drive it too).
@@ -335,6 +348,84 @@ final class LibrarianStore: ObservableObject {
 
     // MARK: fixing a silo whose folder moved
 
+    /// Choose a folder, index it as a silo, then reconcile watcher services.
+    /// The watcher step runs only after indexing succeeds.
+    func chooseSiloFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Add Silo"
+        panel.message = "Choose a folder to index and keep in sync with llmLibrarian."
+        panel.prompt = "Add Silo"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+        panel.directoryURL = URL(fileURLWithPath: NSHomeDirectory())
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        addSilo(at: url)
+    }
+
+    func addSilo(at folderURL: URL) {
+        addSilos(at: [folderURL])
+    }
+
+    /// Validate folders received from the app or Finder Service, then present
+    /// the ingest choices before any indexing work starts.
+    func addSilos(at folderURLs: [URL]) {
+        page = .silos
+        problem = nil
+        var seen = Set<String>()
+        var newFolders: [URL] = []
+        var existingSilo: Silo?
+        for url in folderURLs {
+            let path = SiloAddWorkflow.normalizedPath(for: url)
+            guard seen.insert(path).inserted else { continue }
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                problem = ActionProblem(title: "Couldn't add silo", message: "The selected folder no longer exists: \(path)")
+                return
+            }
+            if let existing = silos.first(where: {
+                SiloAddWorkflow.normalizedPath(for: URL(fileURLWithPath: $0.path)) == path
+            }) {
+                existingSilo = existing
+            } else {
+                newFolders.append(URL(fileURLWithPath: path, isDirectory: true))
+            }
+        }
+
+        guard !newFolders.isEmpty else {
+            if let existingSilo {
+                selectedSilo = existingSilo.slug
+                showInspector = true
+                lastActionMessage = "\(existingSilo.displayName) is already a silo."
+            }
+            return
+        }
+
+        pendingAddRequest = AddSiloRequest(folderURLs: newFolders)
+    }
+
+    func confirmAddSilos(imageVision: Bool) {
+        guard let request = pendingAddRequest else { return }
+        pendingAddRequest = nil
+        let newFolders = request.folderURLs
+
+        let jobs = SiloAddWorkflow.jobs(for: newFolders, imageVision: imageVision)
+        runPalJobs(jobs[...]) { [weak self] succeeded in
+            guard succeeded, let self else { return }
+            let lastPath = SiloAddWorkflow.normalizedPath(for: newFolders.last!)
+            self.selectedSilo = self.silos.first(where: {
+                SiloAddWorkflow.normalizedPath(for: URL(fileURLWithPath: $0.path)) == lastPath
+            })?.slug
+            self.showInspector = true
+            self.lastActionMessage = newFolders.count == 1
+                ? "Added \(newFolders[0].lastPathComponent)\(imageVision ? " with image vision" : "") and started its watcher."
+                : "Added \(newFolders.count) silos\(imageVision ? " with image vision" : "") and started their watchers."
+        }
+    }
+
     /// Ask for the folder's new location, index it, then remove the old silo.
     func relocate(_ silo: Silo) {
         let panel = NSOpenPanel()
@@ -366,6 +457,24 @@ final class LibrarianStore: ObservableObject {
     func reindex(_ silo: Silo) {
         guard activeJob(for: silo) == nil else { return }
         runPal(title: "Reindex \(silo.displayName)", siloSlug: silo.slug, args: ["pull", silo.path])
+    }
+
+    func enableImageVision(_ silo: Silo) {
+        pendingImageVision = silo
+    }
+
+    func applyImageVision(_ silo: Silo) {
+        pendingImageVision = nil
+        guard activeJob(for: silo) == nil else { return }
+        runPal(
+            title: "Enable image vision for \(silo.displayName)",
+            siloSlug: silo.slug,
+            args: ["pull", silo.path, "--image-vision"]
+        ) { [weak self] code in
+            guard code == 0, let self else { return }
+            self.lastActionMessage = "Image vision is enabled for \(silo.displayName)."
+            self.refreshSoon()
+        }
     }
 
     /// Toggle a silo's private flag. Going private applies immediately; going
@@ -401,7 +510,17 @@ final class LibrarianStore: ObservableObject {
     }
 
     private func runPal(title: String, siloSlug: String?, args: [String], completion: ((Int32) -> Void)? = nil) {
-        let job = Job(title: title, siloSlug: siloSlug)
+        // One index job per folder. pal also refuses (exit 75) via a folder lock,
+        // which covers pulls this app instance did not start, e.g. one orphaned
+        // when the app was relaunched; this check just avoids spawning at all.
+        if let target = SiloAddWorkflow.pullTarget(of: args),
+           jobs.contains(where: { $0.isRunning && SiloAddWorkflow.pullTarget(of: $0.arguments) == target }) {
+            problem = ActionProblem(title: "Already being indexed",
+                                    message: "\(target) is already being indexed by a job in this window. Wait for it to finish.")
+            completion?(SiloAddWorkflow.alreadyIndexingExit)
+            return
+        }
+        let job = Job(title: title, siloSlug: siloSlug, arguments: args)
         jobs.insert(job, at: 0)
         if jobs.count > 20 { jobs.removeLast(jobs.count - 20) }
         let cfg = config
@@ -429,6 +548,10 @@ final class LibrarianStore: ObservableObject {
                 job.exitCode = code
                 if code == 0 {
                     self?.lastActionMessage = "\(title) finished"
+                } else if code == SiloAddWorkflow.alreadyIndexingExit {
+                    let detail = job.output.split(whereSeparator: \.isNewline).last.map(String.init)
+                    self?.problem = ActionProblem(title: "Already being indexed",
+                                                  message: detail ?? "Another pal pull is indexing this folder.")
                 } else {
                     let tail = job.output.split(whereSeparator: \.isNewline).suffix(6).joined(separator: "\n")
                     self?.problem = ActionProblem(title: "\(title) failed (exit \(code))",
@@ -445,6 +568,16 @@ final class LibrarianStore: ObservableObject {
             job.isRunning = false
             job.exitCode = -1
             problem = ActionProblem(title: "Couldn't run pal", message: "\(error.localizedDescription)\n\(cfg.python) \(cfg.palPath)")
+        }
+    }
+
+    private func runPalJobs(_ pending: ArraySlice<PalJobSpec>, completion: @escaping (Bool) -> Void) {
+        guard let next = pending.first else { completion(true); return }
+        runPal(title: next.title, siloSlug: next.siloSlug, args: next.arguments) { [weak self] code in
+            // A folder another pull is already indexing is skipped, not fatal:
+            // that pull finishes it and syncs the watchers itself.
+            guard code == 0 || code == SiloAddWorkflow.alreadyIndexingExit, let self else { completion(false); return }
+            self.runPalJobs(pending.dropFirst(), completion: completion)
         }
     }
 

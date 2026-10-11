@@ -557,7 +557,7 @@ def test_image_processor_defers_natural_photo_and_suppresses_low_signal_ocr(monk
     assert out.meta is not None
     assert out.meta["summary_status"] == "deferred"
     assert out.meta["needs_vision_enrichment"] is True
-    assert "deferred visual summary" in out.summary.lower()
+    assert "description deferred" in out.summary.lower()
     assert out.regions[0].role == "full_frame_summary"
     assert out.regions[0].needs_vision_enrichment is True
     assert out.artifact is not None
@@ -625,7 +625,7 @@ def test_image_processor_disabled_mode_emits_ocr_only_summary(monkeypatch):
 
     out = ImageProcessor().extract(b"image-bytes", "receipt.jpg", enable_multimodal=False)
     assert out is not None
-    assert "ocr only" in out.summary.lower()
+    assert "vision off" in out.summary.lower()
     assert out.meta["summary_status"] == "disabled"
     assert out.meta["needs_vision_enrichment"] is False
     assert out.regions[0].needs_vision_enrichment is False

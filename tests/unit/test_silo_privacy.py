@@ -53,7 +53,9 @@ def test_flag_on_missing_silo_reports_failure(db: str) -> None:
 
 def test_filter_clause_excludes_only_private(db: str) -> None:
     set_silo_private(db, "tax-abc", True)
-    assert private_filter_clause(db) == {"silo": {"$nin": ["tax-abc"]}}
+    # Artifact compilation writes "<slug>-artifacts"; a $nin on the parent alone
+    # lets those derived chunks through.
+    assert private_filter_clause(db) == {"silo": {"$nin": ["tax-abc", "tax-abc-artifacts"]}}
     assert [s["slug"] for s in list_visible_silos(db)] == ["recipes-def"]
     # The full roster still shows it: knowing the corpus exists is allowed.
     assert {s["slug"] for s in list_silos(db)} == {"tax-abc", "recipes-def"}
@@ -133,7 +135,7 @@ def test_unscoped_retrieval_where_clause_excludes_private(db: str, monkeypatch: 
     )
     assert captured, "expected a Chroma query"
     where = captured[0].get("where")
-    assert where == {"silo": {"$nin": ["tax-abc"]}}, where
+    assert where == {"silo": {"$nin": ["tax-abc", "tax-abc-artifacts"]}}, where
 
 
 def test_explicit_silo_still_reaches_private(db: str, monkeypatch: object) -> None:
@@ -187,3 +189,228 @@ def test_ask_image_resolves_private_image_only_when_named(db: str, tmp_path: Pat
     assert path is None and "no indexed image" in err
     path, _candidates, err = mcp_server._resolve_indexed_image("W2_scan.jpeg", "tax-abc")
     assert err is None and path == str(img)
+
+
+def _empty_chroma_client(captured: list[dict]):
+    class _Coll:
+        def query(self, **kw: object) -> dict:
+            captured.append(dict(kw))
+            return {"documents": [[]], "metadatas": [[]], "distances": [[]], "ids": [[]]}
+
+        def get(self, **kw: object) -> dict:
+            return {"documents": [], "metadatas": [], "ids": []}
+
+    class _Client:
+        def get_or_create_collection(self, **kw: object) -> _Coll:
+            return _Coll()
+
+    return _Client()
+
+
+def test_display_name_does_not_open_a_private_silo(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """silo="Tax" is what a model produces by guessing; only the exact slug is
+    consent. a30aebf added this refusal; the 2026-10-02 rebase of dev dropped it once."""
+    from query import retrieve_locked
+    from query.core import run_retrieve
+
+    set_silo_private(db, "tax-abc", True)
+    captured: list[dict] = []
+    monkeypatch.setattr(retrieve_locked, "get_embedding_function", lambda **_: None)
+
+    res = run_retrieve(
+        query="anything",
+        silo="Tax",
+        n_results=5,
+        db_path=db,
+        get_chroma_client=lambda _db: _empty_chroma_client(captured),
+    )
+    assert not captured, "a display name reached the private silo's Chroma rows"
+    assert res.get("error") and res.get("chunks") == []
+
+
+def test_lite_roster_omits_private_slugs(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """silo_roster is the lite profile's only discovery tool and retrieve_knowledge
+    accepts any listed slug, so listing a private slug hands out the consent key."""
+    import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_DB_PATH", db)
+    set_silo_private(db, "tax-abc", True)
+
+    slugs = {row["slug"] for row in mcp_server.silo_roster()["silos"]}
+    assert "tax-abc" not in slugs
+    assert "recipes-def" in slugs
+
+
+def _write_ledger(db: str) -> None:
+    from tax.ledger import _write_all_rows
+
+    _write_all_rows(
+        db,
+        [
+            {"silo": "tax-abc", "tax_year": 2024, "form_type": "W-2", "field_label": "fixture", "raw_value": "PRIVATE-MARKER-7f3a"},
+            {"silo": "recipes-def", "tax_year": 2024, "form_type": "other", "field_label": "fixture", "raw_value": "public"},
+        ],
+    )
+
+
+def _tax_query_phase(db: str, silo_slug: str | None, monkeypatch: pytest.MonkeyPatch) -> dict:
+    from query import retrieve_locked
+
+    monkeypatch.setattr(retrieve_locked, "get_embedding_function", lambda **_: None)
+    return retrieve_locked.execute_retrieve_chroma_phase(
+        db=db,
+        intent="TAX_QUERY",
+        # A non-tax question: "sell" + a year is enough for route_intent to say TAX_QUERY.
+        query="how much did my dad sell his old car for in 2024",
+        query_for_retrieval="how much did my dad sell his old car for in 2024",
+        silo_slug=silo_slug,
+        n_stage1=10,
+        n_results=5,
+        section=None,
+        doc_type=None,
+        db_path=db,
+        get_chroma_client=lambda _db: _empty_chroma_client([]),
+    )
+
+
+def test_unscoped_tax_query_does_not_attach_private_ledger_rows(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The chunk where-clause carries the $nin, but tax_ledger is read from
+    tax_ledger.json with silo=None and no privacy filter. On the live DB that file
+    holds 296 rows from the private tax silo, attached to any unscoped TAX_QUERY."""
+    from query.intent import INTENT_TAX_QUERY, route_intent
+
+    assert route_intent("how much did my dad sell his old car for in 2024") == INTENT_TAX_QUERY
+    set_silo_private(db, "tax-abc", True)
+    _write_ledger(db)
+
+    res = _tax_query_phase(db, None, monkeypatch)
+    leaked = [r for r in res.get("tax_ledger") or [] if "PRIVATE-MARKER" in str(r.get("raw_value"))]
+    assert not leaked, f"{len(leaked)} private ledger row(s) attached to an unscoped query"
+
+
+def test_explicit_silo_still_gets_its_ledger_rows(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Naming the silo is consent: the fix must not strip the ledger from scoped calls."""
+    set_silo_private(db, "tax-abc", True)
+    _write_ledger(db)
+
+    res = _tax_query_phase(db, "tax-abc", monkeypatch)
+    assert any("PRIVATE-MARKER" in str(r.get("raw_value")) for r in res.get("tax_ledger") or [])
+
+
+def test_ledger_choke_point_drops_private_rows_unless_named(db: str) -> None:
+    """load_tax_ledger_rows serves both MCP retrieval and the CLI tax resolver, so
+    the filter lives there rather than in each caller."""
+    from tax.ledger import load_tax_ledger_rows
+
+    set_silo_private(db, "tax-abc", True)
+    _write_ledger(db)
+
+    assert {r["silo"] for r in load_tax_ledger_rows(db, tax_year=2024)} == {"recipes-def"}
+    assert {r["silo"] for r in load_tax_ledger_rows(db, silo="tax-abc", tax_year=2024)} == {"tax-abc"}
+
+
+def test_ask_image_path_is_not_consent_for_a_private_silo(db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_resolve_indexed_image also matches silo= against a silo's folder path. A path
+    is not the exact slug, so it must not open a private silo's images."""
+    import mcp_server
+
+    tax_dir = tmp_path / "Tax"
+    img = tax_dir / "W2_scan.jpeg"
+    manifest = {"silos": {"tax-abc": {"path": str(tax_dir), "files": {str(img): {}}}}}
+    monkeypatch.setattr("file_registry._read_file_manifest", lambda _db: manifest)
+    monkeypatch.setattr(mcp_server, "_DB_PATH", db)
+    set_silo_private(db, "tax-abc", True)
+
+    path, _candidates, err = mcp_server._resolve_indexed_image("W2_scan.jpeg", str(tax_dir))
+    assert path is None and "no indexed image" in err
+
+
+# --- LLMLIBRARIAN_MCP_PRIVATE_READS=none: an endpoint that never reads private ---
+
+
+@pytest.fixture()
+def none_policy(db: str, monkeypatch: pytest.MonkeyPatch):
+    import mcp_server
+
+    set_silo_private(db, "tax-abc", True)
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_PRIVATE_READS", "none")
+    monkeypatch.setattr(mcp_server, "_DB_PATH", db)
+    return mcp_server
+
+
+def test_default_policy_is_named(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import mcp_server
+
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS", raising=False)
+    monkeypatch.setattr(mcp_server, "_DB_PATH", db)
+    set_silo_private(db, "tax-abc", True)
+    assert mcp_server._private_reads_policy() == "named"
+    assert mcp_server._private_read_refusal("tax-abc") is None
+
+
+@pytest.mark.parametrize("name", ["tax-abc", "Tax"])
+def test_none_policy_refuses_private_reads_by_slug_or_name(none_policy, name: str) -> None:
+    mcp = none_policy
+    assert mcp._private_read_refusal(name)
+    assert mcp.query_personal_knowledge("agi", silo=name)["error"]
+    assert mcp.multi_query_knowledge(["agi"], silo=name)["error"]
+    assert mcp.explain_retrieval("agi", silo=name)["error"]
+    assert mcp.inspect_silo(name)["error"]
+    assert mcp.find_files(silos=[name])["error"]
+    assert mcp._private_read_refusal("recipes-def") is None
+
+
+def test_none_policy_rosters_give_a_count_not_slugs(none_policy) -> None:
+    mcp = none_policy
+    roster = mcp.list_silos()
+    assert [s["slug"] for s in roster["silos"]] == ["recipes-def"]
+    assert roster["private_silo_count"] == 1
+    assert "tax-abc" not in str(roster)
+
+    note = mcp._private_scope_note(None)
+    assert note["excluded_private_silo_count"] == 1 and "tax-abc" not in str(note)
+
+    assert "tax-abc" not in str(mcp.silo_roster())
+
+
+def test_none_policy_resolver_never_opens_private_files(none_policy, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    mcp = none_policy
+    img = tmp_path / "Tax" / "W2_scan.jpeg"
+    monkeypatch.setattr("file_registry._read_file_manifest", lambda _db: {"silos": {"tax-abc": {"files": {str(img): {}}}}})
+    path, _slug, _c, err = mcp._resolve_indexed_file("W2_scan.jpeg", "tax-abc")
+    assert path is None and err
+
+
+def test_endpoint_policy_overrides_process_policy(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The lite mount sets its own policy per call; the process default stays named."""
+    import mcp_server
+
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS", raising=False)
+    token = mcp_server._PRIVATE_READS.set("none")
+    try:
+        assert mcp_server._private_reads_policy() == "none"
+    finally:
+        mcp_server._PRIVATE_READS.reset(token)
+    assert mcp_server._private_reads_policy() == "named"
+
+
+def test_ledger_ignores_code_and_notes() -> None:
+    """The repo silo indexed tests/unit/test_tax_resolver.py; its fixture strings
+    became W-2 ledger rows."""
+    from tax.ledger import extract_tax_rows_from_chunks
+
+    text = "Form W-2 Wage and Tax Statement 2024. Box 1 Wages, tips, other compensation 85,000.00"
+    for source, doc_type in (("/repo/tests/unit/test_tax_resolver.py", "code"), ("/chats/2026-03-04-taxes.md", "other")):
+        rows = extract_tax_rows_from_chunks([("c1", text, {"source": source, "silo": "s", "doc_type": doc_type})])
+        assert rows == [], source
+
+
+def test_unscoped_ledger_drops_rows_from_removed_silos(db: str) -> None:
+    from tax.ledger import _write_all_rows, load_tax_ledger_rows
+
+    _write_all_rows(db, [
+        {"silo": "recipes-def", "tax_year": 2024, "source": "/r/w2.pdf", "raw_value": "kept"},
+        {"silo": "llmlibrarian-322853c4", "tax_year": 2024, "source": "/r/w2.pdf", "raw_value": "orphan"},
+        {"silo": "recipes-def", "tax_year": 2024, "source": "/repo/tests/test_tax.py", "raw_value": "from code"},
+    ])
+    assert [r["raw_value"] for r in load_tax_ledger_rows(db, tax_year=2024)] == ["kept"]

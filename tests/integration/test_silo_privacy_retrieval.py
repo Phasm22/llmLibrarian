@@ -117,7 +117,7 @@ def test_flag_survives_a_real_reindex(two_silos, tmp_path: Path) -> None:
     run_add(tmp_path / "Tax", db_path=Path(db), incremental=False)
 
     assert is_silo_private(db, private_slug) is True
-    assert private_filter_clause(db) == {"silo": {"$nin": [private_slug]}}
+    assert private_filter_clause(db) == {"silo": {"$nin": sorted([private_slug, f"{private_slug}-artifacts"])}}
     assert private_slug not in {s["slug"] for s in list_visible_silos(db)}
 
     result = run_retrieve(query="adjusted gross income account number", n_results=10, db_path=db)

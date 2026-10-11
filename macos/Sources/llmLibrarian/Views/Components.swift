@@ -157,6 +157,32 @@ struct KeyValueRow: View {
     }
 }
 
+/// KeyValueRow whose value is styled as a link; clicking it copies the value.
+struct CopyableValueRow: View {
+    let key: String
+    let value: String
+    let onCopy: () -> Void
+    var width: CGFloat = 110
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(key).foregroundStyle(.secondary).frame(width: width, alignment: .trailing)
+            Button(action: onCopy) {
+                Text(value)
+                    .zfont(.callout, design: .monospaced)
+                    .underline()
+                    .foregroundStyle(Color.accentColor)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .buttonStyle(.plain)
+            .help("Click to copy")
+            .onHover { inside in if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() } }
+            Spacer(minLength: 0)
+        }
+        .zfont(.callout)
+    }
+}
+
 /// Inspector-style field: label left, value right-aligned.
 struct DetailRow: View {
     let key: String
@@ -176,8 +202,12 @@ struct InspectorHeading: View {
     let text: String
     init(_ text: String) { self.text = text }
     var body: some View {
-        Text(text).zfont(.caption, weight: .semibold).foregroundStyle(.secondary).textCase(.uppercase)
-            .padding(.top, 6)
+        // A hairline above each section keeps stacked inspector sections apart.
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            Text(text).zfont(.caption, weight: .semibold).foregroundStyle(.secondary).textCase(.uppercase)
+        }
+        .padding(.top, 8)
     }
 }
 
@@ -323,10 +353,68 @@ struct ProblemAlert: ViewModifier {
             } message: { silo in
                 Text("Any unscoped query will be able to return chunks from \(silo.tildePath) — including a query issued by a cloud model over MCP. \(silo.chunks.grouped) chunks become reachable without anyone naming the silo.")
             }
+            .confirmationDialog(
+                "Enable image vision for \(store.pendingImageVision?.displayName ?? "silo")?",
+                isPresented: Binding(get: { store.pendingImageVision != nil },
+                                     set: { if !$0 { store.pendingImageVision = nil } }),
+                titleVisibility: .visible,
+                presenting: store.pendingImageVision
+            ) { silo in
+                Button("Enable and Reindex") { store.applyImageVision(silo) }
+                Button("Cancel", role: .cancel) { store.pendingImageVision = nil }
+            } message: { silo in
+                Text("Reindexes images in \(silo.tildePath) with multimodal summaries. This requires `uv sync --extra image` and a vision-capable LLMLIBRARIAN_VISION_MODEL; missing dependencies fail before changing the index.")
+            }
     }
 
     private var pendingSilo: Silo? { lastProblemSilo }
     @State private var lastProblemSilo: Silo?
+}
+
+struct AddSiloSheet: View {
+    @EnvironmentObject private var store: LibrarianStore
+    let request: AddSiloRequest
+    @State private var imageVision = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.system(size: 30))
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Add \(request.displayName) as a silo?")
+                        .font(.headline)
+                    Text(request.folderURLs.map(\.path).joined(separator: "\n"))
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .truncationMode(.middle)
+                }
+            }
+
+            Toggle("Enable image vision", isOn: $imageVision)
+                .font(.body.weight(.medium))
+            Text(imageVision
+                 ? "Generates multimodal summaries and enables semantic photo search. Requires the optional image dependencies and a vision-capable Ollama model."
+                 : "Images use metadata and OCR only. You can enable multimodal vision later from the silo details.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { store.pendingAddRequest = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button(request.folderURLs.count == 1 ? "Add Silo" : "Add Silos") {
+                    store.confirmAddSilos(imageVision: imageVision)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 500)
+    }
 }
 
 

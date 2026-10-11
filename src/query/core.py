@@ -23,6 +23,7 @@ except ImportError:
     get_silo_image_vision_enabled = None  # type: ignore[misc, assignment]
 
 from query.core_reexports import *  # noqa: F403
+from state import is_silo_private
 
 _DETERMINISTIC_INTENTS = frozenset({
     INTENT_CAPABILITIES,
@@ -82,6 +83,15 @@ def run_retrieve(
     db_path: str | Path | None = None,
     config_path: str | Path | None = None,
     get_chroma_client: Any | None = None,
+    source: str | None = None,
+    category: str | None = None,
+    main_protein: str | None = None,
+    min_servings: int | None = None,
+    max_servings: int | None = None,
+    max_total_time: int | None = None,
+    tags: str | list[str] | None = None,
+    course: str | None = None,
+    era: str | None = None,
 ) -> dict:
     """
     Return raw retrieved chunks with metadata — no LLM synthesis.
@@ -91,27 +101,45 @@ def run_retrieve(
     Pass section= to post-filter chunks to a specific document section (e.g. 'Item 1A').
     Pass doc_type= to restrict to a specific document type stored in chunk metadata
     (e.g. 'transcript', 'resume', 'pdf', 'code', 'other').
-    Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) bypass
-    vector retrieval and return a note field with the answer.
+    Pass source= (an indexed file's full path) to rank chunks within that file only.
+    Pass category / main_protein / course / era for exact metadata matches; min_servings /
+    max_servings / max_total_time for numeric ranges; tags for membership against the
+    flattened tags/dietary_flags fields written at ingest from YAML frontmatter.
+    Deterministic intents (CAPABILITIES, CODE_LANGUAGE, STRUCTURE, etc.) are
+    retrieved as LOOKUP: the handlers that answer them live in run_ask, so here a
+    short-circuit could only ever return nothing. The routed intent is kept as
+    ``deterministic_intent`` so the caller can point at the tool that answers the
+    inventory-style reading of the question.
     """
     db = str(db_path or DB_PATH)
     intent = route_intent(query)
 
+    # These intents match single common words ("capabilities", "inventory",
+    # "history", "language") anywhere in a question. Short-circuiting them here
+    # returned chunks=[] for ordinary content questions — every empty result in the
+    # 2026-10-02 Open-WebUI session — and a small model rephrased in a loop.
+    deterministic_intent: str | None = None
     if intent in _DETERMINISTIC_INTENTS:
-        return {
-            "query": query,
-            "intent": intent,
-            "silo_filter": silo,
-            "note": (
-                f"Intent '{intent}' is deterministic and does not use vector retrieval. "
-                "Try rephrasing as a descriptive question for semantic retrieval."
-            ),
-            "chunks": [],
-        }
+        deterministic_intent = intent
+        intent = INTENT_LOOKUP
 
     silo_slug: str | None = None
     if silo:
         silo_slug = resolve_silo_to_slug(db, silo) or silo
+        if silo_slug != silo and is_silo_private(db, silo_slug):
+            # Naming the exact slug is the consent signal for a private silo. A
+            # display name ("Tax") is too easy to produce by accident or by a
+            # model guessing, so it does not open one.
+            return {
+                "query": query,
+                "intent": intent,
+                "silo_filter": silo,
+                "error": (
+                    f"Silo {silo!r} is private and is only reachable by its exact slug. "
+                    "Ask the user for the slug rather than guessing."
+                ),
+                "chunks": [],
+            }
 
     use_reranker = is_reranker_enabled()
     n_effective = effective_k(intent, n_results)
@@ -144,7 +172,18 @@ def run_retrieve(
             doc_type=doc_type,
             db_path=str(db_path) if db_path is not None else None,
             get_chroma_client=_gc,
+            source=source,
+            category=category,
+            main_protein=main_protein,
+            min_servings=min_servings,
+            max_servings=max_servings,
+            max_total_time=max_total_time,
+            tags=tags,
+            course=course,
+            era=era,
         )
+    if deterministic_intent:
+        result["deterministic_intent"] = deterministic_intent
     return annotate_write_state(result, before, _sample_write_state(db, silo_slug))
 
 

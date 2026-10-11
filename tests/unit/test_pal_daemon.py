@@ -67,6 +67,27 @@ def test_daemon_runtime_metadata_preserves_venv_python_symlink(monkeypatch, tmp_
     assert metadata["python_executable"] == str(python_path)
 
 
+def test_daemon_metadata_prefers_editable_checkout_over_site_packages_copy(monkeypatch, tmp_path: Path):
+    """site-packages holds force-included cli.py, pal.py and src/ but no pyproject.toml."""
+    checkout = tmp_path / "checkout"
+    site = tmp_path / "site-packages"
+    for root in (checkout, site):
+        (root / "src").mkdir(parents=True)
+        (root / "cli.py").write_text("")
+        (root / "pal.py").write_text("")
+    (checkout / "pyproject.toml").write_text("")
+    (site / "_llmlibrarian.pth").write_text(f"{checkout}\n{checkout / 'src'}\n")
+    monkeypatch.chdir(site)
+    monkeypatch.setattr(pal, "_PAL_ROOT", site)
+    monkeypatch.setenv("LLMLIBRARIAN_DB", str(tmp_path / "db"))
+
+    metadata = pal._daemon_runtime_metadata("launchd")
+
+    assert metadata["workdir"] == str(checkout.resolve())
+    assert metadata["pal_path"] == str(checkout.resolve() / "pal.py")
+    assert checkout.resolve() / ".env.mcp" in pal._mcp_env_file_candidates()
+
+
 def test_jobs_ls_renders_derived_jobs(monkeypatch):
     job = pal.jobsrt.JobSpec(
         id="watch_silo:docs",

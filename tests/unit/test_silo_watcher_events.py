@@ -82,6 +82,8 @@ def test_drain_due_emits_batch_drain(watcher_setup):
     assert len(batch) == 1
     assert batch[0]["silo"] == "demo"
     assert batch[0]["updated"] == 1
+    assert batch[0]["updated_paths"] == ["a.txt"]
+    assert batch[0]["removed_paths"] == []
     assert "duration_ms" in batch[0]
     assert batch[0]["last_failures_path"].endswith("llmli_last_failures.json")
 
@@ -107,6 +109,7 @@ def test_drain_due_treats_skipped_as_success(watcher_setup, monkeypatch):
     assert watcher._queue == {}
     batch = [e for e in emitted if e.get("event") == "batch_drain"]
     assert batch and batch[-1].get("skipped") == 1
+    assert batch[-1]["updated_paths"] == []
 
 
 def test_enqueue_delete_skips_excluded_paths(watcher_setup):
@@ -139,3 +142,27 @@ def test_reconcile_emits_event_when_queued(watcher_setup, monkeypatch):
     recon = [e for e in emitted if e.get("event") == "reconcile"]
     assert len(recon) == 1
     assert recon[0]["queued_updates"] == 1
+
+
+def test_batch_drain_samples_changed_paths(watcher_setup, monkeypatch):
+    watcher, emitted, _db = watcher_setup
+    monkeypatch.setattr(
+        pal,
+        "_mcp_call_sync",
+        lambda tool, **kw: {"status": "removed" if tool == "remove_file" else "updated"},
+    )
+    for i in range(pal.WATCH_EVENT_PATH_SAMPLE + 2):
+        watcher._queue_action(str(watcher.root / "notes" / f"n{i}.md"), "update", delay=0.0)
+    watcher._queue_action(str(watcher.root / "gone.md"), "delete", delay=0.0)
+    with watcher._queue_lock:
+        for meta in watcher._queue.values():
+            meta["due_at"] = 0.0
+
+    watcher._drain_due(now=time.time())
+
+    batch = [e for e in emitted if e.get("event") == "batch_drain"][-1]
+    assert batch["updated"] == pal.WATCH_EVENT_PATH_SAMPLE + 2
+    assert len(batch["updated_paths"]) == pal.WATCH_EVENT_PATH_SAMPLE
+    assert all(p.startswith("notes/") for p in batch["updated_paths"])
+    assert batch["removed"] == 1
+    assert batch["removed_paths"] == ["gone.md"]
