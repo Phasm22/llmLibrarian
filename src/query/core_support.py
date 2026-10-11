@@ -956,7 +956,7 @@ def _llm_summarize_structure(
                     ),
                 },
             ],
-            keep_alive=0,
+            keep_alive=_qc().query_keep_alive(),
             options={"temperature": 0, "seed": 42},
         )
         text = ((resp.get("message") or {}).get("content") or "").strip()
@@ -1009,7 +1009,7 @@ def _repair_direct_address_answer(
                 {"role": "system", "content": repair_system_prompt},
                 {"role": "user", "content": repair_user_prompt},
             ],
-            keep_alive=0,
+            keep_alive=_qc().query_keep_alive(),
             options={"temperature": 0, "seed": 42},
         )
         repaired = ((response.get("message") or {}).get("content") or "").strip()

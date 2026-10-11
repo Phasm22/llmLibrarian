@@ -65,6 +65,14 @@ MAX_WORKERS = 8
 # Query defaults
 DEFAULT_N_RESULTS = 12
 DEFAULT_MODEL = "llama3.2:latest"
+
+
+def query_keep_alive() -> str | int:
+    """Ollama residency for query-time generation; 0 preserves unload-after-use."""
+    value = os.environ.get("LLMLIBRARIAN_KEEP_ALIVE", "").strip()
+    return value or 0
+
+
 # Keep snippets short enough for terminal readability while still showing enough context.
 SNIPPET_MAX_LEN = 180
 # Limit per-source chunks to avoid a single file dominating answers.
