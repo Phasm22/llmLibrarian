@@ -37,16 +37,18 @@ def deterministic_alternative(
 ) -> dict[str, Any] | None:
     """The tool that answers the inventory-style reading of a question.
 
-    Full profile only: lite has none of these tools, and a recommended_action must
-    never name a tool the caller's catalog does not have.
+    A recommended_action must never name a tool the caller's catalog lacks.
+    Lite has find_files (date/filename listing) but not capabilities/list_silos.
 
     run_retrieve retrieves these questions as ordinary lookups (the router matches
     single words like "capabilities" or "inventory"); this names the tool for the
     case where the user really did mean "which file types" or "list my files".
     """
-    if not deterministic_intent or profile != "full":
+    if not deterministic_intent:
         return None
     if deterministic_intent == "CAPABILITIES":
+        if profile != "full":
+            return None
         return {
             "tool": "capabilities",
             "args": {},
@@ -65,6 +67,8 @@ def deterministic_alternative(
             ),
         }
     if deterministic_intent == "CODE_LANGUAGE":
+        if profile != "full":
+            return None
         return {
             "tool": "list_silos",
             "args": {"verbose": True},
@@ -108,13 +112,23 @@ def empty_result_action(
     if alternative:
         return alternative
     if profile == "lite":
+        if silo and _YEAR.search(query or ""):
+            return {
+                "tool": "find_files",
+                "args": _find_files_args(query, silo),
+                "reason": (
+                    f"Nothing in {silo!r} matched as text. If the user named a date or "
+                    "filename, call find_files. Otherwise check silo_roster for a "
+                    "better-fitting silo; do not repeat the same query."
+                ),
+            }
         return {
             "tool": "silo_roster",
             "args": {},
             "reason": (
                 f"Nothing in {silo!r} matched. Check silo_roster for a better-fitting "
-                "silo; if none fits, tell the user the index has nothing on this. "
-                "Do not repeat the same query."
+                "silo, or find_files if the user named a file or date. If none fits, "
+                "tell the user the index has nothing on this. Do not repeat the same query."
             ),
         }
     if silo:

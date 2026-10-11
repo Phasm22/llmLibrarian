@@ -1744,8 +1744,9 @@ def _mcp_missing_tool_hint(tool: str) -> str:
         f"the MCP server at {_mcp_url()} does not expose {tool!r}. The write tools "
         "(add_silo, trigger_reindex, repair_silo, update_file, remove_file) exist only "
         "in the full profile; a server started with LLMLIBRARIAN_MCP_PROFILE=lite serves "
-        "just silo_roster and retrieve_knowledge. Set lite only on a dedicated "
-        "small-context client's process, not on the shared server pal writes through."
+        "only silo_roster, retrieve_knowledge, find_files, read_document, and ask_image. "
+        "Set lite only on a dedicated small-context client's process, not on the shared "
+        "server pal writes through."
     )
 
 

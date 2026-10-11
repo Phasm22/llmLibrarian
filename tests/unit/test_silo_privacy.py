@@ -334,6 +334,7 @@ def none_policy(db: str, monkeypatch: pytest.MonkeyPatch):
 
     set_silo_private(db, "tax-abc", True)
     monkeypatch.setenv("LLMLIBRARIAN_MCP_PRIVATE_READS", "none")
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW", raising=False)
     monkeypatch.setattr(mcp_server, "_DB_PATH", db)
     return mcp_server
 
@@ -342,6 +343,7 @@ def test_default_policy_is_named(db: str, monkeypatch: pytest.MonkeyPatch) -> No
     import mcp_server
 
     monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS", raising=False)
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW", raising=False)
     monkeypatch.setattr(mcp_server, "_DB_PATH", db)
     set_silo_private(db, "tax-abc", True)
     assert mcp_server._private_reads_policy() == "named"
@@ -392,6 +394,53 @@ def test_endpoint_policy_overrides_process_policy(db: str, monkeypatch: pytest.M
     finally:
         mcp_server._PRIVATE_READS.reset(token)
     assert mcp_server._private_reads_policy() == "named"
+
+
+def test_private_reads_allow_list_named_policy(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ALLOW restricts which private slugs named-policy endpoints may open."""
+    import mcp_server
+
+    set_silo_private(db, "tax-abc", True)
+    monkeypatch.setattr(mcp_server, "_DB_PATH", db)
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW", "not-this-slug")
+
+    assert mcp_server._private_reads_policy() == "named"
+    assert mcp_server._private_read_refusal("tax-abc")
+    assert mcp_server._private_read_refusal("recipes-def") is None
+
+    roster = mcp_server.list_silos()
+    assert [s["slug"] for s in roster["silos"]] == ["recipes-def"]
+    assert roster.get("private_silo_count") == 1
+    assert "tax-abc" not in {r["slug"] for r in mcp_server.silo_roster()["silos"]}
+
+
+def test_private_reads_allow_list_surfaces_allowed_private(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allow-listed private silos appear on silo_roster so a model can name them."""
+    import mcp_server
+
+    set_silo_private(db, "tax-abc", True)
+    monkeypatch.setattr(mcp_server, "_DB_PATH", db)
+    monkeypatch.delenv("LLMLIBRARIAN_MCP_PRIVATE_READS", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW", "tax-abc")
+
+    assert mcp_server._private_read_refusal("tax-abc") is None
+    lite = mcp_server.silo_roster()
+    assert any(r["slug"] == "tax-abc" and r.get("private") for r in lite["silos"])
+
+
+def test_private_reads_allow_list_none_policy_override(db: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ALLOW lets selected private silos through even when policy is none."""
+    import mcp_server
+
+    set_silo_private(db, "tax-abc", True)
+    monkeypatch.setattr(mcp_server, "_DB_PATH", db)
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_PRIVATE_READS", "none")
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW", "tax-abc")
+
+    assert mcp_server._private_read_refusal("tax-abc") is None
+    roster = mcp_server.silo_roster()
+    assert any(r["slug"] == "tax-abc" and r.get("private") for r in roster["silos"])
 
 
 def test_ledger_ignores_code_and_notes() -> None:

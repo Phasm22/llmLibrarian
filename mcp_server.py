@@ -386,7 +386,10 @@ if _MCP_PROFILE not in {"full", "lite"}:
 
 _LITE_INSTRUCTIONS = (
     "Use silo_roster only when you need an exact silo slug. "
-    "Use retrieve_knowledge with that slug to answer from the user's indexed files. "
+    "Use retrieve_knowledge with that slug to answer from the user's indexed files; "
+    "optional filters (main_protein, category, course, tags, servings, max_total_time, "
+    "section, doc_type, era) narrow recipe/frontmatter hits. "
+    "Use find_files for filename or date-range listing (notes from last week, meals on a day). "
     "Use read_document to read a file a chunk came from, and ask_image for what a "
     "photo shows. If a result carries recommended_action, follow it instead of "
     "rephrasing. If results_may_be_incomplete is true, retry after the index rebuild finishes."
@@ -1237,6 +1240,15 @@ def _current_host() -> str:
 import contextvars  # noqa: E402
 
 _PRIVATE_READS: contextvars.ContextVar[str | None] = contextvars.ContextVar("llmli_private_reads", default=None)
+# Mounted lite catalog shares process _MCP_PROFILE=full; this marks the active endpoint.
+_ENDPOINT_PROFILE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "llmli_endpoint_profile", default=None
+)
+
+
+def _endpoint_profile() -> str:
+    """Active MCP catalog profile for this call (lite mount or process profile)."""
+    return _ENDPOINT_PROFILE.get() or _MCP_PROFILE
 
 
 def _private_reads_policy() -> str:
@@ -1245,12 +1257,39 @@ def _private_reads_policy() -> str:
     "named" (default): a private silo opens when its exact slug is passed — naming
     it is the consent signal. "none": no read tool opens one, and rosters and
     unscoped responses report a count instead of slugs, so the endpoint never
-    hands out the key. Writes (update_file/remove_file from watchers, add_silo,
-    reindex, repair) are unaffected. Set per process with
+    hands out the key. Both modes honor LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW when
+    set (see `_private_reads_allow`). Writes (update_file/remove_file from watchers,
+    add_silo, reindex, repair) are unaffected. Set per process with
     LLMLIBRARIAN_MCP_PRIVATE_READS, or per mounted endpoint (_PrivateReadsPolicy).
     """
     raw = _PRIVATE_READS.get() or os.environ.get("LLMLIBRARIAN_MCP_PRIVATE_READS", "named")
     return "none" if str(raw).strip().lower() == "none" else "named"
+
+
+def _private_reads_allow() -> frozenset[str] | None:
+    """Optional per-silo allow-list for private reads (both full and lite endpoints).
+
+    ``LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW=slug1,slug2``:
+    - with policy ``named``: only these private slugs open by exact slug; others refuse
+    - with policy ``none``: these private slugs still open by exact slug (override);
+      every other private silo stays refused
+
+    ``None`` means no allow-list is configured (legacy named/none behavior).
+    """
+    raw = os.environ.get("LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW", "").strip()
+    if not raw:
+        return None
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _private_slug_readable(slug: str) -> bool:
+    """True when this endpoint may open the given private silo slug."""
+    allow = _private_reads_allow()
+    if _private_reads_policy() == "none":
+        return bool(allow and slug in allow)
+    if allow is None:
+        return True
+    return slug in allow
 
 
 _PRIVATE_READ_REFUSAL = (
@@ -1260,9 +1299,7 @@ _PRIVATE_READ_REFUSAL = (
 
 
 def _private_read_refusal(*silos: str | None) -> str | None:
-    """Error text when the policy is "none" and any named silo is private."""
-    if _private_reads_policy() != "none":
-        return None
+    """Error text when a named silo is private and this endpoint cannot read it."""
     from state import private_silo_slugs, resolve_silo_by_path, resolve_silo_to_slug
 
     private = set(private_silo_slugs(_DB_PATH))
@@ -1274,17 +1311,31 @@ def _private_read_refusal(*silos: str | None) -> str | None:
         slug = resolve_silo_to_slug(_DB_PATH, name)
         if slug is None and "/" in name:
             slug = resolve_silo_by_path(_DB_PATH, name)
-        if (slug or name) in private:
+        resolved = slug or name
+        if resolved in private and not _private_slug_readable(resolved):
             return _PRIVATE_READ_REFUSAL
     return None
 
 
 def _roster_for_policy(result: dict) -> dict:
-    """Drop private rows from a roster when this endpoint cannot read them."""
-    if _private_reads_policy() != "none" or not isinstance(result.get("silos"), list):
+    """Drop private rows this endpoint cannot read (none policy and/or allow-list)."""
+    if not isinstance(result.get("silos"), list):
         return result
-    visible = [row for row in result["silos"] if not row.get("private")]
-    hidden = len(result["silos"]) - len(visible)
+    allow = _private_reads_allow()
+    # named + no allow-list: full roster (legacy).
+    if _private_reads_policy() == "named" and allow is None:
+        return result
+    visible = []
+    hidden = 0
+    for row in result["silos"]:
+        if not row.get("private"):
+            visible.append(row)
+            continue
+        slug = str(row.get("slug") or "")
+        if _private_slug_readable(slug):
+            visible.append(row)
+        else:
+            hidden += 1
     out = {**result, "silos": visible, "silo_count": len(visible)}
     if hidden:
         out["private_silo_count"] = hidden
@@ -2099,14 +2150,17 @@ def find_files(
 
         unknown = [name for name in silos if not resolve_silo_to_slug(_DB_PATH, name)]
         if unknown:
+            roster_tool = "silo_roster" if _endpoint_profile() == "lite" else "list_silos"
             return {
                 "db_path": _DB_PATH,
                 "error": f"unknown silo(s): {', '.join(unknown)}",
                 "files": [],
                 "recommended_action": {
-                    "tool": "list_silos",
+                    "tool": roster_tool,
                     "args": {},
-                    "reason": "Copy the exact slug from list_silos; do not retype or guess it.",
+                    "reason": (
+                        f"Copy the exact slug from {roster_tool}; do not retype or guess it."
+                    ),
                 },
             }
     refusal = _private_read_refusal(*(silos or []))
@@ -2140,9 +2194,10 @@ def find_files(
         if isinstance(result, dict) and result.get("files"):
             # find_files used to end here; with no tool that takes a path, the
             # 2026-10-02 client reached for Open-WebUI's own KB tools instead.
+            # Wording stays valid on both profiles (lite uses retrieve_knowledge).
             result["next_step"] = (
-                "read_document(path) reads a file; "
-                "query_personal_knowledge(query, source=path) searches inside one."
+                "read_document(path) reads a file; pass source=path on your "
+                "retrieval tool to search inside one."
             )
         return result
     except Exception as e:
@@ -2750,41 +2805,53 @@ def silo_roster() -> dict:
     from state import list_silos as _list_silos
 
     registered = [entry for entry in _list_silos(_DB_PATH) if entry.get("slug")]
-    # Private silos are left off the roster entirely, slug included: on the lite
-    # profile this is the only discovery tool, so listing a private slug would
-    # hand the model the exact key retrieve_knowledge accepts as consent.
-    silos = [
-        {
-            "slug": str(entry.get("slug") or ""),
-            "display_name": str(entry.get("display_name") or entry.get("slug") or ""),
+    # Private silos stay off the roster unless the operator allow-listed them:
+    # listing a private slug hands the model the consent key retrieve_knowledge
+    # accepts. LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW is the deliberate exception
+    # (e.g. expose journal but not tax on an Open-WebUI endpoint).
+    allow = _private_reads_allow()
+    silos: list[dict] = []
+    for entry in registered:
+        slug = str(entry.get("slug") or "")
+        if entry.get("private"):
+            if allow is None or slug not in allow or not _private_slug_readable(slug):
+                continue
+        row = {
+            "slug": slug,
+            "display_name": str(entry.get("display_name") or slug),
             "chunks_count": int(entry.get("chunks_count") or 0),
         }
-        for entry in registered
-        if not entry.get("private")
-    ]
+        if entry.get("private"):
+            row["private"] = True
+        silos.append(row)
     silos.sort(key=lambda entry: entry["slug"])
     out: dict = {
         "db_exists": True,
         "silo_count": len(silos),
         "silos": silos,
     }
-    hidden = len(registered) - len(silos)
+    listed_private = {row["slug"] for row in silos if row.get("private")}
+    hidden = sum(
+        1
+        for entry in registered
+        if entry.get("private") and str(entry.get("slug") or "") not in listed_private
+    )
     if hidden:
         out["private_silos_hidden"] = hidden
         out["privacy_note"] = (
             f"{hidden} private silo(s) are not listed. If the user's question is about "
             + (
                 "one of them, ask the user for its exact slug."
-                if _private_reads_policy() == "named"
+                if _private_reads_policy() == "named" and allow is None
                 else "one of them, tell the user to run `pal ask --in <slug>` locally; "
-                "this endpoint does not read private silos."
+                "this endpoint does not read those private silos."
             )
         )
     return out
 
 
 def _compact_lite_chunk(chunk: dict) -> dict:
-    """Keep only answer evidence needed by small-context MCP clients."""
+    """Keep answer evidence a small model needs to cite and filter."""
     out = {
         "text": str(chunk.get("text") or ""),
         "score": chunk.get("score"),
@@ -2792,14 +2859,17 @@ def _compact_lite_chunk(chunk: dict) -> dict:
         "section": str(chunk.get("section") or ""),
         "doc_type": str(chunk.get("doc_type") or "other"),
     }
-    for field in ("page", "line_start"):
+    for field in ("page", "line_start", "mtime_iso", "silo"):
         value = chunk.get(field)
-        if value is not None:
+        if value not in (None, ""):
             out[field] = value
     for field in ("source_modality", "summary_status", "needs_vision_enrichment"):
         value = chunk.get(field)
         if value is not None:
             out[field] = value
+    meta = chunk.get("metadata")
+    if isinstance(meta, dict) and meta:
+        out["metadata"] = dict(meta)
     photo_metadata = chunk.get("photo_metadata")
     if isinstance(photo_metadata, dict) and photo_metadata:
         out["photo_metadata"] = dict(photo_metadata)
@@ -2839,15 +2909,38 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
     return out
 
 
-def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | None = None) -> dict:
+def retrieve_knowledge(
+    query: str,
+    silo: str,
+    n_results: int = 8,
+    source: str | None = None,
+    section: str | None = None,
+    doc_type: str | None = None,
+    category: str | None = None,
+    main_protein: str | None = None,
+    min_servings: int | None = None,
+    max_servings: int | None = None,
+    max_total_time: int | None = None,
+    tags: str | list[str] | None = None,
+    course: str | None = None,
+    era: str | None = None,
+) -> dict:
     """Use when: answering from one known silo on a small-context client.
     Do not use when: you need diagnostics, broad discovery, or more than twelve chunks.
-    Pairs with: `silo_roster`.
+    Pairs with: `silo_roster`, `find_files` for filename/date listing, `read_document`.
 
     Retrieve compact source chunks for the exact silo slug. Defaults to eight
     chunks so a one-file cookbook can still surface a hybrid-ranked hit;
     request up to twelve when needed. Pass source= (a path or filename in that
     silo) to search inside one file.
+
+    Optional frontmatter filters match query_personal_knowledge (reindex the silo
+    after upgrading for these to take effect):
+      category / main_protein / course / era — exact match
+      min_servings / max_servings — inclusive servings range
+      max_total_time — total_time (minutes) ≤ this value
+      tags — string or list; every listed tag must appear in tags or dietary_flags
+      section / doc_type — document section or file type
     """
     if not _db_present():
         return {**_db_missing_error(), "chunks": []}
@@ -2883,6 +2976,17 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | 
         if err:
             return {"error": err, "chunks": []}
 
+    meta_params = {
+        "category": category,
+        "main_protein": main_protein,
+        "min_servings": min_servings,
+        "max_servings": max_servings,
+        "max_total_time": max_total_time,
+        "tags": tags,
+        "course": course,
+        "era": era,
+    }
+
     def _compute() -> tuple[dict, dict | None]:
         try:
             with _mcp_chroma_lock("retrieve_knowledge"):
@@ -2890,9 +2994,12 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | 
                     query=query,
                     silo=silo,
                     n_results=n_results,
+                    section=section,
+                    doc_type=doc_type,
                     source=source_path,
                     db_path=_DB_PATH,
                     config_path=_CONFIG_PATH,
+                    **meta_params,
                 )
                 chunks = result.get("chunks", [])
                 _emit_usage_event(
@@ -2906,7 +3013,13 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | 
                 tool="retrieve_knowledge",
                 queries=[query],
                 silo=silo,
-                params={"n_results": n_results, **({"source": source_path} if source_path else {})},
+                params={
+                    "n_results": n_results,
+                    "section": section,
+                    "doc_type": doc_type,
+                    **({"source": source_path} if source_path else {}),
+                    **{k: v for k, v in meta_params.items() if v is not None},
+                },
                 chunks=chunks,
                 outcome={"confidence": confidence, "confidence_score": confidence_score},
             )
@@ -2919,7 +3032,24 @@ def retrieve_knowledge(query: str, silo: str, n_results: int = 8, source: str | 
             _release_chroma()
 
     return _cached_retrieval(
-        "retrieve_knowledge", (_query_key(query), silo, n_results, source_path), _compute
+        "retrieve_knowledge",
+        (
+            _query_key(query),
+            silo,
+            n_results,
+            source_path,
+            section,
+            doc_type,
+            category,
+            main_protein,
+            min_servings,
+            max_servings,
+            max_total_time,
+            tuple(tags) if isinstance(tags, list) else tags,
+            course,
+            era,
+        ),
+        _compute,
     )
 
 
@@ -2956,7 +3086,7 @@ def _resolve_indexed_file(
     for slug, entry in silos.items():
         if target_slug and slug != target_slug and (entry or {}).get("path") != target_slug:
             continue
-        if slug in private and (slug != target_slug or _private_reads_policy() == "none"):
+        if slug in private and (slug != target_slug or not _private_slug_readable(slug)):
             continue
         roots[slug] = str((entry or {}).get("path") or "")
         for path in ((entry or {}).get("files") or {}):
@@ -3208,11 +3338,12 @@ _FULL_TOOL_NAMES = (
 
 
 def _lite_tools() -> tuple:
-    # Reading a found file and looking at a photo were the two dead ends the
-    # 2026-10-02 small-model session hit; both resolve privacy themselves.
+    # keep the catalog tiny: filters live as optional params on retrieve_knowledge;
+    # find_files covers date/filename listing that retrieval cannot.
     return (
         ("silo_roster", silo_roster),
         ("retrieve_knowledge", retrieve_knowledge),
+        ("find_files", find_files),
         ("read_document", read_document),
         ("ask_image", ask_image),
     )
@@ -3242,19 +3373,36 @@ class _PrivateReadsPolicy(Middleware):
             _PRIVATE_READS.reset(token)
 
 
+class _LiteEndpointPolicy(Middleware):
+    """Pin private-reads + endpoint profile for the mounted lite catalog."""
+
+    def __init__(self, private_reads: str) -> None:
+        self.private_reads = private_reads
+
+    async def on_call_tool(self, context, call_next):
+        t_reads = _PRIVATE_READS.set(self.private_reads)
+        t_profile = _ENDPOINT_PROFILE.set("lite")
+        try:
+            return await call_next(context)
+        finally:
+            _PRIVATE_READS.reset(t_reads)
+            _ENDPOINT_PROFILE.reset(t_profile)
+
+
 def _build_lite_server() -> FastMCP:
     """A second, lite catalog served from this process (LLMLIBRARIAN_MCP_LITE_PATH).
 
     Shares models, locks and the result cache with the full endpoint, so a small
-    client gets the 1.3 KB catalog without a second ~400 MB-1.3 GB process, and
+    client gets a few-KB catalog without a second ~400 MB-1.3 GB process, and
     the watchers keep the full endpoint they write through. Its private-reads
     policy defaults to "none" (LLMLIBRARIAN_MCP_LITE_PRIVATE_READS): this is the
     endpoint meant for Open-WebUI, which is told in prose not to ask about tax.
+    Use LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW to expose specific private silos.
     """
     lite = FastMCP("llmLibrarian-lite", instructions=_LITE_INSTRUCTIONS)
     lite.add_middleware(_ImportErrorExplainer())
     policy = os.environ.get("LLMLIBRARIAN_MCP_LITE_PRIVATE_READS", "none").strip().lower() or "none"
-    lite.add_middleware(_PrivateReadsPolicy("none" if policy == "none" else "named"))
+    lite.add_middleware(_LiteEndpointPolicy("none" if policy == "none" else "named"))
     for name, fn in _lite_tools():
         lite.tool(name=name)(fn)
     if mcp.auth is not None:

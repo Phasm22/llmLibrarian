@@ -56,7 +56,8 @@ read them before reporting an absence. For a private corpus, prefer telling the
 user to run `pal ask --in <slug>` over pulling values into a cloud context.
 The tax ledger obeys the same rule (`tax.ledger.load_tax_ledger_rows`). An
 endpoint started with `LLMLIBRARIAN_MCP_PRIVATE_READS=none` refuses private
-silos even by exact slug and lists only a count; writes are unaffected.
+silos even by exact slug and lists only a count, unless
+`LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW` names specific slugs; writes are unaffected.
 
 **Empty results name a next step.** Every MCP retrieval response with no chunks
 carries `recommended_action {tool, args, reason}`; follow it rather than

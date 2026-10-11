@@ -62,7 +62,13 @@ asyncio.run(main())
         text=True,
     )
 
-    assert json.loads(proc.stdout) == ["ask_image", "read_document", "retrieve_knowledge", "silo_roster"]
+    assert json.loads(proc.stdout) == [
+        "ask_image",
+        "find_files",
+        "read_document",
+        "retrieve_knowledge",
+        "silo_roster",
+    ]
 
 
 def test_silo_roster_is_sorted_and_compact(mcp_module):
@@ -129,12 +135,24 @@ def test_retrieve_knowledge_projects_evidence_and_rebuild_signal(monkeypatch, mc
     assert out["results_may_be_incomplete"] is True
     assert out["retryable"] is True
     assert set(out["chunks"][0]) == {
-        "text", "score", "source", "section", "doc_type", "page", "line_start"
+        "text",
+        "score",
+        "source",
+        "section",
+        "doc_type",
+        "page",
+        "line_start",
+        "mtime_iso",
+        "silo",
     }
     assert "tax_ledger" not in out
     assert "chunks_by_silo" not in out
     assert audit_calls[0]["tool"] == "retrieve_knowledge"
-    assert audit_calls[0]["params"] == {"n_results": 8}
+    assert audit_calls[0]["params"] == {
+        "n_results": 8,
+        "section": None,
+        "doc_type": None,
+    }
     assert usage_calls[0][1]["profile"] == "lite"
 
 
@@ -154,6 +172,53 @@ def test_compact_lite_chunk_preserves_photo_metadata(mcp_module):
         "photo_taken_at": "2009-11-27T07:56:43",
         "camera_model": "Canon PowerShot A1000 IS",
     }
+
+
+def test_compact_lite_chunk_keeps_frontmatter_metadata(mcp_module):
+    out = mcp_module._compact_lite_chunk(
+        {
+            "text": "Bison burger",
+            "source": "/recipes/bison-burger.md",
+            "metadata": {"title": "Bison Burger", "main_protein": "bison", "tags": ["grill"]},
+            "mtime_iso": "2026-10-10",
+        }
+    )
+    assert out["metadata"]["main_protein"] == "bison"
+    assert out["mtime_iso"] == "2026-10-10"
+
+
+def test_retrieve_knowledge_forwards_frontmatter_filters(monkeypatch, mcp_module):
+    _register_silo(Path(mcp_module._DB_PATH))
+    captured: dict = {}
+
+    def fake_retrieve(**kwargs):
+        captured.update(kwargs)
+        return {
+            "query": kwargs["query"],
+            "chunks": [
+                {
+                    "text": "Bison",
+                    "score": 0.9,
+                    "source": "/r/bison.md",
+                    "metadata": {"main_protein": "bison"},
+                }
+            ],
+        }
+
+    monkeypatch.setitem(sys.modules, "query.core", SimpleNamespace(run_retrieve=fake_retrieve))
+    out = mcp_module.retrieve_knowledge(
+        "dinner",
+        "notes-1234abcd",
+        main_protein="bison",
+        category="dinner",
+        max_total_time=45,
+        tags=["grill"],
+    )
+    assert captured["main_protein"] == "bison"
+    assert captured["category"] == "dinner"
+    assert captured["max_total_time"] == 45
+    assert captured["tags"] == ["grill"]
+    assert out["chunks"][0]["metadata"]["main_protein"] == "bison"
 
 
 @pytest.mark.parametrize("n_results", [0, 13, True, "3"])
@@ -228,7 +293,13 @@ def test_lite_mount_serves_both_catalogs_and_pins_its_privacy_policy(monkeypatch
         refused = rpc(client, "/lite/mcp", "tools/call", {"name": "retrieve_knowledge", "arguments": {"query": "q", "silo": "tax-abc"}})
         healthz = client.get("/healthz")
 
-    assert lite == {"silo_roster", "retrieve_knowledge", "read_document", "ask_image"}
+    assert lite == {
+        "silo_roster",
+        "retrieve_knowledge",
+        "find_files",
+        "read_document",
+        "ask_image",
+    }
     assert {"query_personal_knowledge", "update_file", "list_silos"} <= full
     assert "does not read private silos" in json.dumps(refused)
     assert healthz.status_code == 200
