@@ -1336,6 +1336,8 @@ def query_personal_knowledge(
                 **meta_params,
             )
             chunks = result.get("chunks", [])
+            # Lexical-leg diagnostics belong to explain_retrieval; keep this payload slim.
+            result.pop("lexical_retrieval", None)
 
             _emit_usage_event("usage.llmlibrarian.query", {"silo": silo or "unscoped"})
 
@@ -1655,7 +1657,10 @@ def explain_retrieval(
     before deciding to re-query with different parameters.
 
     Returns:
-    - retrieval_method: 'hybrid' (vector + lexical RRF) or 'vector_only'
+    - retrieval_method: 'hybrid' (vector + BM25 lexical RRF) or 'vector_only'; may carry
+      '+image_rrf', or be 'dual_stream_rrf' / 'image_vector'
+    - lexical_terms: terms the lexical leg searched, terms it dropped and why
+      (no_match, too_common), and its status
     - lexical_hit_count: chunks with lexical_rank set (exact-text match)
     - vector_only_chunk_count: chunks with no lexical_rank (semantic-only in this result set)
     - chunk_with_vector_rank_count: chunks that participated in vector ranking (includes hybrid rows)
@@ -1702,22 +1707,45 @@ def explain_retrieval(
                     "rrf_score": sig.get("rrf_score"),
                 })
 
-            # Build human-readable signal summary
-            if method == "hybrid":
+            # Build human-readable signal summary from the path actually taken.
+            lexical = result.get("lexical_retrieval") or {}
+            lexical_terms = {
+                k: lexical[k]
+                for k in ("status", "terms_extracted", "terms_used", "terms_dropped", "scope_size", "candidates", "error")
+                if k in lexical
+            }
+            dropped = lexical.get("terms_dropped") or {}
+            dropped_note = (
+                " Dropped terms: " + ", ".join(f"{t} ({why})" for t, why in dropped.items()) + "."
+                if dropped
+                else ""
+            )
+            if lexical_hits:
                 summary_parts = [
-                    f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had exact-text matches (lexical_rank set); "
+                    f"Hybrid retrieval fired: {len(lexical_hits)} chunk(s) had BM25 lexical matches (lexical_rank set) "
+                    f"on terms {lexical.get('terms_used') or '?'}; "
                     f"{with_vector_rank} chunk(s) have vector_rank (semantic ranking); "
-                    f"{len(vector_only_hits)} chunk(s) are semantic-only in this set (no lexical_rank).",
+                    f"{len(vector_only_hits)} chunk(s) are semantic-only in this set (no lexical_rank).{dropped_note}",
                 ]
-                if lexical_hits:
-                    top_lex = lexical_hits[0]
-                    summary_parts.append(
-                        f"Top lexical hit (rank {top_lex['rank']}): {top_lex.get('source','?')} "
-                        f"— score {top_lex.get('score')}"
-                    )
+                top_lex = lexical_hits[0]
+                summary_parts.append(
+                    f"Top lexical hit (rank {top_lex['rank']}): {top_lex.get('source','?')} "
+                    f"— score {top_lex.get('score')}"
+                )
             else:
+                status = lexical.get("status")
+                if status == "no_terms":
+                    reason = "no lexical terms were extracted from the query (all stopwords or too short)."
+                elif status == "no_discriminative_terms":
+                    reason = "every extracted term matched nothing or was too common to rank on."
+                elif status == "error":
+                    reason = f"the lexical lookup failed ({lexical.get('error')})."
+                elif status == "ranked":
+                    reason = "lexical matches existed but none survived into the final result set."
+                else:
+                    reason = "the lexical leg did not run for this query."
                 summary_parts = [
-                    f"Vector-only retrieval: no exact-text terms were extracted from the query or lexical search returned no results. "
+                    f"No lexical contribution: {reason}{dropped_note} "
                     f"All {len(chunks)} chunk(s) matched semantically."
                 ]
 
@@ -1738,6 +1766,7 @@ def explain_retrieval(
                 **({"deterministic_intent": result["deterministic_intent"]} if result.get("deterministic_intent") else {}),
                 **{k: guidance[k] for k in ("recommended_action", "alternative_tool") if guidance.get(k)},
                 "retrieval_method": method,
+                "lexical_terms": lexical_terms,
                 "lexical_hit_count": len(lexical_hits),
                 "vector_only_chunk_count": len(vector_only_hits),
                 "chunk_with_vector_rank_count": with_vector_rank,

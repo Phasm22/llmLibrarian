@@ -1,3 +1,12 @@
+---
+description: Open when you need the current runtime contract for query, retrieval, ingest, or MCP behavior, rather than the narrative guide.
+type: reference
+globs:
+  - "src/**/*.py"
+  - "mcp_server.py"
+updated: 2026-10-10
+---
+
 # Technical Reference
 
 Current runtime contracts only. Narrative guide: [GUIDE.md](./GUIDE.md).
@@ -37,6 +46,23 @@ The system is organized around a few stable ideas:
 
 Scoped retrieval can run dual streams (`<silo>` + `<silo>-artifacts`) with
 per-stream source diversity and RRF merge when artifact metadata exists.
+
+Hybrid retrieval (`query/retrieval.py`, `run_hybrid_retrieve`) fuses the vector
+list with a lexical list by RRF, which reads list position as relevance. The
+lexical list is therefore BM25-ordered, never storage-ordered:
+- terms: quoted phrases, numbers, and 3+ letter words minus
+  `DIRECT_LEXICAL_STOPWORDS`, lowercased, at most 8
+- matching: case-insensitive Chroma `$regex` with a leading word boundary
+  (`lexical_term_pattern`)
+- a term in more than `LEXICAL_MAX_DF_RATIO` (20%) of the scoped chunks is
+  dropped once the scope has at least 50 chunks; no surviving term means
+  `vector_only`
+- the 200-hit cap (`MAX_LEXICAL_FOR_RRF`) applies after BM25 sorting
+- a failed lexical lookup logs a warning and falls back to `vector_only`
+
+`explain_retrieval` reports the method actually taken and a `lexical_terms`
+block (terms used, terms dropped and why). Background:
+[RCA_HYBRID_LEXICAL_RANKING_RECIPES_SILO.md](./RCA_HYBRID_LEXICAL_RANKING_RECIPES_SILO.md).
 
 Deterministic query families:
 - capabilities

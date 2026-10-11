@@ -113,7 +113,9 @@ def execute_retrieve_chroma_phase(
             return {"$and": parts}
         return None
 
-    def _query_stream(target_silo: str | None) -> tuple[list[str], list[dict | None], list[float | None], str | None]:
+    def _query_stream(
+        target_silo: str | None,
+    ) -> tuple[list[str], list[dict | None], list[float | None], str | None, str, dict[str, Any]]:
         query_kw: dict[str, Any] = {
             "query_texts": [query_for_retrieval],
             "n_results": n_stage1,
@@ -125,7 +127,8 @@ def execute_retrieve_chroma_phase(
         docs_v, metas_v, dists_v, ids_v, _warn = _safe_query(collection, query_kw, target_silo, db_path=db_path)
         _hybrid_where = query_kw.get("where") if isinstance(query_kw.get("where"), dict) else None
         _lexical_phrases = PROFILE_LEXICAL_PHRASES if intent == INTENT_EVIDENCE_PROFILE else None
-        docs_h, metas_h, dists_h, _method = run_hybrid_retrieve(
+        lexical_diag: dict[str, Any] = {}
+        docs_h, metas_h, dists_h, method = run_hybrid_retrieve(
             ids_v=ids_v,
             docs_v=docs_v,
             metas_v=metas_v,
@@ -135,6 +138,7 @@ def execute_retrieve_chroma_phase(
             where_filter=_hybrid_where,
             top_k=n_stage1,
             lexical_phrases=_lexical_phrases,
+            diagnostics=lexical_diag,
         )
         per_cap = source_diversity_cap(
             intent,
@@ -145,13 +149,14 @@ def execute_retrieve_chroma_phase(
         docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, n_results, max_per_source=per_cap)
         docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
         docs_h, metas_h, dists_h = apply_tag_postfilter(docs_h, metas_h, dists_h, required_tags)
-        return docs_h, metas_h, dists_h, _warn
+        return docs_h, metas_h, dists_h, _warn, method, lexical_diag
 
-    docs, metas, dists, _silo_warning = _query_stream(silo_slug)
-    retrieval_method = "hybrid_or_vector"
+    # Report the path actually taken; this used to be a constant "hybrid_or_vector",
+    # which left explain_retrieval describing hybrid runs as vector-only.
+    docs, metas, dists, _silo_warning, retrieval_method, lexical_retrieval = _query_stream(silo_slug)
     if silo_slug and (doc_type is None or doc_type == "artifact") and _artifact_stream_enabled(db, silo_slug):
         artifact_slug = f"{silo_slug}-artifacts"
-        artifact_docs, artifact_metas, artifact_dists, _artifact_warning = _query_stream(artifact_slug)
+        artifact_docs, artifact_metas, artifact_dists, _artifact_warning, _m, _d = _query_stream(artifact_slug)
         if artifact_docs:
             docs, metas, dists = merge_dual_streams_rrf(
                 docs,
@@ -292,6 +297,7 @@ def execute_retrieve_chroma_phase(
         "intent": intent,
         "silo_filter": silo_slug,
         "retrieval_method": retrieval_method,
+        "lexical_retrieval": lexical_retrieval,
         "image_search": image_search,
         "chunks": chunks,
     }

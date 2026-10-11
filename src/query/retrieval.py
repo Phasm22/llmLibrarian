@@ -2,12 +2,16 @@
 Retrieval utilities: hybrid search (vector + lexical RRF), diversity, dedup,
 relevance gating, and catalog sub-scope resolution.
 """
+import logging
+import math
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from constants import DEFAULT_RELEVANCE_MAX_DISTANCE
+
+logger = logging.getLogger(__name__)
 
 # Lexical triggers for "what do I like / what did I say / do I mention" — prefer chunks containing these.
 PROFILE_TRIGGERS = re.compile(
@@ -18,14 +22,23 @@ PROFILE_TRIGGERS = re.compile(
     re.IGNORECASE,
 )
 
-# Hybrid search: phrases for Chroma where_document $contains (case-sensitive in Chroma). Used for EVIDENCE_PROFILE.
+# Hybrid search: lexical anchors for EVIDENCE_PROFILE. Matched case-insensitively like every lexical term.
 PROFILE_LEXICAL_PHRASES = [
     "I like", "I love", "I enjoy", "I prefer", "I think", "I believe",
     "my favorite", "favorite", "I said", "I wrote", "I feel", "I want",
     "I decided", "I chose", "in my opinion", "I mentioned",
 ]
 RRF_K = 60  # Reciprocal Rank Fusion constant
-MAX_LEXICAL_FOR_RRF = 200  # cap lexical get() results for RRF
+MAX_LEXICAL_FOR_RRF = 200  # cap on the BM25-sorted lexical list handed to RRF (applied after sorting)
+# A term in more than this share of the scoped chunks carries no ranking signal
+# ("and", "cup" in a cookbook). Below the min scope size the ratio is too coarse to trust.
+LEXICAL_MAX_DF_RATIO = 0.2
+LEXICAL_DF_CUTOFF_MIN_SCOPE = 50
+# Documents fetched per query for in-process BM25; candidates are pre-ordered by
+# IDF-weighted term coverage, so the cut only ever drops the weakest matches.
+MAX_LEXICAL_SCORING_DOCS = 2000
+BM25_K1 = 1.2
+BM25_B = 0.75
 
 # Per-intent source diversity caps: broader evidence profile, deeper aggregate.
 DIVERSITY_CAPS: dict[str, int] = {
@@ -47,33 +60,18 @@ SCOPE_TOKEN_STOPLIST = frozenset(
     {"llm", "tool", "fast", "slow", "why", "the", "is", "it", "so", "a", "an", "how", "does", "feel", "take"}
 )
 MAX_SCOPE_TOKENS = 2  # extract up to 2 candidates; union path results
+# Terms are \b[\w-]{3,}\b, so only 3+ letter words need listing. This is the
+# fixed floor; LEXICAL_MAX_DF_RATIO drops whatever else is common in a given scope.
 DIRECT_LEXICAL_STOPWORDS = frozenset(
-    {
-        "the",
-        "a",
-        "an",
-        "is",
-        "are",
-        "was",
-        "were",
-        "what",
-        "which",
-        "who",
-        "when",
-        "where",
-        "why",
-        "how",
-        "in",
-        "on",
-        "for",
-        "to",
-        "of",
-        "as",
-        "by",
-        "from",
-        "latest",
-        "current",
-    }
+    """
+    the and are was were what which who whom whose when where why how for from
+    with without into onto about above after before over under than then there
+    here this that these those they them their its his her hers our ours your
+    yours you can could would should will shall may might must have has had
+    having does did done doing not but nor any all some each every other also
+    just only very more most much many few such been being use used using make
+    makes made one get got give tell show find list please latest current
+    """.split()
 )
 
 
@@ -245,6 +243,106 @@ def merge_dual_streams_rrf(
     )
 
 
+def lexical_term_pattern(term: str) -> str:
+    """Case-insensitive regex for one lexical term, valid in both Chroma ($regex) and Python re.
+
+    Anchored at a leading word boundary so "corn" does not match "acorn", but not at
+    the end, so "chicken" still matches "chickens".
+    """
+    escaped = re.sub(r"([\\.^$|?*+()\[\]{}])", r"\\\1", term)
+    lead = "\\b" if re.match(r"\w", term) else ""
+    return f"(?i){lead}{escaped}"
+
+
+def _lexical_scope_size(collection: Any, where_filter: dict | None) -> int:
+    if not where_filter:
+        return int(collection.count())
+    return len(collection.get(where=where_filter, include=[]).get("ids") or [])
+
+
+def rank_lexical_candidates(
+    collection: Any,
+    terms: list[str],
+    where_filter: dict | None,
+    limit: int = MAX_LEXICAL_FOR_RRF,
+) -> tuple[list[str], list[str], list[dict | None], dict[str, Any]]:
+    """Return lexical hits ordered by BM25, best first, plus diagnostics.
+
+    RRF reads list position as relevance, so the order here is the whole contract.
+    A filtered ``collection.get`` returns storage order; ranking that directly let
+    the first-indexed file supply every lexical rank 1 (docs/RCA_HYBRID_LEXICAL_RANKING_RECIPES_SILO.md).
+
+    1. Per term, fetch matching ids only (case-insensitive ``$regex``) to get document frequency.
+    2. Drop terms that match nothing, or that match more than LEXICAL_MAX_DF_RATIO of the scope.
+    3. Pre-order the union by IDF-weighted term coverage; fetch the top MAX_LEXICAL_SCORING_DOCS.
+    4. Score those with BM25 (term frequency, length normalization), sort, then cap at ``limit``.
+    """
+    diag: dict[str, Any] = {"terms_used": [], "terms_dropped": {}}
+    base_kw: dict[str, Any] = {"where": where_filter} if where_filter else {}
+    scope_size = _lexical_scope_size(collection, where_filter)
+    diag["scope_size"] = scope_size
+
+    df_ids: dict[str, set[str]] = {}
+    patterns: dict[str, str] = {}
+    for term in terms:
+        pattern = lexical_term_pattern(term)
+        hit = collection.get(where_document={"$regex": pattern}, include=[], **base_kw)
+        ids = set(hit.get("ids") or [])
+        if not ids:
+            diag["terms_dropped"][term] = "no_match"
+            continue
+        if scope_size >= LEXICAL_DF_CUTOFF_MIN_SCOPE and len(ids) > LEXICAL_MAX_DF_RATIO * scope_size:
+            diag["terms_dropped"][term] = f"too_common ({len(ids)}/{scope_size} chunks)"
+            continue
+        df_ids[term] = ids
+        patterns[term] = pattern
+    diag["terms_used"] = list(df_ids)
+    if not df_ids:
+        diag["status"] = "no_discriminative_terms"
+        return [], [], [], diag
+
+    n = max(scope_size, max(len(ids) for ids in df_ids.values()))
+    idf = {t: math.log(1.0 + (n - len(ids) + 0.5) / (len(ids) + 0.5)) for t, ids in df_ids.items()}
+    coverage: dict[str, float] = {}
+    for term, ids in df_ids.items():
+        for cid in ids:
+            coverage[cid] = coverage.get(cid, 0.0) + idf[term]
+    # Sort by id within equal coverage so the cut is deterministic, never storage order.
+    shortlist = sorted(coverage, key=lambda cid: (-coverage[cid], cid))[:MAX_LEXICAL_SCORING_DOCS]
+    diag["candidates"] = len(coverage)
+    diag["scored"] = len(shortlist)
+
+    fetched = collection.get(ids=shortlist, include=["documents", "metadatas"])
+    f_ids: list[str] = list(fetched.get("ids") or [])
+    f_docs: list[str] = list(fetched.get("documents") or [])
+    f_metas: list[dict | None] = list(fetched.get("metadatas") or [])
+    compiled = {t: re.compile(p) for t, p in patterns.items()}
+    lengths = [max(1, len((d or "").split())) for d in f_docs]
+    avgdl = (sum(lengths) / len(lengths)) if lengths else 1.0
+
+    scored: list[tuple[float, float, str, int]] = []
+    for i, (cid, doc) in enumerate(zip(f_ids, f_docs)):
+        text = doc or ""
+        norm = BM25_K1 * (1.0 - BM25_B + BM25_B * lengths[i] / avgdl)
+        score = 0.0
+        for term, rx in compiled.items():
+            if cid not in df_ids[term]:
+                continue
+            tf = len(rx.findall(text)) or 1  # Chroma matched it; Python's regex disagreeing is no reason to drop it
+            score += idf[term] * tf * (BM25_K1 + 1.0) / (tf + norm)
+        scored.append((score, coverage.get(cid, 0.0), cid, i))
+    scored.sort(key=lambda row: (-row[0], -row[1], row[2]))
+    top = scored[:limit]
+    diag["status"] = "ranked"
+    diag["hits"] = len(top)
+    return (
+        [f_ids[i] for *_, i in top],
+        [f_docs[i] if i < len(f_docs) else "" for *_, i in top],
+        [f_metas[i] if i < len(f_metas) else None for *_, i in top],
+        diag,
+    )
+
+
 def run_hybrid_retrieve(
     ids_v: list[str],
     docs_v: list[str],
@@ -255,13 +353,18 @@ def run_hybrid_retrieve(
     where_filter: dict | None,
     top_k: int,
     lexical_phrases: list[str] | None = None,
+    diagnostics: dict | None = None,
 ) -> tuple[list[str], list[dict | None], list[float | None], str]:
-    """Run hybrid retrieval: combine pre-executed vector results with a lexical query and merge via RRF.
+    """Run hybrid retrieval: combine pre-executed vector results with a BM25-ranked lexical list via RRF.
 
-    If ids_v is empty or no lexical terms can be extracted, falls back to vector-only results.
+    Falls back to vector-only when ids_v is empty, no terms are extracted, every term is
+    too common or unmatched, or the lexical lookup raises (logged, never silent).
 
-    lexical_phrases — if provided, use these directly as $contains anchors (e.g. PROFILE_LEXICAL_PHRASES
+    lexical_phrases — if provided, use these as lexical anchors (e.g. PROFILE_LEXICAL_PHRASES
     for EVIDENCE_PROFILE intent). If None, terms are extracted from query_text automatically.
+
+    diagnostics — if a dict is passed, it is filled with what the lexical leg did:
+    terms_extracted, terms_used, terms_dropped, status, and counts.
 
     Injects ``_signals`` into each returned meta dict with keys:
         vector_rank, lexical_rank, rrf_score  (all None for vector-only path)
@@ -273,16 +376,22 @@ def run_hybrid_retrieve(
     else:
         terms = extract_direct_lexical_terms(query_text)
 
-    if ids_v and terms:
-        where_doc: dict = {"$or": [{"$contains": t} for t in terms[:MAX_LEXICAL_FOR_RRF]]}
-        get_kw: dict[str, Any] = {"where_document": where_doc, "include": ["documents", "metadatas"]}
-        if where_filter:
-            get_kw["where"] = where_filter
+    lexical: dict[str, Any] = {"terms_extracted": list(terms)}
+    if not terms:
+        lexical["status"] = "no_terms"
+    elif not ids_v:
+        lexical["status"] = "no_vector_results"
+    else:
         try:
-            lex = collection.get(**get_kw)
-            ids_l: list[str] = (lex.get("ids") or [])[:MAX_LEXICAL_FOR_RRF]
-            docs_l: list[str] = (lex.get("documents") or [])[:MAX_LEXICAL_FOR_RRF]
-            metas_l: list[dict | None] = (lex.get("metadatas") or [])[:MAX_LEXICAL_FOR_RRF]
+            ids_l, docs_l, metas_l, lex_diag = rank_lexical_candidates(collection, terms, where_filter)
+        except Exception as exc:
+            logger.warning(
+                "lexical retrieval failed, falling back to vector-only: %s: %s", type(exc).__name__, exc
+            )
+            lexical["status"] = "error"
+            lexical["error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            lexical.update(lex_diag)
             if ids_l:
                 docs, metas, dists, signals = rrf_merge(
                     ids_v, docs_v, metas_v, dists_v,
@@ -292,9 +401,11 @@ def run_hybrid_retrieve(
                 for meta, sig in zip(metas, signals):
                     if meta is not None:
                         meta["_signals"] = sig
+                if diagnostics is not None:
+                    diagnostics.update(lexical)
                 return docs, metas, dists, "hybrid"
-        except Exception:
-            pass
+    if diagnostics is not None:
+        diagnostics.update(lexical)
 
     # Vector-only fallback: annotate with positional signals
     for i, meta in enumerate(metas_v):
@@ -654,7 +765,10 @@ def resolve_subscope(
 
 
 def extract_direct_lexical_terms(query: str, limit: int = 8) -> list[str]:
-    """Extract lexical anchors for direct BM25-like fallback from user query."""
+    """Extract lexical anchors (quoted phrases, numbers, words) for the BM25 lexical leg.
+
+    Lowercased and deduplicated: matching is case-insensitive, so case carries nothing.
+    """
     q = (query or "").strip()
     if not q:
         return []
@@ -663,7 +777,7 @@ def extract_direct_lexical_terms(query: str, limit: int = 8) -> list[str]:
     words = re.findall(r"\b[\w-]{3,}\b", q.lower())
     terms: list[str] = []
     for tok in quoted + numbers + words:
-        t = tok.strip().strip(".,:;!?")
+        t = tok.strip().strip(".,:;!?").lower()
         if not t:
             continue
         if t in DIRECT_LEXICAL_STOPWORDS:
