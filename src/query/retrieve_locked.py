@@ -32,6 +32,12 @@ from query.retrieval import (
     source_diversity_cap,
 )
 from processors import PHOTO_METADATA_FIELDS
+from frontmatter import frontmatter_fields_for_response
+from query.meta_filters import (
+    apply_tag_postfilter,
+    build_metadata_where_parts,
+    normalize_tag_filters,
+)
 
 
 def _artifact_stream_enabled(db: str, silo_slug: str) -> bool:
@@ -59,6 +65,14 @@ def execute_retrieve_chroma_phase(
     db_path: str | None,
     get_chroma_client: Callable[[str], Any] | None = None,
     source: str | None = None,
+    category: str | None = None,
+    main_protein: str | None = None,
+    min_servings: int | None = None,
+    max_servings: int | None = None,
+    max_total_time: int | None = None,
+    tags: str | list[str] | None = None,
+    course: str | None = None,
+    era: str | None = None,
 ) -> dict:
     _gc = get_chroma_client or get_client
     ef = get_embedding_function(batch_size=1)
@@ -69,6 +83,16 @@ def execute_retrieve_chroma_phase(
     # silo. Reading it here (rather than per stream) keeps the clause consistent
     # across the vector and lexical arms, which share this where filter.
     private_clause = private_filter_clause(db)
+    required_tags = normalize_tag_filters(tags)
+    meta_where_parts = build_metadata_where_parts(
+        category=category,
+        main_protein=main_protein,
+        min_servings=min_servings,
+        max_servings=max_servings,
+        max_total_time=max_total_time,
+        course=course,
+        era=era,
+    )
 
     def _where_for_silo(target_silo: str | None) -> dict | None:
         parts: list[dict[str, Any]] = []
@@ -82,6 +106,7 @@ def execute_retrieve_chroma_phase(
             parts.append({"doc_type": doc_type})
         if source:
             parts.append({"source": source})
+        parts.extend(meta_where_parts)
         if len(parts) == 1:
             return parts[0]
         if len(parts) > 1:
@@ -119,6 +144,7 @@ def execute_retrieve_chroma_phase(
         )
         docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, n_results, max_per_source=per_cap)
         docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
+        docs_h, metas_h, dists_h = apply_tag_postfilter(docs_h, metas_h, dists_h, required_tags)
         return docs_h, metas_h, dists_h, _warn
 
     docs, metas, dists, _silo_warning = _query_stream(silo_slug)
@@ -254,6 +280,9 @@ def execute_retrieve_chroma_phase(
             "indexed_at": m.get("indexed_at"),
             "_signals": signals,
         }
+        fm_fields = frontmatter_fields_for_response(m)
+        if fm_fields:
+            chunk["metadata"] = fm_fields
         if photo_metadata:
             chunk["photo_metadata"] = photo_metadata
         chunks.append(chunk)

@@ -1234,6 +1234,14 @@ def query_personal_knowledge(
     section: str | None = None,
     doc_type: str | None = None,
     source: str | None = None,
+    category: str | None = None,
+    main_protein: str | None = None,
+    min_servings: int | None = None,
+    max_servings: int | None = None,
+    max_total_time: int | None = None,
+    tags: str | list[str] | None = None,
+    course: str | None = None,
+    era: str | None = None,
 ) -> dict:
     """
     Use when: answering a content/meaning question from indexed files.
@@ -1247,14 +1255,21 @@ def query_personal_knowledge(
     Specify silo to scope retrieval by slug or display name (a private silo opens only
     by its exact slug); call list_silos first
     rather than inferring a silo's domain from its slug. Returns chunks with text, score (0–1),
-    source path, silo, doc_type, and section/page/date when known. Image chunks also carry
-    source_modality and, once per photo, capture/camera/GPS data under photo_metadata.
+    source path, silo, doc_type, section/page/date when known, and a ``metadata`` object
+    when the source had YAML frontmatter (title, category, servings, tags, …). Image chunks
+    also carry source_modality and, once per photo, capture/camera/GPS data under photo_metadata.
     n_results defaults to 12; raise it only when a broad survey needs more.
 
     Pass section= to restrict to a document section.
     Pass doc_type= to restrict by file type.
     Pass source= (a path or unique filename from `find_files`) to search inside one
     file; use `read_document` to read it start to finish instead.
+    Metadata filters (from frontmatter indexed as Chroma metadata — reindex the silo
+    after upgrading for these to take effect):
+      category / main_protein / course / era — exact match
+      min_servings / max_servings — inclusive servings range
+      max_total_time — total_time (minutes) ≤ this value
+      tags — string or list; every listed tag must appear in tags or dietary_flags
     Intent routing is applied automatically.
     For tax queries, also returns a tax_ledger field with structured extracted values.
     Response includes answer_confidence and coverage_note to calibrate hedging.
@@ -1286,6 +1301,17 @@ def query_personal_knowledge(
                 **({"candidates": candidates[:20]} if candidates else {}),
                 "chunks": [],
             }
+    meta_params = {
+        "category": category,
+        "main_protein": main_protein,
+        "min_servings": min_servings,
+        "max_servings": max_servings,
+        "max_total_time": max_total_time,
+        "tags": tags,
+        "course": course,
+        "era": era,
+    }
+
     def _compute() -> tuple[dict, dict | None]:
         try:
             return _query_personal_knowledge_uncached()
@@ -1307,6 +1333,7 @@ def query_personal_knowledge(
                 source=source_path,
                 db_path=_DB_PATH,
                 config_path=_CONFIG_PATH,
+                **meta_params,
             )
             chunks = result.get("chunks", [])
 
@@ -1341,7 +1368,13 @@ def query_personal_knowledge(
             tool="query_personal_knowledge",
             queries=[query],
             silo=silo,
-            params={"n_results": n_results, "section": section, "doc_type": doc_type, "source": source_path},
+            params={
+                "n_results": n_results,
+                "section": section,
+                "doc_type": doc_type,
+                "source": source_path,
+                **{k: v for k, v in meta_params.items() if v is not None},
+            },
             chunks=chunks,
             outcome={"confidence": conf_level, "confidence_score": conf_score},
         )
@@ -1349,7 +1382,22 @@ def query_personal_knowledge(
 
     return _cached_retrieval(
         "query_personal_knowledge",
-        (_query_key(query), silo, n_results, section, doc_type, source_path),
+        (
+            _query_key(query),
+            silo,
+            n_results,
+            section,
+            doc_type,
+            source_path,
+            category,
+            main_protein,
+            min_servings,
+            max_servings,
+            max_total_time,
+            tuple(tags) if isinstance(tags, list) else tags,
+            course,
+            era,
+        ),
         _compute,
     )
 
@@ -1362,6 +1410,14 @@ def multi_query_knowledge(
     section: str | None = None,
     doc_type: str | None = None,
     max_total_chunks: int = 30,
+    category: str | None = None,
+    main_protein: str | None = None,
+    min_servings: int | None = None,
+    max_servings: int | None = None,
+    max_total_time: int | None = None,
+    tags: str | list[str] | None = None,
+    course: str | None = None,
+    era: str | None = None,
 ) -> dict:
     """
     Use when: one task needs multiple retrieval angles merged in one response.
@@ -1375,6 +1431,12 @@ def multi_query_knowledge(
     Each chunk is tagged with the query that retrieved it. Pass section= to restrict
     all queries to a document section. Pass doc_type= to restrict by file type
     (e.g. 'transcript', 'resume', 'tax_return', 'code', 'other').
+    Metadata filters (same as query_personal_knowledge; applied to every sub-query):
+      category / main_protein / course / era — exact match on frontmatter metadata
+      min_servings / max_servings — inclusive servings range
+      max_total_time — total_time (minutes) ≤ this value
+      tags — string or list; every listed tag must appear in tags or dietary_flags
+    Chunks include a ``metadata`` object when the source had YAML frontmatter.
     max_total_chunks caps the merged output (default 30) to avoid context overflow.
     If the cap is hit, response includes truncated=True — lower n_results or reduce queries.
     Response includes answer_confidence, answer_confidence_score, and coverage_note.
@@ -1392,6 +1454,17 @@ def multi_query_knowledge(
     refusal = _private_read_refusal(silo)
     if refusal:
         return {"db_path": _DB_PATH, "queries": queries, "error": refusal, "total_chunks": 0, "chunks": []}
+    meta_params = {
+        "category": category,
+        "main_protein": main_protein,
+        "min_servings": min_servings,
+        "max_servings": max_servings,
+        "max_total_time": max_total_time,
+        "tags": tags,
+        "course": course,
+        "era": era,
+    }
+
     def _compute() -> tuple[dict, dict]:
         seen: set[str] = set()
         all_chunks: list[dict] = []
@@ -1410,6 +1483,7 @@ def multi_query_knowledge(
                         doc_type=doc_type,
                         db_path=_DB_PATH,
                         config_path=_CONFIG_PATH,
+                        **meta_params,
                     )
                 if res.get("write_in_progress"):
                     write_states.append(res["write_in_progress"])
@@ -1452,6 +1526,7 @@ def multi_query_knowledge(
                 "max_total_chunks": max_total_chunks,
                 "section": section,
                 "doc_type": doc_type,
+                **{k: v for k, v in meta_params.items() if v is not None},
             },
             chunks=all_chunks,
             outcome={
@@ -1488,7 +1563,22 @@ def multi_query_knowledge(
 
     return _cached_retrieval(
         "multi_query_knowledge",
-        (tuple(_query_key(q) for q in queries), silo, n_results, section, doc_type, max_total_chunks),
+        (
+            tuple(_query_key(q) for q in queries),
+            silo,
+            n_results,
+            section,
+            doc_type,
+            max_total_chunks,
+            category,
+            main_protein,
+            min_servings,
+            max_servings,
+            max_total_time,
+            tuple(tags) if isinstance(tags, list) else tags,
+            course,
+            era,
+        ),
         _compute,
     )
 

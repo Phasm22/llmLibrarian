@@ -177,7 +177,7 @@ def slim_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Project retrieval chunks to what a model uses; drop empty fields.
 
     photo_metadata is kept once per source: every OCR region of a photo carried
-    the same capture/camera/GPS block.
+    the same capture/camera/GPS block. Frontmatter scalars landed in ``metadata``.
     """
     out: list[dict[str, Any]] = []
     photo_seen: set[str] = set()
@@ -185,6 +185,9 @@ def slim_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(chunk, dict):
             continue
         slim = {k: chunk[k] for k in _CHUNK_FIELDS if chunk.get(k) not in (None, "")}
+        meta = chunk.get("metadata")
+        if isinstance(meta, dict) and meta:
+            slim["metadata"] = meta
         if chunk.get("source_modality") == "image":
             for k in _IMAGE_FIELDS:
                 if chunk.get(k):

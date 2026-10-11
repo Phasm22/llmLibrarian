@@ -32,10 +32,18 @@ from constants import (
     DB_PATH,
     LLMLI_COLLECTION,
     LLMLI_IMAGE_COLLECTION,
-    CHUNK_SIZE,
-    CHUNK_OVERLAP,
     ADD_BATCH_SIZE,
     MAX_WORKERS,
+)
+from frontmatter import (
+    chroma_metadata_from_frontmatter,
+    compact_frontmatter_preamble,
+    parse_markdown_frontmatter,
+)
+from ingest.chunking import (
+    chunk_markdown,
+    chunk_text,
+    is_markdown_path,
 )
 
 from chroma_client import get_client, release as release_chroma_client, writer_client
@@ -346,76 +354,6 @@ def is_safe_path(base: Path, path: str) -> bool:
         return False
 
 
-def _chunk_params() -> tuple[int, int]:
-    """(chunk_size, overlap) from env or defaults. Used so add/index can be tuned without code change."""
-    size = CHUNK_SIZE
-    overlap = CHUNK_OVERLAP
-    try:
-        if os.environ.get("LLMLIBRARIAN_CHUNK_SIZE"):
-            size = max(100, min(int(os.environ["LLMLIBRARIAN_CHUNK_SIZE"]), 4000))
-        if os.environ.get("LLMLIBRARIAN_CHUNK_OVERLAP"):
-            overlap = max(0, min(int(os.environ["LLMLIBRARIAN_CHUNK_OVERLAP"]), size // 2))
-    except (TypeError, ValueError):
-        pass
-    return (size, overlap)
-
-
-def chunk_text(text: str, size: int | None = None, overlap: int | None = None) -> list[tuple[str, int]]:
-    """Returns list of (chunk_text, line_start). line_start is 1-based approximate. Uses env LLMLIBRARIAN_CHUNK_* when size/overlap not passed."""
-    if size is None or overlap is None:
-        psize, poverlap = _chunk_params()
-        size = size if size is not None else psize
-        overlap = overlap if overlap is not None else poverlap
-    if not text.strip():
-        return []
-    lines = text.split("\n")
-    result: list[tuple[str, int]] = []
-    current: list[str] = []
-    current_len = 0
-    line_start = 1
-    for i, line in enumerate(lines):
-        line_num = i + 1
-        if len(line) > size:
-            if current:
-                result.append(("\n".join(current), line_start))
-                current = []
-                current_len = 0
-            n = len(line)
-            start = 0
-            while start < n:
-                end = min(start + size, n)
-                result.append((line[start:end], line_num))
-                if end >= n:
-                    break
-                next_start = end - overlap
-                if next_start <= start:
-                    next_start = start + 1
-                start = next_start
-            line_start = line_num + 1
-            continue
-        current.append(line)
-        current_len += len(line) + 1
-        if current_len >= size:
-            chunk = "\n".join(current)
-            result.append((chunk, line_start))
-            # overlap: keep last few lines
-            overlap_len = 0
-            overlap_lines: list[str] = []
-            for j in range(len(current) - 1, -1, -1):
-                overlap_lines.insert(0, current[j])
-                overlap_len += len(current[j]) + 1
-                if overlap_len >= overlap and j > 0:
-                    line_start = line_num - len(overlap_lines) + 1
-                    break
-            current = overlap_lines
-            current_len = overlap_len
-            if not current:
-                line_start = line_num + 1
-    if current:
-        result.append(("\n".join(current), line_start))
-    return result
-
-
 # --- Extraction (delegated to processors.py; wrappers kept for ZIP processing) ---
 from processors import (
     PDFProcessor,
@@ -677,27 +615,56 @@ def _chunks_from_content(
     content_extracted: bool = True,
     extra_meta: dict[str, Any] | None = None,
 ) -> list[ChunkTuple]:
-    """Build chunk list (id, doc, meta). doc_type from content (first 500 chars) overrides path when not 'other'."""
-    content_type = _doc_type_from_content(text[:CONTENT_SAMPLE_LEN], Path(source_path).suffix.lower())
+    """Build chunk list (id, doc, meta). doc_type from content (first 500 chars) overrides path when not 'other'.
+
+    Markdown paths: YAML frontmatter becomes Chroma metadata (scalars; lists flattened),
+    and the body is chunked as a single piece when small, else split on headings before
+    falling back to size-based chunking. Malformed frontmatter is ignored.
+    """
+    fm_meta: dict[str, Any] = {}
+    working = text
+    markdown = is_markdown_path(source_path)
+    if markdown:
+        raw_fm, body = parse_markdown_frontmatter(text)
+        fm_meta = chroma_metadata_from_frontmatter(raw_fm)
+        preamble = compact_frontmatter_preamble(fm_meta)
+        if preamble:
+            working = f"{preamble}\n\n{body}" if body.strip() else preamble
+        else:
+            working = body
+
+    sample_src = working if markdown else text
+    content_type = _doc_type_from_content(sample_src[:CONTENT_SAMPLE_LEN], Path(source_path).suffix.lower())
     doc_type = content_type if content_type != "other" else _doc_type_from_path(source_path)
 
     # Build line→section map from §SECTION: ...§ markers before chunking
     section_by_line: dict[int, str] = {}
     current_section = ""
-    for lineno, line in enumerate(text.splitlines(), start=1):
+    for lineno, line in enumerate(working.splitlines(), start=1):
         m = _SECTION_MARKER_RE.match(line.strip())
         if m:
             current_section = m.group(1)
         section_by_line[lineno] = current_section
 
     # Strip markers from text so chunker sees clean content
-    clean_text = _SECTION_MARKER_RE.sub("", text)
-    chunks_with_lines = chunk_text(clean_text)
+    clean_text = _SECTION_MARKER_RE.sub("", working)
+    if markdown:
+        chunks_with_lines = chunk_markdown(clean_text)
+    else:
+        chunks_with_lines = chunk_text(clean_text)
 
     out: list[ChunkTuple] = []
     for i, (chunk, line_s) in enumerate(chunks_with_lines):
+        if prefix:
+            chunk = f"{prefix}{chunk}"
         cid = _stable_chunk_id(source_path, mtime, i)
         section = section_by_line.get(line_s, current_section if not section_by_line else "")
+        # Prefer an ATX heading line as section when markdown and no §SECTION marker.
+        if markdown and not section:
+            for line in chunk.splitlines():
+                if line.startswith("#"):
+                    section = line.lstrip("#").strip()
+                    break
         meta: dict = {
             "source": source_path,
             "source_path": source_path,
@@ -714,7 +681,10 @@ def _chunks_from_content(
             meta["file_hash"] = file_hash
         if page is not None:
             meta["page"] = page
+        if fm_meta:
+            meta.update(fm_meta)
         if extra_meta:
+            # Pipeline extras win over frontmatter on key collision.
             meta.update(extra_meta)
         out.append((cid, chunk, meta))
     return out
