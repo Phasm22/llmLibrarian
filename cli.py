@@ -791,7 +791,7 @@ def cmd_repair_ladder(args: argparse.Namespace) -> int:
         print(storage.get("chroma_hnsw_bloat_note", ""), file=sys.stderr)
     ladder = result.get("repair_ladder") or {}
     print("\nRepair ladder:")
-    print(f"  L1: {ladder.get('l1', 'llmli repair <silo>')}")
+    print(f"  L1: {ladder.get('l1', 'llmli repair <silo> --yes')}")
     print(f"  L2: {ladder.get('l2', 'diagnostics only')}")
     print(f"  L3: {ladder.get('l3', 'rehydrate from registry into fresh DB path')}")
     return 0
@@ -976,7 +976,8 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     if viol_n:
         print(
             f"[llmli] exclude violations: {viol_n} indexed file(s) match this silo's "
-            f"exclude patterns. Run `llmli verify {slug} --purge` to remove them.",
+            f"exclude patterns. Run `llmli verify {slug} --purge --yes` to remove them "
+            f"(or `--dry-run` to preview).",
             file=sys.stderr,
         )
         for hit in (result.get("exclude_violations") or [])[:5]:

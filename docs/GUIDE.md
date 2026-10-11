@@ -165,7 +165,7 @@ Common variables:
 ## Troubleshooting
 
 - **Low confidence / thin answers** — narrow silo, check `pal inspect`, reindex if files changed.
-- **`Error finding id`** — `llmli repair <silo>`.
+- **`Error finding id`** — `llmli repair <silo> --yes` (or `--dry-run` first).
 - **MCP + `pal pull` conflicts** — enable Chroma server mode; don’t use embedded writers while HTTP MCP holds the DB without server mode.
 - **Cloud-sync paths** — blocked by default; use `--allow-cloud` only if files are truly local copies.
 

@@ -2268,7 +2268,7 @@ def repair_silo(silo: str, confirm: bool = False) -> dict:
 
     Hard-wipe and fully re-index a silo to fix ChromaDB index corruption or 0-chunk inconsistencies.
     Runs inside this process (safe even when the MCP server has the DB open).
-    Equivalent to `llmli repair <silo>` but avoids the concurrent-write crash that happens
+    Equivalent to `llmli repair <silo> --yes` but avoids the concurrent-write crash that happens
     when a second process opens the same ChromaDB path.
     Requires confirm=True to proceed (safety guard).
     This is synchronous — it blocks until complete (may take a few minutes for large silos).

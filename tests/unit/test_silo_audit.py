@@ -86,7 +86,7 @@ def test_format_report_includes_orphans(tmp_path):
     report = format_report([], [], [], [], orphans=orphans)
     assert "Orphaned sources" in report
     assert "dead-silo" in report
-    assert "llmli rm" in report
+    assert "llmli rm <silo> --yes" in report
     assert "All clean." not in report
 
 

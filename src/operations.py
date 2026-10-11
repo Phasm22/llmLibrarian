@@ -159,7 +159,7 @@ def op_chroma_diagnostics(db_path: str) -> dict[str, Any]:
         "query_health_recent": latest_health,
         "storage": storage,
         "repair_ladder": {
-            "l1": "llmli repair <silo>",
+            "l1": "llmli repair <silo> --yes  # or --dry-run to preview",
             "l2": "Run diagnostics only: sqlite integrity check + segment inspection.",
             "l3": "Run llmli rehydrate to rebuild into a fresh DB path from registry sources.",
         },

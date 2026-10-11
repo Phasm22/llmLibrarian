@@ -79,7 +79,7 @@ def cleanup_stale_registry_entries(llmli_registry_path: Path) -> bool:
 
     - only *legacy-shaped* slugs are removable. A slug carrying a ``-<hash8>``
       suffix is a real silo; two of those sharing a path are a duplicate for a
-      human to resolve (``llmli rm``), not something to delete silently.
+      human to resolve (``llmli rm <silo> --yes``), not something to delete silently.
     - the whole read-modify-write runs under the registry lock and lands
       atomically.
 
