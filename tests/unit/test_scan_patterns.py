@@ -43,7 +43,7 @@ def test_names_that_only_contain_a_pattern_are_indexed(path):
         "/r/.env",
         "/r/.env.local",
         "/r/key.pem",
-        "/vault/cortex/a.md",
+        "/vault/much thinks/cortex/plan/a.md",
         "/r/.claude/worktrees/w/a.py",
         "/r/.pytest_cache/README.md",
         "/r/Foo.app/Contents/Info.json",
@@ -54,6 +54,12 @@ def test_names_that_only_contain_a_pattern_are_indexed(path):
 )
 def test_excluded_paths_stay_excluded(path):
     assert not should_index(path, ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE)
+
+
+def test_only_the_intent_cortex_is_excluded():
+    assert should_index("/vault/cortex/resumes/a.md", ADD_DEFAULT_INCLUDE, ADD_DEFAULT_EXCLUDE)
+    assert not should_descend_into_dir("/vault/much thinks/cortex", ADD_DEFAULT_EXCLUDE)
+    assert should_descend_into_dir("/vault/cortex", ADD_DEFAULT_EXCLUDE)
 
 
 def test_directory_descent_uses_segments():
