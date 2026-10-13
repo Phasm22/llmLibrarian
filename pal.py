@@ -3774,6 +3774,7 @@ def queries_command(
     contains: str | None = typer.Option(None, "--grep", help="Substring over query text, source filenames, or silo."),
     since: str | None = typer.Option(None, "--since", help="Window: 30m, 24h, 7d, or an ISO timestamp."),
     tool: str | None = typer.Option(None, "--tool", help="query_personal_knowledge or multi_query_knowledge."),
+    client: str | None = typer.Option(None, "--client", help="Caller label, app, or session id substring (e.g. 'Claude Code', 'AnythingLLM')."),
     summary: bool = typer.Option(False, "--summary", help="Roll-up only, no individual records."),
     as_json: bool = typer.Option(False, "--json", help="Emit raw JSONL records."),
 ) -> None:
@@ -3782,7 +3783,7 @@ def queries_command(
 
     log_path = query_audit.audit_log_path()
     records = query_audit.read_records(
-        limit=limit, silo=silo, contains=contains, since=since, tool=tool
+        limit=limit, silo=silo, contains=contains, since=since, tool=tool, client=client
     )
 
     if as_json:
@@ -3805,7 +3806,10 @@ def queries_command(
         for entry in records:
             result = entry.get("result") or {}
             ts = str(entry.get("ts") or "").replace("T", " ").replace("+00:00", "Z")
-            head = f"{ts}  {entry.get('tool')}  silo={entry.get('silo') or 'unscoped'}"
+            head = (
+                f"{ts}  {entry.get('tool')}  silo={entry.get('silo') or 'unscoped'}"
+                f"  client={query_audit.client_label(entry)}"
+            )
             flags = []
             if result.get("truncated"):
                 flags.append("TRUNCATED")
@@ -3830,6 +3834,8 @@ def queries_command(
     print(f"# {roll['calls']} call(s)  {roll.get('first_ts')} → {roll.get('last_ts')}")
     if roll["by_silo"]:
         print("  silos: " + ", ".join(f"{k}×{v}" for k, v in roll["by_silo"].items()))
+    if roll.get("by_client"):
+        print("  clients: " + ", ".join(f"{k}×{v}" for k, v in roll["by_client"].items()))
     if roll["top_sources"]:
         print("  top sources: " + ", ".join(f"{s['file']}×{s['chunks']}" for s in roll["top_sources"][:5]))
     notes = []

@@ -11,6 +11,8 @@ struct ActivityView: View {
             (siloFilter == nil || q.silo == siloFilter)
             && (search.isEmpty
                 || q.queries.contains { $0.localizedCaseInsensitiveContains(search) }
+                || q.clientLabel.localizedCaseInsensitiveContains(search)
+                || (q.client?.session?.localizedCaseInsensitiveContains(search) ?? false)
                 || q.sources.contains { $0.file.localizedCaseInsensitiveContains(search) })
         }
     }
@@ -32,6 +34,12 @@ struct ActivityView: View {
                         Text(store.silo(slug: q.silo)?.displayName ?? q.silo ?? "All silos")
                     }
                     .width(min: 100, ideal: 140).customizationID("silo")
+                    TableColumn("Client") { q in
+                        Text(q.clientLabel)
+                            .foregroundStyle(q.client == nil ? .secondary : .primary)
+                            .help(q.client?.session.map { "Session \($0)" } ?? q.clientLabel)
+                    }
+                    .width(min: 80, ideal: 120).customizationID("client")
                     TableColumn("Query") { q in
                         Text(q.queries.joined(separator: "  |  ")).lineLimit(1).help(q.queries.joined(separator: "\n"))
                     }
@@ -99,6 +107,35 @@ struct QueryDetail: View {
                 DetailRow("Chunks", String(record.chunks))
                 if record.errored { Warning("The retrieval reported errors.") }
                 if record.truncated { Warning("The result was truncated.") }
+
+                InspectorHeading("Client")
+                if let c = record.client {
+                    DetailRow("Submitted by", c.label)
+                    if let name = c.name {
+                        DetailRow("MCP client", [name, c.version].compactMap { $0 }.joined(separator: " "))
+                    }
+                    if let app = c.app {
+                        DetailRow("App", c.pid.map { "\(app) · pid \($0)" } ?? app)
+                    }
+                    DetailRow("Transport", [c.transport, c.endpoint].compactMap { $0 }.joined(separator: " · "))
+                    if let entry = c.entrypoint { DetailRow("Entrypoint", entry) }
+                    if let agent = c.agent { DetailRow("Agent", agent) }
+                    if let ua = c.userAgent { DetailRow("User-Agent", ua) }
+                    if let session = c.session {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text("Session").foregroundStyle(.secondary)
+                            Spacer(minLength: 12)
+                            Text(session).lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                            Button { store.copy(session, note: "Copied session id") } label: { Image(systemName: "doc.on.doc") }
+                                .buttonStyle(.borderless)
+                                .help("Copy session id")
+                        }
+                        .zfont(.callout)
+                    }
+                } else {
+                    Text("Not recorded — this query predates caller attribution.")
+                        .zfont(.callout).foregroundStyle(.secondary)
+                }
 
                 InspectorHeading(record.queries.count == 1 ? "Query" : "Queries")
                 ForEach(record.queries, id: \.self) { q in

@@ -64,7 +64,7 @@ macos/build.sh --install       # builds macos/build/llmLibrarian.app and replace
 
 **MCP tools:** `session_context`, `mcp_runtime_status`, `query_personal_knowledge`, `multi_query_knowledge`, `read_document`, `ask_image`, `recent_queries`, `list_silos`, `add_silo`, `set_silo_privacy`, `trigger_reindex`, `repair_silo`, `health`, … — see [AGENTS.md](AGENTS.md). Response-shaping rules for small models (empty-result `recommended_action`, slim chunks, repeat coalescing): [docs/plans/mcp-small-model-contract.md](docs/plans/mcp-small-model-contract.md).
 
-**Query audit:** every MCP query appends query text + params + per-source-file chunk breakdown to `~/.pal/logs/query-audit.jsonl` (`src/query_audit.py`; disable with `LLMLIBRARIAN_QUERY_AUDIT=0`). Read it via `pal queries` or the `recent_queries` MCP tool. Separate from `usage.log`, which stays a text-free metrics feed for the Argus dashboard.
+**Query audit:** every MCP query appends query text + params + per-source-file chunk breakdown to `~/.pal/logs/query-audit.jsonl` (`src/query_audit.py`; disable with `LLMLIBRARIAN_QUERY_AUDIT=0`). Each record carries a `client` block naming who asked (`src/query_attribution.py`): stdio servers record the parent app, MCP `clientInfo`, and the Claude Code session id they inherit (`CLAUDE_CODE_SESSION_ID`, whitelisted env only); the stateless HTTP server maps the loopback peer port to its app via `lsof` and reuses the `clientInfo` from that process's last `initialize`. An HTTP client can self-label with `?client=<name>` in its URL or an `X-LLMLI-Client` header. Read it via `pal queries [--client …]` or the `recent_queries` MCP tool. Separate from `usage.log`, which stays a text-free metrics feed for the Argus dashboard.
 
 **Data flow:**
 

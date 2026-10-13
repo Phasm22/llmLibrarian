@@ -377,6 +377,105 @@ class _ImportErrorExplainer(Middleware):
 mcp.add_middleware(_ImportErrorExplainer())
 
 
+import contextvars  # noqa: E402
+
+import query_attribution  # noqa: E402
+
+# The client behind the current tool call, for the query audit (see _CallerAttribution).
+_CALLER: contextvars.ContextVar[dict | None] = contextvars.ContextVar("llmli_caller", default=None)
+_STDIO_IDENTITY: dict | None = None
+
+
+def _stdio_identity() -> dict:
+    global _STDIO_IDENTITY
+    if _STDIO_IDENTITY is None:
+        _STDIO_IDENTITY = query_attribution.static_stdio_identity()
+    return dict(_STDIO_IDENTITY)
+
+
+def _http_request_or_none():
+    try:
+        from fastmcp.server.dependencies import get_http_request
+
+        return get_http_request()
+    except Exception:
+        return None
+
+
+async def _http_peer(request) -> dict:
+    """``{pid, app}`` for a loopback HTTP caller; empty for remote or unknown peers."""
+    import asyncio
+
+    client = getattr(request, "client", None)
+    if client is None or client.host not in {"127.0.0.1", "::1", "localhost"}:
+        return {"remote_host": client.host} if client is not None else {}
+    return await asyncio.to_thread(query_attribution.peer_for_port, client.port) or {}
+
+
+class _CallerAttribution(Middleware):
+    """Record who is calling, so each query-audit record names its client.
+
+    stdio: fixed identity (parent app, Claude Code session env) plus the
+    session's MCP clientInfo. HTTP: peer process via lsof on loopback, the
+    clientInfo that process sent on its last initialize, the User-Agent, and an
+    optional self-declared tag (``?client=`` or ``X-LLMLI-Client``).
+    Never fails the call it is attributing.
+    """
+
+    async def on_initialize(self, context, call_next):
+        try:
+            request = _http_request_or_none()
+            if request is not None:
+                params = getattr(context.message, "params", None)
+                info = query_attribution.client_info_dict(getattr(params, "clientInfo", None))
+                peer = await _http_peer(request)
+                query_attribution.remember_handshake(peer.get("pid"), info)
+        except Exception:
+            _logger.debug("caller attribution (initialize) failed", exc_info=True)
+        return await call_next(context)
+
+    async def on_call_tool(self, context, call_next):
+        token = _CALLER.set(await self._identify(context))
+        try:
+            return await call_next(context)
+        finally:
+            _CALLER.reset(token)
+
+    async def _identify(self, context) -> dict | None:
+        try:
+            request = _http_request_or_none()
+            if request is None:
+                client = _stdio_identity()
+                try:
+                    params = context.fastmcp_context.session.client_params
+                    client.update(query_attribution.client_info_dict(getattr(params, "clientInfo", None)))
+                except Exception:
+                    pass
+            else:
+                client = {"transport": "http"}
+                peer = await _http_peer(request)
+                client.update(peer)
+                client.update(query_attribution.handshake_for(peer.get("pid")))
+                headers = request.headers
+                agent = (headers.get("user-agent") or "").strip()
+                if agent:
+                    client["user_agent"] = agent[:200]
+                tag = (request.query_params.get("client") or headers.get("x-llmli-client") or "").strip()
+                if tag:
+                    client["tag"] = tag[:60]
+                session_id = (headers.get("mcp-session-id") or "").strip()
+                if session_id:
+                    client["session"] = session_id[:100]
+            client["label"] = query_attribution.client_label(client)
+            return client
+        except Exception:
+            _logger.debug("caller attribution failed", exc_info=True)
+            return None
+
+
+mcp.add_middleware(_CallerAttribution())
+
+
 _MCP_PROFILE = os.environ.get("LLMLIBRARIAN_MCP_PROFILE", "full").strip().lower() or "full"
 if _MCP_PROFILE not in {"full", "lite"}:
     raise RuntimeError(
@@ -1171,6 +1270,9 @@ def _emit_query_audit(**kwargs) -> None:
     try:
         import query_audit
 
+        caller = _CALLER.get()
+        if caller is not None and "client" not in kwargs:
+            kwargs["client"] = {**caller, "endpoint": _endpoint_profile()}
         query_audit.record(**kwargs)
     except Exception:
         _logger.debug("query audit emit failed", exc_info=True)
@@ -1236,8 +1338,6 @@ def _current_host() -> str:
     except Exception:
         return ""
 
-
-import contextvars  # noqa: E402
 
 _PRIVATE_READS: contextvars.ContextVar[str | None] = contextvars.ContextVar("llmli_private_reads", default=None)
 # Mounted lite catalog shares process _MCP_PROFILE=full; this marks the active endpoint.
@@ -1747,6 +1847,7 @@ def recent_queries(
     since: str | None = None,
     tool: str | None = None,
     summary_only: bool = False,
+    client: str | None = None,
 ) -> dict:
     """
     Use when: auditing what was already retrieved — which queries ran, against which silo, and which files answered them.
@@ -1761,7 +1862,9 @@ def recent_queries(
 
     Filters: silo (exact slug), contains (substring over query text, source
     filenames, and silo), since ('30m', '24h', '7d', or an ISO timestamp),
-    tool ('query_personal_knowledge' or 'multi_query_knowledge').
+    tool ('query_personal_knowledge' or 'multi_query_knowledge'), client
+    (substring over the caller label, e.g. 'Claude Code', 'AnythingLLM', or a
+    Claude Code session id). Each record's `client` block names who asked.
     Pass summary_only=True for roll-up counts without individual records.
 
     Returns records oldest-first plus a summary with call counts, silo mix,
@@ -1776,6 +1879,7 @@ def recent_queries(
             contains=contains,
             since=since,
             tool=tool,
+            client=client,
         )
         summary = query_audit.summarize_records(records)
         payload = {
@@ -3403,6 +3507,7 @@ def _build_lite_server() -> FastMCP:
     lite.add_middleware(_ImportErrorExplainer())
     policy = os.environ.get("LLMLIBRARIAN_MCP_LITE_PRIVATE_READS", "none").strip().lower() or "none"
     lite.add_middleware(_LiteEndpointPolicy("none" if policy == "none" else "named"))
+    lite.add_middleware(_CallerAttribution())
     for name, fn in _lite_tools():
         lite.tool(name=name)(fn)
     if mcp.auth is not None:
@@ -3506,35 +3611,8 @@ async def healthz(_: Request) -> Response:
 
 
 def _client_app_name() -> str | None:
-    """Best-effort name of the MCP client that spawned this stdio server.
-
-    Walks up the parent chain past wrapper processes (uv, Claude's
-    disclaimer helper, shells) to the first real application, so multiple
-    stdio instances are distinguishable in ps (e.g. Claude vs Cursor).
-    """
-    import subprocess
-
-    wrappers = {
-        "disclaimer", "uv", "sh", "bash", "zsh", "fish", "login", "env",
-        "python", "python3", "Python", "node",
-    }
-    pid = os.getppid()
-    for _ in range(6):
-        if pid <= 1:
-            return None
-        try:
-            out = subprocess.run(
-                ["/bin/ps", "-o", "ppid=", "-o", "comm=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=2,
-            ).stdout.strip()
-            ppid_str, _, comm = out.partition(" ")
-            name = Path(comm.strip()).name
-            pid = int(ppid_str)
-        except Exception:
-            return None
-        if name and name not in wrappers:
-            return name
-    return None
+    """Best-effort name of the MCP client that spawned this stdio server (see query_attribution)."""
+    return query_attribution.client_app_name()
 
 
 

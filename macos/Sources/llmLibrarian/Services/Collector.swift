@@ -213,6 +213,22 @@ enum Collector {
                 if let d = errors as? [String: Any] { return !d.isEmpty }
                 return errors != nil && !(errors is NSNull)
             }()
+            let client: QueryClient? = (obj["client"] as? [String: Any]).map { c in
+                QueryClient(
+                    label: (c["label"] as? String) ?? "Unknown",
+                    name: c["client_name"] as? String,
+                    version: c["client_version"] as? String,
+                    app: c["app"] as? String,
+                    pid: (c["pid"] as? Int) ?? (c["server_pid"] as? Int),
+                    transport: c["transport"] as? String,
+                    endpoint: c["endpoint"] as? String,
+                    session: c["session"] as? String,
+                    entrypoint: c["entrypoint"] as? String,
+                    agent: c["agent"] as? String,
+                    userAgent: c["user_agent"] as? String,
+                    tag: c["tag"] as? String
+                )
+            }
             out.append(QueryRecord(
                 id: i,
                 timestamp: Dates.parse(obj["ts"] as? String),
@@ -222,7 +238,8 @@ enum Collector {
                 chunks: (result["chunks"] as? Int) ?? 0,
                 sources: sources,
                 truncated: (result["truncated"] as? Bool) ?? false,
-                errored: errored
+                errored: errored,
+                client: client
             ))
         }
         return out.reversed()

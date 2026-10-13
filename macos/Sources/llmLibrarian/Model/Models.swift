@@ -94,6 +94,22 @@ struct QuerySource: Hashable, Sendable {
     let chunks: Int
 }
 
+/// Who submitted a query (the audit record's `client` block). Nil fields were not observable.
+struct QueryClient: Hashable, Sendable {
+    let label: String
+    let name: String?
+    let version: String?
+    let app: String?
+    let pid: Int?
+    let transport: String?
+    let endpoint: String?
+    let session: String?
+    let entrypoint: String?
+    let agent: String?
+    let userAgent: String?
+    let tag: String?
+}
+
 struct QueryRecord: Identifiable, Hashable, Sendable {
     let id: Int
     let timestamp: Date?
@@ -104,6 +120,10 @@ struct QueryRecord: Identifiable, Hashable, Sendable {
     let sources: [QuerySource]
     let truncated: Bool
     let errored: Bool
+    /// Nil for records written before caller attribution shipped.
+    let client: QueryClient?
+
+    var clientLabel: String { client?.label ?? "Unknown" }
 }
 
 struct MCPHealth: Hashable, Sendable {

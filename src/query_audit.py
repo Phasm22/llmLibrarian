@@ -9,7 +9,8 @@ or truncates mid-answer, and you want to know why without re-running it.
 
 Written by the MCP query tools (best-effort — an audit failure must never
 break a retrieval), read back by `pal queries` and the `recent_queries`
-MCP tool. JSONL, one record per tool call, size-rotated.
+MCP tool. JSONL, one record per tool call, size-rotated. Each record also
+carries a `client` block naming the caller (see `query_attribution`).
 """
 
 from __future__ import annotations
@@ -104,6 +105,7 @@ def record(
     params: dict | None = None,
     chunks: list[dict] | None = None,
     outcome: dict | None = None,
+    client: dict | None = None,
     path: Path | None = None,
 ) -> None:
     """Append one audit record. Never raises."""
@@ -121,6 +123,9 @@ def record(
             "params": {k: v for k, v in (params or {}).items() if v is not None},
             "result": {**summarize_chunks(chunks or []), **(outcome or {})},
         }
+        caller = {k: v for k, v in (client or {}).items() if v not in (None, "")}
+        if caller:
+            entry["client"] = caller
         with target.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
     except Exception:
@@ -159,6 +164,19 @@ def _parse_since(since: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def client_label(entry: dict) -> str:
+    """Who made the call; records written before attribution read as "unknown"."""
+    return str((entry.get("client") or {}).get("label") or "unknown")
+
+
+def _client_matches(entry: dict, needle: str) -> bool:
+    caller = entry.get("client") or {}
+    hay = " ".join(
+        str(caller.get(k) or "") for k in ("label", "client_name", "app", "tag", "session")
+    ).strip().lower() or "unknown"
+    return needle in hay
+
+
 def _record_ts(entry: dict) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(entry.get("ts") or "").replace("Z", "+00:00"))
@@ -174,12 +192,18 @@ def read_records(
     contains: str | None = None,
     since: str | None = None,
     tool: str | None = None,
+    client: str | None = None,
     path: Path | None = None,
 ) -> list[dict]:
-    """Most-recent-last list of audit records matching the filters."""
+    """Most-recent-last list of audit records matching the filters.
+
+    ``client`` is a case-insensitive substring over the caller's label, MCP
+    client name, app, tag, and session id ("unknown" matches old records).
+    """
     target = path or audit_log_path()
     cutoff = _parse_since(since)
     needle = (contains or "").lower().strip()
+    client_needle = (client or "").lower().strip()
     matched: list[dict] = []
     for file in _iter_files(target):
         try:
@@ -197,6 +221,8 @@ def read_records(
             if silo and (entry.get("silo") or "") != silo:
                 continue
             if tool and entry.get("tool") != tool:
+                continue
+            if client_needle and not _client_matches(entry, client_needle):
                 continue
             if cutoff:
                 ts = _record_ts(entry)
@@ -218,6 +244,7 @@ def summarize_records(records: list[dict]) -> dict:
     by_silo: dict[str, int] = {}
     by_tool: dict[str, int] = {}
     by_source: dict[str, int] = {}
+    by_client: dict[str, int] = {}
     empty = 0
     truncated = 0
     errored = 0
@@ -226,6 +253,8 @@ def summarize_records(records: list[dict]) -> dict:
         by_silo[silo] = by_silo.get(silo, 0) + 1
         tool = entry.get("tool") or "?"
         by_tool[tool] = by_tool.get(tool, 0) + 1
+        caller = client_label(entry)
+        by_client[caller] = by_client.get(caller, 0) + 1
         result = entry.get("result") or {}
         if not result.get("chunks"):
             empty += 1
@@ -240,6 +269,7 @@ def summarize_records(records: list[dict]) -> dict:
         "calls": len(records),
         "by_tool": dict(sorted(by_tool.items(), key=lambda kv: kv[1], reverse=True)),
         "by_silo": dict(sorted(by_silo.items(), key=lambda kv: kv[1], reverse=True)),
+        "by_client": dict(sorted(by_client.items(), key=lambda kv: kv[1], reverse=True)),
         "top_sources": [
             {"file": name, "chunks": n}
             for name, n in sorted(by_source.items(), key=lambda kv: kv[1], reverse=True)[:10]

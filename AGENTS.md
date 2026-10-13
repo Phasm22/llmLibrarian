@@ -29,7 +29,7 @@ Do not use outdated names like `retrieve` / `retrieve_bulk`. Current surface:
 | `query_personal_knowledge` | Primary retrieval → chunks (no LLM in MCP) |
 | `multi_query_knowledge` | Parallel queries, merged chunks |
 | `explain_retrieval` | Debug hybrid/vector signals |
-| `recent_queries` | Audit past queries: text, silo scope, per-source-file chunk breakdown |
+| `recent_queries` | Audit past queries: text, silo scope, per-source-file chunk breakdown, and the calling client (`client=` filters by label/app/session) |
 | `find_files` | Manifest-only path/date search |
 | `read_document` | Read one indexed file in order, paged (`next_start_chunk`); index-only, never disk |
 | `ask_image` | Re-read photos with the local vision model; `files=[...]` (≤4) in one call, or none to use the best matches |

@@ -228,3 +228,41 @@ def test_audit_failure_does_not_break_retrieval(mcp, monkeypatch):
     )
     res = mcp.query_personal_knowledge("q", silo="hot_seat")
     assert len(res["chunks"]) == 3
+
+
+def test_record_keeps_client_block_and_drops_empty_fields(tmp_path):
+    log = tmp_path / "audit.jsonl"
+    query_audit.record(
+        tool="query_personal_knowledge",
+        queries=["q"],
+        silo="s",
+        client={"label": "Claude Code", "session": "abc", "app": None, "tag": ""},
+        path=log,
+    )
+    entry = json.loads(log.read_text().strip())
+    assert entry["client"] == {"label": "Claude Code", "session": "abc"}
+
+
+def test_client_filter_and_rollup_treat_old_records_as_unknown(tmp_path):
+    log = tmp_path / "audit.jsonl"
+    query_audit.record(tool="t", queries=["old"], silo="s", path=log)
+    query_audit.record(tool="t", queries=["cc"], silo="s", client={"label": "Claude Code", "session": "abc-123"}, path=log)
+    query_audit.record(tool="t", queries=["any"], silo="s", client={"label": "AnythingLLM", "app": "AnythingLLM"}, path=log)
+
+    assert [r["queries"] for r in query_audit.read_records(path=log, client="claude code")] == [["cc"]]
+    assert [r["queries"] for r in query_audit.read_records(path=log, client="abc-123")] == [["cc"]]
+    assert [r["queries"] for r in query_audit.read_records(path=log, client="unknown")] == [["old"]]
+    summary = query_audit.summarize_records(query_audit.read_records(path=log))
+    assert summary["by_client"] == {"unknown": 1, "Claude Code": 1, "AnythingLLM": 1}
+
+
+def test_query_tool_audit_names_the_current_caller(mcp):
+    token = mcp._CALLER.set({"transport": "stdio", "label": "Claude Code", "session": "abc"})
+    try:
+        mcp.query_personal_knowledge("Amentum contract types", silo="hot_seat")
+    finally:
+        mcp._CALLER.reset(token)
+
+    record = mcp.recent_queries(client="Claude Code")["records"][-1]
+    assert record["client"]["session"] == "abc"
+    assert record["client"]["endpoint"] == "full"
