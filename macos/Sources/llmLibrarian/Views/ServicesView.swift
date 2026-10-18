@@ -88,7 +88,7 @@ struct ServicesView: View {
             if let s = selected {
                 ServiceDetail(service: s, requestStop: requestStop)
             } else {
-                NothingSelected(text: "Select a service")
+                ConnectPanel()
             }
         }
         .inspectorColumnWidth(min: 260, ideal: 320, max: 420)
@@ -223,5 +223,39 @@ struct WatchChangeRow: View {
             Text(Dates.relativeString(change.at)).foregroundStyle(.secondary).monospacedDigit()
         }
         .zfont(.callout)
+    }
+}
+
+/// Endpoints and paths; shown in the Services inspector when nothing is selected.
+struct ConnectPanel: View {
+    @EnvironmentObject private var store: LibrarianStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+                InspectorHeading("Connect")
+                CopyableValueRow(key: "MCP endpoint", value: store.config.mcpURL) {
+                    store.copy(store.config.mcpURL, note: "Copied MCP endpoint")
+                }
+                if let lite = store.mcpHealth?.litePath {
+                    CopyableValueRow(key: "Lite endpoint", value: store.config.mcpURL(path: lite)) {
+                        store.copy(store.config.mcpURL(path: lite), note: "Copied lite MCP endpoint")
+                    }
+                } else if let lite = store.config.mcpLitePath {
+                    KeyValueRow(key: "Lite endpoint", value: "\(lite) is configured but not being served")
+                        .foregroundStyle(.secondary)
+                }
+                if let v = store.mcpHealth?.version {
+                    KeyValueRow(key: "Server", value: "v\(v), up since \(Dates.absoluteString(store.mcpHealth?.startedAt))")
+                }
+                InspectorHeading("Paths")
+                KeyValueRow(key: "Index", value: (store.config.dbPath as NSString).abbreviatingWithTildeInPath, mono: true)
+                KeyValueRow(key: "Checkout", value: (store.config.workdir as NSString).abbreviatingWithTildeInPath, mono: true)
+                KeyValueRow(key: "Logs", value: (store.config.logsDir as NSString).abbreviatingWithTildeInPath, mono: true)
+                Text("Select a service for its details.").zfont(.callout).foregroundStyle(.tertiary).padding(.top, 8)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
