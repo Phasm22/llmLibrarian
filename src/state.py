@@ -418,12 +418,19 @@ def failures_path(db_path: str | Path) -> Path:
     return _failures_path(db_path)
 
 
-def set_last_failures(db_path: str | Path, failures: list[dict[str, str]]) -> None:
-    """Save last add failures for 'log --last'."""
+def _write_failures_file(db_path: str | Path, failures: list[dict[str, str]]) -> None:
     path = _failures_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(failures, f, indent=2)
+
+
+def set_last_failures(db_path: str | Path, failures: list[dict[str, str]]) -> None:
+    """Save last add failures for 'log --last'. Each one is an occurrence in the activity ledger."""
+    _write_failures_file(db_path, failures)
+    from activity_ledger import record_failures  # lazy: ledger imports state
+
+    record_failures(db_path, failures)
 
 
 def append_last_failures(
@@ -448,7 +455,11 @@ def append_last_failures(
     ordered = list(merged.values())
     if len(ordered) > max_entries:
         ordered = ordered[-max_entries:]
-    set_last_failures(db_path, ordered)
+    _write_failures_file(db_path, ordered)
+    from activity_ledger import record_failures
+
+    # Only the new entries occurred now; the merged history must not re-count.
+    record_failures(db_path, entries)
 
 
 def get_last_failures(db_path: str | Path) -> list[dict[str, str]]:

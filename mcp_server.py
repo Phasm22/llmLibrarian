@@ -1276,6 +1276,23 @@ def _emit_query_audit(**kwargs) -> None:
         query_audit.record(**kwargs)
     except Exception:
         _logger.debug("query audit emit failed", exc_info=True)
+    try:
+        import activity_ledger
+        import query_audit
+
+        activity_ledger.record_search(
+            _DB_PATH,
+            tool=str(kwargs.get("tool") or ""),
+            queries=list(kwargs.get("queries") or []),
+            silo=kwargs.get("silo"),
+            chunks=kwargs.get("chunks"),
+            outcome=kwargs.get("outcome"),
+            client=query_audit.client_label({"client": kwargs.get("client") or {}}),
+            # Turning the audit off means "don't keep my query text"; counts still land.
+            keep_text=query_audit.audit_enabled(),
+        )
+    except Exception:
+        _logger.debug("activity ledger emit failed", exc_info=True)
 
 
 from mcp_result_cache import ResultCache, repeat_fields  # noqa: E402
@@ -2518,14 +2535,16 @@ def update_file(silo: str, path: str, confirm: bool = False) -> dict:
     try:
         with _mcp_chroma_lock("update_file", write=True):
             try:
+                from activity_ledger import origin as activity_origin
                 from ingest import update_single_file
 
-                status, resolved = update_single_file(
-                    abs_path,
-                    db_path=_DB_PATH,
-                    silo_slug=slug,
-                    allow_cloud=True,  # path was already validated under the registered silo root
-                )
+                with activity_origin("mcp"):
+                    status, resolved = update_single_file(
+                        abs_path,
+                        db_path=_DB_PATH,
+                        silo_slug=slug,
+                        allow_cloud=True,  # path was already validated under the registered silo root
+                    )
             finally:
                 # Release only after a successful acquire. A timed-out waiter
                 # must not clear the singleton from under the lock holder.
@@ -2569,13 +2588,15 @@ def remove_file(silo: str, path: str, confirm: bool = False) -> dict:
     try:
         with _mcp_chroma_lock("remove_file", write=True):
             try:
+                from activity_ledger import origin as activity_origin
                 from ingest import remove_single_file
 
-                status, resolved = remove_single_file(
-                    abs_path,
-                    db_path=_DB_PATH,
-                    silo_slug=slug,
-                )
+                with activity_origin("mcp"):
+                    status, resolved = remove_single_file(
+                        abs_path,
+                        db_path=_DB_PATH,
+                        silo_slug=slug,
+                    )
             finally:
                 _release_chroma()
         return {"status": status, "silo": slug, "path": resolved}

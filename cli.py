@@ -496,6 +496,7 @@ def cmd_query(args: argparse.Namespace) -> int:
     if result.get("error"):
         extra = {k: result[k] for k in ("chunks", "query", "intent", "silo_filter") if k in result}
         return _emit_result(args, error_payload(str(result["error"]), code="retrieve", **extra))
+    _record_cli_search(args, "query", [query], getattr(args, "in_silo", None), result.get("chunks"), {})
     payload = ok_payload(result)
     if getattr(args, "text", False):
         args.json = False
@@ -505,6 +506,33 @@ def cmd_query(args: argparse.Namespace) -> int:
         ]
         return _emit_result(args, payload, human="\n\n".join(lines) if lines else "(no chunks)")
     return _emit_result(args, payload)
+
+
+def _record_cli_search(
+    args: argparse.Namespace,
+    tool: str,
+    queries: list[str],
+    silo: str | None,
+    chunks: list[dict] | None,
+    outcome: dict,
+) -> None:
+    """Count a CLI retrieval in the activity ledger (best-effort, never raises)."""
+    try:
+        import activity_ledger
+        import query_audit
+
+        activity_ledger.record_search(
+            _db_path(args),
+            tool=tool,
+            queries=queries,
+            silo=silo,
+            chunks=chunks,
+            outcome=outcome,
+            client="llmli",
+            keep_text=query_audit.audit_enabled(),
+        )
+    except Exception:
+        pass
 
 
 def cmd_multi_query(args: argparse.Namespace) -> int:
@@ -545,6 +573,14 @@ def cmd_multi_query(args: argparse.Namespace) -> int:
         return _emit_result(args, error_payload(str(e)))
     if result.get("ok") is False and result.get("busy"):
         return _emit_result(args, result)
+    _record_cli_search(
+        args,
+        "multi_query",
+        cleaned,
+        getattr(args, "in_silo", None),
+        result.get("chunks"),
+        {"truncated": result.get("truncated"), "errors": result.get("errors")},
+    )
     result.setdefault("ok", True)
     return _emit_result(args, result)
 
