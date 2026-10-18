@@ -144,6 +144,8 @@ struct Snapshot: Sendable {
     var chromaReachable: Bool?
     var unindexedBookmarks: [String] = []
     var registryError: String?
+    /// Nil until the activity ledger exists on this machine.
+    var activity: ActivityOverview?
 }
 
 enum Dates {

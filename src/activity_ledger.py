@@ -1029,7 +1029,7 @@ def overview(
             "without_sources": n_without,
             "by_silo": use_silos,
             "top_documents": top_docs,
-            "by_client": [{"client": c, "searches": n} for c, n in sorted(by_client.items(), key=lambda kv: -kv[1])],
+            "by_client": [{"client": c, "searches": n} for c, n in sorted(by_client.items(), key=lambda kv: (-kv[1], kv[0]))],
             "recent": recent_queries,
             "timeline": search_timeline,
         },

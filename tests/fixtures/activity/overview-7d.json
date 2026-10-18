@@ -1,0 +1,431 @@
+{
+  "attention": {
+    "failures": [
+      {
+        "error_class": "encrypted",
+        "files": 2,
+        "last_seen": "2026-10-17T15:00:00+00:00",
+        "name": "Research",
+        "occurrences": 4,
+        "paths": [
+          "/library/Research/scan1.pdf",
+          "/library/Research/scan2.pdf"
+        ],
+        "sample_error": "PdfReadError: encrypted",
+        "silo": "research-1"
+      },
+      {
+        "error_class": "too_large",
+        "files": 1,
+        "last_seen": "2026-10-15T15:00:00+00:00",
+        "name": "Project Notes",
+        "occurrences": 1,
+        "paths": [
+          "/library/Project Notes/huge.csv"
+        ],
+        "sample_error": "file too large",
+        "silo": "notes-2"
+      }
+    ],
+    "falling_behind": [],
+    "no_source_searches": [
+      {
+        "count": 2,
+        "last_ts": "2026-10-15T15:00:00+00:00",
+        "name": "Project Notes",
+        "query": "quarterly budget",
+        "silo": "notes-2"
+      },
+      {
+        "count": 1,
+        "last_ts": "2026-10-13T15:00:00+00:00",
+        "name": "All collections",
+        "query": "vacation photos",
+        "silo": null
+      },
+      {
+        "count": 1,
+        "last_ts": "2026-10-14T03:00:00+00:00",
+        "name": "Tax",
+        "query": "w2 total",
+        "silo": "tax-3"
+      }
+    ]
+  },
+  "changes": {
+    "by_silo": [
+      {
+        "added": 1,
+        "files": [
+          {
+            "kind": "added",
+            "path": "/library/Research/today.md",
+            "ts": "2026-10-18T13:00:00+00:00"
+          },
+          {
+            "kind": "updated",
+            "path": "/library/Research/a.md",
+            "ts": "2026-10-17T15:00:00+00:00"
+          },
+          {
+            "kind": "updated",
+            "path": "/library/Research/b.md",
+            "ts": "2026-10-16T15:00:00+00:00"
+          },
+          {
+            "kind": "removed",
+            "path": "/library/Research/gone.md",
+            "ts": "2026-10-15T15:00:00+00:00"
+          }
+        ],
+        "name": "Research",
+        "previous_total": 1,
+        "private": false,
+        "removed": 1,
+        "silo": "research-1",
+        "total": 4,
+        "updated": 2
+      },
+      {
+        "added": 1,
+        "files": [
+          {
+            "kind": "added",
+            "path": "/library/Project Notes/plan.md",
+            "ts": "2026-10-17T15:00:00+00:00"
+          },
+          {
+            "kind": "updated",
+            "path": "/library/Project Notes/plan.md",
+            "ts": "2026-10-13T15:00:00+00:00"
+          }
+        ],
+        "name": "Project Notes",
+        "previous_total": 1,
+        "private": false,
+        "removed": 0,
+        "silo": "notes-2",
+        "total": 2,
+        "updated": 1
+      },
+      {
+        "added": 1,
+        "files": [
+          {
+            "kind": "added",
+            "path": "/library/Tax/w2.pdf",
+            "ts": "2026-10-16T15:00:00+00:00"
+          }
+        ],
+        "name": "Tax",
+        "previous_total": 0,
+        "private": false,
+        "removed": 0,
+        "silo": "tax-3",
+        "total": 1,
+        "updated": 0
+      }
+    ],
+    "collections": [
+      {
+        "files": 2,
+        "kind": "silo_added",
+        "name": "Photo Journal",
+        "silo": "photos-4",
+        "ts": "2026-10-14T15:00:00+00:00"
+      }
+    ],
+    "previous_totals": {
+      "added": 2,
+      "removed": 0,
+      "updated": 0
+    },
+    "timeline": [
+      {
+        "added": 0,
+        "removed": 0,
+        "start": "2026-10-12T00:00:00+00:00",
+        "updated": 0
+      },
+      {
+        "added": 0,
+        "removed": 0,
+        "start": "2026-10-13T00:00:00+00:00",
+        "updated": 1
+      },
+      {
+        "added": 0,
+        "removed": 0,
+        "start": "2026-10-14T00:00:00+00:00",
+        "updated": 0
+      },
+      {
+        "added": 0,
+        "removed": 1,
+        "start": "2026-10-15T00:00:00+00:00",
+        "updated": 0
+      },
+      {
+        "added": 1,
+        "removed": 0,
+        "start": "2026-10-16T00:00:00+00:00",
+        "updated": 1
+      },
+      {
+        "added": 1,
+        "removed": 0,
+        "start": "2026-10-17T00:00:00+00:00",
+        "updated": 1
+      },
+      {
+        "added": 1,
+        "removed": 0,
+        "start": "2026-10-18T00:00:00+00:00",
+        "updated": 0
+      }
+    ],
+    "totals": {
+      "added": 3,
+      "removed": 1,
+      "updated": 3
+    }
+  },
+  "enabled": true,
+  "generated_at": "2026-10-18T15:00:00+00:00",
+  "health": [
+    {
+      "files": 2,
+      "last_change": null,
+      "last_search": null,
+      "name": "Photo Journal",
+      "open_failures": 0,
+      "private": false,
+      "silo": "photos-4",
+      "updated": "2026-10-01T00:00:00"
+    },
+    {
+      "files": 2,
+      "last_change": "2026-10-17T15:00:00+00:00",
+      "last_search": "2026-10-18T12:36:00+00:00",
+      "name": "Project Notes",
+      "open_failures": 1,
+      "private": false,
+      "silo": "notes-2",
+      "updated": "2026-10-01T00:00:00"
+    },
+    {
+      "files": 2,
+      "last_change": "2026-10-18T13:00:00+00:00",
+      "last_search": "2026-10-17T15:00:00+00:00",
+      "name": "Research",
+      "open_failures": 2,
+      "private": false,
+      "silo": "research-1",
+      "updated": "2026-10-01T00:00:00"
+    },
+    {
+      "files": 2,
+      "last_change": "2026-10-16T15:00:00+00:00",
+      "last_search": "2026-10-14T03:00:00+00:00",
+      "name": "Tax",
+      "open_failures": 0,
+      "private": true,
+      "silo": "tax-3",
+      "updated": "2026-10-01T00:00:00"
+    }
+  ],
+  "history": {
+    "files_since": "2026-07-20T15:00:00+00:00",
+    "full_comparison": true,
+    "full_file_comparison": true,
+    "full_search_comparison": true,
+    "searches_since": "2026-07-20T15:00:00+00:00",
+    "since": "2026-07-20T15:00:00+00:00"
+  },
+  "period": {
+    "bucket_unit": "day",
+    "end": "2026-10-18T15:00:00+00:00",
+    "start": "2026-10-12T00:00:00+00:00"
+  },
+  "previous_period": {
+    "end": "2026-10-11T15:00:00+00:00",
+    "start": "2026-10-05T00:00:00+00:00"
+  },
+  "silo": null,
+  "summary": {
+    "headline": "Research was the busiest collection this week.",
+    "sentences": [
+      "Most document changes were in Research and Project Notes.",
+      "Photo Journal was added with 2 files.",
+      "Searches increased to 8 from 2 compared with the previous week; 4 returned no sources.",
+      "3 files could not be indexed."
+    ]
+  },
+  "use": {
+    "by_client": [
+      {
+        "client": "Claude Code",
+        "searches": 4
+      },
+      {
+        "client": "Cursor",
+        "searches": 2
+      },
+      {
+        "client": "Codex",
+        "searches": 1
+      },
+      {
+        "client": "llmli",
+        "searches": 1
+      }
+    ],
+    "by_silo": [
+      {
+        "name": "Project Notes",
+        "private": false,
+        "searches": 4,
+        "silo": "notes-2",
+        "unique_files": 1
+      },
+      {
+        "name": "Research",
+        "private": false,
+        "searches": 3,
+        "silo": "research-1",
+        "unique_files": 1
+      },
+      {
+        "name": "Tax",
+        "private": false,
+        "searches": 1,
+        "silo": "tax-3",
+        "unique_files": 0
+      }
+    ],
+    "previous_searches": 2,
+    "recent": [
+      {
+        "client": "Claude Code",
+        "name": "Project Notes",
+        "query": "launch checklist",
+        "silo": "notes-2",
+        "sources_found": true,
+        "ts": "2026-10-18T12:36:00+00:00"
+      },
+      {
+        "client": "Claude Code",
+        "name": "Research",
+        "query": "offline search decision",
+        "silo": "research-1",
+        "sources_found": true,
+        "ts": "2026-10-17T15:00:00+00:00"
+      },
+      {
+        "client": "Cursor",
+        "name": "All collections",
+        "query": "hybrid retrieval",
+        "silo": null,
+        "sources_found": true,
+        "ts": "2026-10-17T03:00:00+00:00"
+      },
+      {
+        "client": "Cursor",
+        "name": "All collections",
+        "query": "hybrid retrieval",
+        "silo": null,
+        "sources_found": true,
+        "ts": "2026-10-16T15:00:00+00:00"
+      },
+      {
+        "client": "Claude Code",
+        "name": "Project Notes",
+        "query": "Quarterly   Budget",
+        "silo": "notes-2",
+        "sources_found": false,
+        "ts": "2026-10-15T15:00:00+00:00"
+      },
+      {
+        "client": "Codex",
+        "name": "Project Notes",
+        "query": "quarterly budget",
+        "silo": "notes-2",
+        "sources_found": false,
+        "ts": "2026-10-14T15:00:00+00:00"
+      },
+      {
+        "client": "llmli",
+        "name": "Tax",
+        "query": "w2 total",
+        "silo": "tax-3",
+        "sources_found": false,
+        "ts": "2026-10-14T03:00:00+00:00"
+      },
+      {
+        "client": "Claude Code",
+        "name": "All collections",
+        "query": "vacation photos",
+        "silo": null,
+        "sources_found": false,
+        "ts": "2026-10-13T15:00:00+00:00"
+      }
+    ],
+    "searches": 8,
+    "timeline": [
+      {
+        "searches": 0,
+        "start": "2026-10-12T00:00:00+00:00",
+        "without_sources": 0
+      },
+      {
+        "searches": 1,
+        "start": "2026-10-13T00:00:00+00:00",
+        "without_sources": 1
+      },
+      {
+        "searches": 2,
+        "start": "2026-10-14T00:00:00+00:00",
+        "without_sources": 2
+      },
+      {
+        "searches": 1,
+        "start": "2026-10-15T00:00:00+00:00",
+        "without_sources": 1
+      },
+      {
+        "searches": 1,
+        "start": "2026-10-16T00:00:00+00:00",
+        "without_sources": 0
+      },
+      {
+        "searches": 2,
+        "start": "2026-10-17T00:00:00+00:00",
+        "without_sources": 0
+      },
+      {
+        "searches": 1,
+        "start": "2026-10-18T00:00:00+00:00",
+        "without_sources": 0
+      }
+    ],
+    "top_documents": [
+      {
+        "file": "a.md",
+        "name": "Research",
+        "path": "/library/Research/a.md",
+        "searches": 3,
+        "silo": "research-1"
+      },
+      {
+        "file": "plan.md",
+        "name": "Project Notes",
+        "path": "/library/Project Notes/plan.md",
+        "searches": 2,
+        "silo": "notes-2"
+      }
+    ],
+    "with_sources": 4,
+    "without_sources": 4
+  },
+  "window": "7d"
+}

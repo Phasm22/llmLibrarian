@@ -10,7 +10,7 @@ See index health, manage searchable folders, control background services, and in
 which assistant retrieved which sources. The app lives in the menu bar and supports
 native File, Edit, View, Silo, Window, and Help commands.
 
-![llmLibrarian macOS overview with service health and recent queries](docs/images/macos-overview.png)
+![llmLibrarian macOS overview: library changes, searches, and what needs attention over the last 7 days](docs/images/macos-overview.png)
 
 *Actual app capture with synthetic sample data. Counts and service states illustrate the UI, not a benchmark.*
 

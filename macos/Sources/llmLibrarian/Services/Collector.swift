@@ -3,8 +3,8 @@ import Foundation
 /// Gathers everything the UI shows. Runs off the main actor; pure functions over
 /// files, launchctl, ps, and two local HTTP endpoints. No Python is started.
 enum Collector {
-    static func collect(config: PalConfig) async -> Snapshot {
-        if SampleLibrary.enabled { return SampleLibrary.snapshot() }
+    static func collect(config: PalConfig, window: ActivityWindow = .week) async -> Snapshot {
+        if SampleLibrary.enabled { return SampleLibrary.snapshot(window: window) }
         var snap = Snapshot()
         let (silos, regErr) = readSilos(config)
         snap.silos = silos
@@ -68,6 +68,9 @@ enum Collector {
         }
 
         snap.queries = readQueries(config, limit: 100)
+        snap.activity = ActivityLedger.overview(
+            dbPath: config.dbPath, window: window,
+            names: Dictionary(silos.map { ($0.slug, $0.displayName) }, uniquingKeysWith: { a, _ in a }))
         snap.unindexedBookmarks = readBookmarks(config).filter { path in
             !silos.contains { $0.path == path }
         }

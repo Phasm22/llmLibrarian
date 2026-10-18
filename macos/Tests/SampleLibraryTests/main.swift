@@ -20,4 +20,17 @@ expect(snapshot.services.allSatisfy { $0.label.hasPrefix("sample.") }, "No real 
 expect(snapshot.watchers.allSatisfy { $0.label.hasPrefix("sample.") }, "No real watcher labels")
 expect(snapshot.queries.allSatisfy { $0.sources.reduce(0) { $0 + $1.chunks } == $0.chunks }, "Audit totals match sources")
 expect(snapshot.silos.filter(\.isPrivate).count == 1, "Show explicit privacy state")
+for window in ActivityWindow.allCases {
+    let activity = SampleLibrary.snapshot(now: now, window: window).activity
+    expect(activity?.window == window, "Sample activity follows the selected window")
+    expect(activity?.timeline.count == (window == .today ? Calendar.current.component(.hour, from: now) + 1 : window.days),
+           "Sample timeline matches the window's buckets")
+    expect(activity?.fullSearchComparison == true && activity?.searchCount ?? 0 > 0, "Sample activity is comparable")
+    expect(activity?.timeline.reduce(0) { $0 + $1.searches } == activity?.searchCount, "Search chart matches the total")
+    expect(activity?.timeline.reduce(0) { $0 + $1.added + $1.updated + $1.removed } == activity?.changeTotal,
+           "Change chart matches the total")
+    expect(activity?.changeSilos.reduce(0) { $0 + $1.total } == activity?.changeTotal, "Per-collection rows add up")
+    let paths = (activity?.changeSilos.flatMap { $0.files.map(\.path) } ?? []) + (activity?.topDocuments.map(\.path) ?? [])
+    expect(paths.allSatisfy { $0.hasPrefix(SampleLibrary.root + "/") }, "Sample activity has no personal paths")
+}
 print("SampleLibraryTests: passed")

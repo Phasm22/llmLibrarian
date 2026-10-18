@@ -54,6 +54,13 @@ final class LibrarianStore: ObservableObject {
     @Published private(set) var mcpHealth: MCPHealth?
     @Published private(set) var unindexedBookmarks: [String] = []
     @Published private(set) var registryError: String?
+    @Published private(set) var activity: ActivityOverview?
+    @Published var activityWindow = ActivityWindow(rawValue: UserDefaults.standard.string(forKey: "activityWindow") ?? "") ?? .week {
+        didSet {
+            UserDefaults.standard.set(activityWindow.rawValue, forKey: "activityWindow")
+            if oldValue != activityWindow { Task { await refresh() } }
+        }
+    }
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var isRefreshing = false
     @Published private(set) var hasLoaded = false
@@ -261,7 +268,8 @@ final class LibrarianStore: ObservableObject {
         isRefreshing = true
         config = PalConfig.load()
         let cfg = config
-        let snap = await Task.detached(priority: .userInitiated) { await Collector.collect(config: cfg) }.value
+        let window = activityWindow
+        let snap = await Task.detached(priority: .userInitiated) { await Collector.collect(config: cfg, window: window) }.value
         silos = snap.silos
         services = snap.services
         watchers = snap.watchers
@@ -269,6 +277,7 @@ final class LibrarianStore: ObservableObject {
         mcpHealth = snap.mcpHealth
         unindexedBookmarks = snap.unindexedBookmarks
         registryError = snap.registryError
+        activity = snap.activity
         lastRefresh = Date()
         hasLoaded = true
         isRefreshing = false

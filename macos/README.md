@@ -8,8 +8,16 @@ or from the menu bar item.
 
 Everything it shows is read directly from the same sources `pal ls --status`
 uses — `~/.pal/daemon.json`, `<db>/llmli_registry.json`, `~/.pal/watch_locks`,
-`launchctl list`, `/healthz`, Chroma's heartbeat, and
-`~/.pal/logs/query-audit.jsonl` — so opening it never starts Python.
+`launchctl list`, `/healthz`, Chroma's heartbeat,
+`~/.pal/logs/query-audit.jsonl`, and the activity ledger
+`<db>/llmli_activity.sqlite3` (read-only, via the system SQLite) — so opening it
+never starts Python.
+
+The Overview tells the story of the library over Today / 7 days / 30 days:
+document changes, searches (with how many found sources), and what needs
+attention, each compared with the previous period when the ledger's history
+covers it. `Services/ActivityLedger.swift` mirrors `activity_ledger.overview()`;
+`tests/fixtures/activity` pins both to the same numbers and wording.
 Actions shell out: launchctl for start/stop/restart, `pal pull` for adding and
 reindexing silos, and `pal daemon sync` for reconciling watchers. Add Silo is
 available from the Silos toolbar, the empty state, and File → Add Silo….
@@ -32,7 +40,10 @@ launchd plists exec (`llmlibrarian-mcp`, `llmlibrarian-chroma`); they point at
 this checkout, so rebuild after moving the repo.
 
 Run the framework-free workflow tests with `macos/test.sh`. They compile the
-cross-platform Add Silo command planner directly, so XCTest is not required.
+cross-platform Add Silo command planner, the watcher-log parser, the sample
+library, and the activity-ledger reader directly, so XCTest is not required. The
+ledger test reads the shared fixture; after changing the overview contract,
+regenerate it with `TZ=UTC uv run python tests/fixtures/activity/make_fixture.py`.
 
 ## Layout
 
