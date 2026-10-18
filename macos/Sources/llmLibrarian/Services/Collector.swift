@@ -4,6 +4,7 @@ import Foundation
 /// files, launchctl, ps, and two local HTTP endpoints. No Python is started.
 enum Collector {
     static func collect(config: PalConfig) async -> Snapshot {
+        if SampleLibrary.enabled { return SampleLibrary.snapshot() }
         var snap = Snapshot()
         let (silos, regErr) = readSilos(config)
         snap.silos = silos

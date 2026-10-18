@@ -50,3 +50,36 @@ without screen-recording permission:
 ```bash
 open -W --env LLMLIBRARIAN_SNAPSHOT_DIR=/tmp/shots macos/build/llmLibrarian.app
 ```
+
+## Native menus and toolbar
+
+- **File:** Add Silo (⇧⌘O), reveal the selected silo in Finder (⇧⌘R), or open the selected service log.
+- **Edit:** native text editing, Copy Selected Item (⇧⌘C), and Copy MCP Endpoint.
+- **View:** persistent Show Toolbar Labels (compact secondary captions), sidebar, pages (⌘1–4), details (⌥⌘I), zoom (⌘+/⌘−/⌘0), and refresh (⌘R).
+- **Silo:** reindex, privacy, and image vision for the selected silo, using the same confirmations as its detail view.
+- **Window:** Show llmLibrarian (⇧⌘L), plus native window management.
+- **Help:** guide (⌘?), setup, CLI reference, and the GitHub issue form.
+
+Selection-dependent actions disable when they do not apply. Native Cut/Copy/Paste
+continue to target the focused text field. The toolbar provides Add Silo and Refresh
+on every page; the service-status buttons navigate to the matching details.
+Closing the window leaves the menu bar app running; Window → Show llmLibrarian reopens it.
+
+## Public screenshots
+
+Never publish the default snapshot output without reviewing it: it contains live
+folder names, paths, and query history. Use the isolated sample library for public assets:
+
+```bash
+macos/build.sh
+open -n -W \
+  --env LLMLIBRARIAN_SNAPSHOT_DIR=/tmp/llmlibrarian-public-shots \
+  --env LLMLIBRARIAN_SNAPSHOT_SAMPLE=1 \
+  macos/build/llmLibrarian.app
+```
+
+Both environment variables are required for sample mode. It bypasses live collection,
+uses synthetic records under `/tmp/llmlibrarian-sample`, and blocks subprocess/service
+actions. The title identifies it as a sample library. The PNGs are captures of the
+actual SwiftUI views, not mockups. Review them visually before copying selected images
+into `docs/images/`. Sample counts are illustrative, not performance claims.

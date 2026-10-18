@@ -69,17 +69,19 @@ struct ServicesView: View {
         .searchable(text: $search, placement: .toolbar, prompt: "Filter services")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button { if let s = selected { store.start(s) } } label: { Label("Start", systemImage: "play.fill") }
-                    .help(selectedFolderMissing ? "This watcher's folder is missing; use Locate Folder or Remove Silo in the details" : "Start the selected service")
-                    .disabled(!(selected.map { $0.state == .stopped && $0.installed } ?? false) || selectedFolderMissing)
-                Button { if let s = selected { requestStop(s) } } label: { Label("Stop", systemImage: "stop.fill") }
-                    .help("Stop the selected service")
-                    .disabled(!(selected?.loaded ?? false))
-                Button { if let s = selected { store.restart(s) } } label: { Label("Restart", systemImage: "arrow.clockwise") }
-                    .help("Restart the selected service")
-                    .disabled(!(selected?.loaded ?? false))
-                Button { store.showInspector.toggle() } label: { Label("Details", systemImage: "info.circle") }
-                    .help("Show or hide details (⌥⌘I)")
+                Group {
+                    Button { if let s = selected { store.start(s) } } label: { Label("Start", systemImage: "play.fill") }
+                        .help(selectedFolderMissing ? "This watcher's folder is missing; use Locate Folder or Remove Silo in the details" : "Start the selected service")
+                        .disabled(!(selected.map { $0.state == .stopped && $0.installed } ?? false) || selectedFolderMissing)
+                    Button { if let s = selected { requestStop(s) } } label: { Label("Stop", systemImage: "stop.fill") }
+                        .help("Stop the selected service")
+                        .disabled(!(selected?.loaded ?? false))
+                    Button { if let s = selected { store.restart(s) } } label: { Label("Restart", systemImage: "arrow.clockwise") }
+                        .help("Restart the selected service")
+                        .disabled(!(selected?.loaded ?? false))
+                    Button { store.showInspector.toggle() } label: { Label("Details", systemImage: "info.circle") }
+                        .help("Show or hide details (⌥⌘I)")
+                }.labelStyle(ToolbarActionLabelStyle(showsTitle: store.showToolbarLabels))
             }
         }
         .inspector(isPresented: $store.showInspector) {

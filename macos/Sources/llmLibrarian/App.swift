@@ -16,34 +16,7 @@ struct LibrarianApp: App {
         .windowToolbarStyle(.unified)
         .defaultSize(width: 1320, height: 820)
         .commands {
-            CommandGroup(replacing: .newItem) {
-                Button("Add Silo…") { store.chooseSiloFolder() }
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
-            }
-            SidebarCommands()
-            CommandGroup(after: .sidebar) {
-                Divider()
-                ForEach(SidebarItem.allCases) { item in
-                    Button(item.title) { store.page = item }
-                        .keyboardShortcut(KeyEquivalent(item.shortcut), modifiers: .command)
-                }
-                Divider()
-                Button("Show Details") { store.showInspector.toggle() }
-                    .keyboardShortcut("i", modifiers: [.command, .option])
-                Divider()
-                Button("Zoom In") { store.zoomIn() }
-                    .keyboardShortcut("=", modifiers: .command)
-                    .disabled(!store.canZoomIn)
-                Button("Zoom Out") { store.zoomOut() }
-                    .keyboardShortcut("-", modifiers: .command)
-                    .disabled(!store.canZoomOut)
-                Button("Actual Size") { store.zoomReset() }
-                    .keyboardShortcut("0", modifiers: .command)
-                    .disabled(store.zoomStep == 0)
-                Divider()
-                Button("Refresh") { Task { await store.refresh() } }
-                    .keyboardShortcut("r", modifiers: .command)
-            }
+            LibrarianCommands(store: store)
         }
     }
 }

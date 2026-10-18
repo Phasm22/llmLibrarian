@@ -2,7 +2,36 @@
 
 **Ask questions of your own files** — notes, code, PDFs, journals — with answers grounded in what you actually saved, not in the model’s memory of the internet.
 
-Your data stays on your machine. You choose which folders become searchable. An assistant (Cursor, Claude, etc.) can pull **cited chunks** from that index through a small **MCP server**, or you can ask in the terminal with **local Ollama** via `pal ask`.
+Your files and search index stay on your machine. You choose which folders become searchable; when a cloud assistant calls MCP, retrieved excerpts are sent to that assistant. An assistant (Cursor, Claude, etc.) can pull **cited chunks** from that index through a small **MCP server**, or you can ask in the terminal with **local Ollama** via `pal ask`.
+
+## Native macOS app
+
+See index health, manage searchable folders, control background services, and inspect
+which assistant retrieved which sources. The app lives in the menu bar and supports
+native File, Edit, View, Silo, Window, and Help commands.
+
+![llmLibrarian macOS overview with service health and recent queries](docs/images/macos-overview.png)
+
+*Actual app capture with synthetic sample data. Counts and service states illustrate the UI, not a benchmark.*
+
+<details>
+<summary>Folder controls and query provenance</summary>
+
+![Searchable folders with privacy and image-vision controls](docs/images/macos-silos.png)
+
+![Query audit showing the calling assistant and source file](docs/images/macos-activity.png)
+
+</details>
+
+The Mac app currently requires macOS 14+, Xcode Command Line Tools, and a configured
+Python checkout. It is a source build, not a standalone signed installer:
+
+```bash
+macos/build.sh --install
+```
+
+See [Mac setup and screenshot workflow](macos/README.md). The engine and CLI also run
+on Linux; the native status app is macOS-only.
 
 ---
 
@@ -65,7 +94,13 @@ There is **no** built-in “the AI remembers you forever.” Each question uses 
 
 ## Quick start
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and use Python
+3.10–3.13. Install [Ollama](https://ollama.com/) if you want local answers.
+From a fresh checkout:
+
 ```bash
+git clone https://github.com/Phasm22/llmLibrarian.git
+cd llmLibrarian
 uv venv && source .venv/bin/activate
 uv sync
 ollama pull llama3.2:latest   # only needed for pal ask / llmli ask
@@ -141,24 +176,13 @@ Watchers (`pal pull --watch`) keep silos fresh; `trigger_reindex` via MCP after 
 
 ---
 
-## Local runtime (on-demand / `pc-stacks`)
+## Background services
 
-On TJ's Linux desktop this stack is **not** auto-started at login (~18 GB RAM when always-on). Use the host orchestrator:
-
-```bash
-pc-stacks up llmlibrarian    # chroma :8000 → MCP :8765/healthz → watch daemons
-pc-stacks down llmlibrarian
-pc-stacks status
-pc-stacks pin llmlibrarian   # keep warm through idle periods
-```
-
-- **Orchestrator:** [`/home/tj/bin/pc-stacks`](/home/tj/bin/pc-stacks) — see [`/home/tj/bin/README.md`](/home/tj/bin/README.md) for all stacks.
-- **Systemd units** (`llmlibrarian-chroma`, `llmlibrarian-mcp`, `llmlibrarian-watch-*`) exist but are **disabled** at boot; `pc-stacks` starts them in order.
-- **Agents / MCP:** call `pc-stacks up llmlibrarian` before expecting MCP tools or `:8765` to respond.
-- **Idle shutdown:** `pc-stacks-idle.timer` stops warm stacks after 30 min session idle (unless pinned).
-- **Traceability:** PC Idle Quietdown plan (Cursor plans, Jul 2025).
-
-Details: [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md#local-runtime-on-demand--pc-stacks).
+On macOS, use `pal chroma`, `pal mcp`, and `pal daemon` to manage launchd services;
+the native app shows their status and exposes start/restart controls. For Linux
+systemd setup and the maintainer's optional `pc-stacks` wrapper, see
+[Chroma and stack setup](docs/CHROMA_AND_STACK.md). `pc-stacks` is host-specific,
+not a prerequisite shipped with this project.
 
 ---
 

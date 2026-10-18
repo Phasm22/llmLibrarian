@@ -32,10 +32,21 @@ struct MainWindow: View {
                 }
             }
             .background(Color(nsColor: .windowBackgroundColor))
-            .navigationTitle("\(store.page.title) — llmLibrarian")
+            .navigationTitle("\(store.page.title) — llmLibrarian" + (SampleLibrary.enabled ? " · Sample library" : ""))
         }
         .toolbar {
             ToolbarItem(placement: .principal) { StatusStrip() }
+            ToolbarItemGroup(placement: .primaryAction) {
+                Group {
+                    if store.page != .silos {
+                        Button { store.chooseSiloFolder() } label: { Label("Add Silo", systemImage: "plus") }
+                            .help("Add a folder (⇧⌘O)")
+                    }
+                    Button { Task { await store.refresh() } } label: { Label("Refresh", systemImage: "arrow.triangle.2.circlepath") }
+                        .help("Refresh status (⌘R)")
+                        .disabled(store.isRefreshing)
+                }.labelStyle(ToolbarActionLabelStyle(showsTitle: store.showToolbarLabels))
+            }
         }
         .environment(\.zoom, store.zoom)
         .font(Font.scaled(.body, zoom: store.zoom))
@@ -109,20 +120,22 @@ struct StatusStrip: View {
     var body: some View {
         HStack(spacing: 16) {
             ForEach(store.services) { s in
-                HStack(spacing: 5) {
+                Button { store.show(service: s) } label: { HStack(spacing: 5) {
                     StatusDot(state: s.state, size: 7)
                     Text(s.kind == .chroma ? "Chroma" : "MCP")
                 }
+                }
+                .buttonStyle(.plain)
                 .help("\(s.title): \(s.stateText)")
-                .onTapGesture { store.show(service: s) }
             }
             if !store.watchers.isEmpty {
-                HStack(spacing: 5) {
+                Button { store.page = .services } label: { HStack(spacing: 5) {
                     StatusDot(state: store.watchersRunning == store.watchers.count ? .running : .attention, size: 7)
                     Text("Watchers \(store.watchersRunning) of \(store.watchers.count)")
                 }
+                }
+                .buttonStyle(.plain)
                 .help("Folder watchers running")
-                .onTapGesture { store.page = .services }
             }
             if store.jobs.contains(where: { $0.isRunning }) {
                 HStack(spacing: 5) {
