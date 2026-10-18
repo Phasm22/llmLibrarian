@@ -431,3 +431,21 @@ struct Warning: View {
         .zfont(.caption)
     }
 }
+
+
+/// Quiet optional captions for toolbar actions; unaffected by table/body zoom.
+struct ToolbarActionLabelStyle: LabelStyle {
+    let showsTitle: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 4) {
+            configuration.icon
+            if showsTitle {
+                configuration.title
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundStyle(.secondary)
+                    .fixedSize()
+            }
+        }
+    }
+}

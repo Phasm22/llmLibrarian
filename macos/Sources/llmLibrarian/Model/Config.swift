@@ -33,6 +33,7 @@ struct PalConfig: Sendable, Equatable {
     var isInstalled: Bool { FileManager.default.fileExists(atPath: palPath) }
 
     static func load() -> PalConfig {
+        if SampleLibrary.enabled { return SampleLibrary.config }
         let env = ProcessInfo.processInfo.environment
         let home = NSHomeDirectory()
         let palHome = env["PAL_HOME"] ?? home + "/.pal"

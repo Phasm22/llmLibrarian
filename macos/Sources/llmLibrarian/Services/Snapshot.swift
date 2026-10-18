@@ -12,10 +12,16 @@ enum SnapshotMode {
         guard let dir = directory else { return }
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try? await Task.sleep(for: .seconds(2.5))
+        if let window = NSApp.windows.first(where: { AppDelegate.isMainWindow($0) }) {
+            window.setContentSize(NSSize(width: 1440, height: 860))
+            window.center()
+        }
         for appearance in [NSAppearance.Name.aqua, .darkAqua] {
             NSApp.appearance = NSAppearance(named: appearance)
             for item in SidebarItem.allCases {
+                AppDelegate.showMainWindow()
                 store.page = item
+                store.showInspector = item != .overview
                 if item == .silos {
                     store.selectedSilo = store.silos.first { store.watcher(for: $0)?.recentChanges.isEmpty == false }?.slug
                     store.showInspector = store.selectedSilo != nil

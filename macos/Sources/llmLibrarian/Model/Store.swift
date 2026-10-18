@@ -73,12 +73,20 @@ final class LibrarianStore: ObservableObject {
     @Published var selectedSilo: String?
     @Published var selectedQuery: Int?
     @Published var showInspector = true
+    @Published var showToolbarLabels = UserDefaults.standard.bool(forKey: "showToolbarLabels") {
+        didSet { UserDefaults.standard.set(showToolbarLabels, forKey: "showToolbarLabels") }
+    }
     @Published private(set) var zoomStep: Int = UserDefaults.standard.integer(forKey: "zoomStep")
 
     private var loopTask: Task<Void, Never>?
     private var pendingRefresh = false
 
     init() {
+        if SampleLibrary.enabled {
+            do { try SampleLibrary.prepare() }
+            catch { fatalError("Cannot prepare screenshot fixtures: \(error)") }
+            zoomStep = 0
+        }
         loopTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -212,6 +220,7 @@ final class LibrarianStore: ObservableObject {
     /// quick action). Goes straight to NSPerformService, so it works even when
     /// the service's own Info.plist forgets to declare NSSendTypes.
     func performService(_ name: String) {
+        guard !SampleLibrary.enabled else { return }
         guard let text = selectionText else { return }
         let pb = NSPasteboard(name: .init("llmLibrarianService"))
         pb.clearContents()
@@ -284,6 +293,7 @@ final class LibrarianStore: ObservableObject {
     // MARK: service actions
 
     func restart(_ s: ServiceStatus) {
+        guard !SampleLibrary.enabled else { return }
         Task.detached { [weak self] in
             let r = Launchctl.kickstart(s.label)
             await self?.finishAction(r, success: "Restarted \(s.title)", failure: "Could not restart \(s.title)")
@@ -291,6 +301,7 @@ final class LibrarianStore: ObservableObject {
     }
 
     func stop(_ s: ServiceStatus) {
+        guard !SampleLibrary.enabled else { return }
         Task.detached { [weak self] in
             let r = Launchctl.bootout(s.label)
             await self?.finishAction(r, success: "Stopped \(s.title)", failure: "Could not stop \(s.title)")
@@ -298,6 +309,7 @@ final class LibrarianStore: ObservableObject {
     }
 
     func start(_ s: ServiceStatus) {
+        guard !SampleLibrary.enabled else { return }
         if let silo = silo(slug: s.siloSlug), !silo.pathExists {
             problem = ActionProblem(
                 title: "The watcher for \(s.title) can't start",
@@ -510,6 +522,7 @@ final class LibrarianStore: ObservableObject {
     }
 
     private func runPal(title: String, siloSlug: String?, args: [String], completion: ((Int32) -> Void)? = nil) {
+        guard !SampleLibrary.enabled else { return }
         // One index job per folder. pal also refuses (exit 75) via a folder lock,
         // which covers pulls this app instance did not start, e.g. one orphaned
         // when the app was relaunched; this check just avoids spawning at all.

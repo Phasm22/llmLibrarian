@@ -93,16 +93,18 @@ struct SilosView: View {
         .searchable(text: $search, placement: .toolbar, prompt: "Filter silos")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button { store.chooseSiloFolder() } label: { Label("Add Silo", systemImage: "plus") }
-                    .help("Choose a folder to index and watch")
-                Button { if let s = selected { store.reindex(s) } } label: { Label("Reindex", systemImage: "arrow.clockwise") }
-                    .help("Reindex the selected silo now")
-                    .disabled(!(selected.map { $0.pathExists && store.activeJob(for: $0) == nil } ?? false))
-                Button { if let s = selected { store.reveal(s.path) } } label: { Label("Reveal in Finder", systemImage: "folder") }
-                    .help("Reveal the selected silo's folder in Finder")
-                    .disabled(!(selected?.pathExists ?? false))
-                Button { store.showInspector.toggle() } label: { Label("Details", systemImage: "info.circle") }
-                    .help("Show or hide details (⌥⌘I)")
+                Group {
+                    Button { store.chooseSiloFolder() } label: { Label("Add Silo", systemImage: "plus") }
+                        .help("Choose a folder to index and watch")
+                    Button { if let s = selected { store.reindex(s) } } label: { Label("Reindex", systemImage: "arrow.clockwise") }
+                        .help("Reindex the selected silo now")
+                        .disabled(!(selected.map { $0.pathExists && store.activeJob(for: $0) == nil } ?? false))
+                    Button { if let s = selected { store.reveal(s.path) } } label: { Label("Reveal in Finder", systemImage: "folder") }
+                        .help("Reveal the selected silo's folder in Finder")
+                        .disabled(!(selected?.pathExists ?? false))
+                    Button { store.showInspector.toggle() } label: { Label("Details", systemImage: "info.circle") }
+                        .help("Show or hide details (⌥⌘I)")
+                }.labelStyle(ToolbarActionLabelStyle(showsTitle: store.showToolbarLabels))
             }
         }
         .inspector(isPresented: $store.showInspector) {

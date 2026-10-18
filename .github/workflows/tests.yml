@@ -46,3 +46,14 @@ jobs:
 
       - name: Run unit and contract tests
         run: uv run --no-sync pytest -q tests/unit tests/contract
+
+  macos:
+    name: native macOS build + workflow tests
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native app
+        run: swift build --package-path macos -c release
+      - name: Run native workflow tests
+        run: macos/test.sh

@@ -73,14 +73,16 @@ struct ActivityView: View {
         .searchable(text: $search, placement: .toolbar, prompt: "Filter queries")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Picker("Silo", selection: $siloFilter) {
-                    Text("All silos").tag(String?.none)
-                    ForEach(store.silos) { s in Text(s.displayName).tag(Optional(s.slug)) }
-                }
-                .frame(minWidth: 140)
-                .help("Only queries scoped to this silo")
-                Button { store.showInspector.toggle() } label: { Label("Details", systemImage: "info.circle") }
-                    .help("Show or hide details (⌥⌘I)")
+                Group {
+                    Picker("Silo", selection: $siloFilter) {
+                        Text("All silos").tag(String?.none)
+                        ForEach(store.silos) { s in Text(s.displayName).tag(Optional(s.slug)) }
+                    }
+                    .frame(minWidth: 140)
+                    .help("Only queries scoped to this silo")
+                    Button { store.showInspector.toggle() } label: { Label("Details", systemImage: "info.circle") }
+                        .help("Show or hide details (⌥⌘I)")
+                }.labelStyle(ToolbarActionLabelStyle(showsTitle: store.showToolbarLabels))
             }
         }
         .inspector(isPresented: $store.showInspector) {
