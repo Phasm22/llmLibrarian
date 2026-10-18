@@ -54,7 +54,8 @@ final class LibrarianStore: ObservableObject {
     @Published private(set) var mcpHealth: MCPHealth?
     @Published private(set) var unindexedBookmarks: [String] = []
     @Published private(set) var registryError: String?
-    @Published private(set) var activity: ActivityOverview?
+    @Published private(set) var activity: ActivitySummary?
+    @Published private(set) var activityUnreadable = false
     @Published var activityWindow = ActivityWindow(rawValue: UserDefaults.standard.string(forKey: "activityWindow") ?? "") ?? .week {
         didSet {
             UserDefaults.standard.set(activityWindow.rawValue, forKey: "activityWindow")
@@ -79,6 +80,14 @@ final class LibrarianStore: ObservableObject {
     @Published var selectedService: String?
     @Published var selectedSilo: String?
     @Published var selectedQuery: Int?
+    // Activity page: tab + filters, set by Overview click-throughs.
+    @Published var activityTab: ActivityTab = .searches
+    @Published var activitySilo: String?
+    @Published var activityNoSourceOnly = false
+    @Published var selectedSearch: Int?
+    @Published var selectedChange: Int?
+    /// The selected Activity row as text (query or path), for Services and copying.
+    @Published var activitySelectionText: String?
     @Published var showInspector = true
     @Published var showToolbarLabels = UserDefaults.standard.bool(forKey: "showToolbarLabels") {
         didSet { UserDefaults.standard.set(showToolbarLabels, forKey: "showToolbarLabels") }
@@ -218,8 +227,7 @@ final class LibrarianStore: ObservableObject {
             guard let s = service(label: selectedService) else { return nil }
             return "\(s.title) — \(s.stateText) — \(s.subtitle)"
         case .activity:
-            guard let q = selectedQuery.flatMap({ id in queries.first { $0.id == id } }) else { return nil }
-            return q.queries.joined(separator: "\n")
+            return activitySelectionText
         }
     }
 
@@ -254,6 +262,19 @@ final class LibrarianStore: ObservableObject {
         showInspector = true
     }
 
+    /// Open the Activity page on the rows behind an Overview number.
+    func showActivity(_ tab: ActivityTab, silo: String? = nil, noSourceOnly: Bool = false) {
+        activityTab = tab
+        activitySilo = silo
+        activityNoSourceOnly = noSourceOnly
+        page = .activity
+    }
+
+    /// Action items for the Overview strip and the Problems tab: service, watcher and
+    /// folder issues, plus indexing failures from the ledger. No-source searches are a
+    /// usage signal (an Overview tile), not an action item.
+    var attentionCount: Int { issues.count + (activity?.failures.count ?? 0) }
+
     func show(issue: Issue) {
         page = issue.page
         if let l = issue.serviceLabel { selectedService = l }
@@ -278,6 +299,7 @@ final class LibrarianStore: ObservableObject {
         unindexedBookmarks = snap.unindexedBookmarks
         registryError = snap.registryError
         activity = snap.activity
+        activityUnreadable = snap.activityUnreadable
         lastRefresh = Date()
         hasLoaded = true
         isRefreshing = false

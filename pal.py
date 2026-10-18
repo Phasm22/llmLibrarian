@@ -3779,14 +3779,19 @@ app.add_typer(activity_app, name="activity")
 def activity_callback(
     ctx: typer.Context,
     window: str = typer.Option("7d", "--window", "-w", help="today, 7d, or 30d."),
-    silo: str | None = typer.Option(None, "--silo", help="Only this silo slug.", autocompletion=_complete_silo),
+    detail: str | None = typer.Option(
+        None, "--detail", "-d", help="List the rows behind a number: changes, searches, documents, clients, failures."
+    ),
+    silo: str | None = typer.Option(None, "--silo", help="Filter --detail to this silo slug.", autocompletion=_complete_silo),
+    no_sources: bool = typer.Option(False, "--no-sources", help="With --detail searches: only searches that found no sources."),
+    limit: int = typer.Option(50, "--limit", "-n", min=1, help="Rows for --detail."),
     include_private: bool = typer.Option(
         False, "--include-private", help="Show paths and query text for private silos (counts are always shown)."
     ),
     check_staleness: bool = typer.Option(
         False, "--check-staleness", help="Walk source folders to flag silos falling behind (slower)."
     ),
-    as_json: bool = typer.Option(False, "--json", help="Emit the overview as JSON."),
+    as_json: bool = typer.Option(False, "--json", help="Emit JSON."),
 ) -> None:
     if ctx.invoked_subcommand is not None:
         return
@@ -3796,17 +3801,23 @@ def activity_callback(
     if window not in activity_ledger.WINDOWS:
         print(f"--window must be one of: {', '.join(activity_ledger.WINDOWS)}", file=sys.stderr)
         raise typer.Exit(code=2)
-    data = activity_ledger.overview(
-        _resolved_db_path(),
-        window,
-        silo=silo,
-        include_private=include_private,
-        check_staleness=check_staleness,
+    if detail:
+        if detail not in activity_ledger.DETAIL_KINDS:
+            print(f"--detail must be one of: {', '.join(activity_ledger.DETAIL_KINDS)}", file=sys.stderr)
+            raise typer.Exit(code=2)
+        data = activity_ledger.detail(
+            _resolved_db_path(), detail, window, silo=silo, no_source_only=no_sources,
+            include_private=include_private, limit=limit,
+        )
+        print(activity_ledger.to_json(data) if as_json else activity_ledger.format_detail(data))
+        return
+    data = activity_ledger.summary(
+        _resolved_db_path(), window, include_private=include_private, check_staleness=check_staleness
     )
     if as_json:
         print(activity_ledger.to_json(data))
         return
-    print(activity_ledger.format_overview(data))
+    print(activity_ledger.format_summary(data))
     if not data["enabled"]:
         print("\nNote: the activity ledger is disabled (LLMLIBRARIAN_ACTIVITY).", file=sys.stderr)
 

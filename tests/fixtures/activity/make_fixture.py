@@ -3,11 +3,11 @@
 Writes, under ``tests/fixtures/activity/``:
 
 - ``db/`` — a tiny registry, file manifest, and ``llmli_activity.sqlite3``
-- ``overview-7d.json`` — ``activity_ledger.overview(db, "7d", include_private=True)``
-  at the fixed ``NOW`` below, in UTC
+- ``summary-today.json`` / ``summary-7d.json`` — ``activity_ledger.summary()`` at the
+  fixed ``NOW`` below, in UTC
 
 ``macos/Tests/ActivityLedgerTests`` reads the same ledger with the Swift reader
-and must reproduce the JSON; ``tests/unit/test_activity_fixture.py`` regenerates
+and must reproduce both JSON files; ``tests/unit/test_activity_fixture.py`` regenerates
 it and fails when the committed copy is stale. Regenerate after changing the
 overview contract:
 
@@ -43,7 +43,7 @@ def _ago(days: float, hours: float = 0.0) -> float:
 
 
 def build(out: Path) -> dict:
-    """Write the fixture DB into ``out`` and return the 7d overview."""
+    """Write the fixture DB into ``out``; return ``{window: summary}`` for today and 7d."""
     os.environ["TZ"] = "UTC"
     time.tzset()
     os.environ["LLMLIBRARIAN_ACTIVITY"] = "1"
@@ -124,19 +124,20 @@ def build(out: Path) -> dict:
     for extra in ("llmli_activity.sqlite3-wal", "llmli_activity.sqlite3-shm"):
         (db / extra).unlink(missing_ok=True)
 
-    data = al.overview(db, "7d", now=NOW, include_private=True)
-    # Machine-specific fields stay out of the shared contract.
-    data.pop("ledger_path", None)
-    for h in data["health"]:
-        h.pop("path_exists", None)
-    data["attention"]["falling_behind"] = []
-    return data
+    out_data = {}
+    for window in ("today", "7d"):
+        data = al.summary(db, window, now=NOW, include_private=True)
+        data.pop("ledger_path", None)  # machine-specific
+        out_data[window] = data
+    return out_data
 
 
 def main() -> None:
-    data = build(HERE)
-    (HERE / "overview-7d.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    print(f"wrote {HERE / 'overview-7d.json'}")
+    for window, data in build(HERE).items():
+        target = HERE / f"summary-{window}.json"
+        target.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        print(f"wrote {target}")
+    (HERE / "overview-7d.json").unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

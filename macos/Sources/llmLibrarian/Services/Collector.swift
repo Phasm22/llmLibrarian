@@ -68,13 +68,37 @@ enum Collector {
         }
 
         snap.queries = readQueries(config, limit: 100)
-        snap.activity = ActivityLedger.overview(
-            dbPath: config.dbPath, window: window,
-            names: Dictionary(silos.map { ($0.slug, $0.displayName) }, uniquingKeysWith: { a, _ in a }))
+        snap.activity = ActivityLedger.summary(dbPath: config.dbPath, window: window)
+        snap.activityUnreadable = snap.activity == nil
+            && FileManager.default.fileExists(atPath: ActivityLedger.path(dbPath: config.dbPath))
         snap.unindexedBookmarks = readBookmarks(config).filter { path in
             !silos.contains { $0.path == path }
         }
         return snap
+    }
+
+    /// Rows behind one Overview number; read only while the Activity page shows them.
+    static func activityDetail(config: PalConfig, request r: ActivityDetailRequest) -> ActivityDetail {
+        if SampleLibrary.enabled { return SampleLibrary.detail(r) }
+        let db = config.dbPath
+        var d = ActivityDetail()
+        switch r.tab {
+        case .searches:
+            let rows = ActivityLedger.searches(dbPath: db, window: r.window, silo: r.silo, noSourceOnly: r.noSourceOnly)
+            d.available = rows != nil
+            d.searches = rows ?? []
+            d.documents = ActivityLedger.documents(dbPath: db, window: r.window, silo: r.silo, limit: 8) ?? []
+            d.clients = ActivityLedger.clients(dbPath: db, window: r.window) ?? []
+        case .changes:
+            let rows = ActivityLedger.changes(dbPath: db, window: r.window, silo: r.silo)
+            d.available = rows != nil
+            d.changes = rows ?? []
+        case .problems:
+            let rows = ActivityLedger.failures(dbPath: db, silo: r.silo)
+            d.available = rows != nil
+            d.failures = rows ?? []
+        }
+        return d
     }
 
     // MARK: silos

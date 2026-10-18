@@ -21,16 +21,24 @@ expect(snapshot.watchers.allSatisfy { $0.label.hasPrefix("sample.") }, "No real 
 expect(snapshot.queries.allSatisfy { $0.sources.reduce(0) { $0 + $1.chunks } == $0.chunks }, "Audit totals match sources")
 expect(snapshot.silos.filter(\.isPrivate).count == 1, "Show explicit privacy state")
 for window in ActivityWindow.allCases {
-    let activity = SampleLibrary.snapshot(now: now, window: window).activity
-    expect(activity?.window == window, "Sample activity follows the selected window")
-    expect(activity?.timeline.count == (window == .today ? Calendar.current.component(.hour, from: now) + 1 : window.days),
-           "Sample timeline matches the window's buckets")
-    expect(activity?.fullSearchComparison == true && activity?.searchCount ?? 0 > 0, "Sample activity is comparable")
-    expect(activity?.timeline.reduce(0) { $0 + $1.searches } == activity?.searchCount, "Search chart matches the total")
-    expect(activity?.timeline.reduce(0) { $0 + $1.added + $1.updated + $1.removed } == activity?.changeTotal,
-           "Change chart matches the total")
-    expect(activity?.changeSilos.reduce(0) { $0 + $1.total } == activity?.changeTotal, "Per-collection rows add up")
-    let paths = (activity?.changeSilos.flatMap { $0.files.map(\.path) } ?? []) + (activity?.topDocuments.map(\.path) ?? [])
+    guard let activity = SampleLibrary.snapshot(now: now, window: window).activity else { fatalError("sample activity") }
+    expect(activity.window == window, "Sample activity follows the selected window")
+    expect(activity.buckets.count == (window == .today ? Calendar.current.component(.hour, from: now) + 1 : window.days),
+           "Sample buckets match the window")
+    expect(activity.fullSearchComparison && activity.searches > 0, "Sample activity is comparable")
+    expect(activity.buckets.reduce(0) { $0 + $1.searches } == activity.searches, "Search sparkline matches the total")
+    expect(activity.buckets.reduce(0) { $0 + $1.changes } == activity.changes, "Change sparkline matches the total")
+    // Every Overview number matches what its click-through lists.
+    let searches = SampleLibrary.detail(.init(window: window, tab: .searches, silo: nil, noSourceOnly: false), now: now)
+    let misses = SampleLibrary.detail(.init(window: window, tab: .searches, silo: nil, noSourceOnly: true), now: now)
+    let changes = SampleLibrary.detail(.init(window: window, tab: .changes, silo: nil, noSourceOnly: false), now: now)
+    expect(searches.searches.count == activity.searches && misses.searches.count == activity.noSource, "Search tiles match their rows")
+    expect(changes.changes.count == activity.changes, "Change tile matches its rows")
+    for silo in snapshot.silos {
+        let rows = SampleLibrary.detail(.init(window: window, tab: .changes, silo: silo.slug, noSourceOnly: false), now: now)
+        expect(rows.changes.count == activity.stats(silo.slug).changes, "Collection row matches its changes")
+    }
+    let paths = changes.changes.map(\.path) + searches.searches.flatMap { $0.hits.map(\.path) }
     expect(paths.allSatisfy { $0.hasPrefix(SampleLibrary.root + "/") }, "Sample activity has no personal paths")
 }
 print("SampleLibraryTests: passed")

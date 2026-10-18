@@ -145,7 +145,10 @@ struct Snapshot: Sendable {
     var unindexedBookmarks: [String] = []
     var registryError: String?
     /// Nil until the activity ledger exists on this machine.
-    var activity: ActivityOverview?
+    var activity: ActivitySummary?
+    /// The ledger file exists but could not be summarised (usually: created by an
+    /// older build, so the activity views are missing until a current writer opens it).
+    var activityUnreadable = false
 }
 
 enum Dates {

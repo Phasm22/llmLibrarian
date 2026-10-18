@@ -19,8 +19,10 @@ index, so an overview can be built from counts rather than log scraping:
 Writes are best-effort and never raise: a ledger failure must never break an
 ingest or a retrieval. ``LLMLIBRARIAN_ACTIVITY=0`` turns the ledger off.
 
-Read with ``overview()`` (``pal activity``) or directly from SQLite (the macOS
-app). Timestamps are epoch seconds (REAL) so both sides can range-query them.
+Read with ``summary()`` (Overview aggregates) and ``detail()`` (the rows behind
+one number), via ``pal activity`` or directly from SQLite in the macOS app. Both
+readers query the ``activity_*_v1`` views, which hold the event semantics once.
+Timestamps are epoch seconds (REAL) so both sides can range-query them.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 LEDGER_BASENAME = "llmli_activity.sqlite3"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_RETENTION_DAYS = 180
 PRUNE_INTERVAL_SECONDS = 24 * 3600
 MAX_QUERY_CHARS = 500
@@ -105,6 +107,37 @@ CREATE TABLE IF NOT EXISTS failures (
 CREATE INDEX IF NOT EXISTS failures_open ON failures(silo, path, error_class, resolved_at);
 """
 
+# Read contract shared with the macOS app (ActivityLedger.swift). The rules that
+# decide what an event *means* live here, once: re-index origins are not changes,
+# buckets are local-time day/hour, a search "touches" its scoped silo and every
+# silo it surfaced a file from, failures group by (silo, error class). Readers
+# only filter by ts and group. Bump the _vN suffix to change a view's shape.
+_VIEWS = """
+CREATE VIEW IF NOT EXISTS activity_changes_v1 AS
+    SELECT id, ts, silo, path, kind, origin,
+           date(ts, 'unixepoch', 'localtime') AS day,
+           CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER) AS hour
+    FROM file_events WHERE origin NOT IN ('repair', 'rehydrate');
+CREATE VIEW IF NOT EXISTS activity_collection_events_v1 AS
+    SELECT id, ts, silo, kind, files FROM silo_events WHERE origin NOT IN ('repair', 'rehydrate');
+CREATE VIEW IF NOT EXISTS activity_searches_v1 AS
+    SELECT id, ts, tool, silo, query_text, unique_files, sources_found, client,
+           date(ts, 'unixepoch', 'localtime') AS day,
+           CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER) AS hour
+    FROM searches;
+CREATE VIEW IF NOT EXISTS activity_search_silos_v1 AS
+    SELECT id AS search_id, ts, silo FROM searches WHERE silo IS NOT NULL
+    UNION
+    SELECT h.search_id, s.ts, h.silo FROM search_hits h JOIN searches s ON s.id = h.search_id;
+CREATE VIEW IF NOT EXISTS activity_failure_groups_v1 AS
+    SELECT silo, error_class, COUNT(*) AS files, SUM(occurrences) AS occurrences,
+           MAX(last_seen) AS last_seen,
+           (SELECT f2.error FROM failures f2
+             WHERE f2.silo = f.silo AND f2.error_class = f.error_class AND f2.resolved_at IS NULL
+             ORDER BY f2.last_seen DESC LIMIT 1) AS sample_error
+    FROM failures f WHERE resolved_at IS NULL GROUP BY silo, error_class;
+"""
+
 _ORIGIN: contextvars.ContextVar[str] = contextvars.ContextVar("llmli_activity_origin", default="index")
 _INIT_LOCK = threading.Lock()
 _INITIALIZED: set[str] = set()
@@ -157,11 +190,12 @@ def _connect(db_path: str | Path, *, readonly: bool = False) -> sqlite3.Connecti
             if key not in _INITIALIZED or not path.exists():
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.executescript(_SCHEMA)
+                conn.executescript(_VIEWS)
                 now = str(time.time())
                 for meta_key in ("files_since", "searches_since", "created_at"):
                     conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)", (meta_key, now))
                 conn.execute(
-                    "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
                 _INITIALIZED.add(key)
@@ -634,16 +668,9 @@ def period_bounds(window: str, now: datetime) -> dict[str, Any]:
     }
 
 
-def _bucket_index(ts: float, buckets: list[datetime]) -> int | None:
-    if not buckets or ts < buckets[0].timestamp():
-        return None
-    idx = 0
-    for i, b in enumerate(buckets):
-        if ts >= b.timestamp():
-            idx = i
-        else:
-            break
-    return idx
+def bucket_key(b: datetime, window: str) -> tuple[str, int | None]:
+    """(local day, hour) for Today's hourly buckets, (local day, None) otherwise."""
+    return (b.strftime("%Y-%m-%d"), b.hour if window == "today" else None)
 
 
 def _norm_query(text: str | None) -> str:
@@ -696,33 +723,269 @@ def _names_list(names: list[str]) -> str:
     return ", ".join(names[:-1]) + " and " + names[-1]
 
 
-def overview(
+def _plural(n: int, noun: str, plural: str | None = None) -> str:
+    return f"{n} {noun if n == 1 else (plural or noun + 's')}"
+
+
+# Queries both readers run against the views. ActivityLedger.swift carries the
+# same strings; keep them identical so the shared fixture tests the same SQL.
+SUMMARY_SQL = {
+    "change_buckets": "SELECT day, hour, kind, COUNT(*) FROM activity_changes_v1"
+                      " WHERE ts >= ? AND ts <= ? GROUP BY day, hour, kind",
+    "change_silos": "SELECT silo, COUNT(*) FROM activity_changes_v1 WHERE ts >= ? AND ts <= ? GROUP BY silo",
+    "change_count": "SELECT COUNT(*) FROM activity_changes_v1 WHERE ts >= ? AND ts <= ?",
+    "search_buckets": "SELECT day, hour, COUNT(*), SUM(sources_found = 0) FROM activity_searches_v1"
+                      " WHERE ts >= ? AND ts <= ? GROUP BY day, hour",
+    "search_count": "SELECT COUNT(*), IFNULL(SUM(sources_found = 0), 0) FROM activity_searches_v1"
+                    " WHERE ts >= ? AND ts <= ?",
+    "search_silos": "SELECT silo, COUNT(DISTINCT search_id) FROM activity_search_silos_v1"
+                    " WHERE ts >= ? AND ts <= ? GROUP BY silo",
+    "collection_events": "SELECT ts, silo, kind, files FROM activity_collection_events_v1"
+                         " WHERE ts >= ? AND ts <= ? ORDER BY ts DESC",
+    "last_change": "SELECT silo, MAX(ts) FROM activity_changes_v1 GROUP BY silo",
+    "last_search": "SELECT silo, MAX(ts) FROM activity_search_silos_v1 GROUP BY silo",
+    "failure_groups": "SELECT silo, error_class, files, occurrences, last_seen, sample_error"
+                      " FROM activity_failure_groups_v1",
+}
+
+
+def _open_for_read(db_path: str | Path) -> sqlite3.Connection | None:
+    """Connection with the current views, or None when no ledger exists yet.
+
+    Opens through the writer path so an older ledger gains the views; it never
+    creates a ledger that is not there.
+    """
+    if not ledger_path(db_path).exists():
+        return None
+    return _connect(db_path)
+
+
+def _meta(conn: sqlite3.Connection | None) -> dict[str, float]:
+    if conn is None:
+        return {}
+    out: dict[str, float] = {}
+    for k, v in conn.execute("SELECT key, value FROM meta"):
+        try:
+            out[k] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def summary(
     db_path: str | Path,
     window: str = "7d",
     *,
     now: datetime | None = None,
-    silo: str | None = None,
     include_private: bool = False,
     check_staleness: bool = False,
-    detail_limit: int = 20,
 ) -> dict[str, Any]:
-    """Counts and comparisons for the Overview.
+    """Aggregates for the Overview: totals with deltas, buckets, one row per collection.
 
-    Private silos keep their counts but lose paths and query text unless the
-    caller names that silo (``silo=``) or passes ``include_private`` — the same
-    naming-is-consent rule retrieval follows.
+    O(collections + buckets) regardless of event volume. Lists of files and
+    queries are ``detail()``'s job. Private silos keep their counts; only the
+    failure sample error is withheld unless ``include_private``.
     """
     now_dt = (now or datetime.now()).astimezone()
-    bounds = period_bounds(window, now_dt)
-    start, end = bounds["start"].timestamp(), bounds["end"].timestamp()
-    pstart, pend = bounds["prev_start"].timestamp(), bounds["prev_end"].timestamp()
-    buckets: list[datetime] = bounds["buckets"]
+    b = period_bounds(window, now_dt)
+    cur = (b["start"].timestamp(), b["end"].timestamp())
+    prev = (b["prev_start"].timestamp(), b["prev_end"].timestamp())
 
     registry = _registry_rows(db_path)
     names = {str(r.get("slug")): str(r.get("display_name") or r.get("slug")) for r in registry if r.get("slug")}
     private = _private_slugs(db_path)
 
-    def redacted(slug: str | None) -> bool:
+    def label(slug: str | None) -> str:
+        return names.get(slug or "", slug or "All collections")
+
+    def is_private(slug: str) -> bool:
+        return private is None or slug in private
+
+    conn = _open_for_read(db_path)
+
+    def q(name: str, args: tuple = ()) -> list[tuple]:
+        return conn.execute(SUMMARY_SQL[name], args).fetchall() if conn is not None else []
+
+    try:
+        meta = _meta(conn)
+        keys = [bucket_key(x, window) for x in b["buckets"]]
+        index = {k: i for i, k in enumerate(keys)}
+        buckets = [
+            {"start": _iso(x.timestamp()), "added": 0, "updated": 0, "removed": 0, "searches": 0, "no_source": 0}
+            for x in b["buckets"]
+        ]
+        totals = {"added": 0, "updated": 0, "removed": 0}
+        for day, hour, kind, n in q("change_buckets", cur):
+            totals[kind] = totals.get(kind, 0) + n
+            i = index.get((day, hour if window == "today" else None))
+            if i is not None:
+                buckets[i][kind] += n
+        searches = no_source = 0
+        for day, hour, n, miss in q("search_buckets", cur):
+            searches += n
+            no_source += miss or 0
+            i = index.get((day, hour if window == "today" else None))
+            if i is not None:
+                buckets[i]["searches"] += n
+                buckets[i]["no_source"] += miss or 0
+        prev_changes = (q("change_count", prev) or [(0,)])[0][0]
+        prev_searches, prev_no_source = (q("search_count", prev) or [(0, 0)])[0]
+        change_by_silo = dict(q("change_silos", cur))
+        search_by_silo = dict(q("search_silos", cur))
+        last_change = dict(q("last_change"))
+        last_search = dict(q("last_search"))
+        events = q("collection_events", cur)
+        fail_rows = q("failure_groups")
+    finally:
+        if conn is not None:
+            conn.close()
+
+    files_since = meta.get("files_since")
+    searches_since = meta.get("searches_since")
+    full_files = files_since is not None and files_since <= prev[0]
+    full_searches = searches_since is not None and searches_since <= prev[0]
+
+    open_failures: dict[str, int] = {}
+    failures = []
+    for f_silo, cls, files, occ, last, sample in fail_rows:
+        open_failures[f_silo] = open_failures.get(f_silo, 0) + files
+        failures.append({
+            "silo": f_silo, "name": label(f_silo), "error_class": cls, "files": files, "occurrences": occ,
+            "last_seen": _iso(last), "sample_error": None if (is_private(f_silo) and not include_private) else sample,
+        })
+    failures.sort(key=lambda g: (-g["files"], g["name"], g["error_class"]))
+
+    staleness: dict[str, dict] = {}
+    if check_staleness:
+        try:
+            from operations import op_list_silos
+
+            staleness = {str(r.get("slug")): r for r in op_list_silos(str(db_path), check_staleness=True)}
+        except Exception:
+            staleness = {}
+
+    counts = _manifest_counts(db_path)
+    # Registered collections only: activity from removed silos or unattributed
+    # backfilled hits ("?") still counts in the totals but has no row to land on.
+    collections = []
+    for slug in names:
+        lc, ls = last_change.get(slug), last_search.get(slug)
+        row = {
+            "silo": slug,
+            "name": label(slug),
+            "private": is_private(slug),
+            "files": counts.get(slug, 0),
+            "changes": change_by_silo.get(slug, 0),
+            "searches": search_by_silo.get(slug, 0),
+            "last_change": _iso(lc),
+            "last_search": _iso(ls),
+            "last_activity": _iso(max(x for x in (lc, ls) if x is not None)) if (lc or ls) else None,
+            "open_failures": open_failures.get(slug, 0),
+        }
+        if slug in staleness:
+            row["is_stale"] = staleness[slug].get("is_stale")
+            row["stale_file_count"] = staleness[slug].get("stale_file_count")
+        collections.append(row)
+    collections.sort(key=lambda r: (-(r["changes"] + r["searches"]), r["name"].lower()))
+
+    collection_events = [
+        {"silo": s, "name": label(s), "kind": k, "files": n, "ts": _iso(ts)} for ts, s, k, n in events
+    ]
+
+    # --- headline + sentences (the CLI's voice; the app shows the headline) ---
+    span, compared = _phrase(window)
+    busiest = collections[0] if collections and collections[0]["changes"] + collections[0]["searches"] > 0 else None
+    headline = f"{busiest['name']} was the busiest collection {span}." if busiest else f"No library activity {span}."
+    n_changes = sum(totals.values())
+    sentences: list[str] = []
+    changed = sorted((r for r in collections if r["changes"]), key=lambda r: (-r["changes"], r["name"].lower()))
+    if n_changes:
+        if len(changed) == 1:
+            sentences.append(f"All {_plural(n_changes, 'document change')} were in {changed[0]['name']}.")
+        else:
+            sentences.append(f"Most document changes were in {_names_list([r['name'] for r in changed[:2]])}.")
+    elif not full_files and files_since and files_since > cur[0]:
+        sentences.append(f"No document changes recorded since history began on {_iso(files_since)[:10]}.")
+    else:
+        sentences.append("No documents changed.")
+    for ev in collection_events:
+        if ev["kind"] == "silo_added":
+            sentences.append(f"{ev['name']} was added with {_plural(ev['files'], 'file')}.")
+    if full_searches:
+        if searches > prev_searches:
+            line = f"Searches increased to {searches} from {prev_searches} compared with {compared}"
+        elif searches < prev_searches:
+            line = f"Searches decreased to {searches} from {prev_searches} compared with {compared}"
+        else:
+            line = f"Searches held steady at {searches} compared with {compared}"
+    else:
+        line = f"{_plural(searches, 'search', 'searches').capitalize()} {span}"
+    line += f"; {no_source} returned no sources." if no_source else "."
+    sentences.append(line)
+    if failures:
+        nf = sum(g["files"] for g in failures)
+        sentences.append(f"{_plural(nf, 'file')} could not be indexed.")
+
+    return {
+        "window": window,
+        "generated_at": _iso(now_dt.timestamp()),
+        "period": {"start": _iso(cur[0]), "end": _iso(cur[1]), "bucket_unit": b["bucket_unit"]},
+        "previous_period": {"start": _iso(prev[0]), "end": _iso(prev[1])},
+        "history": {
+            "files_since": _iso(files_since),
+            "searches_since": _iso(searches_since),
+            "full_file_comparison": bool(full_files),
+            "full_search_comparison": bool(full_searches),
+        },
+        "headline": headline,
+        "sentences": sentences,
+        "totals": {
+            **totals,
+            "changes": n_changes,
+            "previous_changes": prev_changes if full_files else None,
+            "searches": searches,
+            "previous_searches": prev_searches if full_searches else None,
+            "no_source": no_source,
+            "previous_no_source": (prev_no_source or 0) if full_searches else None,
+        },
+        "buckets": buckets,
+        "collections": collections,
+        "collection_events": collection_events,
+        "failures": failures,
+        "ledger_path": str(ledger_path(db_path)),
+        "enabled": activity_enabled(),
+    }
+
+
+DETAIL_KINDS = ("changes", "searches", "documents", "clients", "failures")
+
+
+def detail(
+    db_path: str | Path,
+    kind: str,
+    window: str = "7d",
+    *,
+    silo: str | None = None,
+    no_source_only: bool = False,
+    include_private: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Rows behind one Overview number, filtered and paged.
+
+    Private silos' paths, query text and errors are withheld unless the caller
+    names the silo or passes ``include_private`` (naming is consent).
+    """
+    if kind not in DETAIL_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(DETAIL_KINDS)}")
+    b = period_bounds(window, (now or datetime.now()).astimezone())
+    span = (b["start"].timestamp(), b["end"].timestamp())
+    registry = _registry_rows(db_path)
+    names = {str(r.get("slug")): str(r.get("display_name") or r.get("slug")) for r in registry if r.get("slug")}
+    private = _private_slugs(db_path)
+
+    def hidden(slug: str | None) -> bool:
         if not slug or include_private or (silo and slug == silo):
             return False
         return private is None or slug in private
@@ -730,375 +993,137 @@ def overview(
     def label(slug: str | None) -> str:
         return names.get(slug or "", slug or "All collections")
 
-    path = ledger_path(db_path)
-    empty_meta = {"files_since": None, "searches_since": None}
-    if not path.exists():
-        conn = None
-        meta = empty_meta
-    else:
-        conn = _connect(db_path, readonly=True)
-        meta = {k: float(v) for k, v in conn.execute("SELECT key, value FROM meta") if k.endswith("_since")}
-
-    def q(sql: str, args: tuple = ()) -> list[tuple]:
-        return conn.execute(sql, args).fetchall() if conn is not None else []
-
-    silo_clause = " AND silo = ?" if silo else ""
-    silo_arg: tuple = (silo,) if silo else ()
-    reindex = tuple(REINDEX_ORIGINS)
-    origin_clause = f" AND origin NOT IN ({','.join('?' * len(reindex))})"
-
-    # --- Library changes ---------------------------------------------------
-    def file_rows(a: float, b: float) -> list[tuple]:
-        return q(
-            "SELECT ts, silo, path, kind FROM file_events WHERE ts >= ? AND ts <= ?"
-            + origin_clause + silo_clause + " ORDER BY ts DESC",
-            (a, b, *reindex, *silo_arg),
-        )
-
-    cur_files = file_rows(start, end)
-    prev_files = file_rows(pstart, pend)
-    kinds = ("added", "updated", "removed")
-
-    def totals(rows: list[tuple]) -> dict[str, int]:
-        t = {k: 0 for k in kinds}
-        for _, _, _, kind in rows:
-            t[kind] = t.get(kind, 0) + 1
-        return t
-
-    prev_by_silo: dict[str, int] = {}
-    for _, s, _, _ in prev_files:
-        prev_by_silo[s] = prev_by_silo.get(s, 0) + 1
-    by_silo: dict[str, dict[str, Any]] = {}
-    change_timeline = [{"start": _iso(b.timestamp()), **{k: 0 for k in kinds}} for b in buckets]
-    for ts, s, p, kind in cur_files:
-        row = by_silo.setdefault(s, {"silo": s, "name": label(s), "private": redacted(s),
-                                     **{k: 0 for k in kinds}, "files": []})
-        row[kind] += 1
-        if not row["private"] and len(row["files"]) < detail_limit:
-            row["files"].append({"path": p, "kind": kind, "ts": _iso(ts)})
-        i = _bucket_index(ts, buckets)
-        if i is not None:
-            change_timeline[i][kind] += 1
-    change_silos = sorted(
-        (
-            {**r, "total": r["added"] + r["updated"] + r["removed"], "previous_total": prev_by_silo.get(s, 0)}
-            for s, r in by_silo.items()
-        ),
-        key=lambda r: (-r["total"], r["name"]),
-    )
-    silo_events = [
-        {"silo": s, "name": label(s), "kind": k, "files": n, "ts": _iso(ts)}
-        for ts, s, k, n in q(
-            "SELECT ts, silo, kind, files FROM silo_events WHERE ts >= ? AND ts <= ?"
-            + origin_clause + silo_clause + " ORDER BY ts DESC",
-            (start, end, *reindex, *silo_arg),
-        )
-    ]
-
-    # --- Library use -------------------------------------------------------
-    def search_rows(a: float, b: float) -> list[tuple]:
-        if silo:
-            return q(
-                "SELECT id, ts, silo, query_text, sources_found, client FROM searches"
-                " WHERE ts >= ? AND ts <= ? AND (silo = ? OR id IN"
-                " (SELECT search_id FROM search_hits WHERE silo = ?)) ORDER BY ts DESC",
-                (a, b, silo, silo),
-            )
-        return q(
-            "SELECT id, ts, silo, query_text, sources_found, client FROM searches"
-            " WHERE ts >= ? AND ts <= ? ORDER BY ts DESC",
-            (a, b),
-        )
-
-    cur_searches = search_rows(start, end)
-    prev_searches = search_rows(pstart, pend)
-    ids = [r[0] for r in cur_searches]
-    hits_by_search: dict[int, list[tuple[str, str]]] = {}
-    for i in range(0, len(ids), 500):
-        part = ids[i : i + 500]
-        for sid, s, p in q(
-            f"SELECT search_id, silo, path FROM search_hits WHERE search_id IN ({','.join('?' * len(part))})",
-            tuple(part),
-        ):
-            hits_by_search.setdefault(sid, []).append((s, p))
-
-    use_by_silo: dict[str, dict[str, Any]] = {}
-    doc_counts: dict[tuple[str, str], int] = {}
-    by_client: dict[str, int] = {}
-    search_timeline = [{"start": _iso(b.timestamp()), "searches": 0, "without_sources": 0} for b in buckets]
-    no_source: dict[tuple[str, str | None], dict[str, Any]] = {}
-    with_sources = 0
-    for sid, ts, s_silo, text, found, client in cur_searches:
-        by_client[client] = by_client.get(client, 0) + 1
-        i = _bucket_index(ts, buckets)
-        if i is not None:
-            search_timeline[i]["searches"] += 1
-        if found:
-            with_sources += 1
-        else:
-            if i is not None:
-                search_timeline[i]["without_sources"] += 1
-            hidden = redacted(s_silo)
-            key = ("(private collection)" if hidden else _norm_query(text) or "(query text not kept)", s_silo)
-            grp = no_source.setdefault(key, {"query": key[0], "silo": s_silo, "name": label(s_silo),
-                                             "count": 0, "last_ts": None})
-            grp["count"] += 1
-            grp["last_ts"] = grp["last_ts"] or _iso(ts)
-        touched: dict[str, set[str]] = {}
-        for h_silo, h_path in hits_by_search.get(sid, []):
-            touched.setdefault(h_silo, set()).add(h_path)
-            doc_counts[(h_silo, h_path)] = doc_counts.get((h_silo, h_path), 0) + 1
-        if s_silo and s_silo not in touched:
-            touched[s_silo] = set()
-        for t_silo, paths in touched.items():
-            row = use_by_silo.setdefault(t_silo, {"silo": t_silo, "name": label(t_silo),
-                                                  "private": redacted(t_silo), "searches": 0, "files": set()})
-            row["searches"] += 1
-            row["files"].update(paths)
-    use_silos = sorted(
-        ({**{k: v for k, v in r.items() if k != "files"}, "unique_files": len(r["files"])}
-         for r in use_by_silo.values()),
-        key=lambda r: (-r["searches"], r["name"]),
-    )
-    if silo:
-        use_silos = [r for r in use_silos if r["silo"] == silo]
-    top_docs = [
-        {"silo": s, "name": label(s), "path": p, "file": Path(p).name, "searches": n}
-        for (s, p), n in sorted(doc_counts.items(), key=lambda kv: (-kv[1], kv[0][1]))
-        if not redacted(s) and (not silo or s == silo)
-    ][:detail_limit]
-    recent_queries = [
-        {"ts": _iso(ts), "silo": s, "name": label(s), "query": None if redacted(s) else text,
-         "sources_found": bool(found), "client": client}
-        for _, ts, s, text, found, client in cur_searches[:detail_limit]
-    ]
-
-    # --- Attention ---------------------------------------------------------
-    fail_rows = q(
-        "SELECT silo, path, error_class, error, first_seen, last_seen, occurrences FROM failures"
-        " WHERE resolved_at IS NULL" + silo_clause + " ORDER BY last_seen DESC",
-        silo_arg,
-    )
-    groups: dict[tuple[str, str], dict[str, Any]] = {}
-    open_by_silo: dict[str, int] = {}
-    for f_silo, f_path, cls, err, first, last, occ in fail_rows:
-        open_by_silo[f_silo] = open_by_silo.get(f_silo, 0) + 1
-        g = groups.setdefault((f_silo, cls), {"silo": f_silo, "name": label(f_silo), "error_class": cls,
-                                              "files": 0, "occurrences": 0, "sample_error": err,
-                                              "last_seen": _iso(last), "paths": []})
-        g["files"] += 1
-        g["occurrences"] += occ
-        if not redacted(f_silo) and len(g["paths"]) < 5:
-            g["paths"].append(f_path)
-        if redacted(f_silo):
-            g["sample_error"] = None
-    failure_groups = sorted(groups.values(), key=lambda g: (-g["files"], g["name"]))
-    no_source_groups = sorted(no_source.values(), key=lambda g: (-g["count"], g["query"]))[:detail_limit]
-
-    # --- Collection health (every silo, searched or not) --------------------
-    counts = _manifest_counts(db_path)
-    last_change = dict(q("SELECT silo, MAX(ts) FROM file_events WHERE 1=1" + origin_clause + " GROUP BY silo", reindex))
-    last_search: dict[str, float] = dict(q("SELECT silo, MAX(ts) FROM searches WHERE silo IS NOT NULL GROUP BY silo"))
-    for s, ts in q("SELECT h.silo, MAX(s.ts) FROM search_hits h JOIN searches s ON s.id = h.search_id GROUP BY h.silo"):
-        last_search[s] = max(ts, last_search.get(s, 0.0))
-    staleness: dict[str, dict] = {}
-    if check_staleness:
-        try:
-            from operations import op_list_silos
-
-            for row in op_list_silos(str(db_path), check_staleness=True):
-                staleness[str(row.get("slug"))] = row
-        except Exception:
-            staleness = {}
-    health = []
-    for row in sorted(registry, key=lambda r: str(r.get("display_name") or r.get("slug") or "").lower()):
-        slug = str(row.get("slug") or "")
-        if not slug or (silo and slug != silo):
-            continue
-        h = {
-            "silo": slug,
-            "name": label(slug),
-            "private": bool(private is None or slug in private),
-            "files": counts.get(slug, int(row.get("files_indexed") or 0)),
-            "updated": row.get("updated"),
-            "path_exists": bool(row.get("path")) and Path(str(row.get("path"))).exists(),
-            "last_change": _iso(last_change.get(slug)),
-            "last_search": _iso(last_search.get(slug)),
-            "open_failures": open_by_silo.get(slug, 0),
-        }
-        if slug in staleness:
-            st = staleness[slug]
-            h["is_stale"] = st.get("is_stale")
-            h["stale_file_count"] = st.get("stale_file_count")
-        health.append(h)
-    behind = [
-        {"silo": h["silo"], "name": h["name"],
-         "reason": "missing_folder" if not h["path_exists"] else ("stale" if h.get("is_stale") else "failures"),
-         "open_failures": h["open_failures"], "stale_file_count": h.get("stale_file_count")}
-        for h in health
-        if (not h["path_exists"]) or h.get("is_stale") or h["open_failures"]
-    ]
-
-    if conn is not None:
+    out: dict[str, Any] = {"kind": kind, "window": window, "silo": silo, "rows": [], "total": 0,
+                           "limit": limit, "offset": offset}
+    conn = _open_for_read(db_path)
+    if conn is None:
+        return out
+    try:
+        if kind == "changes":
+            where = " WHERE ts >= ? AND ts <= ?" + (" AND silo = ?" if silo else "")
+            args = (*span, *((silo,) if silo else ()))
+            out["total"] = conn.execute("SELECT COUNT(*) FROM activity_changes_v1" + where, args).fetchone()[0]
+            out["rows"] = [
+                {"ts": _iso(ts), "silo": s, "name": label(s), "kind": k, "path": None if hidden(s) else p}
+                for ts, s, p, k in conn.execute(
+                    "SELECT ts, silo, path, kind FROM activity_changes_v1" + where
+                    + " ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?", (*args, limit, offset))
+            ]
+        elif kind == "searches":
+            where = " WHERE ts >= ? AND ts <= ?"
+            args: tuple = span
+            if silo:
+                where += " AND id IN (SELECT search_id FROM activity_search_silos_v1 WHERE silo = ?)"
+                args = (*args, silo)
+            if no_source_only:
+                where += " AND sources_found = 0"
+            out["total"] = conn.execute("SELECT COUNT(*) FROM activity_searches_v1" + where, args).fetchone()[0]
+            rows = conn.execute(
+                "SELECT id, ts, silo, query_text, sources_found, unique_files, client FROM activity_searches_v1"
+                + where + " ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?", (*args, limit, offset)).fetchall()
+            hits: dict[int, list[tuple[str, str]]] = {}
+            ids = [r[0] for r in rows]
+            if ids:
+                for sid, h_silo, h_path in conn.execute(
+                    f"SELECT search_id, silo, path FROM search_hits WHERE search_id IN ({','.join('?' * len(ids))})"
+                    " ORDER BY rowid", ids):
+                    hits.setdefault(sid, []).append((h_silo, h_path))
+            out["rows"] = [
+                {
+                    "id": sid, "ts": _iso(ts), "silo": s, "name": label(s),
+                    "query": None if hidden(s) else text,
+                    "sources_found": bool(found), "unique_files": n, "client": client,
+                    "files": [{"silo": hs, "path": hp} for hs, hp in hits.get(sid, []) if not hidden(hs)],
+                }
+                for sid, ts, s, text, found, n, client in rows
+            ]
+        elif kind == "documents":
+            where = " WHERE s.ts >= ? AND s.ts <= ?" + (" AND h.silo = ?" if silo else "")
+            args = (*span, *((silo,) if silo else ()))
+            rows = conn.execute(
+                "SELECT h.silo, h.path, COUNT(DISTINCT h.search_id) AS n FROM search_hits h"
+                " JOIN searches s ON s.id = h.search_id" + where
+                + " GROUP BY h.silo, h.path ORDER BY n DESC, h.path", args).fetchall()
+            visible = [(s, p, n) for s, p, n in rows if not hidden(s)]
+            out["total"] = len(visible)
+            out["rows"] = [{"silo": s, "name": label(s), "path": p, "file": Path(p).name, "searches": n}
+                           for s, p, n in visible[offset: offset + limit]]
+        elif kind == "clients":
+            rows = conn.execute(
+                "SELECT client, COUNT(*) FROM activity_searches_v1 WHERE ts >= ? AND ts <= ?"
+                " GROUP BY client ORDER BY COUNT(*) DESC, client", span).fetchall()
+            out["total"] = len(rows)
+            out["rows"] = [{"client": c, "searches": n} for c, n in rows[offset: offset + limit]]
+        elif kind == "failures":
+            where = " WHERE resolved_at IS NULL" + (" AND silo = ?" if silo else "")
+            args = (silo,) if silo else ()
+            out["total"] = conn.execute("SELECT COUNT(*) FROM failures" + where, args).fetchone()[0]
+            out["rows"] = [
+                {"silo": s, "name": label(s), "error_class": cls, "occurrences": occ,
+                 "first_seen": _iso(first), "last_seen": _iso(last),
+                 "path": None if hidden(s) else p, "error": None if hidden(s) else err}
+                for s, p, cls, err, first, last, occ in conn.execute(
+                    "SELECT silo, path, error_class, error, first_seen, last_seen, occurrences FROM failures"
+                    + where + " ORDER BY last_seen DESC, id DESC LIMIT ? OFFSET ?", (*args, limit, offset))
+            ]
+    finally:
         conn.close()
-
-    # --- History coverage + summary ----------------------------------------
-    files_since = meta.get("files_since")
-    searches_since = meta.get("searches_since")
-    full_files = files_since is not None and files_since <= pstart
-    full_searches = searches_since is not None and searches_since <= pstart
-    history_since = min(x for x in (files_since, searches_since) if x is not None) if (files_since or searches_since) else None
-
-    cur_tot = totals(cur_files)
-    prev_tot = totals(prev_files)
-    n_changes = sum(cur_tot.values())
-    n_searches = len(cur_searches)
-    n_prev_searches = len(prev_searches)
-    n_without = n_searches - with_sources
-    span, compared = _phrase(window)
-
-    score: dict[str, int] = {}
-    for r in change_silos:
-        score[r["silo"]] = score.get(r["silo"], 0) + r["total"]
-    for r in use_silos:
-        score[r["silo"]] = score.get(r["silo"], 0) + r["searches"]
-    busiest = sorted(score.items(), key=lambda kv: (-kv[1], label(kv[0])))
-    if busiest and busiest[0][1] > 0:
-        headline = f"{label(busiest[0][0])} was the busiest collection {span}."
-    else:
-        headline = f"No library activity {span}."
-    sentences: list[str] = []
-    if n_changes:
-        top = [r["name"] for r in change_silos[:2] if r["total"]]
-        if len(change_silos) == 1:
-            sentences.append(f"All {n_changes} document change{'s' if n_changes != 1 else ''} were in {top[0]}.")
-        else:
-            sentences.append(f"Most document changes were in {_names_list(top)}.")
-    elif not full_files and files_since and files_since > start:
-        sentences.append(f"No document changes recorded since history began on {_iso(files_since)[:10]}.")
-    else:
-        sentences.append("No documents changed.")
-    for ev in silo_events:
-        if ev["kind"] == "silo_added":
-            sentences.append(f"{ev['name']} was added with {ev['files']} file{'s' if ev['files'] != 1 else ''}.")
-    search_word = f"{n_searches} search{'es' if n_searches != 1 else ''}"
-    if full_searches:
-        if n_searches > n_prev_searches:
-            s = f"Searches increased to {n_searches} from {n_prev_searches} compared with {compared}"
-        elif n_searches < n_prev_searches:
-            s = f"Searches decreased to {n_searches} from {n_prev_searches} compared with {compared}"
-        else:
-            s = f"Searches held steady at {n_searches} compared with {compared}"
-    else:
-        s = f"{search_word.capitalize()} {span}"
-    if n_without:
-        s += f"; {n_without} returned no sources."
-    else:
-        s += "."
-    sentences.append(s)
-    if failure_groups:
-        nf = sum(g["files"] for g in failure_groups)
-        sentences.append(f"{nf} file{'s' if nf != 1 else ''} could not be indexed.")
-
-    return {
-        "window": window,
-        "generated_at": _iso(now_dt.timestamp()),
-        "silo": silo,
-        "period": {"start": _iso(start), "end": _iso(end), "bucket_unit": bounds["bucket_unit"]},
-        "previous_period": {"start": _iso(pstart), "end": _iso(pend)},
-        "history": {
-            "since": _iso(history_since),
-            "files_since": _iso(files_since),
-            "searches_since": _iso(searches_since),
-            "full_comparison": bool(full_files and full_searches),
-            "full_file_comparison": bool(full_files),
-            "full_search_comparison": bool(full_searches),
-        },
-        "summary": {"headline": headline, "sentences": sentences},
-        "changes": {
-            "totals": cur_tot,
-            "previous_totals": prev_tot if full_files else None,
-            "by_silo": change_silos,
-            "collections": silo_events,
-            "timeline": change_timeline,
-        },
-        "use": {
-            "searches": n_searches,
-            "previous_searches": n_prev_searches if full_searches else None,
-            "with_sources": with_sources,
-            "without_sources": n_without,
-            "by_silo": use_silos,
-            "top_documents": top_docs,
-            "by_client": [{"client": c, "searches": n} for c, n in sorted(by_client.items(), key=lambda kv: (-kv[1], kv[0]))],
-            "recent": recent_queries,
-            "timeline": search_timeline,
-        },
-        "attention": {
-            "failures": failure_groups,
-            "no_source_searches": no_source_groups,
-            "falling_behind": behind,
-        },
-        "health": health,
-        "ledger_path": str(path),
-        "enabled": activity_enabled(),
-    }
+    return out
 
 
-def format_overview(data: dict) -> str:
-    """Human text for ``pal activity``."""
-    lines: list[str] = []
-    s = data["summary"]
-    lines.append(s["headline"])
-    lines.extend(f"  {x}" for x in s["sentences"])
+def format_summary(data: dict) -> str:
+    """Human text for ``pal activity``: headline, three numbers, collections, problems."""
+    t = data["totals"]
     hist = data["history"]
+    lines = [data["headline"], *(f"  {s}" for s in data["sentences"])]
     for flag, key, what in (
         ("full_file_comparison", "files_since", "Document-change"),
         ("full_search_comparison", "searches_since", "Search"),
     ):
         if not hist[flag] and hist.get(key):
             lines.append(f"  {what} history available since {hist[key][:10]}.")
-    lines.append("")
-    ch = data["changes"]
-    t = ch["totals"]
-    lines.append(f"Library changes  +{t['added']} added  ~{t['updated']} updated  -{t['removed']} removed")
-    for r in ch["by_silo"][:10]:
-        prev = f"  (prev {r['previous_total']})" if ch["previous_totals"] is not None else ""
-        lines.append(f"  {r['name']:<28} +{r['added']} ~{r['updated']} -{r['removed']}{prev}")
-    for ev in ch["collections"]:
-        verb = "added" if ev["kind"] == "silo_added" else "removed"
-        lines.append(f"  collection {verb}: {ev['name']} ({ev['files']} files)")
-    lines.append("")
-    u = data["use"]
-    prev = f" (prev {u['previous_searches']})" if u["previous_searches"] is not None else ""
-    lines.append(f"Library use  {u['searches']} searches{prev}, {u['with_sources']} found sources, {u['without_sources']} none")
-    for r in u["by_silo"][:10]:
-        lines.append(f"  {r['name']:<28} {r['searches']} searches, {r['unique_files']} files")
-    if u["top_documents"]:
-        lines.append("  Most surfaced:")
-        lines.extend(f"    {d['searches']:>3}  {d['file']}  ({d['name']})" for d in u["top_documents"][:8])
-    if u["by_client"]:
-        lines.append("  Assistants: " + ", ".join(f"{c['client']} {c['searches']}" for c in u["by_client"][:6]))
-    lines.append("")
-    a = data["attention"]
-    lines.append("Attention needed")
-    if not (a["failures"] or a["no_source_searches"] or a["falling_behind"]):
-        lines.append("  Nothing needs attention.")
-    for g in a["failures"]:
-        lines.append(f"  {g['name']}: {g['files']} file(s) failing ({g['error_class']})")
-    for g in a["no_source_searches"][:8]:
-        times = f" ×{g['count']}" if g["count"] > 1 else ""
-        lines.append(f"  no sources{times}: {g['query']!r} in {g['name']}")
-    for b in a["falling_behind"]:
-        if b["reason"] != "failures":
-            lines.append(f"  {b['name']}: {b['reason'].replace('_', ' ')}")
-    lines.append("")
-    lines.append("Collection health")
-    for h in data["health"]:
-        lock = " [private]" if h["private"] else ""
-        last = (h["last_search"] or "never")[:10]
-        lines.append(f"  {h['name']:<28} {h['files']:>6} files  last search {last}{lock}")
+
+    def vs(prev: int | None) -> str:
+        return f" (prev {prev})" if prev is not None else ""
+
+    lines += [
+        "",
+        f"Documents changed  {t['changes']}{vs(t['previous_changes'])}   +{t['added']} ~{t['updated']} -{t['removed']}",
+        f"Searches           {t['searches']}{vs(t['previous_searches'])}",
+        f"Found no sources   {t['no_source']}{vs(t['previous_no_source'])}",
+        "",
+        f"{'Collection':<28} {'changed':>8} {'searches':>9}  last activity",
+    ]
+    for r in data["collections"]:
+        lock = " [private]" if r["private"] else ""
+        fail = f"  {r['open_failures']} failing" if r["open_failures"] else ""
+        lines.append(f"{r['name'][:28]:<28} {r['changes']:>8} {r['searches']:>9}  "
+                     f"{(r['last_activity'] or 'never')[:10]}{fail}{lock}")
+    if data["failures"]:
+        lines += ["", "Needs action"]
+        for g in data["failures"]:
+            lines.append(f"  {g['name']}: {_plural(g['files'], 'file')} failing ({g['error_class']})")
     return "\n".join(lines)
 
+
+def format_detail(data: dict) -> str:
+    """Human text for ``pal activity --detail KIND``."""
+    rows = data["rows"]
+    head = f"{data['kind']} — {len(rows)} of {data['total']}"
+    lines = [head]
+    for r in rows:
+        if data["kind"] == "changes":
+            lines.append(f"  {r['ts'][:16]}  {r['kind']:<7}  {r['name']}: {r['path'] or '(private)'}")
+        elif data["kind"] == "searches":
+            mark = " " if r["sources_found"] else "∅"
+            lines.append(f"  {r['ts'][:16]} {mark} {r['client']:<14} {r['name']}: {r['query'] or '(private or not kept)'}")
+        elif data["kind"] == "documents":
+            lines.append(f"  {r['searches']:>4}  {r['file']}  ({r['name']})")
+        elif data["kind"] == "clients":
+            lines.append(f"  {r['searches']:>4}  {r['client']}")
+        elif data["kind"] == "failures":
+            lines.append(f"  {r['last_seen'][:16]}  {r['error_class']:<12} {r['name']}: {r['path'] or '(private)'}")
+    return "\n".join(lines)
 
 def to_json(data: dict) -> str:
     return json.dumps(data, indent=2)

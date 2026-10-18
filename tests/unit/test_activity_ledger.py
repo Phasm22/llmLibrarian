@@ -130,8 +130,8 @@ def test_repair_origin_is_excluded_from_library_changes(db):
     with al.origin("repair"):
         _put(db, "research-1", root, {f"{root}/a.md": "h2"})
     _put(db, "research-1", root, {f"{root}/b.md": "h3"})
-    data = al.overview(db, "today")
-    assert data["changes"]["totals"] == {"added": 1, "updated": 0, "removed": 0}
+    t = al.summary(db, "today")["totals"]
+    assert (t["added"], t["updated"], t["removed"]) == (1, 0, 0)
     assert _rows(db, "SELECT origin FROM file_events ORDER BY id") == [("repair",), ("index",)]
 
 
@@ -191,7 +191,7 @@ def test_failures_group_by_silo_and_class_and_resolve_on_success(db):
     _put(db, "research-1", root, {bad: "fixed"})
     assert _rows(db, "SELECT resolved_at IS NOT NULL FROM failures WHERE path=?", (bad,)) == [(1,)]
 
-    groups = al.overview(db, "7d")["attention"]["failures"]
+    groups = al.summary(db, "7d")["failures"]
     assert {g["error_class"] for g in groups} == {"too_large", "permission"}
 
 
@@ -310,42 +310,74 @@ def _seed_week(db):
                          client="Claude Code" if days != 2 else "Codex", now=_ts(days))
 
 
-def test_overview_counts_and_compares(db):
+def test_summary_counts_and_compares(db):
     _seed_week(db)
-    data = al.overview(db, "7d", now=NOW)
+    data = al.summary(db, "7d", now=NOW)
 
-    assert data["history"]["full_comparison"] is True
-    assert data["changes"]["totals"] == {"added": 3, "updated": 1, "removed": 1}
-    assert data["changes"]["previous_totals"] == {"added": 1, "updated": 0, "removed": 0}
-    by = {r["silo"]: r for r in data["changes"]["by_silo"]}
-    assert by["research-1"]["total"] == 3 and by["notes-2"]["previous_total"] == 1
+    assert data["history"]["full_file_comparison"] and data["history"]["full_search_comparison"]
+    t = data["totals"]
+    assert (t["added"], t["updated"], t["removed"], t["changes"], t["previous_changes"]) == (3, 1, 1, 5, 1)
+    assert (t["searches"], t["previous_searches"], t["no_source"], t["previous_no_source"]) == (6, 1, 3, 0)
+    assert sum(b["searches"] for b in data["buckets"]) == 6 and len(data["buckets"]) == 7
+    assert sum(b["added"] + b["updated"] + b["removed"] for b in data["buckets"]) == 5
 
-    u = data["use"]
-    assert (u["searches"], u["previous_searches"], u["with_sources"], u["without_sources"]) == (6, 1, 3, 3)
-    assert u["top_documents"][0]["file"] == "a.md" and u["top_documents"][0]["searches"] == 3
-    assert {c["client"]: c["searches"] for c in u["by_client"]} == {"Claude Code": 3, "Codex": 3}
-    assert sum(b["searches"] for b in u["timeline"]) == 6
+    by = {r["silo"]: r for r in data["collections"]}
+    # A search touches its scoped silo and every silo it surfaced a file from.
+    assert (by["research-1"]["changes"], by["research-1"]["searches"]) == (3, 5)
+    assert (by["notes-2"]["changes"], by["notes-2"]["searches"]) == (1, 1)
+    assert [r["silo"] for r in data["collections"]] == ["research-1", "notes-2", "tax-3"]
 
-    groups = data["attention"]["no_source_searches"]
-    assert groups[0]["query"] == "missing thing" and groups[0]["count"] == 2
+    assert data["headline"] == "Research was the busiest collection this week."
+    assert "Searches increased to 6 from 1 compared with the previous week; 3 returned no sources." in data["sentences"]
 
-    assert data["summary"]["headline"] == "Research was the busiest collection this week."
-    assert "Searches increased to 6 from 1 compared with the previous week; 3 returned no sources." in data["summary"]["sentences"]
+
+def test_summary_size_does_not_grow_with_events(db):
+    _seed_week(db)
+    data = al.summary(db, "7d", now=NOW)
+    # Per-collection rows are scalars; file and query lists belong to detail().
+    assert all(not isinstance(v, (list, dict)) for r in data["collections"] for v in r.values())
+    assert not any(k in data for k in ("searches", "rows"))
+
+
+def test_detail_rows_filter_and_page(db):
+    _seed_week(db)
+    changes = al.detail(db, "changes", "7d", now=NOW, silo="research-1")
+    assert changes["total"] == 3 and [r["kind"] for r in changes["rows"]] == ["added", "updated", "removed"]
+
+    misses = al.detail(db, "searches", "7d", now=NOW, no_source_only=True, include_private=True)
+    assert misses["total"] == 3 and {r["query"] for r in misses["rows"]} == {"Missing   Thing", "missing thing", "my agi"}
+
+    scoped = al.detail(db, "searches", "7d", now=NOW, silo="notes-2")
+    assert [r["query"] for r in scoped["rows"]] == ["budget"]  # unscoped search that surfaced a notes file
+
+    docs = al.detail(db, "documents", "7d", now=NOW)
+    assert docs["rows"][0]["file"] == "a.md" and docs["rows"][0]["searches"] == 3
+
+    clients = al.detail(db, "clients", "7d", now=NOW)["rows"]
+    assert clients == [{"client": "Claude Code", "searches": 3}, {"client": "Codex", "searches": 3}]
+
+    page = al.detail(db, "searches", "7d", now=NOW, limit=2, offset=2)
+    assert page["total"] == 6 and len(page["rows"]) == 2
+
+    with pytest.raises(ValueError):
+        al.detail(db, "nope")
 
 
 def test_private_silo_counts_without_paths_or_text(db):
     _seed_week(db)
-    data = al.overview(db, "7d", now=NOW)
-    tax = next(r for r in data["changes"]["by_silo"] if r["silo"] == "tax-3")
-    assert tax["added"] == 1 and tax["files"] == [] and tax["private"] is True
-    assert all(d["silo"] != "tax-3" for d in data["use"]["top_documents"])
-    priv = [g for g in data["attention"]["no_source_searches"] if g["silo"] == "tax-3"]
-    assert priv and priv[0]["query"] == "(private collection)"
-    assert "my agi" not in json.dumps(data)
+    data = al.summary(db, "7d", now=NOW)
+    tax = next(r for r in data["collections"] if r["silo"] == "tax-3")
+    assert tax["changes"] == 1 and tax["private"] is True
 
-    named = al.overview(db, "7d", now=NOW, silo="tax-3")
-    assert named["changes"]["by_silo"][0]["files"][0]["path"] == "/tax/w2-2025.pdf"
-    assert named["attention"]["no_source_searches"][0]["query"] == "my agi"
+    changes = al.detail(db, "changes", "7d", now=NOW)
+    assert next(r for r in changes["rows"] if r["silo"] == "tax-3")["path"] is None
+    searches = al.detail(db, "searches", "7d", now=NOW)
+    assert "my agi" not in json.dumps(searches)
+    assert all(d["silo"] != "tax-3" for d in al.detail(db, "documents", "7d", now=NOW)["rows"])
+
+    named = al.detail(db, "changes", "7d", now=NOW, silo="tax-3")
+    assert named["rows"][0]["path"] == "/tax/w2-2025.pdf"
+    assert al.detail(db, "searches", "7d", now=NOW, silo="tax-3")["rows"][0]["query"] == "my agi"
 
 
 def test_history_shorter_than_previous_period_drops_comparison(db):
@@ -354,25 +386,42 @@ def test_history_shorter_than_previous_period_drops_comparison(db):
     conn.execute("UPDATE meta SET value=? WHERE key IN ('files_since','searches_since')", (str(_ts(3)),))
     conn.commit()
     conn.close()
-    data = al.overview(db, "7d", now=NOW)
-    assert data["history"]["full_comparison"] is False
-    assert data["use"]["previous_searches"] is None and data["changes"]["previous_totals"] is None
-    assert not any("compared with" in s for s in data["summary"]["sentences"])
-    assert "Search history available since" in al.format_overview(data)
+    data = al.summary(db, "7d", now=NOW)
+    assert not data["history"]["full_search_comparison"]
+    assert data["totals"]["previous_searches"] is None and data["totals"]["previous_changes"] is None
+    assert not any("compared with" in s for s in data["sentences"])
+    assert "Search history available since" in al.format_summary(data)
 
 
-def test_health_lists_unsearched_silos(db):
+def test_collections_list_unsearched_silos_and_only_registered_ones(db):
     _seed_week(db)
-    health = {h["silo"]: h for h in al.overview(db, "7d", now=NOW)["health"]}
-    assert set(health) == {"research-1", "notes-2", "tax-3"}
-    assert health["tax-3"]["private"] is True
-    assert health["research-1"]["files"] == 1 and health["research-1"]["last_search"]
+    al.record_search(db, tool="query_personal_knowledge", queries=["ghost"], silo="removed-9",
+                     chunks=[{"source": "/gone/x.md", "silo": "removed-9"}], now=_ts(1))
+    data = al.summary(db, "7d", now=NOW)
+    rows = {r["silo"]: r for r in data["collections"]}
+    assert set(rows) == {"research-1", "notes-2", "tax-3"}
+    assert data["totals"]["searches"] == 7  # still counted
+    assert rows["research-1"]["files"] == 1 and rows["research-1"]["last_activity"]
 
 
-def test_overview_without_ledger_is_empty_not_an_error(db):
-    data = al.overview(db, "today", now=NOW)
-    assert data["use"]["searches"] == 0 and data["summary"]["headline"] == "No library activity today."
-    assert len(data["health"]) == 3
+def test_summary_without_ledger_is_empty_not_an_error(db):
+    data = al.summary(db, "today", now=NOW)
+    assert data["totals"]["searches"] == 0 and data["headline"] == "No library activity today."
+    assert len(data["collections"]) == 3
+    assert not al.ledger_path(db).exists()  # reading never creates a ledger
+    assert al.detail(db, "searches", "today", now=NOW)["rows"] == []
+
+
+def test_older_ledger_gains_views_on_read(db):
+    al.record_search(db, tool="query_personal_knowledge", queries=["q"], silo=None, chunks=[], now=_ts(0, 1))
+    conn = sqlite3.connect(al.ledger_path(db))
+    for view in ("activity_changes_v1", "activity_searches_v1", "activity_search_silos_v1",
+                 "activity_failure_groups_v1", "activity_collection_events_v1"):
+        conn.execute(f"DROP VIEW {view}")
+    conn.commit()
+    conn.close()
+    al._INITIALIZED.clear()
+    assert al.summary(db, "today", now=NOW)["totals"]["searches"] == 1
 
 
 # ---------------------------------------------------------------------------

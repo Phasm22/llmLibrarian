@@ -13,11 +13,14 @@ uses — `~/.pal/daemon.json`, `<db>/llmli_registry.json`, `~/.pal/watch_locks`,
 `<db>/llmli_activity.sqlite3` (read-only, via the system SQLite) — so opening it
 never starts Python.
 
-The Overview tells the story of the library over Today / 7 days / 30 days:
-document changes, searches (with how many found sources), and what needs
-attention, each compared with the previous period when the ledger's history
-covers it. `Services/ActivityLedger.swift` mirrors `activity_ledger.overview()`;
-`tests/fixtures/activity` pins both to the same numbers and wording.
+The Overview answers four things over Today / 7 days / 30 days: what needs
+action (one strip, only when something does), three numbers with trends
+(documents changed, searches, searches that found no sources), the busiest
+collection, and one row per collection. Every number clicks through to the
+Activity page (Searches / Changes / Problems), which reads the rows on demand.
+`Services/ActivityLedger.swift` runs the same SQL as `activity_ledger.SUMMARY_SQL`
+against the ledger's views; `tests/fixtures/activity` pins both readers to the
+same output. Design: [docs/plans/overview-information-design.md](../docs/plans/overview-information-design.md).
 Actions shell out: launchctl for start/stop/restart, `pal pull` for adding and
 reindexing silos, and `pal daemon sync` for reconciling watchers. Add Silo is
 available from the Silos toolbar, the empty state, and File → Add Silo….

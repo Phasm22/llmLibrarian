@@ -1,7 +1,7 @@
 """The shared activity fixture must match what the Python overview produces today.
 
 macOS reads the same ledger with its own Swift reader and checks itself against
-``tests/fixtures/activity/overview-7d.json``; this test keeps that JSON honest,
+``tests/fixtures/activity/summary-*.json``; this test keeps that JSON honest,
 so a change to the overview contract fails here until the fixture is regenerated
 (``TZ=UTC uv run python tests/fixtures/activity/make_fixture.py``) and the Swift
 reader is updated to match.
@@ -26,18 +26,19 @@ def _load_generator():
     return mod
 
 
-def test_committed_overview_matches_generator(tmp_path, monkeypatch):
+def test_committed_summaries_match_generator(tmp_path):
     old_tz = os.environ.get("TZ")
     try:
-        data = _load_generator().build(tmp_path)
+        built = _load_generator().build(tmp_path)
     finally:
         if old_tz is None:
             os.environ.pop("TZ", None)
         else:
             os.environ["TZ"] = old_tz
         time.tzset()
-    committed = json.loads((FIXTURE / "overview-7d.json").read_text())
-    data = json.loads(json.dumps(data, sort_keys=True))
-    data.pop("enabled", None)
-    committed.pop("enabled", None)
-    assert data == committed
+    for window, data in built.items():
+        committed = json.loads((FIXTURE / f"summary-{window}.json").read_text())
+        data = json.loads(json.dumps(data, sort_keys=True))
+        data.pop("enabled", None)
+        committed.pop("enabled", None)
+        assert data == committed, window

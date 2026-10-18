@@ -10,30 +10,36 @@ enum ActivityWindow: String, CaseIterable, Identifiable, Hashable, Sendable {
     var title: String { switch self { case .today: "Today"; case .week: "7 days"; case .month: "30 days" } }
     /// "Research was the busiest collection <span>."
     var span: String { switch self { case .today: "today"; case .week: "this week"; case .month: "in the last 30 days" } }
-    /// "… compared with <compared>"
-    var compared: String {
-        switch self {
-        case .today: "the same time yesterday"
-        case .week: "the previous week"
-        case .month: "the 30 days before"
-        }
-    }
+    /// "vs <previous>" under a tile.
+    var previous: String { switch self { case .today: "yesterday"; case .week: "last week"; case .month: "prior 30 days" } }
 }
 
-struct ActivityFile: Hashable, Sendable {
-    let path: String
-    let kind: String   // added | updated | removed
-    let at: Date
-    var name: String { (path as NSString).lastPathComponent }
-}
-
-struct ActivityChangeSilo: Identifiable, Hashable, Sendable {
-    let slug: String
+struct ActivityBucket: Identifiable, Hashable, Sendable {
+    let start: Date
     var added = 0, updated = 0, removed = 0
-    var previousTotal = 0
-    var files: [ActivityFile] = []
-    var id: String { slug }
-    var total: Int { added + updated + removed }
+    var searches = 0, noSource = 0
+    var id: Date { start }
+    var changes: Int { added + updated + removed }
+}
+
+/// One collection's numbers for the window, plus all-time last activity.
+struct ActivityCollectionStats: Hashable, Sendable {
+    var changes = 0
+    var searches = 0
+    var lastChange: Date?
+    var lastSearch: Date?
+    var openFailures = 0
+    var lastActivity: Date? { [lastChange, lastSearch].compactMap { $0 }.max() }
+}
+
+struct ActivityFailureGroup: Identifiable, Hashable, Sendable {
+    let slug: String
+    let errorClass: String
+    let files: Int
+    let occurrences: Int
+    let lastSeen: Date
+    let sampleError: String
+    var id: String { slug + "\u{0}" + errorClass }
 }
 
 struct ActivityCollectionEvent: Hashable, Sendable {
@@ -43,58 +49,9 @@ struct ActivityCollectionEvent: Hashable, Sendable {
     let at: Date
 }
 
-struct ActivityBucket: Identifiable, Hashable, Sendable {
-    let start: Date
-    var added = 0, updated = 0, removed = 0
-    var searches = 0, withoutSources = 0
-    var id: Date { start }
-}
-
-struct ActivitySearch: Identifiable, Hashable, Sendable {
-    let id: Int
-    let at: Date
-    let silo: String?
-    let query: String?
-    let sourcesFound: Bool
-    let client: String
-}
-
-struct ActivityUseSilo: Identifiable, Hashable, Sendable {
-    let slug: String
-    var searches = 0
-    var uniqueFiles = 0
-    var id: String { slug }
-}
-
-struct ActivityDocument: Identifiable, Hashable, Sendable {
-    let slug: String
-    let path: String
-    let searches: Int
-    var id: String { slug + "\u{0}" + path }
-    var name: String { (path as NSString).lastPathComponent }
-}
-
-struct ActivityFailureGroup: Identifiable, Hashable, Sendable {
-    let slug: String
-    let errorClass: String
-    var files = 0
-    var occurrences = 0
-    var sampleError = ""
-    var lastSeen: Date
-    var paths: [String] = []
-    var id: String { slug + "\u{0}" + errorClass }
-}
-
-struct ActivityQueryGroup: Identifiable, Hashable, Sendable {
-    let query: String
-    let silo: String?
-    var count = 0
-    var lastSeen: Date
-    var searchIDs: [Int] = []
-    var id: String { (silo ?? "") + "\u{0}" + query }
-}
-
-struct ActivityOverview: Hashable, Sendable {
+/// Aggregates only: size is O(collections + buckets), whatever the event volume.
+/// Rows behind a number come from the `ActivityLedger.changes/searches/…` detail reads.
+struct ActivitySummary: Hashable, Sendable {
     let window: ActivityWindow
     let periodStart: Date
     let periodEnd: Date
@@ -103,100 +60,130 @@ struct ActivityOverview: Hashable, Sendable {
     let filesSince: Date?
     let searchesSince: Date?
 
-    var changeTotals: (added: Int, updated: Int, removed: Int) = (0, 0, 0)
-    var previousChangeTotal = 0
-    var changeSilos: [ActivityChangeSilo] = []
-    var collections: [ActivityCollectionEvent] = []
-    var timeline: [ActivityBucket] = []
+    var added = 0, updated = 0, removed = 0
+    var previousChangeCount = 0
+    var searches = 0, previousSearchCount = 0
+    var noSource = 0, previousNoSourceCount = 0
+    var buckets: [ActivityBucket] = []
+    var perSilo: [String: ActivityCollectionStats] = [:]
+    var collectionEvents: [ActivityCollectionEvent] = []
+    var failures: [ActivityFailureGroup] = []
 
-    var searches: [ActivitySearch] = []
-    var previousSearches = 0
-    var useSilos: [ActivityUseSilo] = []
-    var topDocuments: [ActivityDocument] = []
-    var clients: [(name: String, searches: Int)] = []
-
-    var failureGroups: [ActivityFailureGroup] = []
-    var noSourceGroups: [ActivityQueryGroup] = []
-
-    var lastChange: [String: Date] = [:]
-    var lastSearch: [String: Date] = [:]
-    var openFailures: [String: Int] = [:]
-
+    var changes: Int { added + updated + removed }
     var fullFileComparison: Bool { filesSince.map { $0 <= previousStart } ?? false }
     var fullSearchComparison: Bool { searchesSince.map { $0 <= previousStart } ?? false }
-    var changeTotal: Int { changeTotals.added + changeTotals.updated + changeTotals.removed }
-    var searchCount: Int { searches.count }
-    var withSources: Int { searches.filter(\.sourcesFound).count }
-    var withoutSources: Int { searchCount - withSources }
+    /// Nil when the ledger's history does not cover the previous period.
+    var previousChanges: Int? { fullFileComparison ? previousChangeCount : nil }
+    var previousSearches: Int? { fullSearchComparison ? previousSearchCount : nil }
+    var previousNoSource: Int? { fullSearchComparison ? previousNoSourceCount : nil }
 
-    static func == (a: ActivityOverview, b: ActivityOverview) -> Bool {
-        a.window == b.window && a.periodEnd == b.periodEnd && a.searches == b.searches
-            && a.changeSilos == b.changeSilos && a.failureGroups == b.failureGroups
-            && a.previousSearches == b.previousSearches && a.previousChangeTotal == b.previousChangeTotal
-    }
+    func stats(_ slug: String) -> ActivityCollectionStats { perSilo[slug] ?? ActivityCollectionStats() }
 
-    func hash(into h: inout Hasher) {
-        h.combine(window); h.combine(periodEnd); h.combine(searches.count); h.combine(changeTotal)
-    }
-
-    /// Same templates as `activity_ledger.overview()["summary"]`; the shared
-    /// fixture test pins the wording on both sides.
-    func summary(name: (String?) -> String) -> (headline: String, sentences: [String]) {
-        var score: [String: Int] = [:]
-        for r in changeSilos { score[r.slug, default: 0] += r.total }
-        for r in useSilos { score[r.slug, default: 0] += r.searches }
-        let busiest = score.sorted { ($0.value, name($1.key)) > ($1.value, name($0.key)) }.first
-        let headline = busiest.map { $0.value > 0 } == true
-            ? "\(name(busiest!.key)) was the busiest collection \(window.span)."
-            : "No library activity \(window.span)."
-
-        var out: [String] = []
-        let n = changeTotal
-        if n > 0 {
-            let top = changeSilos.prefix(2).filter { $0.total > 0 }.map { name($0.slug) }
-            if changeSilos.count == 1 {
-                out.append("All \(n) document change\(n == 1 ? "" : "s") were in \(top[0]).")
-            } else {
-                out.append("Most document changes were in \(Self.list(top)).")
-            }
-        } else if !fullFileComparison, let since = filesSince, since > periodStart {
-            out.append("No document changes recorded since history began on \(Self.day(since)).")
-        } else {
-            out.append("No documents changed.")
+    /// Registered collections ordered by window activity, then name — the
+    /// collections table order and the busiest-collection rule, same as Python.
+    func ranked(_ collections: [(slug: String, name: String)]) -> [(slug: String, name: String)] {
+        collections.sorted {
+            let a = stats($0.slug), b = stats($1.slug)
+            let x = a.changes + a.searches, y = b.changes + b.searches
+            return x != y ? x > y : $0.name.lowercased() < $1.name.lowercased()
         }
-        for ev in collections where ev.added {
-            out.append("\(name(ev.slug)) was added with \(ev.files) file\(ev.files == 1 ? "" : "s").")
-        }
-        let s = searchCount
-        var line: String
-        if fullSearchComparison {
-            if s > previousSearches {
-                line = "Searches increased to \(s) from \(previousSearches) compared with \(window.compared)"
-            } else if s < previousSearches {
-                line = "Searches decreased to \(s) from \(previousSearches) compared with \(window.compared)"
-            } else {
-                line = "Searches held steady at \(s) compared with \(window.compared)"
-            }
-        } else {
-            line = "\(s) search\(s == 1 ? "" : "es") \(window.span)"
-        }
-        line += withoutSources > 0 ? "; \(withoutSources) returned no sources." : "."
-        out.append(line)
-        if !failureGroups.isEmpty {
-            let nf = failureGroups.reduce(0) { $0 + $1.files }
-            out.append("\(nf) file\(nf == 1 ? "" : "s") could not be indexed.")
-        }
-        return (headline, out)
     }
 
-    static func list(_ names: [String]) -> String {
-        guard names.count > 1 else { return names.joined() }
-        return names.dropLast().joined(separator: ", ") + " and " + names.last!
+    func headline(_ collections: [(slug: String, name: String)]) -> String {
+        if let top = ranked(collections).first, stats(top.slug).changes + stats(top.slug).searches > 0 {
+            return "\(top.name) was the busiest collection \(window.span)."
+        }
+        return "No library activity \(window.span)."
     }
+}
 
-    /// yyyy-MM-dd in the local time zone (matches Python's ISO date prefix).
-    static func day(_ d: Date, calendar: Calendar = .current) -> String {
-        let c = calendar.dateComponents([.year, .month, .day], from: d)
-        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+// MARK: detail rows
+
+struct ActivityChangeRow: Identifiable, Hashable, Sendable {
+    let id: Int
+    let at: Date
+    let slug: String
+    let path: String
+    let kind: String   // added | updated | removed
+    var name: String { (path as NSString).lastPathComponent }
+}
+
+struct ActivityHit: Hashable, Sendable {
+    let slug: String
+    let path: String
+    var name: String { (path as NSString).lastPathComponent }
+}
+
+struct ActivitySearchRow: Identifiable, Hashable, Sendable {
+    let id: Int
+    let at: Date
+    let slug: String?
+    let query: String?
+    let sourcesFound: Bool
+    let uniqueFiles: Int
+    let client: String
+    var hits: [ActivityHit] = []
+}
+
+struct ActivityDocumentRow: Identifiable, Hashable, Sendable {
+    let slug: String
+    let path: String
+    let searches: Int
+    var id: String { slug + "\u{0}" + path }
+    var name: String { (path as NSString).lastPathComponent }
+}
+
+struct ActivityFailureRow: Identifiable, Hashable, Sendable {
+    let id: Int
+    let slug: String
+    let path: String
+    let errorClass: String
+    let error: String
+    let lastSeen: Date
+    let occurrences: Int
+    var name: String { (path as NSString).lastPathComponent }
+}
+
+extension ActivityFailureGroup {
+    /// Plain-language cause for an `error_class` from activity_ledger.error_class().
+    static func reason(_ errorClass: String) -> String {
+        switch errorClass {
+        case "encrypted": return "encrypted or password-protected"
+        case "too_large": return "over the size limit"
+        case "unsupported": return "unsupported format"
+        case "timeout": return "timed out"
+        case "permission": return "permission denied"
+        case "no_text": return "no extractable text"
+        case "busy": return "index was busy"
+        case "not_found": return "file not found"
+        case "other": return "other error"
+        default: return errorClass
+        }
     }
+}
+
+// MARK: Activity page
+
+enum ActivityTab: String, CaseIterable, Identifiable, Hashable, Sendable {
+    case searches, changes, problems
+    var id: String { rawValue }
+    var title: String { switch self { case .searches: "Searches"; case .changes: "Changes"; case .problems: "Problems" } }
+}
+
+/// Rows for the Activity page's current tab and filters.
+struct ActivityDetail: Sendable {
+    var searches: [ActivitySearchRow] = []
+    var documents: [ActivityDocumentRow] = []
+    var clients: [(name: String, searches: Int)] = []
+    var changes: [ActivityChangeRow] = []
+    var failures: [ActivityFailureRow] = []
+    /// False when there is no ledger (or it could not be read).
+    var available = true
+}
+
+struct ActivityDetailRequest: Hashable, Sendable {
+    let window: ActivityWindow
+    let tab: ActivityTab
+    let silo: String?
+    let noSourceOnly: Bool
 }
