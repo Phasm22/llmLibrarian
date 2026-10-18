@@ -130,6 +130,7 @@ llmli schema   # self-describing CLI surface
 
 ```bash
 pal ls --status
+pal activity --window 7d   # what changed / was searched / needs attention (private silos: counts only)
 pal inspect <silo> --top 20
 llmli status --json
 llmli repair-ladder

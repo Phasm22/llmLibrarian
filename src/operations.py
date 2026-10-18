@@ -304,8 +304,10 @@ def op_repair_silo(db_path: str, slug_or_name: str, verbose: bool = True) -> dic
 
     from chroma_lock import chroma_exclusive_lock
 
+    from activity_ledger import origin as activity_origin
+
     try:
-        with chroma_exclusive_lock(db_path):
+        with chroma_exclusive_lock(db_path), activity_origin("repair"):
             if verbose:
                 print(f"[repair] Wiping ChromaDB chunks for silo '{slug}'...")
             try:
@@ -400,13 +402,16 @@ def op_rehydrate_registry(
         if verbose:
             print(f"[rehydrate] Re-indexing silo '{slug}' from '{source_path}'...")
         try:
-            files_ok, failures = run_add(
-                path=source_path,
-                db_path=db,
-                incremental=False,
-                forced_silo_slug=slug,
-                display_name_override=display_name,
-            )
+            from activity_ledger import origin as activity_origin
+
+            with activity_origin("rehydrate"):
+                files_ok, failures = run_add(
+                    path=source_path,
+                    db_path=db,
+                    incremental=False,
+                    forced_silo_slug=slug,
+                    display_name_override=display_name,
+                )
             rows.append(
                 {
                     "slug": slug,

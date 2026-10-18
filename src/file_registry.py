@@ -115,10 +115,15 @@ def _write_file_manifest(db_path: str | Path, data: dict) -> None:
 
 def _update_file_manifest(db_path: str | Path, update_fn: Any) -> None:
     path = _file_manifest_path(db_path)
+    from activity_ledger import manifest_signature, record_manifest_change
+
     with _registry_lock(path):
         manifest = _read_file_manifest(db_path)
+        before = manifest_signature(manifest)
         update_fn(manifest)
         _write_file_manifest(db_path, manifest)
+        # Inside the lock so concurrent writers' diffs are recorded in write order.
+        record_manifest_change(db_path, before, manifest_signature(manifest))
 
 
 def manifest_file_entry(

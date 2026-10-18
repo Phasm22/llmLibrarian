@@ -3767,6 +3767,69 @@ def private_command(
     _exit(_run_llmli(args))
 
 
+activity_app = typer.Typer(
+    help="Library activity over Today / 7 days / 30 days: what changed, what was searched, what needs attention.",
+    add_completion=False,
+    invoke_without_command=True,
+)
+app.add_typer(activity_app, name="activity")
+
+
+@activity_app.callback()
+def activity_callback(
+    ctx: typer.Context,
+    window: str = typer.Option("7d", "--window", "-w", help="today, 7d, or 30d."),
+    silo: str | None = typer.Option(None, "--silo", help="Only this silo slug.", autocompletion=_complete_silo),
+    include_private: bool = typer.Option(
+        False, "--include-private", help="Show paths and query text for private silos (counts are always shown)."
+    ),
+    check_staleness: bool = typer.Option(
+        False, "--check-staleness", help="Walk source folders to flag silos falling behind (slower)."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit the overview as JSON."),
+) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    _ensure_src_on_path()
+    import activity_ledger
+
+    if window not in activity_ledger.WINDOWS:
+        print(f"--window must be one of: {', '.join(activity_ledger.WINDOWS)}", file=sys.stderr)
+        raise typer.Exit(code=2)
+    data = activity_ledger.overview(
+        _resolved_db_path(),
+        window,
+        silo=silo,
+        include_private=include_private,
+        check_staleness=check_staleness,
+    )
+    if as_json:
+        print(activity_ledger.to_json(data))
+        return
+    print(activity_ledger.format_overview(data))
+    if not data["enabled"]:
+        print("\nNote: the activity ledger is disabled (LLMLIBRARIAN_ACTIVITY).", file=sys.stderr)
+
+
+@activity_app.command("backfill", help="Import past searches from the query audit log into the activity ledger (idempotent).")
+def activity_backfill_command(as_json: bool = typer.Option(False, "--json", help="Emit the result as JSON.")) -> None:
+    _ensure_src_on_path()
+    import activity_ledger
+
+    result = activity_ledger.backfill_from_audit(_resolved_db_path())
+    if as_json:
+        print(json.dumps(result))
+        return
+    print(
+        f"Imported {result.get('imported', 0)} search(es)"
+        f" ({result.get('skipped_already_covered', 0)} already covered by the ledger)."
+    )
+    if result.get("searches_since"):
+        print(f"Search history now available since {result['searches_since']}.")
+    if result.get("status") != "ok":
+        raise typer.Exit(code=1)
+
+
 @app.command("queries", help="Audit past MCP queries: what was asked, of which silo, and which files answered.")
 def queries_command(
     limit: int = typer.Option(20, "--limit", "-n", min=1, help="Most recent records to show."),

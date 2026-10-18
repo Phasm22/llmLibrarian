@@ -4,7 +4,7 @@ type: reference
 globs:
   - "src/**/*.py"
   - "mcp_server.py"
-updated: 2026-10-10
+updated: 2026-10-18
 ---
 
 # Technical Reference
@@ -183,6 +183,33 @@ Requirements for standalone images:
 
 If `LLMLIBRARIAN_TRACE` is set, asks append JSON-lines traces.
 
+## Activity Ledger
+
+`src/activity_ledger.py` keeps a durable, time-ranged history in
+`<LLMLIBRARIAN_DB>/llmli_activity.sqlite3` (WAL, machine-local like the index).
+`pal activity [--window today|7d|30d] [--silo S] [--json]` reads it; the macOS
+Overview reads the same file.
+
+| Table | Written from | Notes |
+|---|---|---|
+| `file_events` | `file_registry._update_file_manifest` (diff before/after) | `added` / `updated` (hash change; mtime/size for zips) / `removed`; `origin` from `activity_ledger.origin()` |
+| `silo_events` | same | A silo key appearing or vanishing is one event, not N file events |
+| `failures` | `state.set_last_failures` / `append_last_failures` | One open row per (silo, path, error class); repeats bump `occurrences`; a later successful index sets `resolved_at` |
+| `searches` + `search_hits` | `mcp_server._emit_query_audit`, `llmli query` / `multi-query` | One row per request, one hit per **unique file**; `read_document` is not a search |
+
+Rules the overview relies on:
+
+- `repair` / `rehydrate` origins re-index existing files; they are excluded from Library changes.
+- "Sources found" means at least one file came back. It says nothing about answer quality.
+- `meta.files_since` / `meta.searches_since` mark where history begins; a comparison is
+  only reported when that precedes the previous period. `pal activity backfill` imports
+  past searches from `query-audit.jsonl` (file history cannot be reconstructed).
+- Private silos keep counts but lose paths and query text unless the caller names the
+  silo or passes `--include-private`.
+- `LLMLIBRARIAN_QUERY_AUDIT=0` still counts searches but stores no query text.
+- Writes never raise; `LLMLIBRARIAN_ACTIVITY=0` disables the ledger. Events older than
+  `LLMLIBRARIAN_ACTIVITY_RETENTION_DAYS` (default 180) are pruned once a day.
+
 ## Common Environment Variables
 
 - `LLMLIBRARIAN_DB`
@@ -193,6 +220,7 @@ If `LLMLIBRARIAN_TRACE` is set, asks append JSON-lines traces.
 - `LLMLIBRARIAN_MODEL_IDLE_UNLOAD_SECONDS` (MCP server drops cached embedding/rerank models after this long
   without use; default 900, `0` keeps them loaded)
 - `LLMLIBRARIAN_TRACE`
+- `LLMLIBRARIAN_ACTIVITY` / `LLMLIBRARIAN_ACTIVITY_RETENTION_DAYS` (activity ledger on/off; retention, default 180 days)
 - `LLMLIBRARIAN_RERANK`
 - `LLMLIBRARIAN_OCR_BACKEND`
 - `LLMLIBRARIAN_ARTIFACT_SILOS`
