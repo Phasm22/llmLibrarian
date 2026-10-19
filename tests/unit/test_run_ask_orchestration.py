@@ -33,6 +33,12 @@ class _NamedClient:
         return self._collections[kwargs["name"]]
 
 
+def _no_private_silos(monkeypatch) -> None:
+    """These tests assert where-clauses and answer text, not this machine's registry."""
+    monkeypatch.setattr("state.private_silo_slugs", lambda _db: [])
+    monkeypatch.setattr("state.private_filter_clause", lambda _db: None)
+
+
 def _patch_query_runtime(monkeypatch, mock_collection):
     monkeypatch.setattr("query.core.get_embedding_function", lambda **_kw: None)
     monkeypatch.setattr("query.core.get_client", lambda db_path: _DummyClient(mock_collection))
@@ -102,6 +108,7 @@ def test_run_ask_uses_image_vector_hits_to_pull_image_context(monkeypatch, mock_
     )
     monkeypatch.setattr("query.core.is_reranker_enabled", lambda: False)
     monkeypatch.setattr("query.core.get_query_options", lambda *_a, **_k: {})
+    _no_private_silos(monkeypatch)
 
     out = run_ask(archetype_id=None, query="black dog photo", no_color=True, use_reranker=False, quiet=True)
     assert "Ok" in out
@@ -754,6 +761,7 @@ def test_run_ask_code_language_year_scoped_bypasses_llm(monkeypatch, mock_collec
 
 def test_run_ask_code_activity_year_lookup_applies_code_year_source_filter(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
+    _no_private_silos(monkeypatch)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
     monkeypatch.setattr("query.core.resolve_subscope", lambda _q, _db, _gps: None)
     monkeypatch.setattr(
@@ -925,6 +933,7 @@ def test_run_ask_unified_balances_final_context_across_silos(monkeypatch, mock_c
 
 def test_run_ask_unified_analytical_fanout_groups_context_by_silo(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
+    _no_private_silos(monkeypatch)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
     monkeypatch.setattr("query.core.load_config", lambda _p=None: {"archetypes": {}, "query": {"auto_scope_binding": False}})
     monkeypatch.setattr("query.core.resolve_subscope", lambda _q, _db, _gps: None)
@@ -1280,6 +1289,7 @@ def test_run_ask_relevance_gate_allows_scoped_lookup_with_lexical_overlap(monkey
 
 def test_run_ask_quiet_omits_footer_and_sources(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
+    _no_private_silos(monkeypatch)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
     mock_collection.query_result = {
         "documents": [["alpha context"]],
@@ -2099,6 +2109,7 @@ def test_run_ask_measurement_intent_without_timing_short_circuits(monkeypatch, m
 
 def test_run_ask_uses_subscope_where_when_resolved(monkeypatch, mock_collection, mock_ollama):
     _patch_query_runtime(monkeypatch, mock_collection)
+    _no_private_silos(monkeypatch)
     monkeypatch.setattr("query.core.route_intent", lambda _q: INTENT_LOOKUP)
     monkeypatch.setattr(
         "query.core.resolve_subscope",
