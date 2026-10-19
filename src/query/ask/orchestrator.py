@@ -1315,7 +1315,12 @@ def execute_run_ask(
                     top_k=n_stage1,
                     lexical_phrases=_lexical_phrases,
                 )
-                per_intent_cap_dual = qc.max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
+                per_intent_cap_dual = qc.source_diversity_cap(
+                    intent,
+                    n_results,
+                    silo_scoped=bool(use_unified and explicit_silo and intent == INTENT_LOOKUP),
+                    default=MAX_CHUNKS_PER_FILE,
+                )
                 raw_docs_stream, raw_metas_stream, raw_dists_stream = qc.diversify_by_source(
                     docs,
                     metas,
@@ -1503,8 +1508,17 @@ def execute_run_ask(
             per_intent_cap = 3
             diversity_top_k = max(48, len(docs))
         else:
-            per_intent_cap = qc.max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
-            diversity_top_k = n_stage1 if unified_analytical_query else n_results
+            # Only an explicit --in lifts the cap; auto-bound and catalog-retry scopes are guesses.
+            per_intent_cap = qc.source_diversity_cap(
+                intent,
+                n_results,
+                silo_scoped=bool(use_unified and explicit_silo and intent == INTENT_LOOKUP),
+                default=MAX_CHUNKS_PER_FILE,
+            )
+            # Unscoped balancing happens after this. Cutting to n_results first
+            # can leave the silo cap with too few chunks to fill the request.
+            silo_balance = use_unified and explicit_silo is None and silo is None
+            diversity_top_k = n_stage1 if (unified_analytical_query or silo_balance) else n_results
         docs, metas, dists = qc.diversify_by_source(
             docs,
             metas,
@@ -1543,7 +1557,7 @@ def execute_run_ask(
                     docs,
                     metas,
                     dists,
-                    diversity_top_k,
+                    n_results,
                     max_per_silo=per_silo_cap,
                     silos=silo_cache,
                 )

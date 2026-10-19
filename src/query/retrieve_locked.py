@@ -140,13 +140,17 @@ def execute_retrieve_chroma_phase(
             lexical_phrases=_lexical_phrases,
             diagnostics=lexical_diag,
         )
+        scoped = bool(target_silo or source)
         per_cap = source_diversity_cap(
             intent,
             n_results,
-            silo_scoped=bool(target_silo),
+            silo_scoped=scoped,
             default=MAX_CHUNKS_PER_FILE,
         )
-        docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, n_results, max_per_source=per_cap)
+        # Unscoped calls still have a silo cap ahead. Cutting each stream to
+        # n_results first leaves that cap with too few chunks to fill the request.
+        stream_k = n_results if scoped else n_stage1
+        docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, stream_k, max_per_source=per_cap)
         docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
         docs_h, metas_h, dists_h = apply_tag_postfilter(docs_h, metas_h, dists_h, required_tags)
         return docs_h, metas_h, dists_h, _warn, method, lexical_diag
@@ -225,7 +229,8 @@ def execute_retrieve_chroma_phase(
                     retrieval_method = f"{retrieval_method}+image_rrf"
                 docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
 
-    if silo_slug is None:
+    # source= pins one file, so there is nothing for silo balancing to spread across.
+    if silo_slug is None and not source:
         per_silo_cap = n_results if explicit_image_query and image_search["status"] == "ok" else max_silo_chunks_for_intent(intent, 3)
         silo_cache = [str(((m or {}).get("silo") or "")) for m in metas]
         docs, metas, dists = diversify_by_silo(
