@@ -162,7 +162,7 @@ Common variables:
 | `LLMLIBRARIAN_DB` | Index directory (default `./my_brain_db`) |
 | `LLMLIBRARIAN_CHROMA_HOST` / `PORT` | Server mode → `pal chroma start` |
 | `LLMLIBRARIAN_MODEL` | Ollama model for `pal ask` |
-| `LLMLIBRARIAN_RERANK=1` | Optional reranker on CLI ask path |
+| `LLMLIBRARIAN_RERANK` | Cross-encoder rerank. On when installed; set `=0` to disable. HTTP MCP leaves it off until flipped. |
 
 ---
 

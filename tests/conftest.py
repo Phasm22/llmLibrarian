@@ -26,6 +26,9 @@ os.environ["LLMLIBRARIAN_ENV_BOOTSTRAPPED"] = "1"
 # audit trail; test_query_audit.py re-enables it against tmp paths.
 os.environ["LLMLIBRARIAN_QUERY_AUDIT"] = "0"
 os.environ["LLMLIBRARIAN_ACTIVITY"] = "0"
+# Reranking is on whenever sentence-transformers imports. Pin it off so the
+# suite never loads the cross-encoder, including once retrieval calls it.
+os.environ["LLMLIBRARIAN_RERANK"] = "0"
 # The MCP result cache would let one test's stubbed retrieval answer another
 # call with the same arguments. Off by default; test_mcp_result_cache.py turns it on.
 os.environ["LLMLIBRARIAN_MCP_RESULT_CACHE_SECONDS"] = "0"

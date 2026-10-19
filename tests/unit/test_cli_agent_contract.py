@@ -222,7 +222,11 @@ def test_query_parses_meta_filters(monkeypatch):
     assert args.query == ["dinner", "ideas"]
 
 
-def test_query_emits_json_chunks(monkeypatch, capsys):
+def test_query_emits_json_chunks(monkeypatch, capsys, tmp_path):
+    # cmd_query records the search in the activity ledger next to LLMLIBRARIAN_DB.
+    # Without a temp db, a suite run that re-enables the ledger writes
+    # llmli_activity.sqlite3 into the checkout.
+    monkeypatch.setenv("LLMLIBRARIAN_DB", str(tmp_path / "db"))
     monkeypatch.setattr(
         "query.core.run_retrieve",
         lambda **kwargs: {
