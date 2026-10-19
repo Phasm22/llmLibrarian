@@ -314,7 +314,6 @@ def execute_retrieve_chroma_phase(
             "mtime_iso": mtime_iso,
             "page": m.get("page"),
             "line_start": m.get("line_start"),
-            "chunk_index": m.get("chunk_index"),
             "record_type": m.get("record_type"),
             "source_modality": m.get("source_modality"),
             "summary_status": m.get("summary_status"),
@@ -322,6 +321,8 @@ def execute_retrieve_chroma_phase(
             "indexed_at": m.get("indexed_at"),
             "_signals": signals,
         }
+        if m.get("chunk_index") is not None:
+            chunk["chunk_index"] = m.get("chunk_index")
         fm_fields = frontmatter_fields_for_response(m)
         if fm_fields:
             chunk["metadata"] = fm_fields

@@ -163,7 +163,7 @@ Open-WebUI's own knowledge-base tools.
 
 | Option | Shape | Pros | Cons |
 |---|---|---|---|
-| A. `read_document` tool | `read_document(path, silo=None, start_chunk=0, max_chars=6000)` → chunks for that `source` ordered by `chunk_index`, joined; `next_start_chunk` for paging | Discoverable by name; one call answers "what does the README say"; works for PDFs/images (reads extracted text, not bytes) | New tool in the catalog (~1 KB of schema) |
+| A. `read_document` tool | `read_document(path, silo=None, cursor=None, max_chars=6000)` → the file's indexed text in order (`page`, then `chunk_index` when the ingest wrote one, then `line_start`); `next_cursor` continues the page. `chunk_index` is written on new ingests and is absent on older chunks. | Discoverable by name; one call answers "what does the README say"; works for PDFs/images (reads extracted text, not bytes) | New tool in the catalog (~1 KB of schema) |
 | B. `source=` on `query_personal_knowledge` | adds `{"source": path}` to the where-clause (`retrieve_locked.py:72-86`) | Tiny change; semantic ranking *within* one file | A small model won't infer that `source=` means "read this file" |
 
 **Recommend both**, A as the documented next step. Hard requirements: resolve

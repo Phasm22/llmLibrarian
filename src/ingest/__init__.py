@@ -491,6 +491,7 @@ def _chunk_metadata_only(
         "is_local": _is_local(source_path),
         "doc_type": "other",
         "content_extracted": 0,
+        "chunk_index": 0,
     }
     if file_hash:
         meta["file_hash"] = file_hash
@@ -649,6 +650,7 @@ def _chunks_from_content(
             "doc_type": doc_type,
             "content_extracted": 1 if content_extracted else 0,
             "section": section,
+            "chunk_index": i,
         }
         if file_hash:
             meta["file_hash"] = file_hash
@@ -727,6 +729,7 @@ def _chunks_from_image_result(
             "needs_vision_enrichment": bool(base_meta.get("needs_vision_enrichment")),
             "summary_status": base_meta.get("summary_status"),
             "chunk_hash": _chunk_hash(summary_text),
+            "chunk_index": 0,
         }
     )
     summary_meta = {k: v for k, v in summary_meta.items() if v is not None}
@@ -750,6 +753,7 @@ def _chunks_from_image_result(
                 "needs_vision_enrichment": bool(region.needs_vision_enrichment),
                 "summary_status": base_meta.get("summary_status"),
                 "chunk_hash": _chunk_hash(doc),
+                "chunk_index": idx,
             }
         )
         region_extra = dict(region.meta or {})
@@ -797,6 +801,8 @@ def _image_vector_from_chunks(
         "image_embedding_backend": image_embedding_backend_name(),
         "needs_vision_enrichment": meta.get("needs_vision_enrichment"),
         "summary_status": meta.get("summary_status"),
+        "chunk_index": meta.get("chunk_index"),
+        "chunk_hash": meta.get("chunk_hash"),
         "is_local": meta.get("is_local"),
     }
     vector_meta.update({field: meta.get(field) for field in PHOTO_METADATA_FIELDS})
@@ -846,6 +852,7 @@ def _chunks_from_csv_text(
             "is_local": _is_local(source_path),
             "doc_type": "other",
             "content_extracted": 1,
+            "chunk_index": len(out),
         }
         if file_hash:
             meta["file_hash"] = file_hash
@@ -1152,6 +1159,7 @@ def _chunks_from_pdf_pages(
                         meta["file_hash"] = file_hash
                     if page_extra_meta:
                         meta.update(page_extra_meta)
+                    meta["chunk_index"] = len(out)
                     out.append((chunk_id, doc, meta))
                 continue
         chunk_id = _stable_chunk_id(source_path, mtime, page_num)
@@ -1170,6 +1178,7 @@ def _chunks_from_pdf_pages(
             meta["file_hash"] = file_hash
         if page_extra_meta:
             meta.update(page_extra_meta)
+        meta["chunk_index"] = len(out)
         out.append((chunk_id, page_text, meta))
     return out
 

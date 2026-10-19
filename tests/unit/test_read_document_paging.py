@@ -28,7 +28,7 @@ def _text_doc(lines: int = 120) -> str:
 
 def _rows_from_ingest(text: str, source: str = "/notes/long.txt") -> list[tuple[str, dict]]:
     rows = [(doc, meta) for _cid, doc, meta in _chunks_from_content("f", text, source, 1.0)]
-    assert len(rows) > 3 and all("chunk_index" not in m for _d, m in rows)
+    assert [m["chunk_index"] for _d, m in rows] == list(range(len(rows)))
     random.Random(3).shuffle(rows)
     return rows
 
