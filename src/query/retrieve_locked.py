@@ -32,6 +32,7 @@ from query.retrieval import (
     source_diversity_cap,
 )
 from processors import PHOTO_METADATA_FIELDS
+from reranker import rerank_head, rerank_head_size
 from frontmatter import frontmatter_fields_for_response
 from query.meta_filters import (
     apply_tag_postfilter,
@@ -73,8 +74,18 @@ def execute_retrieve_chroma_phase(
     tags: str | list[str] | None = None,
     course: str | None = None,
     era: str | None = None,
+    rerank_status: str = "disabled",
 ) -> dict:
     _gc = get_chroma_client or get_client
+    rerank_diag: dict[str, Any] = {"status": rerank_status}
+
+    def _note_rerank(diag: dict[str, Any]) -> None:
+        # One block per call: raw and artifact streams each rerank their own head.
+        failed = rerank_diag.get("status") == "failed" or diag["status"] == "failed"
+        rerank_diag.update({k: v for k, v in diag.items() if k not in ("candidates", "elapsed_ms")})
+        rerank_diag["candidates"] = rerank_diag.get("candidates", 0) + diag["candidates"]
+        rerank_diag["elapsed_ms"] = round(rerank_diag.get("elapsed_ms", 0.0) + diag.get("elapsed_ms", 0.0), 1)
+        rerank_diag["status"] = "failed" if failed else "applied"
     ef = get_embedding_function(batch_size=1)
     client = _gc(str(db))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
@@ -124,7 +135,13 @@ def execute_retrieve_chroma_phase(
         metas_h: list[dict | None],
         dists_h: list[float | None],
     ) -> tuple[list[str], list[dict | None], list[float | None]]:
-        """Placeholder until bounded rerank runs here. Identity until then."""
+        """Score a bounded head, then leave the tail in retrieval order for diversity."""
+        if rerank_status != "eligible" or not docs_h:
+            return docs_h, metas_h, dists_h
+        docs_h, metas_h, dists_h, diag = rerank_head(
+            query, docs_h, metas_h, dists_h, rerank_head_size(n_results)
+        )
+        _note_rerank(diag)
         return docs_h, metas_h, dists_h
 
     def _query_stream(
@@ -317,6 +334,7 @@ def execute_retrieve_chroma_phase(
         "silo_filter": silo_slug,
         "retrieval_method": retrieval_method,
         "lexical_retrieval": lexical_retrieval,
+        "rerank": rerank_diag,
         "image_search": image_search,
         "chunks": chunks,
     }

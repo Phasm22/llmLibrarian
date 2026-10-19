@@ -544,6 +544,7 @@ def run_multi_query(
 ) -> dict[str, Any]:
     """CLI/MCP-shared multi-query merge without importing mcp_server."""
     from query.core import annotate_write_state, run_retrieve
+    from query.multi_merge import merge_query_results
 
     meta = {
         "category": category,
@@ -556,8 +557,8 @@ def run_multi_query(
         "era": era,
         "source": source,
     }
-    seen: set[str] = set()
-    all_chunks: list[dict] = []
+    per_query: list[tuple[str, list[dict]]] = []
+    reranked = False
     errors: list[str] = []
     busy = False
     write_states: list[dict] = []
@@ -580,21 +581,15 @@ def run_multi_query(
                 write_states.append(res["write_in_progress"])
             if res.get("deterministic_intent") and not deterministic_intent:
                 deterministic_intent = res["deterministic_intent"]
-            for chunk in res.get("chunks", []):
-                key = (chunk.get("text") or "")[:200]
-                if key and key not in seen:
-                    seen.add(key)
-                    tagged = dict(chunk)
-                    tagged["query"] = q
-                    all_chunks.append(tagged)
+            per_query.append((q, res.get("chunks", [])))
+            reranked = reranked or (res.get("rerank") or {}).get("status") == "applied"
         except Exception as e:
             if is_lock_timeout(e):
                 busy = True
             errors.append(f"{q!r}: {type(e).__name__}: {e}")
-    all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
-    truncated = len(all_chunks) > max_total_chunks
-    if truncated:
-        all_chunks = all_chunks[:max_total_chunks]
+    all_chunks, truncated, merge_method = merge_query_results(
+        per_query, max_total_chunks, reranked=reranked
+    )
     from ingest_journal import merge_write_states
 
     merged_write = merge_write_states(write_states)
@@ -603,6 +598,7 @@ def run_multi_query(
         "queries": queries,
         "total_chunks": len(all_chunks),
         "truncated": truncated,
+        "merge_method": merge_method,
         "chunks": all_chunks,
     }
     if errors:

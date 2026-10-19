@@ -729,11 +729,12 @@ def execute_run_ask(
 
     n_effective = qc.effective_k(intent, n_results)
     if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE, INTENT_ACADEMIC_HISTORY):
-        n_stage1 = max(n_effective, RERANK_STAGE1_N if use_reranker else 60)
+        n_stage1 = max(n_effective, 60)
     elif intent == INTENT_REFLECT:
         n_stage1 = n_effective
     else:
-        n_stage1 = RERANK_STAGE1_N if use_reranker else min(100, max(n_results * 5, 60))
+        n_stage1 = min(100, max(n_results * 5, 60))
+    n_stage1 = max(n_stage1, n_results)
 
     hybrid_used = False
     query_for_retrieval = (scope_cleaned_query or query).strip()
@@ -1432,9 +1433,11 @@ def execute_run_ask(
             metas = [metas[i] if i < len(metas) else None for i in order]
             dists = [dists[i] if i < len(dists) else None for i in order]
         
-        # Skip reranker when query mentions specific years so year-boosted order is preserved into diversify
-        if use_reranker and docs and not mentioned_years:
-            docs, metas, dists = qc.rerank_chunks(query, docs, metas, dists, top_k=n_results, force=True)
+        # Skip the cross-encoder when the query names a year so the year-boosted order survives.
+        if docs and qc.rerank_decision(query, use_reranker) == "eligible":
+            docs, metas, dists, _rerank_diag = qc.rerank_head(
+                query, docs, metas, dists, qc.rerank_head_size(n_results)
+            )
         else:
             # Heuristic: prefer README/overview chunks for overview queries; preserve year order when years mentioned
             q_lower = query.lower()

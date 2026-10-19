@@ -92,6 +92,7 @@ def run_retrieve(
     tags: str | list[str] | None = None,
     course: str | None = None,
     era: str | None = None,
+    use_reranker: bool | None = None,
 ) -> dict:
     """
     Return raw retrieved chunks with metadata — no LLM synthesis.
@@ -110,6 +111,8 @@ def run_retrieve(
     short-circuit could only ever return nothing. The routed intent is kept as
     ``deterministic_intent`` so the caller can point at the tool that answers the
     inventory-style reading of the question.
+    use_reranker overrides the LLMLIBRARIAN_RERANK policy for this call; the
+    result's ``rerank`` block says whether the cross-encoder ran.
     """
     db = str(db_path or DB_PATH)
     intent = route_intent(query)
@@ -141,14 +144,19 @@ def run_retrieve(
                 "chunks": [],
             }
 
-    use_reranker = is_reranker_enabled()
+    if use_reranker is None:
+        use_reranker = is_reranker_enabled()
+    rerank_status = rerank_decision(query, use_reranker)
     n_effective = effective_k(intent, n_results)
+    # Stage one does not shrink when the reranker is on: it scores a bounded head
+    # and the rest of the pool stays available for diversity.
     if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE, INTENT_ACADEMIC_HISTORY):
-        n_stage1 = max(n_effective, RERANK_STAGE1_N if use_reranker else 60)
+        n_stage1 = max(n_effective, 60)
     elif intent == INTENT_REFLECT:
         n_stage1 = n_effective
     else:
-        n_stage1 = RERANK_STAGE1_N if use_reranker else min(100, max(n_results * 5, 60))
+        n_stage1 = min(100, max(n_results * 5, 60))
+    n_stage1 = max(n_stage1, n_results)
 
     query_for_retrieval = query.strip()
     if intent not in (INTENT_FIELD_LOOKUP, INTENT_CAPABILITIES, INTENT_CODE_LANGUAGE):
@@ -181,6 +189,7 @@ def run_retrieve(
             tags=tags,
             course=course,
             era=era,
+            rerank_status=rerank_status,
         )
     if deterministic_intent:
         result["deterministic_intent"] = deterministic_intent
