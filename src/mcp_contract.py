@@ -106,6 +106,17 @@ def empty_result_action(
                 "evidence of absence. Retry the same call once the rebuild finishes."
             ),
         }
+    section_filter = result.get("section_filter") or {}
+    if section_filter and not section_filter.get("matched"):
+        return {
+            "tool": "retrieve_knowledge" if profile == "lite" else "query_personal_knowledge",
+            "args": {"query": query, **({"silo": silo} if silo else {})},
+            "reason": (
+                f"No matching passage is in a section named like {section_filter.get('section')!r}. "
+                "Retry once without section=; section names come from document headings "
+                "and a guessed name rarely matches."
+            ),
+        }
     alternative = deterministic_alternative(
         result.get("deterministic_intent"), query=query, silo=silo, profile=profile
     )

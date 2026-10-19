@@ -113,6 +113,20 @@ def execute_retrieve_chroma_phase(
             return {"$and": parts}
         return None
 
+    # section= is a substring match Chroma's where cannot express, so it filters each
+    # stream's stage-1 pool before diversity and the n_results cut. No match means no
+    # chunks: falling back to unfiltered results hands back text from other sections.
+    section_lower = (section or "").strip().lower()
+    section_stats = {"candidates": 0, "matched": 0}
+
+    def _apply_rerank(
+        docs_h: list[str],
+        metas_h: list[dict | None],
+        dists_h: list[float | None],
+    ) -> tuple[list[str], list[dict | None], list[float | None]]:
+        """Placeholder until bounded rerank runs here. Identity until then."""
+        return docs_h, metas_h, dists_h
+
     def _query_stream(
         target_silo: str | None,
     ) -> tuple[list[str], list[dict | None], list[float | None], str | None, str, dict[str, Any]]:
@@ -140,6 +154,16 @@ def execute_retrieve_chroma_phase(
             lexical_phrases=_lexical_phrases,
             diagnostics=lexical_diag,
         )
+        if section_lower:
+            section_stats["candidates"] += len(docs_h)
+            kept = [
+                (d, m, x) for d, m, x in zip(docs_h, metas_h, dists_h)
+                if section_lower in str((m or {}).get("section") or "").lower()
+            ]
+            section_stats["matched"] += len(kept)
+            docs_h, metas_h, dists_h = (list(col) for col in zip(*kept)) if kept else ([], [], [])
+        docs_h, metas_h, dists_h = apply_tag_postfilter(docs_h, metas_h, dists_h, required_tags)
+        docs_h, metas_h, dists_h = _apply_rerank(docs_h, metas_h, dists_h)
         scoped = bool(target_silo or source)
         per_cap = source_diversity_cap(
             intent,
@@ -152,7 +176,6 @@ def execute_retrieve_chroma_phase(
         stream_k = n_results if scoped else n_stage1
         docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, stream_k, max_per_source=per_cap)
         docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
-        docs_h, metas_h, dists_h = apply_tag_postfilter(docs_h, metas_h, dists_h, required_tags)
         return docs_h, metas_h, dists_h, _warn, method, lexical_diag
 
     # Report the path actually taken; this used to be a constant "hybrid_or_vector",
@@ -176,7 +199,7 @@ def execute_retrieve_chroma_phase(
 
     image_search: dict[str, Any] = {"attempted": False, "status": "not_applicable", "matches": 0}
     explicit_image_query = _query_explicitly_requests_image(query)
-    if _query_is_image_relevant(query, docs, metas):
+    if not section_lower and _query_is_image_relevant(query, docs, metas):
         image_search["attempted"] = True
         image_adapter = get_image_embedding_adapter()
         if image_adapter is None:
@@ -236,15 +259,6 @@ def execute_retrieve_chroma_phase(
         docs, metas, dists = diversify_by_silo(
             docs, metas, dists, n_results, max_per_silo=per_silo_cap, silos=silo_cache
         )
-
-    if section:
-        section_lower = section.lower()
-        filtered = [
-            (d, m, dist) for d, m, dist in zip(docs, metas, dists)
-            if section_lower in (m or {}).get("section", "").lower()
-        ]
-        if filtered:
-            docs, metas, dists = zip(*filtered)
 
     chunks = []
     for rank, (doc, meta, dist) in enumerate(zip(docs, metas, dists), start=1):
@@ -328,6 +342,8 @@ def execute_retrieve_chroma_phase(
         }
     if _silo_warning:
         result["silo_warning"] = _silo_warning
+    if section_lower and not section_stats["matched"]:
+        result["section_filter"] = {"section": section, **section_stats}
 
     if intent == INTENT_TAX_QUERY:
         try:
