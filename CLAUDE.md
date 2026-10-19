@@ -83,7 +83,7 @@ macos/build.sh --install       # builds macos/build/llmLibrarian.app and replace
 | `LLMLIBRARIAN_CHROMA_HOST` / `PORT` | HTTP to `chroma run` |
 | `LLMLIBRARIAN_MODEL` | Ollama model for ask (default `qwen3.5:9b`) |
 | `LLMLIBRARIAN_VISION_MODEL` | Vision-capable Ollama model used when image vision is enabled (default `qwen3.5:9b`) |
-| `LLMLIBRARIAN_RERANK=1` | Cross-encoder rerank (CLI ask) |
+| `LLMLIBRARIAN_RERANK` | Cross-encoder rerank. On when `sentence-transformers` imports; set `=0` to disable. Ask uses it; the HTTP server ships with `=0` in `.env.mcp`. |
 | `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` | MCP embedded reader restart (default on in mcp_server) |
 | `LLMLIBRARIAN_MCP_PRIVATE_READS` | `named` (default) or `none`: when `none`, read tools refuse private silos unless allow-listed; rosters hide unreadable private rows |
 | `LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW` | Comma-separated private slugs readable (and listable) on both full and lite endpoints |

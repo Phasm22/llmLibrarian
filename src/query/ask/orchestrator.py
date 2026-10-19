@@ -46,6 +46,30 @@ for _sym in (
     globals()[_sym] = getattr(qc, _sym)
 
 
+def _unscoped_privacy_note(db_path: str) -> str:
+    """Same sentence MCP puts on an unscoped query, for the ask answer text."""
+    try:
+        from state import private_silo_slugs
+
+        skipped = private_silo_slugs(db_path)
+    except Exception:
+        return ""
+    if not skipped:
+        return ""
+    return (
+        "Unscoped query: "
+        + ", ".join(skipped)
+        + " were not searched because they are marked private. If the question is "
+        "actually about one of them, pass --in <slug> or run `pal ask --in <slug>`."
+    )
+
+
+def _append_privacy_note(text: str, note: str) -> str:
+    if not note or note in text:
+        return text
+    return text.rstrip() + "\n\n" + note
+
+
 def _apply_context_budget(
     docs: list[str],
     metas: list[dict | None],
@@ -187,6 +211,16 @@ def execute_run_ask(
     academic_identity_name = str(query_opts.get("user_name") or "").strip() or None
     direct_canonical_available = False
     explicit_silo = silo
+    # A named --in is the consent signal. Auto-binding and catalog retry set `silo`
+    # later; they must not be treated as the caller naming a private silo.
+    privacy_note = _unscoped_privacy_note(db) if use_unified and explicit_silo is None else ""
+    if privacy_note:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\n"
+            + privacy_note
+            + " Do not treat their absence as evidence that nothing relevant exists."
+        )
     scope_binding_reason: str | None = None
     scope_binding_confidence: float | None = None
     scope_bound_slug: str | None = None
@@ -1078,6 +1112,16 @@ def execute_run_ask(
             where_parts.append({"silo": silo})
         elif subscope_where:
             where_parts.append(subscope_where)
+        if use_unified and not silo and explicit_silo is None:
+            # Unscoped ask used to query with where=None, so private silos (tax,
+            # lab results) reached the answer context. MCP retrieval already
+            # applies this clause; the CLI path has to as well. A catalog
+            # sub-scope is not consent, so it keeps the exclusion too.
+            from state import private_filter_clause
+
+            private_clause = private_filter_clause(db)
+            if private_clause is not None:
+                where_parts.append(private_clause)
         if code_year_where:
             where_parts.append(code_year_where)
         if len(where_parts) == 1:
@@ -1623,7 +1667,10 @@ def execute_run_ask(
                 lines = [text, "", qc.dim(no_color, "---"), qc.label_style(no_color, f"Answered by: {source_label}")]
                 return "\n".join(lines)
             if use_unified:
-                return f"No indexed content for {source_label}. Run: llmli add <path>"
+                return _append_privacy_note(
+                    f"No indexed content for {source_label}. Run: llmli add <path>",
+                    privacy_note,
+                )
             return f"No indexed content for {source_label}. Run: index --archetype {archetype_id}"
         
         if code_activity_year_lookup and code_activity_requested_year is not None:
@@ -2017,7 +2064,7 @@ def execute_run_ask(
         _mark_stage("answer_postprocess")
         
         if quiet:
-            return answer
+            return _append_privacy_note(answer, privacy_note)
         
         out = [
             answer,
@@ -2077,4 +2124,4 @@ def execute_run_ask(
             slowest_stage=slowest_stage,
             slowest_stage_ms=slowest_stage_ms,
         )
-        return "\n".join(out)
+        return _append_privacy_note("\n".join(out), privacy_note)

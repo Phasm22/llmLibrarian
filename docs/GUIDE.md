@@ -163,7 +163,7 @@ Common variables:
 | `LLMLIBRARIAN_CHROMA_HOST` / `PORT` | Server mode → `pal chroma start` |
 | `LLMLIBRARIAN_MODEL` | Ollama model for `pal ask` (default `qwen3.5:9b`) |
 | `LLMLIBRARIAN_VISION_MODEL` | Vision-capable model used only when image vision is enabled (default `qwen3.5:9b`) |
-| `LLMLIBRARIAN_RERANK=1` | Optional reranker on CLI ask path |
+| `LLMLIBRARIAN_RERANK` | Cross-encoder rerank. On when installed; set `=0` to disable. HTTP MCP leaves it off until flipped. |
 
 ---
 

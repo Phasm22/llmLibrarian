@@ -236,7 +236,7 @@ Rules the overview relies on:
   without use; default 900, `0` keeps them loaded)
 - `LLMLIBRARIAN_TRACE`
 - `LLMLIBRARIAN_ACTIVITY` / `LLMLIBRARIAN_ACTIVITY_RETENTION_DAYS` (activity ledger on/off; retention, default 180 days)
-- `LLMLIBRARIAN_RERANK`
+- `LLMLIBRARIAN_RERANK` — cross-encoder rerank. On when `sentence-transformers` imports (a core dependency); set `0` to disable. Ask reranks; `.env.mcp` keeps the HTTP server at `0` until that is flipped on purpose.
 - `LLMLIBRARIAN_OCR_BACKEND`
 - `LLMLIBRARIAN_ARTIFACT_SILOS`
 - `LLMLIBRARIAN_ARTIFACT_MAX_FACTS`

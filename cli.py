@@ -349,7 +349,24 @@ def cmd_ask(args: argparse.Namespace) -> int:
             return busy_rc
         return _emit_result(args, error_payload(str(e)))
     if _wants_json(args):
-        return _emit_result(args, ok_payload({"answer": out, "silo": silo_slug, "query": query}))
+        body: dict = {"answer": out, "silo": silo_slug, "query": query}
+        if not silo_slug:
+            try:
+                from state import private_silo_slugs
+
+                skipped = private_silo_slugs(_db_path(args))
+            except Exception:
+                skipped = []
+            if skipped:
+                body["excluded_private_silos"] = skipped
+                body["privacy_note"] = (
+                    "Unscoped query: "
+                    + ", ".join(skipped)
+                    + " were not searched because they are marked private. If the user's "
+                    "question is actually about one of them, pass --in <slug> or tell them "
+                    "to run `pal ask --in <slug>` locally."
+                )
+        return _emit_result(args, ok_payload(body))
     print(out)
     return 0
 
