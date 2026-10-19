@@ -1533,7 +1533,8 @@ def query_personal_knowledge(
     Pass section= to restrict to a document section.
     Pass doc_type= to restrict by file type.
     Pass source= (a path or unique filename from `find_files`) to search inside one
-    file; use `read_document` to read it start to finish instead.
+    file; use `read_document` to read it start to finish instead. To read around one
+    chunk, call read_document(path=its source, cursor=its read_cursor).
     Metadata filters (from frontmatter indexed as Chroma metadata — reindex the silo
     after upgrading for these to take effect):
       category / main_protein / course / era — exact match
@@ -3251,16 +3252,19 @@ def read_document(
     silo: str | None = None,
     start_chunk: int = 0,
     max_chars: int = 6000,
+    cursor: str | None = None,
 ) -> dict:
     """
     Use when: you have a file path (from `find_files`, a chunk's source, or the user) and need to read that file, not search for an answer.
     Do not use when: you are looking for which file answers a question (`query_personal_knowledge`), or searching inside one file for a passage (`query_personal_knowledge` with source=).
-    Pairs with: `find_files` before it; call again with next_start_chunk to keep reading.
+    Pairs with: `find_files` before it; call again with cursor=next_cursor to keep reading.
 
     Returns the file's indexed text in document order, up to max_chars (default
     6000, max 20000), with overlapping chunk seams removed. path may be a full path
-    or a bare filename if it is unique. When more remains, next_start_chunk is set:
-    pass it as start_chunk to continue. Reads the index, not the disk, so PDFs and
+    or a bare filename if it is unique. When more remains, next_cursor is set: pass
+    it back as cursor to continue with nothing skipped or repeated. A retrieval
+    chunk's read_cursor, passed as cursor with that chunk's source, starts reading
+    one chunk before it. Reads the index, not the disk, so PDFs and
     images come back as their extracted text. A private silo's file opens only when
     its exact slug is passed as silo.
     """
@@ -3291,13 +3295,22 @@ def read_document(
                 silo=str(slug),
                 source=str(resolved),
                 start_chunk=start_chunk,
+                cursor=cursor,
                 max_chars=max_chars,
             )
+        if result.get("error"):
+            if result.get("cursor_stale"):
+                result["recommended_action"] = {
+                    "tool": "read_document",
+                    "args": {"path": str(resolved), **({"silo": silo} if silo else {})},
+                    "reason": "The file changed since this cursor was issued. Read it again from the start.",
+                }
+            return result
         _emit_query_audit(
             tool="read_document",
             queries=[str(resolved)],
             silo=slug,
-            params={"start_chunk": start_chunk, "max_chars": max_chars},
+            params={"start_chunk": start_chunk, "cursor": cursor, "max_chars": max_chars},
             chunks=[{"source": resolved, "silo": slug}] * max(0, result["end_chunk"] - result["start_chunk"]),
             outcome={},
         )

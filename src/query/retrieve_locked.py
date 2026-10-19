@@ -33,6 +33,7 @@ from query.retrieval import (
 )
 from processors import PHOTO_METADATA_FIELDS
 from reranker import rerank_head, rerank_head_size
+from document_read import anchor_cursor
 from frontmatter import frontmatter_fields_for_response
 from query.meta_filters import (
     apply_tag_postfilter,
@@ -326,6 +327,8 @@ def execute_retrieve_chroma_phase(
             chunk["metadata"] = fm_fields
         if photo_metadata:
             chunk["photo_metadata"] = photo_metadata
+        if m.get("chunk_hash"):
+            chunk["read_cursor"] = anchor_cursor(str(m["chunk_hash"]))
         chunks.append(chunk)
 
     result: dict = {

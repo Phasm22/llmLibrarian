@@ -194,7 +194,7 @@ def apply_guidance(
 # Per-chunk fields a model reads to answer and cite. Everything else (rank,
 # per-chunk confidence, chunk_index, record_type, indexed_at, _signals) is
 # pipeline state; explain_retrieval still returns the signals.
-_CHUNK_FIELDS = ("text", "score", "source", "silo", "doc_type", "section", "page", "line_start", "mtime_iso", "query")
+_CHUNK_FIELDS = ("text", "score", "source", "silo", "doc_type", "section", "page", "line_start", "mtime_iso", "query", "read_cursor")
 _IMAGE_FIELDS = ("source_modality", "summary_status")
 
 
