@@ -711,7 +711,7 @@ def _compute_answer_confidence(chunks: list[dict]) -> tuple[str, float, str]:
     scores = [c["score"] for c in chunks[:10] if c.get("score") is not None]
     if not scores:
         return "low", 0.0, "no chunks returned"
-    top = scores[0]
+    top = max(scores)
     mean = sum(scores) / len(scores)
     high_count = sum(1 for s in scores if s >= 0.5)
     sources = len({c.get("source", "") for c in chunks[:10]})
@@ -1606,8 +1606,9 @@ def query_personal_knowledge(
                 **meta_params,
             )
             chunks = result.get("chunks", [])
-            # Lexical-leg diagnostics belong to explain_retrieval; keep this payload slim.
+            # Lexical-leg and rerank diagnostics belong to explain_retrieval; keep this payload slim.
             result.pop("lexical_retrieval", None)
+            result.pop("rerank", None)
 
             _emit_usage_event("usage.llmlibrarian.query", {"silo": silo or "unscoped"})
 
@@ -1698,9 +1699,11 @@ def multi_query_knowledge(
 
     Call this when a task needs multiple angles of context from personal knowledge.
     Fire multiple semantic queries and return merged, deduplicated chunks ranked
-    by best score. Use when a topic requires several retrieval angles — for example,
+    by best score (merge_method="score_sort"), or, when the cross-encoder reordered
+    any sub-query, by reciprocal-rank fusion of each query's order
+    (merge_method="rrf"). Use when a topic requires several retrieval angles — for example,
     to cover the user's thinking on related topics in one call instead of many.
-    Each chunk is tagged with the query that retrieved it. Pass section= to restrict
+    Each chunk is tagged with the query that retrieved it (the one that ranked it best under rrf). Pass section= to restrict
     all queries to a document section. Pass doc_type= to restrict by file type
     (e.g. 'transcript', 'resume', 'tax_return', 'code', 'other').
     Metadata filters (same as query_personal_knowledge; applied to every sub-query):
@@ -1738,8 +1741,10 @@ def multi_query_knowledge(
     }
 
     def _compute() -> tuple[dict, dict]:
-        seen: set[str] = set()
-        all_chunks: list[dict] = []
+        from query.multi_merge import merge_query_results
+
+        per_query: list[tuple[str, list[dict]]] = []
+        reranked = False
         errors: list[str] = []
         busy = False
         write_states: list[dict] = []
@@ -1761,21 +1766,16 @@ def multi_query_knowledge(
                     write_states.append(res["write_in_progress"])
                 if res.get("deterministic_intent") and not deterministic_intent:
                     deterministic_intent = res["deterministic_intent"]
-                for chunk in res.get("chunks", []):
-                    key = (chunk.get("text") or "")[:200]
-                    if key and key not in seen:
-                        seen.add(key)
-                        chunk["query"] = q
-                        all_chunks.append(chunk)
+                per_query.append((q, res.get("chunks", [])))
+                reranked = reranked or (res.get("rerank") or {}).get("status") == "applied"
             except Exception as e:
                 if _is_lock_timeout(e):
                     busy = True
                     _HEALTH.set("degraded", _HEALTH_CHROMA_BUSY)
                 errors.append(f"{q!r}: {type(e).__name__}: {e}")
-        all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
-        truncated = len(all_chunks) > max_total_chunks
-        if truncated:
-            all_chunks = all_chunks[:max_total_chunks]
+        all_chunks, truncated, merge_method = merge_query_results(
+            per_query, max_total_chunks, reranked=reranked
+        )
 
         # Feature 6: answer-level confidence on merged results
         conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
@@ -1816,6 +1816,7 @@ def multi_query_knowledge(
             "queries": queries,
             "total_chunks": len(all_chunks),
             "truncated": truncated,
+            "merge_method": merge_method,
             "answer_confidence": conf_level,
             "answer_confidence_score": conf_score,
             "coverage_note": coverage_note,
@@ -2042,6 +2043,7 @@ def explain_retrieval(
                 **{k: guidance[k] for k in ("recommended_action", "alternative_tool") if guidance.get(k)},
                 "retrieval_method": method,
                 "lexical_terms": lexical_terms,
+                **({"rerank": result["rerank"]} if result.get("rerank") else {}),
                 "lexical_hit_count": len(lexical_hits),
                 "vector_only_chunk_count": len(vector_only_hits),
                 "chunk_with_vector_rank_count": with_vector_rank,
