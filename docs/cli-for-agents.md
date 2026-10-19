@@ -51,7 +51,7 @@ llmli find --in my-silo --name "README*" --json
 
 ```bash
 llmli read README.md --in my-silo
-# page with --start-chunk from next_start_chunk
+# page with --cursor from next_cursor
 ```
 
 ### Verify exclude violations

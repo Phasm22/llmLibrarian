@@ -17,7 +17,12 @@ class _Collection:
         return {"documents": [d for d, _m in page], "metadatas": [m for _d, m in page]}
 
 
-def test_trim_overlap_removes_repeated_seam():
+def test_long_line_overlap_is_trimmed():
+    """A seam longer than the old 400-char cap is still one copy, not two."""
+    line = "L" * 2500
+    previous = "intro\n" + line
+    following = line + "\nand the rest of the next chunk"
+    assert trim_overlap(previous, following) == "\nand the rest of the next chunk"
     seam = "gamma delta epsilon and the overlap"
     assert trim_overlap("alpha beta " + seam, seam + " zeta") == " zeta"
     # Under 20 characters a match is likely coincidence, so it is kept.

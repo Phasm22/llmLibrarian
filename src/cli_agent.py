@@ -326,6 +326,7 @@ def command_schema() -> dict[str, Any]:
                 {"name": "path", "type": "string", "required": True},
                 {"name": "--in", "type": "silo", "help": "exact slug for private silos"},
                 {"name": "--start-chunk", "type": "int", "default": 0},
+                {"name": "--cursor", "type": "str", "default": None},
                 {"name": "--max-chars", "type": "int", "default": 6000},
             ],
         },
