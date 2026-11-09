@@ -281,17 +281,18 @@ class StaticBearerTokenAuth(AuthProvider):
 
     Tokens are configured via LLMLIBRARIAN_MCP_AUTH_TOKEN(S) and carry
     ``read`` and/or ``write`` scopes. Auth is fail-closed for HTTP when
-    LLMLIBRARIAN_MCP_REQUIRE_AUTH is enabled (the default).
+    LLMLIBRARIAN_MCP_REQUIRE_AUTH is enabled (the default). Token matching
+    uses hmac.compare_digest against every configured caller.
     """
 
     def __init__(self, callers: list[mcp_http_security.CallerToken]):
         super().__init__(required_scopes=[])
         if not callers:
             raise RuntimeError("StaticBearerTokenAuth requires at least one token")
-        self._by_token = {c.token: c for c in callers}
+        self._callers = list(callers)
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        caller = self._by_token.get(token)
+        caller = mcp_http_security.find_caller_by_token(token, self._callers)
         if caller is None:
             return None
         return AccessToken(
@@ -311,7 +312,12 @@ def _auth_for_transport(transport: str) -> AuthProvider | None:
 
 
 def _install_write_scope_middleware() -> None:
-    """Hide/deny write-tagged tools unless the caller token has ``write`` scope."""
+    """Hide/deny write-tagged tools unless the caller token has ``write`` scope.
+
+    ENABLE_WRITE_TOOLS without auth is rejected at startup
+    (``validate_http_security_config``); this middleware only runs when both
+    auth and write tools are enabled.
+    """
     if not mcp_http_security.require_auth_enabled():
         return
     if not mcp_http_security.write_tools_enabled():
@@ -3585,8 +3591,8 @@ _apply_write_tool_policy()
 # not at import — otherwise list_tools() in-process would hide write tools
 # whenever auth defaults on and no request token is present.
 
-# Shared limiter for HTTP routes (keyed by bearer token, else client host).
-_HTTP_RATE_LIMITER = mcp_http_security.default_rate_limiter()
+# Shared limiters for HTTP routes (read_cheap 60/min, read_heavy 10/min).
+_HTTP_RATE_LIMITERS = mcp_http_security.default_cost_class_limiters()
 
 
 @mcp.resource("silos://list")
@@ -3665,7 +3671,7 @@ def _authorized_for_http_route(request: Request) -> bool:
         callers = mcp_http_security.load_caller_tokens()
     except RuntimeError:
         return False
-    return any(c.token == token for c in callers)
+    return mcp_http_security.find_caller_by_token(token, callers) is not None
 
 
 def _caller_scopes_for_request(request: Request) -> set[str]:
@@ -3677,10 +3683,8 @@ def _caller_scopes_for_request(request: Request) -> set[str]:
         callers = mcp_http_security.load_caller_tokens()
     except RuntimeError:
         return set()
-    for caller in callers:
-        if caller.token == token:
-            return set(caller.scopes)
-    return set()
+    caller = mcp_http_security.find_caller_by_token(token, callers)
+    return set(caller.scopes) if caller else set()
 
 
 @mcp.custom_route("/v1/capabilities", methods=["GET"], include_in_schema=False)
@@ -3719,12 +3723,29 @@ async def v1_capabilities(request: Request) -> Response:
     return JSONResponse(payload)
 
 
-def _known_auth_tokens() -> set[str]:
+def _known_auth_tokens() -> list[str]:
     """Configured bearer values used as rate-limit identities (never raw unknowns)."""
     try:
-        return {c.token for c in mcp_http_security.load_caller_tokens()}
+        return [c.token for c in mcp_http_security.load_caller_tokens()]
     except RuntimeError:
-        return set()
+        return []
+
+
+async def _receive_http_body(receive, *, max_bytes: int = 1_000_000) -> bytes:
+    """Buffer an ASGI HTTP request body (capped) so we can classify MCP calls."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        message = await receive()
+        if message["type"] != "http.request":
+            break
+        chunk = message.get("body") or b""
+        total += len(chunk)
+        if total <= max_bytes:
+            chunks.append(chunk)
+        if not message.get("more_body"):
+            break
+    return b"".join(chunks)
 
 
 class _HttpRateLimitMiddleware:
@@ -3732,11 +3753,17 @@ class _HttpRateLimitMiddleware:
 
     /healthz is exempt. Keyed by a verified bearer token when present, else
     client host — unknown Authorization values must not mint new buckets.
+    Enforces the advertised cost classes: read_heavy tools (RAG/vision) at
+    10/min, everything else at read_cheap 60/min.
     """
 
-    def __init__(self, app, limiter: mcp_http_security.SlidingWindowRateLimiter | None = None):
+    def __init__(
+        self,
+        app,
+        limiters: mcp_http_security.CostClassRateLimiters | None = None,
+    ):
         self.app = app
-        self.limiter = limiter or _HTTP_RATE_LIMITER
+        self.limiters = limiters or _HTTP_RATE_LIMITERS
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -3758,14 +3785,31 @@ class _HttpRateLimitMiddleware:
             client_host,
             known_tokens=_known_auth_tokens(),
         )
-        retry_after = self.limiter.check(key)
+
+        body_bytes = b""
+        cost_class = "read_cheap"
+        method = (scope.get("method") or "GET").upper()
+        if method in {"POST", "PUT", "PATCH"}:
+            body_bytes = await _receive_http_body(receive)
+            tool_name = mcp_http_security.mcp_tool_name_from_jsonrpc(body_bytes)
+            cost_class = mcp_http_security.tool_cost_class(tool_name)
+
+            async def replay_receive():
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+
+            receive = replay_receive
+
+        retry_after = self.limiters.check(key, cost_class)
         if retry_after is None:
             await self.app(scope, receive, send)
             return
 
         body, status, extra_headers = mcp_http_security.error_v1(
             code="rate_limited",
-            message="llmlibrarian MCP: per-caller rate limit exceeded",
+            message=(
+                f"llmlibrarian MCP: {cost_class} rate limit exceeded "
+                f"({mcp_http_security.RATE_LIMITS.get(cost_class, {}).get('per_caller_per_min', '?')}/min)"
+            ),
             http_status=429,
             retryable=True,
             retry_after_s=retry_after,
@@ -3791,7 +3835,7 @@ def _client_app_name() -> str | None:
 
 def _wrap_http_app(app):
     """Attach HTTP rate limiting. Path prefixes are routing only, not auth."""
-    return _HttpRateLimitMiddleware(app, _HTTP_RATE_LIMITER)
+    return _HttpRateLimitMiddleware(app, _HTTP_RATE_LIMITERS)
 
 
 def _serve_http(transport: str) -> None:
@@ -3807,13 +3851,14 @@ def _serve_http(transport: str) -> None:
     log_level = os.environ.get("LLMLIBRARIAN_MCP_LOG_LEVEL", "warning")
     stateless_http = _env_bool("LLMLIBRARIAN_MCP_STATELESS_HTTP", True)
     lite_mount = os.environ.get("LLMLIBRARIAN_MCP_LITE_PATH", "").strip()
+    # Fail closed on unsafe combos before binding.
+    mcp_http_security.validate_http_security_config(host)
     if host.strip() in {"0.0.0.0", "::", "*"}:
         print(
             "[llmLibrarian] WARNING: LLMLIBRARIAN_MCP_HOST binds all interfaces. "
             "Public exposure (Funnel/port-forward) is not supported; prefer "
             "127.0.0.1 plus an explicit LAN/tailnet bind only when needed. "
-            "Auth is required by default — keep LLMLIBRARIAN_MCP_REQUIRE_AUTH=true "
-            "and never rely on a secret URL path.",
+            "Auth is required — never rely on a secret URL path.",
             file=sys.stderr,
         )
     try:

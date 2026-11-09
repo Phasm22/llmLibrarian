@@ -267,9 +267,12 @@ def test_rate_limit_middleware_emits_error_v1(monkeypatch):
         return PlainTextResponse("ok")
 
     monkeypatch.setenv("LLMLIBRARIAN_MCP_AUTH_TOKEN", "r1")
-    limiter = sec.SlidingWindowRateLimiter(limit=1, window_s=60.0)
+    limiters = sec.CostClassRateLimiters(
+        read_cheap=sec.SlidingWindowRateLimiter(limit=1, window_s=60.0),
+        read_heavy=sec.SlidingWindowRateLimiter(limit=10, window_s=60.0),
+    )
     app = mcp_server._HttpRateLimitMiddleware(
-        Starlette(routes=[Route("/mcp", ok)]), limiter
+        Starlette(routes=[Route("/mcp", ok)]), limiters
     )
     with TestClient(app) as client:
         first = client.get("/mcp", headers={"Authorization": "Bearer r1"})
@@ -289,6 +292,83 @@ def test_rate_limit_middleware_emits_error_v1(monkeypatch):
     # /healthz is exempt even when the route is missing on this stub app —
     # middleware must not 429 it; Starlette returns 404 which is fine.
     assert health.status_code in {200, 404}
+
+
+def test_rate_limit_middleware_enforces_read_heavy_tool_class(monkeypatch):
+    from starlette.applications import Starlette
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    import mcp_http_security as sec
+    import mcp_server
+
+    async def ok(_request):
+        return PlainTextResponse("ok")
+
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_AUTH_TOKEN", "heavy-tok")
+    limiters = sec.CostClassRateLimiters(
+        read_cheap=sec.SlidingWindowRateLimiter(limit=60, window_s=60.0),
+        read_heavy=sec.SlidingWindowRateLimiter(limit=2, window_s=60.0),
+    )
+    app = mcp_server._HttpRateLimitMiddleware(
+        Starlette(routes=[Route("/mcp", ok, methods=["POST"])]), limiters
+    )
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "query_personal_knowledge", "arguments": {"query": "x"}},
+    }
+    with TestClient(app) as client:
+        headers = {"Authorization": "Bearer heavy-tok"}
+        assert client.post("/mcp", headers=headers, json=payload).status_code == 200
+        assert client.post("/mcp", headers=headers, json=payload).status_code == 200
+        limited = client.post("/mcp", headers=headers, json=payload)
+        # A cheap tools/list must not share the heavy bucket.
+        cheap = client.post(
+            "/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        )
+    assert limited.status_code == 429
+    assert "read_heavy" in limited.json()["error"]["message"]
+    assert cheap.status_code == 200
+
+
+def test_refuse_write_tools_without_auth(monkeypatch):
+    import mcp_http_security as sec
+
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_REQUIRE_AUTH", "false")
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS", "true")
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_HOST", "127.0.0.1")
+    with pytest.raises(RuntimeError, match="ENABLE_WRITE_TOOLS=true requires"):
+        sec.validate_http_security_config("127.0.0.1")
+
+
+def test_refuse_auth_off_on_non_loopback(monkeypatch):
+    import mcp_http_security as sec
+
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_REQUIRE_AUTH", "false")
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS", "false")
+    with pytest.raises(RuntimeError, match="only allowed when"):
+        sec.validate_http_security_config("0.0.0.0")
+    with pytest.raises(RuntimeError, match="only allowed when"):
+        sec.validate_http_security_config("192.168.1.10")
+    # Loopback + auth off + writes off is the trusted local escape hatch.
+    sec.validate_http_security_config("127.0.0.1")
+
+
+def test_token_compare_is_constant_time_helper():
+    import mcp_http_security as sec
+
+    callers = [
+        sec.CallerToken("a", "alpha-token-value-0001", ("read",)),
+        sec.CallerToken("b", "beta-token-value-00002", ("read", "write")),
+    ]
+    assert sec.find_caller_by_token("beta-token-value-00002", callers).client_id == "b"
+    assert sec.find_caller_by_token("nope", callers) is None
+    assert sec.constant_time_token_match("alpha-token-value-0001", [c.token for c in callers])
 
 
 def test_env_example_auth_tokens_json_is_shell_safe():

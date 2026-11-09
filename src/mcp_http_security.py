@@ -9,6 +9,7 @@ supported; bind 127.0.0.1 by default.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import threading
@@ -45,11 +46,12 @@ READ_TOOL_NAMES: tuple[str, ...] = (
     "capabilities",
 )
 
-# Cost classes advertised in /v1/capabilities (service-endpoint standard).
-_RATE_LIMITS = {
+# Cost classes advertised in /v1/capabilities and enforced by the HTTP middleware.
+RATE_LIMITS = {
     "read_cheap": {"per_caller_per_min": 60, "burst": 20},
     "read_heavy": {"per_caller_per_min": 10, "burst": 5},
 }
+_RATE_LIMITS = RATE_LIMITS  # backward-compatible alias for callers/tests
 
 _TOOL_COST_CLASS = {
     "query_personal_knowledge": "read_heavy",
@@ -75,6 +77,56 @@ def require_auth_enabled() -> bool:
 def write_tools_enabled() -> bool:
     """Write MCP tools stay off unless the operator opts in."""
     return env_bool("LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS", False)
+
+
+def is_loopback_bind(host: str) -> bool:
+    """True for loopback-only bind addresses (trusted local testing)."""
+    return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def validate_http_security_config(host: str | None = None) -> None:
+    """Refuse unsafe HTTP combinations before the server binds.
+
+    - Write tools require auth (scope middleware is a no-op when auth is off).
+    - Auth may only be disabled on a loopback bind.
+    """
+    bind_host = (host if host is not None else os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1"))
+    bind_host = (bind_host or "127.0.0.1").strip()
+    auth_on = require_auth_enabled()
+    writes_on = write_tools_enabled()
+    if writes_on and not auth_on:
+        raise RuntimeError(
+            "LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS=true requires "
+            "LLMLIBRARIAN_MCP_REQUIRE_AUTH=true. Write tools without auth would "
+            "be exposed to every caller that can reach the socket."
+        )
+    if not auth_on and not is_loopback_bind(bind_host):
+        raise RuntimeError(
+            "LLMLIBRARIAN_MCP_REQUIRE_AUTH=false is only allowed when "
+            f"LLMLIBRARIAN_MCP_HOST is loopback (got {bind_host!r}). "
+            "Use 127.0.0.1/localhost/::1 for trusted local testing, or keep auth on."
+        )
+
+
+def constant_time_token_match(candidate: str, known_tokens: Iterable[str]) -> bool:
+    """True if candidate equals any known token (hmac.compare_digest)."""
+    matched = False
+    cand = candidate or ""
+    for token in known_tokens:
+        # Always run the compare so timing does not short-circuit on the first hit.
+        if hmac.compare_digest(cand, token or ""):
+            matched = True
+    return matched
+
+
+def find_caller_by_token(candidate: str, callers: Iterable[CallerToken]) -> CallerToken | None:
+    """Return the matching CallerToken using constant-time compares."""
+    matched: CallerToken | None = None
+    cand = candidate or ""
+    for caller in callers:
+        if hmac.compare_digest(cand, caller.token or ""):
+            matched = caller
+    return matched
 
 
 @dataclass(frozen=True)
@@ -231,16 +283,17 @@ class StaticBearerTokenAuth:
 
     Constructed lazily so mcp_server can subclass/wrap FastMCP's AuthProvider
     without importing heavy auth stacks at module import for every unit test.
+    Lookup uses hmac.compare_digest against every configured token.
     """
 
     def __init__(self, callers: Iterable[CallerToken], *, required_scopes: list[str] | None = None):
-        self._by_token = {c.token: c for c in callers}
-        if not self._by_token:
+        self._callers = list(callers)
+        if not self._callers:
             raise RuntimeError("StaticBearerTokenAuth requires at least one token")
         self.required_scopes = required_scopes or []
 
     def lookup(self, token: str) -> CallerToken | None:
-        return self._by_token.get(token)
+        return find_caller_by_token(token, self._callers)
 
 
 class SlidingWindowRateLimiter:
@@ -319,13 +372,53 @@ def rate_limit_key_from_authorization(
     unknown Authorization values fall back to the client host so failed-auth
     floods cannot mint unbounded buckets or bypass the IP throttle.
     """
-    known = set(known_tokens or ())
+    known = list(known_tokens or ())
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
-        if token and token in known:
+        if token and constant_time_token_match(token, known):
             return f"token:{token}"
     host = (client_host or "").strip() or "unknown"
     return f"ip:{host}"
+
+
+def tool_cost_class(tool_name: str | None) -> str:
+    """Cost class for a tool name (default read_cheap)."""
+    if not tool_name:
+        return "read_cheap"
+    return _TOOL_COST_CLASS.get(tool_name, "read_cheap")
+
+
+def mcp_tool_name_from_jsonrpc(body: bytes | str | None) -> str | None:
+    """Best-effort tool name from a JSON-RPC tools/call body."""
+    if not body:
+        return None
+    try:
+        raw = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else body
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("method") != "tools/call":
+        return None
+    params = payload.get("params") or {}
+    if not isinstance(params, dict):
+        return None
+    name = params.get("name")
+    return str(name) if name else None
+
+
+@dataclass
+class CostClassRateLimiters:
+    """Separate sliding windows for read_cheap vs read_heavy (as advertised)."""
+
+    read_cheap: SlidingWindowRateLimiter
+    read_heavy: SlidingWindowRateLimiter
+
+    def check(self, key: str, cost_class: str, *, now: float | None = None) -> float | None:
+        if cost_class == "read_heavy":
+            return self.read_heavy.check(key, now=now)
+        return self.read_cheap.check(key, now=now)
 
 
 def error_v1(
@@ -414,5 +507,20 @@ def capabilities_manifest(
 
 
 def default_rate_limiter() -> SlidingWindowRateLimiter:
+    """Legacy single-window helper (read_cheap). Prefer default_cost_class_limiters()."""
     cheap = _RATE_LIMITS["read_cheap"]["per_caller_per_min"]
     return SlidingWindowRateLimiter(limit=int(cheap), window_s=60.0)
+
+
+def default_cost_class_limiters() -> CostClassRateLimiters:
+    """Limiters matching the advertised /v1/capabilities rate_limits table."""
+    return CostClassRateLimiters(
+        read_cheap=SlidingWindowRateLimiter(
+            limit=int(_RATE_LIMITS["read_cheap"]["per_caller_per_min"]),
+            window_s=60.0,
+        ),
+        read_heavy=SlidingWindowRateLimiter(
+            limit=int(_RATE_LIMITS["read_heavy"]["per_caller_per_min"]),
+            window_s=60.0,
+        ),
+    )
