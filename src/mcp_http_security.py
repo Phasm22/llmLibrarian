@@ -244,37 +244,85 @@ class StaticBearerTokenAuth:
 
 
 class SlidingWindowRateLimiter:
-    """Per-caller sliding window limiter. Returns retry_after_s when limited."""
+    """Per-caller sliding window limiter. Returns retry_after_s when limited.
 
-    def __init__(self, *, limit: int = 60, window_s: float = 60.0):
+    Idle buckets are dropped once their window expires. ``max_keys`` caps how
+    many distinct caller keys can be retained so a flood of unique identities
+    cannot grow memory without bound.
+    """
+
+    def __init__(
+        self,
+        *,
+        limit: int = 60,
+        window_s: float = 60.0,
+        max_keys: int = 1024,
+    ):
         self.limit = max(1, int(limit))
         self.window_s = float(window_s)
+        self.max_keys = max(1, int(max_keys))
         self._events: dict[str, list[float]] = {}
         self._lock = threading.Lock()
+
+    def _prune_bucket(self, bucket: list[float], cutoff: float) -> None:
+        i = 0
+        while i < len(bucket) and bucket[i] <= cutoff:
+            i += 1
+        if i:
+            del bucket[:i]
+
+    def _evict_idle(self, cutoff: float) -> None:
+        stale = [key for key, bucket in self._events.items() if not bucket or bucket[-1] <= cutoff]
+        for key in stale:
+            self._events.pop(key, None)
 
     def check(self, key: str, *, now: float | None = None) -> float | None:
         """Return None if allowed, else seconds until the caller may retry."""
         ts = time.monotonic() if now is None else now
         cutoff = ts - self.window_s
         with self._lock:
-            bucket = self._events.setdefault(key, [])
-            # Drop expired.
-            i = 0
-            while i < len(bucket) and bucket[i] <= cutoff:
-                i += 1
-            if i:
-                del bucket[:i]
+            self._evict_idle(cutoff)
+            bucket = self._events.get(key)
+            if bucket is None:
+                if len(self._events) >= self.max_keys:
+                    # Prefer dropping the oldest idle/least-recent key rather
+                    # than allocating unbounded maps under spoofed identities.
+                    oldest_key = min(
+                        self._events.items(),
+                        key=lambda item: item[1][-1] if item[1] else 0.0,
+                    )[0]
+                    self._events.pop(oldest_key, None)
+                bucket = []
+                self._events[key] = bucket
+            else:
+                self._prune_bucket(bucket, cutoff)
             if len(bucket) >= self.limit:
                 retry_after = max(1.0, self.window_s - (ts - bucket[0]))
                 return retry_after
             bucket.append(ts)
             return None
 
+    def known_keys(self) -> set[str]:
+        with self._lock:
+            return set(self._events)
 
-def rate_limit_key_from_authorization(authorization: str | None, client_host: str | None) -> str:
+
+def rate_limit_key_from_authorization(
+    authorization: str | None,
+    client_host: str | None,
+    *,
+    known_tokens: Iterable[str] | None = None,
+) -> str:
+    """Build a limiter key.
+
+    Only **verified** bearer tokens become ``token:…`` keys. Arbitrary /
+    unknown Authorization values fall back to the client host so failed-auth
+    floods cannot mint unbounded buckets or bypass the IP throttle.
+    """
+    known = set(known_tokens or ())
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
-        if token:
+        if token and token in known:
             return f"token:{token}"
     host = (client_host or "").strip() or "unknown"
     return f"ip:{host}"

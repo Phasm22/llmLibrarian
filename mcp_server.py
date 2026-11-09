@@ -3719,10 +3719,19 @@ async def v1_capabilities(request: Request) -> Response:
     return JSONResponse(payload)
 
 
+def _known_auth_tokens() -> set[str]:
+    """Configured bearer values used as rate-limit identities (never raw unknowns)."""
+    try:
+        return {c.token for c in mcp_http_security.load_caller_tokens()}
+    except RuntimeError:
+        return set()
+
+
 class _HttpRateLimitMiddleware:
     """ASGI middleware: 429 + Retry-After + error/v1 when a caller exceeds the window.
 
-    /healthz is exempt. Keyed by bearer token when present, else client host.
+    /healthz is exempt. Keyed by a verified bearer token when present, else
+    client host — unknown Authorization values must not mint new buckets.
     """
 
     def __init__(self, app, limiter: mcp_http_security.SlidingWindowRateLimiter | None = None):
@@ -3745,7 +3754,9 @@ class _HttpRateLimitMiddleware:
         client = scope.get("client")
         client_host = client[0] if client else None
         key = mcp_http_security.rate_limit_key_from_authorization(
-            headers.get("authorization"), client_host
+            headers.get("authorization"),
+            client_host,
+            known_tokens=_known_auth_tokens(),
         )
         retry_after = self.limiter.check(key)
         if retry_after is None:
