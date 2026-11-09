@@ -1549,11 +1549,11 @@ def _mcp_env_file_candidates() -> list[Path]:
 def _ensure_mcp_client_env() -> None:
     """Populate MCP client env vars from the server's .env.mcp when unset.
 
-    The MCP HTTP server may be mounted on a non-default URL path (e.g. a
-    secret path for funnel exposure) configured in .env.mcp. Without this
-    fallback a pal client in a fresh shell posts to the default /mcp, the
-    server responds 404 before reaching the tool layer, and the MCP client
-    surfaces the opaque error "Session terminated".
+    The MCP HTTP server may be mounted on a non-default URL path configured in
+    .env.mcp (routing only — not a security control). Without this fallback a
+    pal client in a fresh shell posts to the default /mcp, the server responds
+    404 before reaching the tool layer, and the MCP client surfaces the opaque
+    error "Session terminated".
     """
     if os.environ.get("LLMLIBRARIAN_MCP_URL") or os.environ.get("LLMLIBRARIAN_MCP_PATH"):
         return
@@ -1569,10 +1569,18 @@ def _ensure_mcp_client_env() -> None:
             continue
         for key, val in found.items():
             os.environ.setdefault(key, val)
-        require_auth = (parsed.get("LLMLIBRARIAN_MCP_REQUIRE_AUTH") or "").strip().lower() in {"1", "true", "yes", "on"}
-        auth_token = (parsed.get("LLMLIBRARIAN_MCP_AUTH_TOKEN") or "").strip()
-        if require_auth and auth_token:
-            os.environ.setdefault("LLMLIBRARIAN_MCP_BEARER_TOKEN", auth_token)
+        # Match server default: auth required unless explicitly disabled.
+        require_raw = parsed.get("LLMLIBRARIAN_MCP_REQUIRE_AUTH")
+        if require_raw is None:
+            require_auth = True
+        else:
+            require_auth = require_raw.strip().lower() in {"1", "true", "yes", "on"}
+        if require_auth:
+            from mcp_http_security import select_client_bearer_token
+
+            tok = select_client_bearer_token(parsed)
+            if tok:
+                os.environ.setdefault("LLMLIBRARIAN_MCP_BEARER_TOKEN", tok)
         return
 
 
@@ -1741,12 +1749,13 @@ def _mcp_path_mismatch_hint() -> str:
 
 def _mcp_missing_tool_hint(tool: str) -> str:
     return (
-        f"the MCP server at {_mcp_url()} does not expose {tool!r}. The write tools "
-        "(add_silo, trigger_reindex, repair_silo, update_file, remove_file) exist only "
-        "in the full profile; a server started with LLMLIBRARIAN_MCP_PROFILE=lite serves "
-        "only silo_roster, retrieve_knowledge, find_files, read_document, and ask_image. "
-        "Set lite only on a dedicated small-context client's process, not on the shared "
-        "server pal writes through."
+        f"the MCP server at {_mcp_url()} does not expose {tool!r}. Write tools "
+        "(add_silo, trigger_reindex, repair_silo, update_file, remove_file, "
+        "set_silo_privacy) are off by default — set LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS=true "
+        "and use a bearer token with the write scope. They also exist only in the full "
+        "profile; LLMLIBRARIAN_MCP_PROFILE=lite serves only silo_roster, retrieve_knowledge, "
+        "find_files, read_document, and ask_image. Do not point pal's shared write path "
+        "at a lite or read-only server."
     )
 
 

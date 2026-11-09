@@ -300,7 +300,9 @@ def test_lite_mount_serves_both_catalogs_and_pins_its_privacy_policy(monkeypatch
         "read_document",
         "ask_image",
     }
-    assert {"query_personal_knowledge", "update_file", "list_silos"} <= full
+    # Full mount stays read-only unless LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS=true.
+    assert {"query_personal_knowledge", "list_silos", "health"} <= full
+    assert "update_file" not in full
     assert "does not read private silos" in json.dumps(refused)
     assert healthz.status_code == 200
     # The macOS app shows the lite endpoint from this field.

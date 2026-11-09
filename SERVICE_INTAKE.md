@@ -90,7 +90,7 @@ This intake process determines whether a service is ready to be monitored. The g
 
 - **Success:** HTTP 200 on `/healthz` with `db_exists: true` and non-null `started_at`; MCP `health()` for silo audit, storage bloat, and `ingest_failures`.
 - **Silent failure risk:** **Low** for liveness (process down → healthz fails). **Medium** for functional health: `db_exists: false` on probe while process is up; broken embeddings or stale `mcp_server.py` vs packaged extension — use MCP `health()` and `pal extension pack`, not healthz alone.
-- **Failure from outside:** Connection refused; 401 if `LLMLIBRARIAN_MCP_REQUIRE_AUTH=true` without token; crash loop in journald; lock contention if a second HTTP instance tries to start.
+- **Failure from outside:** Connection refused; 401 without bearer when auth is on (default); refuse-to-start if auth is on and no token configured; crash loop in journald; lock contention if a second HTTP instance tries to start.
 
 #### Alerting
 
@@ -209,7 +209,7 @@ services:
 ## Open gaps (before alerting goes live)
 
 1. **`pal sync` command** — docs/warnings reference it for `__self__` staleness; monitoring should key off `ensure_self_silo` / registry mtime until a dedicated sync command exists.
-2. **Auth** — when `LLMLIBRARIAN_MCP_REQUIRE_AUTH=true`, health checks must send `Authorization: Bearer …` (same as `pal` watch mode).
+2. **Auth** — `LLMLIBRARIAN_MCP_REQUIRE_AUTH` defaults to `true` (fail closed). `/healthz` stays open without a token; MCP tool routes and `/v1/capabilities` require `Authorization: Bearer …` (same as `pal` watch mode).
 
 ### Watch JSON example (`batch_drain`)
 
