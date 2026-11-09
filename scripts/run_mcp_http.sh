@@ -21,12 +21,17 @@ export LLMLIBRARIAN_MCP_PORT="${LLMLIBRARIAN_MCP_PORT:-8765}"
 export LLMLIBRARIAN_MCP_PATH="${LLMLIBRARIAN_MCP_PATH:-/mcp}"
 export LLMLIBRARIAN_MCP_STATELESS_HTTP="${LLMLIBRARIAN_MCP_STATELESS_HTTP:-true}"
 export LLMLIBRARIAN_MCP_LOG_LEVEL="${LLMLIBRARIAN_MCP_LOG_LEVEL:-warning}"
-export LLMLIBRARIAN_MCP_REQUIRE_AUTH="${LLMLIBRARIAN_MCP_REQUIRE_AUTH:-false}"
+# Fail closed: auth on by default. Explicit false is for trusted loopback testing only.
+export LLMLIBRARIAN_MCP_REQUIRE_AUTH="${LLMLIBRARIAN_MCP_REQUIRE_AUTH:-true}"
+export LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS="${LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS:-false}"
 
 require_auth_lc="$(printf '%s' "$LLMLIBRARIAN_MCP_REQUIRE_AUTH" | tr '[:upper:]' '[:lower:]')"
-if [[ "$require_auth_lc" == "true" ]] && [[ -z "${LLMLIBRARIAN_MCP_AUTH_TOKEN:-}" ]]; then
-  echo "LLMLIBRARIAN_MCP_AUTH_TOKEN is required when LLMLIBRARIAN_MCP_REQUIRE_AUTH=true." >&2
-  exit 1
+if [[ "$require_auth_lc" == "true" || "$require_auth_lc" == "1" || "$require_auth_lc" == "yes" || "$require_auth_lc" == "on" ]]; then
+  if [[ -z "${LLMLIBRARIAN_MCP_AUTH_TOKEN:-}" && -z "${LLMLIBRARIAN_MCP_AUTH_TOKENS:-}" ]]; then
+    echo "Auth is required (default) but no token is configured." >&2
+    echo "Set LLMLIBRARIAN_MCP_AUTH_TOKEN or LLMLIBRARIAN_MCP_AUTH_TOKENS in $ENV_FILE." >&2
+    exit 1
+  fi
 fi
 
 # Prefer our renamed interpreter (see pal.py's _daemon_runtime_metadata) so

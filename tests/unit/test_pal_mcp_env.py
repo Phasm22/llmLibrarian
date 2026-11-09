@@ -92,6 +92,14 @@ def test_bearer_token_derived_from_auth_token_when_auth_required(monkeypatch, tm
     assert pal._mcp_bearer_token() == "tok-abc"
 
 
+def test_bearer_token_default_auth_on_when_require_auth_omitted(monkeypatch, tmp_path):
+    """Server defaults REQUIRE_AUTH=true; omitting the key in .env.mcp must still wire the token."""
+    env_file = _write_env_mcp(tmp_path, extra="LLMLIBRARIAN_MCP_AUTH_TOKEN=tok-default\n")
+    monkeypatch.setattr(pal, "_mcp_env_file_candidates", lambda: [env_file])
+
+    assert pal._mcp_bearer_token() == "tok-default"
+
+
 def test_no_bearer_token_when_auth_not_required(monkeypatch, tmp_path):
     env_file = _write_env_mcp(
         tmp_path,
@@ -136,6 +144,7 @@ def test_mcp_call_sync_diagnoses_lite_profile_missing_write_tool(monkeypatch):
     with pytest.raises(RuntimeError) as excinfo:
         pal._mcp_call_sync("add_silo", path="/tmp/x", confirm=True)
     msg = str(excinfo.value)
+    assert "LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS=true" in msg
     assert "LLMLIBRARIAN_MCP_PROFILE=lite" in msg
     assert "add_silo" in msg
 
@@ -239,6 +248,6 @@ def test_mcp_call_raises_tool_error_text(monkeypatch):
     monkeypatch.setattr(pal, "_mcp_url", lambda: f"http://127.0.0.1:{srv.server_port}/mcp")
     monkeypatch.setattr(pal, "_mcp_bearer_token", lambda: None)
 
-    with pytest.raises(RuntimeError, match="LLMLIBRARIAN_MCP_PROFILE=lite"):
+    with pytest.raises(RuntimeError, match="LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS=true"):
         pal._mcp_call_sync("add_silo", path="/tmp/x", confirm=True)
     srv.server_close()

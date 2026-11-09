@@ -114,12 +114,15 @@ Boolean variables accept `1`, `true`, `yes`, or `on` (case-insensitive).
 | Variable | Role |
 |----------|------|
 | `LLMLIBRARIAN_MCP_TRANSPORT` | `stdio` (default) or `streamable-http` |
-| `LLMLIBRARIAN_MCP_HOST` / `_PORT` / `_PATH` | Bind address and route for the HTTP service |
+| `LLMLIBRARIAN_MCP_HOST` / `_PORT` / `_PATH` | Bind address (default `127.0.0.1`) and route for the HTTP service. Path is routing only — not a security control. Public Funnel/port-forward exposure is not supported. |
 | `LLMLIBRARIAN_MCP_PROFILE` | `full` (default) or `lite`; `lite` exposes a compact catalog (`silo_roster`, `retrieve_knowledge`, `find_files`, `read_document`, `ask_image`) for small-context clients. Set it only on that client's dedicated MCP process. |
 | `LLMLIBRARIAN_MCP_PRIVATE_READS_ALLOW` | Optional comma-separated private silo slugs readable on both endpoints; with `named`, only these private silos open; with `none`, these override the blanket refusal. |
-| `LLMLIBRARIAN_MCP_REQUIRE_AUTH` | Require a static bearer token on HTTP transports |
-| `LLMLIBRARIAN_MCP_AUTH_TOKEN` | The bearer token. Used by the server *and* by the embedded-write guard's `/healthz` probe — without it that guard cannot identify an authenticated server. |
-| `LLMLIBRARIAN_MCP_BEARER_TOKEN` | Older client-side spelling, still written by `pal`; read as a fallback |
+| `LLMLIBRARIAN_MCP_REQUIRE_AUTH` | Require bearer auth on HTTP transports (**default `true`**, fail closed). `/healthz` stays open. |
+| `LLMLIBRARIAN_MCP_AUTH_TOKEN` | Single bearer token (default scope `read`). Used by the server *and* by the embedded-write guard's `/healthz` probe. |
+| `LLMLIBRARIAN_MCP_AUTH_TOKEN_SCOPES` | Scopes for the single token (`read` default; add `write` for operator tokens). |
+| `LLMLIBRARIAN_MCP_AUTH_TOKENS` | JSON map of per-caller tokens + scopes (preferred for Hermes/pal/mesh). |
+| `LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS` | Expose write tools (`add_silo`, …). Default `false`; also requires a token with `write` scope. |
+| `LLMLIBRARIAN_MCP_BEARER_TOKEN` | Client-side spelling written by `pal`; read as a fallback |
 | `LLMLIBRARIAN_MCP_URL` | Full MCP endpoint for `pal`'s client, overriding host/port/path |
 
 **Recovery / testing**

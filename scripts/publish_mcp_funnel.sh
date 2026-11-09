@@ -1,21 +1,10 @@
 #!/usr/bin/env bash
+# Historical helper. Public Funnel exposure of llmLibrarian MCP is not supported.
+# See docs/MCP_TAILSCALE_FUNNEL.md.
 set -euo pipefail
 
-PORT="${1:-8765}"
-
-if ! command -v tailscale >/dev/null 2>&1; then
-  echo "tailscale CLI not found." >&2
-  exit 1
-fi
-
-echo "Publishing local port $PORT with Tailscale Funnel..."
-if ! tailscale funnel --bg "$PORT"; then
-  echo
-  echo "Funnel could not be enabled automatically." >&2
-  echo "If prompted, enable Funnel in the Tailscale admin UI and rerun this script." >&2
-  exit 1
-fi
-
-echo
-echo "Current Funnel config:"
-tailscale funnel status
+echo "Refusing to publish llmLibrarian MCP via Tailscale Funnel." >&2
+echo "Public exposure is not supported; bind 127.0.0.1 with REQUIRE_AUTH=true." >&2
+echo "If Funnel is already enabled, run: tailscale funnel reset" >&2
+echo "Details: docs/MCP_TAILSCALE_FUNNEL.md" >&2
+exit 1

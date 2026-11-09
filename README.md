@@ -128,7 +128,7 @@ pal ls
 pal ask --in my-project "what is this repo about?"
 ```
 
-For **Cursor**, run the MCP server (`./scripts/run_mcp_http.sh`; see [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md#server-mode-the-supported-deployment)) and connect to `http://127.0.0.1:8765`. Call `list_silos` before trusting retrieval.
+For **Cursor**, run the MCP server (`./scripts/run_mcp_http.sh`; see [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md#server-mode-the-supported-deployment)) and connect to `http://127.0.0.1:8765/mcp` with a bearer token from `.env.mcp` (`LLMLIBRARIAN_MCP_REQUIRE_AUTH` defaults on; write tools stay off unless `LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS=true`). Call `list_silos` before trusting retrieval. Public Funnel exposure is not supported — [docs/MCP_TAILSCALE_FUNNEL.md](docs/MCP_TAILSCALE_FUNNEL.md).
 
 **Secrets:** do not commit API keys. Prefer `~/.config/llmLibrarian/.llmlibrarian.env` (mode `600`). Details in [docs/GUIDE.md](docs/GUIDE.md#configuration).
 
