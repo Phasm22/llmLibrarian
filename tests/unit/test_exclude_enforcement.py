@@ -55,7 +55,7 @@ def test_effective_excludes_merges_defaults_persisted_and_requested(tmp_path):
     assert "*.pdf" in eff
     assert "06-recipes-source/" in eff
     assert "pipeline/" in eff
-    assert "/much thinks/cortex/" in eff  # default
+    assert "/much thinks/intents/" in eff  # default
     # Empty requested keeps persisted
     assert "*.pdf" in effective_excludes(db, slug, [])
     assert "*.pdf" in effective_excludes(db, slug, None)

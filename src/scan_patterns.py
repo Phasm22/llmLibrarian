@@ -22,10 +22,11 @@ ADD_DEFAULT_INCLUDE = [
 ]
 
 ADD_DEFAULT_EXCLUDE = [
-    # journalLinker's intent pipeline writes its cortex to <journal_dir>/cortex, and the
-    # journal dir is "much thinks". Scoped to that run of segments: a bare "/cortex/"
-    # also hid hand-curated vault folders named cortex (resumes, plans, profiles).
-    "/much thinks/cortex/",
+    # journalLinker's intent pipeline writes its notes to <journal_dir>/intents, and the
+    # journal dir is "much thinks". Scoped to that run of segments: a bare "/intents/"
+    # (or "/cortex/") also hid hand-curated vault folders using those names (resumes,
+    # plans, profiles, the vault-root cortex bot hub).
+    "/much thinks/intents/",
     "node_modules/", ".venv/", "venv/", "env/", "__pycache__/", "vendor", "dist", "build", ".git",
     # Matching is by whole segment now, so build dirs and oddly named virtualenvs
     # that "build"/"venv" used to catch only as substrings are listed explicitly.
