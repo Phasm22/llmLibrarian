@@ -235,3 +235,15 @@ Rules the overview relies on:
 2. tests
 3. this file
 4. README examples
+
+## Image backend and failure parking
+
+**Contract.** Image embeddings need the `image` extra (`uv sync --extra image`). The backend is probed once at MCP startup and then every 5 minutes (`image_embeddings.image_backend_status`, cached). Ingest, `/healthz`, `health()`, and the watcher all read that one value.
+
+- `GET /healthz` adds `image_backend: "ok" | "missing"`. Existing fields are unchanged.
+- While `missing`, the HealthState is `degraded` with reason `image embeddings unavailable: run uv sync --extra image`.
+- `update_file` returns `{"status": "error", "reason": "image_backend_unavailable", "retryable": false, "message": ...}` for an image file, before taking the write lock.
+- Other `update_file` / `remove_file` failures return `reason: "index_error"` (or `"path_outside_silo"`) plus `error`/`message`, with no absolute path and no traceback. The full text stays in the local failure ledger.
+- `pal pull --watch` parks a non-retryable file instead of retrying it. It re-checks the backend every 5 minutes and re-queues parked images once `image_backend` is `ok`. A retryable failure is capped at 5 attempts, then parked until the file's mtime changes. An unreachable MCP is retried without a cap and without a failure record.
+
+**Ledger.** `failures` keeps one open row per (silo, path). A repeat report for the same `file_mtime` does not count again. A removed file resolves its row. A one-time migration adds `file_mtime` and resolves rows whose file is gone (only when the parent directory still exists).

@@ -181,12 +181,13 @@ def test_failures_group_by_silo_and_class_and_resolve_on_success(db):
     set_last_failures(db, [{"path": bad, "error": "PdfReadError: file has not been decrypted (encrypted)"}])
     append_last_failures(db, [{"path": f"{root}/big.csv", "error": "file too large"}])
 
+    # Two reports of the same attempt (same file version) count once.
     rows = _rows(db, "SELECT silo, path, error_class, occurrences FROM failures ORDER BY id")
-    assert rows == [("research-1", bad, "encrypted", 2), ("research-1", f"{root}/big.csv", "too_large", 1)]
+    assert rows == [("research-1", bad, "encrypted", 1), ("research-1", f"{root}/big.csv", "too_large", 1)]
 
     # The merged JSON list is rewritten on append, but only the new entry occurred now.
     append_last_failures(db, [{"path": f"{root}/other.md", "error": "Permission denied"}])
-    assert _rows(db, "SELECT occurrences FROM failures WHERE path=?", (bad,)) == [(2,)]
+    assert _rows(db, "SELECT occurrences FROM failures WHERE path=?", (bad,)) == [(1,)]
 
     _put(db, "research-1", root, {bad: "fixed"})
     assert _rows(db, "SELECT resolved_at IS NOT NULL FROM failures WHERE path=?", (bad,)) == [(1,)]

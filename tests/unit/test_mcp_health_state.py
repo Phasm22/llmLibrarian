@@ -7,6 +7,7 @@ from datetime import datetime
 
 import pytest
 
+import image_embeddings
 import mcp_server
 from mcp_server import HealthState
 
@@ -79,7 +80,9 @@ def test_emit_failure_is_swallowed():
 
 
 @pytest.fixture
-def health(monkeypatch, tmp_path):
+def health(monkeypatch, tmp_path, image_backend_ready):
+    # Pinned to an available backend so these transition tests are deterministic
+    # on torch-free runners; the missing-backend transition has its own test below.
     buf = io.StringIO()
     db = tmp_path / "db"
     db.mkdir()
@@ -87,6 +90,52 @@ def health(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_server, "_DB_PATH", str(db))
     monkeypatch.setattr(mcp_server, "_db_present_last", None)
     return buf, db
+
+
+def _set_image_backend(monkeypatch, status: str) -> None:
+    monkeypatch.setattr(
+        image_embeddings,
+        "image_backend_status",
+        lambda **_kw: {"status": status, "reason": None if status == "ok" else "x", "checked_at": 0.0},
+    )
+
+
+def test_startup_with_missing_image_backend_is_degraded_then_recovers(health, monkeypatch):
+    buf, _db = health
+    _set_image_backend(monkeypatch, "missing")
+    mcp_server._health_startup()
+    _set_image_backend(monkeypatch, "ok")
+    mcp_server._refresh_image_backend_health()
+
+    events = _lines(buf)
+    for event in events:
+        _assert_contract(event)
+    assert [(e["status"], e["reason"]) for e in events] == [
+        ("ready", "listening; db present"),
+        ("degraded", mcp_server._HEALTH_IMAGE_BACKEND_MISSING),
+        ("recovered", "image embeddings ready"),
+    ]
+    assert events[1]["metrics"] == {"image_backend": "missing"}
+
+
+def test_image_backend_timer_starts_once_and_not_during_state_checks(health, monkeypatch):
+    _buf, _db = health
+    started = []
+
+    class _Thread:
+        def __init__(self, *a, **kw):
+            started.append(kw.get("name"))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(mcp_server, "_image_backend_watch_thread", None)
+    monkeypatch.setattr(mcp_server.threading, "Thread", _Thread)
+    mcp_server._health_startup()
+    assert started == []  # the startup state check does not start the timer
+    mcp_server._start_image_backend_timer()
+    mcp_server._start_image_backend_timer()
+    assert started == ["image-backend-watch"]
 
 
 def test_startup_ready_then_db_transitions(health):

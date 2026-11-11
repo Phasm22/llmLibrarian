@@ -8,6 +8,7 @@ validation, happy-path delegation to ingest helpers).
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,13 +135,18 @@ def test_update_file_propagates_ingest_error(monkeypatch, mcp_module, tmp_path):
 
     res = mcp_module.update_file("docs", str(target), confirm=True)
     assert res["status"] == "error"
-    assert "RuntimeError: disk full" in res["error"]
+    # The response names the exception type only: exception text can carry paths.
+    assert res["error"] == "RuntimeError"
+    assert res["reason"] == "index_error"
+    assert res["retryable"] is True
+    assert "disk full" not in json.dumps(res)
+    assert str(target.parent) not in json.dumps(res)
     from state import get_last_failures
 
     failures = get_last_failures(mcp_module._DB_PATH)
     assert len(failures) == 1
     assert failures[0]["path"] == str(target.resolve())
-    assert "disk full" in failures[0]["error"]
+    assert "disk full" in failures[0]["error"]  # full text stays in the local ledger
 
 
 # ---------- remove_file ----------

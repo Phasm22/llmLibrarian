@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS failures (
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL,
     occurrences INTEGER NOT NULL DEFAULT 1,
-    resolved_at REAL
+    resolved_at REAL,
+    file_mtime REAL
 );
 CREATE INDEX IF NOT EXISTS failures_open ON failures(silo, path, error_class, resolved_at);
 """
@@ -164,8 +165,27 @@ def _connect(db_path: str | Path, *, readonly: bool = False) -> sqlite3.Connecti
                     "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
+                _migrate(conn, db_path)
                 _INITIALIZED.add(key)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection, db_path: str | Path) -> None:
+    """Idempotent upgrades for ledgers written by earlier builds."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(failures)")}
+    if "file_mtime" not in cols:
+        conn.execute("ALTER TABLE failures ADD COLUMN file_mtime REAL")
+    done = conn.execute("SELECT 1 FROM meta WHERE key='failures_orphan_prune_v1'").fetchone()
+    if done is None:
+        try:
+            roots = _silo_roots(db_path)
+        except Exception:
+            roots = {}
+        prune_orphan_failures(conn, roots=roots)
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('failures_orphan_prune_v1', ?)",
+            (str(time.time()),),
+        )
 
 
 @contextlib.contextmanager
@@ -325,10 +345,11 @@ def record_manifest_change(
             "INSERT INTO silo_events(ts, silo, kind, origin, files) VALUES (?, ?, ?, ?, ?)",
             [(ts, s, k, org, n) for s, k, n in silos],
         )
-        indexed = [(ts, s, p) for s, p, k, _ in files if k in ("added", "updated")]
+        # Added/updated means the file indexed; removed means there is nothing left to fail on.
+        resolved = [(ts, s, p) for s, p, k, _ in files if k in ("added", "updated", "removed")]
         conn.executemany(
             "UPDATE failures SET resolved_at = ? WHERE silo = ? AND path = ? AND resolved_at IS NULL",
-            indexed,
+            resolved,
         )
         for slug, kind, _ in silos:
             # A repair drops and rebuilds the silo; its failures are still open.
@@ -345,6 +366,10 @@ def record_manifest_change(
 
 _ERROR_TYPE = re.compile(r"\b([A-Z][A-Za-z0-9]*(?:Error|Exception|Timeout|Warning))\b")
 _ERROR_PHRASES = (
+    # Parked/actionable classes first: the Problems tab must say what to do.
+    ("image_backend", ("image embeddings unavailable", "image_backend_unavailable")),
+    ("image_model", ("image model not ready",)),
+    ("index_error", ("processing failed", "could not be indexed")),
     ("timeout", ("timed out", "timeout")),
     ("permission", ("permission denied", "operation not permitted", "not permitted")),
     ("unsupported", ("unsupported", "not supported", "unknown file type")),
@@ -404,8 +429,27 @@ def _silo_roots(db_path: str | Path) -> dict[str, str]:
     return roots
 
 
+def _file_mtime(explicit: Any, path: str) -> float:
+    """Caller-supplied mtime, else the file's current mtime, else 0 (gone)."""
+    if explicit is not None:
+        try:
+            return float(explicit)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
 def record_failures(db_path: str | Path, entries: list[dict], *, now: float | None = None) -> None:
-    """Upsert open failures by (silo, path, error_class). Never raises."""
+    """Upsert the open failure for each (silo, path). Never raises.
+
+    One open row per file. A repeat report for the same file version (same
+    mtime) refreshes the text but does not count again, so the MCP server and
+    the watcher both reporting one attempt count once. A new mtime is a new
+    version that failed, so it bumps ``occurrences``.
+    """
     if not activity_enabled() or not entries:
         return
     ts = time.time() if now is None else now
@@ -423,21 +467,74 @@ def record_failures(db_path: str | Path, entries: list[dict], *, now: float | No
             err = str((row or {}).get("error") or "")[:1000]
             silo = silo_for_path(path, roots) or "unknown"
             cls = error_class(err)
+            mtime = _file_mtime((row or {}).get("mtime"), path)
             hit = conn.execute(
-                "SELECT id FROM failures WHERE silo=? AND path=? AND error_class=? AND resolved_at IS NULL",
-                (silo, path, cls),
+                "SELECT id, file_mtime FROM failures WHERE silo=? AND path=? AND resolved_at IS NULL"
+                " ORDER BY id DESC LIMIT 1",
+                (silo, path),
             ).fetchone()
-            if hit:
+            if hit and hit[1] is not None and float(hit[1]) == mtime:
                 conn.execute(
-                    "UPDATE failures SET last_seen=?, occurrences=occurrences+1, error=? WHERE id=?",
-                    (ts, err, hit[0]),
+                    "UPDATE failures SET last_seen=?, error=?, error_class=? WHERE id=?",
+                    (ts, err, cls, hit[0]),
+                )
+            elif hit:
+                conn.execute(
+                    "UPDATE failures SET last_seen=?, occurrences=occurrences+1, error=?,"
+                    " error_class=?, file_mtime=? WHERE id=?",
+                    (ts, err, cls, mtime, hit[0]),
                 )
             else:
                 conn.execute(
-                    "INSERT INTO failures(silo, path, error_class, error, first_seen, last_seen)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (silo, path, cls, err, ts, ts),
+                    "INSERT INTO failures(silo, path, error_class, error, first_seen, last_seen, file_mtime)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (silo, path, cls, err, ts, ts, mtime),
                 )
+
+
+def resolve_failures(db_path: str | Path, silo: str, path: str, *, now: float | None = None) -> None:
+    """Close the open failure for a file that was removed from the silo. Never raises."""
+    if not activity_enabled() or not silo or not path:
+        return
+    ts = time.time() if now is None else now
+    with _writer(db_path) as conn:
+        if conn is None:
+            return
+        conn.execute(
+            "UPDATE failures SET resolved_at = ? WHERE silo = ? AND path = ? AND resolved_at IS NULL",
+            (ts, silo, path),
+        )
+
+
+def prune_orphan_failures(
+    conn: sqlite3.Connection,
+    *,
+    roots: dict[str, str] | None = None,
+    now: float | None = None,
+) -> int:
+    """Resolve open failures whose file no longer exists. Resolves, never deletes.
+
+    The guard is the file's silo root, not its parent directory: when a whole
+    subtree was deleted under a mounted root, the deletion is real and the rows
+    resolve. A row is skipped when its silo root is missing, so a disconnected
+    volume cannot wipe the problems for files on it. A path with no registered
+    root falls back to its parent directory.
+    """
+    ts = time.time() if now is None else now
+    roots = roots or {}
+    rows = conn.execute(
+        "SELECT id, silo, path FROM failures WHERE resolved_at IS NULL"
+    ).fetchall()
+    orphan_ids = []
+    for row_id, silo, path in rows:
+        if not path or os.path.exists(path):
+            continue
+        guard = roots.get(str(silo)) or os.path.dirname(path)
+        if os.path.isdir(guard):
+            orphan_ids.append(row_id)
+    for row_id in orphan_ids:
+        conn.execute("UPDATE failures SET resolved_at = ? WHERE id = ?", (ts, row_id))
+    return len(orphan_ids)
 
 
 # ---------------------------------------------------------------------------

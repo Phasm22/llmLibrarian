@@ -54,8 +54,10 @@ except Exception:
 
 from embeddings import get_embedding_function, validate_embedding_dimension
 from image_embeddings import (
+    IMAGE_SUFFIXES,
     ensure_image_decoders_ready,
     ensure_image_embedding_adapter_ready,
+    image_backend_status,
     image_collection_name,
     image_embedding_backend_name,
 )
@@ -2973,6 +2975,11 @@ def remove_single_file(
         pass
     p = Path(path).resolve()
     path_str = str(p)
+    # A removed file has nothing left to fail on, even if it never reached the
+    # manifest (the manifest-diff resolve only sees files that were indexed).
+    from activity_ledger import resolve_failures
+
+    resolve_failures(db_path, silo_slug, path_str)
 
     manifest = _read_file_manifest(db_path)
     silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
@@ -3036,7 +3043,8 @@ def update_single_file(
 ) -> tuple[str, str]:
     """
     Index or update a single file within a silo. Returns (status, path).
-    status: updated|unchanged|removed|skipped|duplicate|error
+    status: updated|unchanged|removed|skipped|duplicate|error|unavailable
+    (``unavailable``: an image while the image backend is missing; parked by the caller.)
     """
     db_path = db_path or DB_PATH
     try:
@@ -3067,7 +3075,12 @@ def update_single_file(
     # path that matches persisted or default excludes.
     if not should_index(path_str, ADD_DEFAULT_INCLUDE, effective_excludes):
         return remove_single_file(p, db_path=db_path, silo_slug=silo_slug, update_counts=update_counts)
-    if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"}:
+    if p.suffix.lower() in IMAGE_SUFFIXES:
+        # Parked, not failed: no manifest/lock work happens for an image while
+        # the backend is missing, and the caller re-queues once it returns.
+        # Runs before the "unchanged" check so already-indexed images park too.
+        if image_backend_status()["status"] != "ok":
+            return ("unavailable", path_str)
         try:
             if effective_image_vision_enabled:
                 ensure_vision_model_ready()

@@ -1794,6 +1794,27 @@ def _mcp_healthcheck() -> tuple[bool, str]:
     return (True, "")
 
 
+def _mcp_image_backend_state() -> str | None:
+    """``"ok"`` / ``"missing"`` from the MCP /healthz ``image_backend`` field.
+
+    None when the server is unreachable or predates the field, so a parked
+    image is not released on a guess.
+    """
+    import json as _json
+    import urllib.request
+    from urllib.parse import urlparse
+
+    parsed = urlparse(_mcp_url())
+    healthz = f"{parsed.scheme}://{parsed.netloc}/healthz"
+    try:
+        with urllib.request.urlopen(healthz, timeout=2.0) as resp:
+            body = _json.loads(resp.read().decode("utf-8") or "{}")
+    except Exception:
+        return None
+    state = body.get("image_backend") if isinstance(body, dict) else None
+    return state if state in ("ok", "missing") else None
+
+
 def _watch_mcp_wait_seconds() -> float:
     """How long a watch-mode preflight waits for the MCP server before giving up.
 
@@ -1852,6 +1873,12 @@ class _SiloEventHandler(FileSystemEventHandler):
 
 # How many changed paths a batch_drain event names (counts stay exact).
 WATCH_EVENT_PATH_SAMPLE = 5
+# Transient app-level failures (not lock contention or MCP outages) are retried
+# this many times, then the file is parked until its mtime changes.
+WATCH_RETRY_CAP = 5
+# Parked-for-image-backend files are re-checked against /healthz this often.
+IMAGE_BACKEND_POLL_SECONDS = 300.0
+PARK_IMAGE_BACKEND = "image_backend_unavailable"
 
 
 class SiloWatcher:
@@ -1907,6 +1934,10 @@ class SiloWatcher:
         self._handler = _SiloEventHandler(self)
         self._queue: dict[str, dict[str, object]] = {}
         self._queue_lock = threading.Lock()
+        # Parked files are not retried: {path: {"action", "mtime", "reason"}}.
+        # Released by a watcher event with a new mtime, or by the backend poll.
+        self._parked: dict[str, dict[str, object]] = {}
+        self._backend_checked_at = 0.0
         self._stop = threading.Event()
         # Set whenever the queue changes so the worker can sleep until the next
         # item is due instead of polling.
@@ -2003,6 +2034,10 @@ class SiloWatcher:
         # Client-side gate (MCP update_file re-checks persisted excludes).
         if not self._should_index(str(p), self._include, self._exclude):
             return
+        # A parked file re-enters only when its content version changes; the same
+        # mtime re-firing (editor saves, touch) is not a new attempt.
+        if self._still_parked(str(p)):
+            return
         self._queue_action(str(p), "update")
 
     def enqueue_delete(self, path: str) -> None:
@@ -2020,7 +2055,58 @@ class SiloWatcher:
         # the same exclude/include rules as enqueue_update.
         if not self._should_index(str(p), self._include, self._exclude):
             return
+        with self._queue_lock:
+            self._parked.pop(str(p), None)
         self._queue_action(str(p), "delete")
+
+    @staticmethod
+    def _file_version(path: str) -> float:
+        try:
+            return Path(path).stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _still_parked(self, path: str) -> bool:
+        """True when ``path`` is parked at its current version; un-parks it otherwise."""
+        version = self._file_version(path)
+        with self._queue_lock:
+            parked = self._parked.get(path)
+            if parked is None:
+                return False
+            if parked.get("mtime") == version:
+                return True
+            del self._parked[path]
+            return False
+
+    def _park(self, path: str, action: str, reason: str) -> None:
+        with self._queue_lock:
+            self._parked[path] = {
+                "action": action,
+                "mtime": self._file_version(path),
+                "reason": reason,
+            }
+
+    def _resume_parked_for_image_backend(self, now: float) -> int:
+        """Re-queue images parked for a missing backend once /healthz reports it back."""
+        with self._queue_lock:
+            waiting = [p for p, meta in self._parked.items() if meta.get("reason") == PARK_IMAGE_BACKEND]
+        if not waiting or now - self._backend_checked_at < IMAGE_BACKEND_POLL_SECONDS:
+            return 0
+        self._backend_checked_at = now
+        if _mcp_image_backend_state() != "ok":
+            return 0
+        requeued = 0
+        with self._queue_lock:
+            for path in waiting:
+                meta = self._parked.pop(path, None)
+                if meta is None:
+                    continue
+                self._queue[path] = {"due_at": now, "action": meta.get("action") or "update", "attempts": 0}
+                requeued += 1
+        if requeued:
+            self._log(f"{self.label}: image backend back; re-queued {requeued} parked image(s)")
+            self._wake.set()
+        return requeued
 
     def _relative(self, path: str) -> str:
         try:
@@ -2041,6 +2127,7 @@ class SiloWatcher:
                 if now >= due_at:
                     due.append((path, action, attempts))
                     del self._queue[path]
+        self._resume_parked_for_image_backend(now)
         if not due:
             return 0
         started = time.perf_counter()
@@ -2053,11 +2140,15 @@ class SiloWatcher:
         with self._lock:
             for path, action, attempts in due:
                 tool = "remove_file" if action == "delete" else "update_file"
+                transport_error = False
                 try:
                     res = _mcp_call_sync(tool, silo=self.silo_slug, path=path, confirm=True)
                 except Exception as exc:
-                    res = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                    # The MCP server being down says nothing about the file.
+                    transport_error = True
+                    res = {"status": "error", "error": f"{type(exc).__name__}"}
                 status = str(res.get("status") or "")
+                reason = str(res.get("reason") or "")
                 if status in ("updated", "removed", "unchanged", "skipped"):
                     if action == "delete":
                         removed += 1
@@ -2067,9 +2158,9 @@ class SiloWatcher:
                     else:
                         updated += 1
                         updated_paths.append(path)
-                elif res.get("busy") or res.get("retryable") or status == "busy":
-                    # Lock contention is transient: retry without treating it as a
-                    # hard failure (which used to flood llmli_last_failures.json).
+                elif transport_error or res.get("busy") or status == "busy":
+                    # Lock contention or an unreachable MCP is transient: retry
+                    # without a cap and without recording a file failure.
                     next_attempt = attempts + 1
                     hint = res.get("retry_after_seconds")
                     try:
@@ -2085,11 +2176,26 @@ class SiloWatcher:
                         f"retry in {delay:g}s (attempt {next_attempt})"
                     )
                 else:
-                    next_attempt = attempts + 1
-                    delay = self._retry_delay(next_attempt)
-                    self._queue_action(path, action, delay=delay, attempts=next_attempt)
-                    detail = str(res.get("error") or res.get("message") or status or "unknown")
+                    # A file-level answer. Recorded here; the ledger dedupes it
+                    # against the server's own record of the same attempt.
+                    detail = str(res.get("message") or res.get("error") or status or "unknown")[:300]
                     errors.append((path, detail))
+                    if reason == "image_backend_unavailable" or status == "unavailable":
+                        # Not an error loop: wait for the backend or a new mtime.
+                        self._park(path, action, PARK_IMAGE_BACKEND)
+                        continue
+                    if res.get("retryable") is False:
+                        self._park(path, action, reason or "non_retryable")
+                        continue
+                    next_attempt = attempts + 1
+                    if next_attempt >= WATCH_RETRY_CAP:
+                        self._park(path, action, "retry_exhausted")
+                        self._log(
+                            f"{self.label}: {Path(path).name} failed {next_attempt} times; "
+                            "parked until the file changes"
+                        )
+                        continue
+                    self._queue_action(path, action, delay=self._retry_delay(next_attempt), attempts=next_attempt)
         if errors:
             _ensure_src_on_path()
             from state import append_last_failures
@@ -2144,12 +2250,16 @@ class SiloWatcher:
             self._wake.clear()
 
     def _seconds_until_next_due(self) -> float | None:
-        """Time until the earliest queued item is due; None when the queue is empty."""
+        """Time until the earliest queued item is due; None when nothing is queued or parked for polling."""
         with self._queue_lock:
-            if not self._queue:
-                return None
-            next_due = min(float(meta.get("due_at") or 0.0) for meta in self._queue.values())
-        return max(next_due - time.time(), 0.0)
+            waits: list[float] = []
+            if self._queue:
+                next_due = min(float(meta.get("due_at") or 0.0) for meta in self._queue.values())
+                waits.append(max(next_due - time.time(), 0.0))
+            if any(meta.get("reason") == PARK_IMAGE_BACKEND for meta in self._parked.values()):
+                # Parked images need a periodic /healthz check even with an empty queue.
+                waits.append(IMAGE_BACKEND_POLL_SECONDS)
+        return min(waits) if waits else None
 
     def _reconcile_once(self) -> tuple[int, int, int]:
         self._refresh_excludes()
