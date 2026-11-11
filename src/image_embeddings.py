@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -35,6 +36,7 @@ class ImageEmbeddingAdapter(Protocol):
 
 _IMAGE_ADAPTER_CACHE: dict[str, ImageEmbeddingAdapter] = {}
 _IMAGE_ADAPTER_ERROR: str | None = None
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".heic", ".heif", ".tif", ".tiff"})
 
 
 def image_collection_name(base_collection_name: str) -> str:
@@ -156,3 +158,36 @@ def image_embedding_backend_name() -> str | None:
 def image_embedding_unavailable_reason() -> str | None:
     """Return the last adapter initialization failure for observable fallbacks."""
     return _IMAGE_ADAPTER_ERROR
+
+
+# Canonical image-backend capability. Every consumer (ingest gating, the MCP
+# startup/timer check, /healthz `image_backend`, the watcher's recovery poll)
+# reads this one cached value instead of probing on its own.
+IMAGE_BACKEND_RECHECK_SECONDS = 300.0
+IMAGE_BACKEND_MISSING_REASON = "image embeddings unavailable; run `uv sync --extra image`"
+_IMAGE_BACKEND_CHECK: dict[str, Any] | None = None
+
+
+def image_backend_status(
+    *,
+    max_age: float = IMAGE_BACKEND_RECHECK_SECONDS,
+    now: float | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Cached backend capability: ``{"status": "ok"|"missing", "reason", "checked_at"}``.
+
+    Re-probes through ``image_embedding_backend_name`` (import-only, no model
+    load) when the cached answer is older than ``max_age`` or ``refresh`` is set.
+    """
+    global _IMAGE_BACKEND_CHECK
+    ts = time.time() if now is None else now
+    cached = _IMAGE_BACKEND_CHECK
+    if not refresh and cached is not None and ts - float(cached["checked_at"]) < max_age:
+        return dict(cached)
+    ok = image_embedding_backend_name() is not None
+    _IMAGE_BACKEND_CHECK = {
+        "status": "ok" if ok else "missing",
+        "reason": None if ok else (image_embedding_unavailable_reason() or "unknown"),
+        "checked_at": ts,
+    }
+    return dict(_IMAGE_BACKEND_CHECK)

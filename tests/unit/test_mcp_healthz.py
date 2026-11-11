@@ -21,7 +21,14 @@ def mcp_module(monkeypatch, tmp_path):
     return mcp_server
 
 
-def test_healthz_returns_probe_fields(mcp_module, tmp_path):
+def test_healthz_returns_probe_fields(mcp_module, tmp_path, monkeypatch):
+    import image_embeddings
+
+    monkeypatch.setattr(
+        image_embeddings,
+        "image_backend_status",
+        lambda **_kw: {"status": "ok", "reason": None, "checked_at": 0.0},
+    )
     scope = {"type": "http", "method": "GET", "path": "/healthz", "headers": []}
     request = Request(scope)
     expected_db = str(tmp_path / "db")
@@ -30,7 +37,7 @@ def test_healthz_returns_probe_fields(mcp_module, tmp_path):
         response = await mcp_module.healthz(request)
         body = json.loads(response.body)
         assert response.status_code == 200
-        assert body == {
+        expected = {
             "ok": True,
             "service": "llmLibrarian-mcp",
             "version": "0.1.0-test",
@@ -39,6 +46,9 @@ def test_healthz_returns_probe_fields(mcp_module, tmp_path):
             "db_exists": True,
             "started_at": "2026-05-19T12:00:00+00:00",
         }
+        # Additive contract: every existing field keeps its value; image_backend is new.
+        assert {k: body[k] for k in expected} == expected
+        assert body["image_backend"] == "ok"
 
     asyncio.run(_run())
 

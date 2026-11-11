@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 import traceback
 from importlib.metadata import PackageNotFoundError, version as package_version
 from contextlib import contextmanager
@@ -1265,6 +1266,53 @@ def _health_startup() -> None:
     if _db_present():
         _HEALTH.set("ready", "listening; db present", db_exists=True)
     # A missing DB has already set degraded via _db_present.
+    _start_image_backend_watch()
+
+
+_HEALTH_IMAGE_BACKEND_MISSING = "image embeddings unavailable: run `uv sync --extra image`"
+IMAGE_BACKEND_WATCH_SECONDS = 300.0
+_image_backend_watch_thread: threading.Thread | None = None
+
+
+def _refresh_image_backend_health() -> dict:
+    """Re-run the canonical image-backend check and drive HealthState from it."""
+    from image_embeddings import image_backend_status
+
+    status = image_backend_status(refresh=True)
+    if status["status"] == "missing":
+        _logger.warning(
+            "image embeddings unavailable (%s); image files will park until fixed: "
+            "run `uv sync --extra image`",
+            status.get("reason"),
+        )
+        _HEALTH.set("degraded", _HEALTH_IMAGE_BACKEND_MISSING, image_backend="missing")
+    else:
+        _HEALTH.recover(_HEALTH_IMAGE_BACKEND_MISSING, "image embeddings ready", image_backend="ok")
+    return status
+
+
+def _start_image_backend_watch() -> None:
+    """Startup check now, then a cached re-check on a timer (never per file)."""
+    global _image_backend_watch_thread
+    try:
+        _refresh_image_backend_health()
+    except Exception:
+        _logger.debug("image backend startup check failed", exc_info=True)
+    if _image_backend_watch_thread is not None:
+        return
+
+    def _loop() -> None:
+        while True:
+            time.sleep(IMAGE_BACKEND_WATCH_SECONDS)
+            try:
+                _refresh_image_backend_health()
+            except Exception:
+                _logger.debug("image backend re-check failed", exc_info=True)
+
+    _image_backend_watch_thread = threading.Thread(
+        target=_loop, name="image-backend-watch", daemon=True
+    )
+    _image_backend_watch_thread.start()
 
 
 def _rebuild_note(write_state: dict | None) -> str | None:
@@ -2524,11 +2572,59 @@ def _resolve_silo_under_path(silo: str, path: str) -> tuple[str | None, str | No
     try:
         abs_p.relative_to(silo_root_p)
     except ValueError:
+        # No absolute paths in the response: this server can bind 0.0.0.0.
+        msg = "path is not under silo source (outside the registered folder)"
         return (None, None, {
             "status": "error",
-            "error": f"path is not under silo source: path={abs_p} silo_root={silo_root_p}",
+            "reason": "path_outside_silo",
+            "message": msg,
+            "error": msg,
+            "retryable": False,
         })
     return (slug, str(abs_p), None)
+
+
+IMAGE_BACKEND_UNAVAILABLE_MESSAGE = (
+    "image embeddings unavailable; run `uv sync --extra image` in the project checkout"
+)
+
+
+def _is_image_path(path: str) -> bool:
+    from image_embeddings import IMAGE_SUFFIXES
+
+    return Path(path).suffix.lower() in IMAGE_SUFFIXES
+
+
+def _image_backend_missing() -> bool:
+    """Cached capability check (see image_embeddings.image_backend_status)."""
+    from image_embeddings import image_backend_status
+
+    return image_backend_status()["status"] != "ok"
+
+
+def _image_backend_unavailable_response(slug: str) -> dict:
+    """Non-retrying: the caller parks the file until the backend returns or it changes."""
+    return {
+        "status": "error",
+        "reason": "image_backend_unavailable",
+        "message": IMAGE_BACKEND_UNAVAILABLE_MESSAGE,
+        "error": IMAGE_BACKEND_UNAVAILABLE_MESSAGE,  # kept for existing readers
+        "retryable": False,
+        "silo": slug,
+    }
+
+
+def _index_error_response(slug: str, message: str | None = None) -> dict:
+    """Generic per-file failure. Carries no path and no traceback."""
+    text = message or "file could not be indexed; see the server log"
+    return {
+        "status": "error",
+        "reason": "index_error",
+        "message": text,
+        "error": text,  # kept for existing readers
+        "retryable": True,
+        "silo": slug,
+    }
 
 
 @mcp.tool(tags={"write"})
@@ -2552,6 +2648,9 @@ def update_file(silo: str, path: str, confirm: bool = False) -> dict:
     slug, abs_path, err = _resolve_silo_under_path(silo, path)
     if err:
         return err
+    # Checked before the write lock: a missing backend must not hold it.
+    if _is_image_path(abs_path) and _image_backend_missing():
+        return _image_backend_unavailable_response(slug)
     try:
         with _mcp_chroma_lock("update_file", write=True):
             try:
@@ -2569,6 +2668,10 @@ def update_file(silo: str, path: str, confirm: bool = False) -> dict:
                 # Release only after a successful acquire. A timed-out waiter
                 # must not clear the singleton from under the lock holder.
                 _release_chroma()
+        if status == "unavailable":
+            return _image_backend_unavailable_response(slug)
+        if status == "error":
+            return _index_error_response(slug)
         return {"status": status, "silo": slug, "path": resolved}
     except Exception as e:
         if _is_lock_timeout(e):
@@ -2578,11 +2681,11 @@ def update_file(silo: str, path: str, confirm: bool = False) -> dict:
                 "path": abs_path,
             }
         _logger.exception("update_file failed silo=%s path=%s", slug, abs_path)
-        err_msg = f"{type(e).__name__}: {e}"
         from state import append_last_failures
 
-        append_last_failures(_DB_PATH, [{"path": abs_path, "error": err_msg}])
-        return {"status": "error", "error": err_msg}
+        # The ledger keeps the full text (local); the response does not.
+        append_last_failures(_DB_PATH, [{"path": abs_path, "error": f"{type(e).__name__}: {e}"}])
+        return {**_index_error_response(slug), "error": type(e).__name__}
 
 
 @mcp.tool(tags={"write"})
@@ -2628,11 +2731,11 @@ def remove_file(silo: str, path: str, confirm: bool = False) -> dict:
                 "path": abs_path,
             }
         _logger.exception("remove_file failed silo=%s path=%s", slug, abs_path)
-        err_msg = f"{type(e).__name__}: {e}"
         from state import append_last_failures
 
-        append_last_failures(_DB_PATH, [{"path": abs_path, "error": err_msg}])
-        return {"status": "error", "error": err_msg}
+        append_last_failures(_DB_PATH, [{"path": abs_path, "error": f"{type(e).__name__}: {e}"}])
+        return {**_index_error_response(slug, message="file could not be removed; see the server log"),
+                "error": type(e).__name__}
 
 
 @mcp.tool(tags={"write"})
@@ -2919,6 +3022,9 @@ def health() -> dict:
     """
     summary = _collect_health_summary(include_audit=True)
     summary["code_drift"] = _code_drift_report()
+    from image_embeddings import image_backend_status
+
+    summary["image_backend"] = image_backend_status()["status"]  # additive
     return summary
 
 
@@ -3648,6 +3754,10 @@ async def healthz(_: Request) -> Response:
         "db_exists": _db_present(),
         "started_at": _SERVER_STARTED_AT,
     }
+    # Additive. "ok" | "missing": the cached capability, not a live probe.
+    from image_embeddings import image_backend_status
+
+    body["image_backend"] = image_backend_status()["status"]
     if _LITE_URL_PATH:
         body["lite_path"] = _LITE_URL_PATH
     if exposed:
