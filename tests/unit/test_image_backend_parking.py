@@ -316,27 +316,61 @@ def test_removed_file_resolves_its_failure(ledger_db, monkeypatch):
     assert _rows(db, "SELECT resolved_at IS NOT NULL FROM failures WHERE path=?", (photo,)) == [(1,)]
 
 
-def test_orphan_prune_resolves_only_missing_files_with_live_parent(ledger_db, tmp_path):
+def test_orphan_prune_guards_on_the_silo_root_not_the_parent(ledger_db, tmp_path):
     db, root = ledger_db
     live = root / "still-here.jpg"
     live.write_bytes(b"x")
-    orphan = root / "deleted.jpg"  # parent exists, file gone: resolve
-    offline = tmp_path / "unmounted-volume" / "x.jpg"  # parent gone: must not resolve
+    # Whole subdirectory deleted under a mounted root: the deletion is real.
+    gone_dir_file = root / "vampire-portraits" / "render-1.png"
+    # File deleted in the root itself: also real.
+    gone_file = root / "deleted.jpg"
+    # Silo root unmounted (disconnected volume): must never resolve.
+    offline_root = tmp_path / "unmounted-volume"
+    offline_file = offline_root / "x.jpg"
+    roots = {"photos-1": str(root), "offline-1": str(offline_root)}
     al.record_failures(
         db,
         [
             {"path": str(live), "error": "image model not ready", "mtime": 1.0},
-            {"path": str(orphan), "error": "image model not ready", "mtime": 1.0},
-            {"path": str(offline), "error": "image model not ready", "mtime": 1.0},
+            {"path": str(gone_dir_file), "error": "image model not ready", "mtime": 1.0},
+            {"path": str(gone_file), "error": "image model not ready", "mtime": 1.0},
         ],
     )
-    conn = al._connect(db)
+    # Attribute the rows to their silo roots explicitly (the registry is not populated here).
+    conn = sqlite3.connect(str(al.ledger_path(db)), isolation_level=None)
+    conn.execute("UPDATE failures SET silo='photos-1'")
+    conn.execute(
+        "INSERT INTO failures(silo, path, error_class, error, first_seen, last_seen, file_mtime)"
+        " VALUES ('offline-1', ?, 'image_model', 'x', 1, 1, 1)",
+        (str(offline_file),),
+    )
     try:
-        assert al.prune_orphan_failures(conn) == 1
+        assert al.prune_orphan_failures(conn, roots=roots) == 2
     finally:
         conn.close()
     open_paths = {p for (p,) in _rows(db, "SELECT path FROM failures WHERE resolved_at IS NULL")}
-    assert open_paths == {str(live), str(offline)}
+    assert open_paths == {str(live), str(offline_file)}
+
+
+def test_orphan_prune_unregistered_silo_falls_back_to_parent_directory(ledger_db, tmp_path):
+    db, root = ledger_db
+    deleted = root / "deleted.jpg"
+    missing_dir_file = tmp_path / "vanished-dir" / "x.jpg"
+    al.record_failures(
+        db,
+        [
+            {"path": str(deleted), "error": "image model not ready", "mtime": 1.0},
+            {"path": str(missing_dir_file), "error": "image model not ready", "mtime": 1.0},
+        ],
+    )
+    conn = sqlite3.connect(str(al.ledger_path(db)), isolation_level=None)
+    try:
+        # No roots: "unknown" silo, so the guard is the immediate parent directory.
+        assert al.prune_orphan_failures(conn, roots={}) == 1
+    finally:
+        conn.close()
+    open_paths = {p for (p,) in _rows(db, "SELECT path FROM failures WHERE resolved_at IS NULL")}
+    assert open_paths == {str(missing_dir_file)}
 
 
 def test_orphan_prune_migration_runs_once_and_adds_mtime_column(tmp_path, monkeypatch):

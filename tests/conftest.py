@@ -178,3 +178,35 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setitem(sys.modules, "ollama", SimpleNamespace(chat=_chat))
     return state
+
+
+# --- Image backend capability (image_embeddings.image_backend_status) ---
+# The cached probe answers "is open_clip/torch/torchvision importable here?".
+# That answer differs between an image-extra checkout and the torch-free CI
+# runner, so no test may inherit a cached answer from another test or from
+# the machine it runs on.
+@pytest.fixture(autouse=True)
+def _isolate_image_backend_cache(monkeypatch):
+    import image_embeddings
+
+    monkeypatch.setattr(image_embeddings, "_IMAGE_BACKEND_CHECK", None)
+
+
+@pytest.fixture
+def image_backend_ready(monkeypatch):
+    """For tests that assume the image backend is installed.
+
+    Pins the canonical status to ``ok`` so the test exercises the image path
+    regardless of whether the runner has torch/open_clip. Tests that need the
+    backend genuinely missing set their own status instead.
+    """
+    import image_embeddings
+    import ingest
+
+    status = {"status": "ok", "reason": None, "checked_at": 0.0}
+    fake = lambda **_kw: dict(status)  # noqa: E731
+    # ingest binds image_backend_status by name at import, so patch the consumer
+    # as well as the source; mcp_server imports it lazily from the source.
+    monkeypatch.setattr(image_embeddings, "image_backend_status", fake)
+    monkeypatch.setattr(ingest, "image_backend_status", fake)
+    return status

@@ -138,7 +138,7 @@ def test_update_single_file_reuses_cross_silo_duplicate(monkeypatch, mock_collec
     assert any(name == "add" for name, _kwargs in mock_collection.calls)
 
 
-def test_update_single_file_image_adds_image_vector(monkeypatch, mock_collection, db_path: Path, tmp_path: Path):
+def test_update_single_file_image_adds_image_vector(monkeypatch, mock_collection, db_path: Path, tmp_path: Path, image_backend_ready):
     from contextlib import contextmanager
 
     image_collection = type(mock_collection)()
@@ -194,7 +194,7 @@ def test_update_single_file_image_adds_image_vector(monkeypatch, mock_collection
     assert image_add_calls[0]["metadatas"][0]["record_type"] == "image_vector"
 
 
-def test_update_single_file_returns_error_when_image_model_unavailable(monkeypatch, mock_collection, db_path: Path, tmp_path: Path):
+def test_update_single_file_returns_error_when_image_model_unavailable(monkeypatch, mock_collection, db_path: Path, tmp_path: Path, image_backend_ready):
     _patch_ingest_runtime(monkeypatch, mock_collection)
     target = tmp_path / "dog.jpg"
     target.write_bytes(b"fake-image")

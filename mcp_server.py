@@ -1266,7 +1266,12 @@ def _health_startup() -> None:
     if _db_present():
         _HEALTH.set("ready", "listening; db present", db_exists=True)
     # A missing DB has already set degraded via _db_present.
-    _start_image_backend_watch()
+    # Startup check only: the re-check timer starts from the server's startup hook
+    # (_start_image_backend_timer), so state tests never leave a thread running.
+    try:
+        _refresh_image_backend_health()
+    except Exception:
+        _logger.debug("image backend startup check failed", exc_info=True)
 
 
 _HEALTH_IMAGE_BACKEND_MISSING = "image embeddings unavailable: run `uv sync --extra image`"
@@ -1291,13 +1296,9 @@ def _refresh_image_backend_health() -> dict:
     return status
 
 
-def _start_image_backend_watch() -> None:
-    """Startup check now, then a cached re-check on a timer (never per file)."""
+def _start_image_backend_timer() -> None:
+    """Cached re-check every IMAGE_BACKEND_WATCH_SECONDS (never per file). Runs once."""
     global _image_backend_watch_thread
-    try:
-        _refresh_image_backend_health()
-    except Exception:
-        _logger.debug("image backend startup check failed", exc_info=True)
     if _image_backend_watch_thread is not None:
         return
 
@@ -3994,6 +3995,7 @@ def _serve_http(transport: str) -> None:
                 await super().startup(sockets=sockets)
                 if self.started:
                     _health_startup()
+                    _start_image_backend_timer()
 
             async def shutdown(self, sockets=None) -> None:
                 _HEALTH.set("stopping", "graceful shutdown")

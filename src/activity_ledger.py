@@ -165,19 +165,23 @@ def _connect(db_path: str | Path, *, readonly: bool = False) -> sqlite3.Connecti
                     "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
-                _migrate(conn)
+                _migrate(conn, db_path)
                 _INITIALIZED.add(key)
     return conn
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
+def _migrate(conn: sqlite3.Connection, db_path: str | Path) -> None:
     """Idempotent upgrades for ledgers written by earlier builds."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(failures)")}
     if "file_mtime" not in cols:
         conn.execute("ALTER TABLE failures ADD COLUMN file_mtime REAL")
     done = conn.execute("SELECT 1 FROM meta WHERE key='failures_orphan_prune_v1'").fetchone()
     if done is None:
-        prune_orphan_failures(conn)
+        try:
+            roots = _silo_roots(db_path)
+        except Exception:
+            roots = {}
+        prune_orphan_failures(conn, roots=roots)
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('failures_orphan_prune_v1', ?)",
             (str(time.time()),),
@@ -502,19 +506,32 @@ def resolve_failures(db_path: str | Path, silo: str, path: str, *, now: float | 
         )
 
 
-def prune_orphan_failures(conn: sqlite3.Connection, *, now: float | None = None) -> int:
+def prune_orphan_failures(
+    conn: sqlite3.Connection,
+    *,
+    roots: dict[str, str] | None = None,
+    now: float | None = None,
+) -> int:
     """Resolve open failures whose file no longer exists. Resolves, never deletes.
 
-    A row is only resolved when its parent directory still exists, so a
-    disconnected volume cannot wipe the problems for files on it.
+    The guard is the file's silo root, not its parent directory: when a whole
+    subtree was deleted under a mounted root, the deletion is real and the rows
+    resolve. A row is skipped when its silo root is missing, so a disconnected
+    volume cannot wipe the problems for files on it. A path with no registered
+    root falls back to its parent directory.
     """
     ts = time.time() if now is None else now
-    rows = conn.execute("SELECT id, path FROM failures WHERE resolved_at IS NULL").fetchall()
-    orphan_ids = [
-        row_id
-        for row_id, path in rows
-        if path and not os.path.exists(path) and os.path.isdir(os.path.dirname(path))
-    ]
+    roots = roots or {}
+    rows = conn.execute(
+        "SELECT id, silo, path FROM failures WHERE resolved_at IS NULL"
+    ).fetchall()
+    orphan_ids = []
+    for row_id, silo, path in rows:
+        if not path or os.path.exists(path):
+            continue
+        guard = roots.get(str(silo)) or os.path.dirname(path)
+        if os.path.isdir(guard):
+            orphan_ids.append(row_id)
     for row_id in orphan_ids:
         conn.execute("UPDATE failures SET resolved_at = ? WHERE id = ?", (ts, row_id))
     return len(orphan_ids)
