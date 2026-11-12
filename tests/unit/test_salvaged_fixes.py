@@ -45,19 +45,33 @@ def test_watch_guard_ignores_a_lock_for_another_db(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "host,auth,shows_path",
-    [("127.0.0.1", "false", True), ("0.0.0.0", "false", False), ("0.0.0.0", "true", True)],
+    "host,auth,peer,headers,shows_path",
+    [
+        # Direct loopback caller: the path is shown, bind host and auth do not matter.
+        ("127.0.0.1", "false", "127.0.0.1", {}, True),
+        ("0.0.0.0", "true", "127.0.0.1", {}, True),
+        # Remote caller: withheld even when auth is on (the bind host alone used to decide).
+        ("0.0.0.0", "true", "10.0.0.5", {}, False),
+        ("0.0.0.0", "false", "10.0.0.5", {}, False),
+        ("127.0.0.1", "true", "203.0.113.9", {}, False),
+        # Loopback peer behind a reverse proxy carries a forwarding header: remote.
+        ("0.0.0.0", "true", "127.0.0.1", {"X-Forwarded-For": "198.51.100.7"}, False),
+        ("0.0.0.0", "true", "127.0.0.1", {"Forwarded": "for=198.51.100.7"}, False),
+        # IPv4-mapped loopback is still loopback.
+        ("127.0.0.1", "true", "::ffff:127.0.0.1", {}, True),
+    ],
 )
-def test_healthz_withholds_db_path_when_exposed_without_auth(monkeypatch, host, auth, shows_path):
+def test_healthz_withholds_db_path_from_remote_callers(monkeypatch, host, auth, peer, headers, shows_path):
     from starlette.testclient import TestClient
 
     import mcp_server
 
     monkeypatch.setenv("LLMLIBRARIAN_MCP_HOST", host)
     monkeypatch.setenv("LLMLIBRARIAN_MCP_REQUIRE_AUTH", auth)
-    with TestClient(mcp_server.mcp.http_app(path="/mcp")) as client:
-        body = client.get("/healthz").json()
-    assert body["ok"] and ("db_path" in body) is shows_path
+    with TestClient(mcp_server.mcp.http_app(path="/mcp"), client=(peer, 50000)) as client:
+        body = client.get("/healthz", headers=headers).json()
+    assert body["ok"] is True
+    assert ("db_path" in body) is shows_path
     assert body.get("db_path_withheld", False) is (not shows_path)
 
 

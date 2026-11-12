@@ -1279,19 +1279,57 @@ IMAGE_BACKEND_WATCH_SECONDS = 300.0
 _image_backend_watch_thread: threading.Thread | None = None
 
 
+# Cached result of the last refresh: is a missing image extra actually a gap?
+# "warned" keeps the WARNING to one line per missing-backend episode, not one
+# per 5-minute re-check.
+_IMAGE_EXTRA_STATE: dict[str, bool] = {"required": False, "warned": False}
+
+
+def _configured_silo_paths() -> list[str]:
+    """Folder paths of every registered silo (diagnostic roster; no contents read)."""
+    from state import list_silos as _list_silos
+
+    if not _db_present():
+        return []
+    return [s["path"] for s in _list_silos(_DB_PATH) if s.get("path")]
+
+
 def _refresh_image_backend_health() -> dict:
-    """Re-run the canonical image-backend check and drive HealthState from it."""
-    from image_embeddings import image_backend_status
+    """Re-run the canonical image-backend check and drive HealthState from it.
+
+    A missing image extra degrades the server only when a configured silo holds
+    image files; otherwise it is recorded but silent.
+    """
+    from image_embeddings import folder_has_image_files, image_backend_status
 
     status = image_backend_status(refresh=True)
     if status["status"] == "missing":
-        _logger.warning(
-            "image embeddings unavailable (%s); image files will park until fixed: "
-            "run `uv sync --extra image`",
-            status.get("reason"),
-        )
-        _HEALTH.set("degraded", _HEALTH_IMAGE_BACKEND_MISSING, image_backend="missing")
+        try:
+            required = any(folder_has_image_files(p) for p in _configured_silo_paths())
+        except Exception:
+            _logger.debug("image-folder scan failed", exc_info=True)
+            required = False
+        _IMAGE_EXTRA_STATE["required"] = required
+        if required:
+            if not _IMAGE_EXTRA_STATE["warned"]:
+                _logger.warning(
+                    "WARNING: %s (backend reason: %s)",
+                    "image files are in a configured silo but the image extra is not installed; "
+                    "they will park until fixed: run `uv sync --extra image`",
+                    status.get("reason"),
+                )
+                _IMAGE_EXTRA_STATE["warned"] = True
+            _HEALTH.set("degraded", _HEALTH_IMAGE_BACKEND_MISSING, image_backend="missing")
+        else:
+            _IMAGE_EXTRA_STATE["warned"] = False
+            _HEALTH.recover(
+                _HEALTH_IMAGE_BACKEND_MISSING,
+                "image extra not needed: no configured silo holds images",
+                image_backend="missing",
+            )
     else:
+        _IMAGE_EXTRA_STATE["required"] = False
+        _IMAGE_EXTRA_STATE["warned"] = False
         _HEALTH.recover(_HEALTH_IMAGE_BACKEND_MISSING, "image embeddings ready", image_backend="ok")
     return status
 
@@ -3734,19 +3772,37 @@ def get_silo(slug: str) -> str:
     return json.dumps(silo_info, indent=2)
 
 
+_LOOPBACK_PEERS = frozenset({"127.0.0.1", "::1", "localhost"})
+# A reverse proxy on this machine (Funnel, tailscale serve, nginx) connects from
+# loopback, so the peer address alone cannot prove the caller is local.
+_PROXY_FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-real-ip")
+
+
+def _caller_is_loopback(request: Request) -> bool:
+    """True only for a direct loopback connection with no proxy forwarding header.
+
+    Decided per request from the peer address, not from the bind host: a server
+    bound to 0.0.0.0 with auth on still answers remote callers, and they must not
+    receive the DB path. Missing peer info fails closed (treated as remote).
+    """
+    client = request.client
+    host = (client.host if client else "").strip().lower()
+    if host.startswith("::ffff:"):
+        host = host[len("::ffff:"):]
+    if host not in _LOOPBACK_PEERS:
+        return False
+    return not any(request.headers.get(h) for h in _PROXY_FORWARDING_HEADERS)
+
+
 @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
-async def healthz(_: Request) -> Response:
+async def healthz(request: Request) -> Response:
     """Simple liveness check for process supervisors and reverse proxies.
 
     /healthz stays unauthenticated on purpose. The DB path — a home-directory
-    layout — is withheld when the server is bound off-loopback without auth.
-    Public exposure (Funnel / port forwards) is not supported; prefer
-    127.0.0.1 and a bearer token.
+    layout — goes only to direct loopback callers; every other caller gets
+    ``db_path_withheld: true``, whether or not auth is on. Public exposure
+    (Funnel / port forwards) is not supported; prefer 127.0.0.1 and a bearer token.
     """
-    host = os.environ.get("LLMLIBRARIAN_MCP_HOST", "127.0.0.1").strip()
-    exposed = host not in {"127.0.0.1", "localhost", "::1"} and not (
-        mcp_http_security.require_auth_enabled()
-    )
     body = {
         "ok": True,
         "service": "llmLibrarian-mcp",
@@ -3759,14 +3815,16 @@ async def healthz(_: Request) -> Response:
     from image_embeddings import image_backend_status
 
     body["image_backend"] = image_backend_status()["status"]
+    # Additive. True when "missing" matters: configured silos hold image files.
+    body["image_backend_required"] = bool(_IMAGE_EXTRA_STATE["required"])
     if _LITE_URL_PATH:
         body["lite_path"] = _LITE_URL_PATH
-    if exposed:
+    if _caller_is_loopback(request):
+        body["db_path"] = _DB_PATH
+    else:
         # Said explicitly so chroma_client's embedded-write guard fails closed
         # instead of reading a missing field as an older server.
         body["db_path_withheld"] = True
-    else:
-        body["db_path"] = _DB_PATH
     return JSONResponse(body)
 
 
