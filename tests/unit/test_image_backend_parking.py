@@ -242,10 +242,13 @@ def test_healthz_image_backend_field_is_additive(mcp_module, monkeypatch, tmp_pa
     asyncio.run(_run())
 
 
-def test_health_state_degrades_on_missing_and_recovers(monkeypatch, mcp_module):
+def test_health_state_degrades_on_missing_and_recovers(monkeypatch, mcp_module, tmp_path):
     out = io.StringIO()
     health = mcp_module.HealthState(enabled=True, out=out)
     monkeypatch.setattr(mcp_module, "_HEALTH", health)
+    # Degrading needs a configured silo that holds images (see _refresh_image_backend_health).
+    (tmp_path / "p.jpg").write_bytes(b"x")
+    monkeypatch.setattr(mcp_module, "_configured_silo_paths", lambda: [str(tmp_path)])
 
     monkeypatch.setattr(image_embeddings, "image_backend_status", lambda **kw: {"status": "missing", "reason": "x", "checked_at": 0})
     mcp_module._refresh_image_backend_health()

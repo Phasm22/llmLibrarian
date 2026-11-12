@@ -89,6 +89,11 @@ def health(monkeypatch, tmp_path, image_backend_ready):
     monkeypatch.setattr(mcp_server, "_HEALTH", HealthState(enabled=True, out=buf))
     monkeypatch.setattr(mcp_server, "_DB_PATH", str(db))
     monkeypatch.setattr(mcp_server, "_db_present_last", None)
+    # A configured silo with an image makes a missing image extra a real gap.
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    (photos / "a.jpg").write_bytes(b"x")
+    monkeypatch.setattr(mcp_server, "_configured_silo_paths", lambda: [str(photos)])
     return buf, db
 
 

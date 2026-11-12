@@ -102,15 +102,19 @@ From a fresh checkout:
 git clone https://github.com/Phasm22/llmLibrarian.git
 cd llmLibrarian
 uv venv && source .venv/bin/activate
-uv sync
-ollama pull llama3.2:latest   # only needed for pal ask / llmli ask
+uv sync --extra image          # core + image embeddings (open_clip, torch, torchvision, HEIC)
+ollama pull llama3.2:latest    # only needed for pal ask / llmli ask
 ```
 
-To index standalone photos, install the optional image embedding stack:
+**Every `uv sync` removes extras it was not asked to keep.** A plain `uv sync`
+after a `uv sync --extra image` silently uninstalls the image stack, and photo
+indexing then parks without an error. Pass `--extra image` on every sync if
+you index photos.
+When configured silos contain images and the stack is missing, the MCP server
+and each watcher log one `WARNING` at startup, and `/healthz` reports
+`image_backend: "missing"` with `image_backend_required: true`.
 
-```bash
-uv sync --extra image
-```
+Core-only install (no photos): plain `uv sync` is enough.
 
 Photo questions use two stages: `query_personal_knowledge` searches the sibling
 image-vector collection and returns candidate image paths; when a candidate has
@@ -173,6 +177,16 @@ llmli repair <silo> --yes        # wipe + re-index one silo if Chroma errors (--
 If MCP and CLI both run, use **Chroma server mode** (one `chroma run`, everyone else HTTP) — [docs/CHROMA_AND_STACK.md](docs/CHROMA_AND_STACK.md).
 
 Watchers (`pal pull --watch`) keep silos fresh; `trigger_reindex` via MCP after big edits.
+
+After a deploy, run the smoke test against the live MCP URL. It reads the bearer
+token from an env var (never printed) and exits non-zero unless `/healthz` is ok,
+an unauthenticated call gets 401, an authenticated `tools/list` succeeds, and an
+unscoped search returns chunks:
+
+```bash
+export LLMLI_SMOKE_TOKEN=...   # the server's bearer token
+uv run python scripts/smoke_deploy.py http://127.0.0.1:8765/mcp --query "overview"
+```
 
 ---
 
