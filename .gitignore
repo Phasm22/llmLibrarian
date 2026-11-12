@@ -48,3 +48,6 @@ llmLibrarian.mcpb
 # macOS status app (SwiftPM build products)
 macos/.build/
 macos/build/
+
+# Shared activity-ledger fixture (synthetic; read by pytest and macos/test.sh)
+!tests/fixtures/activity/db/llmli_registry.json

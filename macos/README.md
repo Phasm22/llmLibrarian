@@ -8,8 +8,19 @@ or from the menu bar item.
 
 Everything it shows is read directly from the same sources `pal ls --status`
 uses — `~/.pal/daemon.json`, `<db>/llmli_registry.json`, `~/.pal/watch_locks`,
-`launchctl list`, `/healthz`, Chroma's heartbeat, and
-`~/.pal/logs/query-audit.jsonl` — so opening it never starts Python.
+`launchctl list`, `/healthz`, Chroma's heartbeat,
+`~/.pal/logs/query-audit.jsonl`, and the activity ledger
+`<db>/llmli_activity.sqlite3` (read-only, via the system SQLite) — so opening it
+never starts Python.
+
+The Overview answers four things over Today / 7 days / 30 days: what needs
+action (one strip, only when something does), three numbers with trends
+(documents changed, searches, searches that found no sources), the busiest
+collection, and one row per collection. Every number clicks through to the
+Activity page (Searches / Changes / Problems), which reads the rows on demand.
+`Services/ActivityLedger.swift` runs the same SQL as `activity_ledger.SUMMARY_SQL`
+against the ledger's views; `tests/fixtures/activity` pins both readers to the
+same output. Design: [docs/plans/overview-information-design.md](../docs/plans/overview-information-design.md).
 Actions shell out: launchctl for start/stop/restart, `pal pull` for adding and
 reindexing silos, and `pal daemon sync` for reconciling watchers. Add Silo is
 available from the Silos toolbar, the empty state, and File → Add Silo….
@@ -32,7 +43,10 @@ launchd plists exec (`llmlibrarian-mcp`, `llmlibrarian-chroma`); they point at
 this checkout, so rebuild after moving the repo.
 
 Run the framework-free workflow tests with `macos/test.sh`. They compile the
-cross-platform Add Silo command planner directly, so XCTest is not required.
+cross-platform Add Silo command planner, the watcher-log parser, the sample
+library, and the activity-ledger reader directly, so XCTest is not required. The
+ledger test reads the shared fixture; after changing the overview contract,
+regenerate it with `TZ=UTC uv run python tests/fixtures/activity/make_fixture.py`.
 
 ## Layout
 

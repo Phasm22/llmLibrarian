@@ -14,6 +14,7 @@ swiftc \
 ACTIVITY_BIN="$HERE/.build/watch-activity-tests"
 swiftc \
   "$HERE/Sources/llmLibrarian/Model/Models.swift" \
+  "$HERE/Sources/llmLibrarian/Model/Activity.swift" \
   "$HERE/Sources/llmLibrarian/Services/WatchActivity.swift" \
   "$HERE/Tests/WatchActivityTests/main.swift" \
   -o "$ACTIVITY_BIN"
@@ -23,7 +24,20 @@ SAMPLE_BIN="$HERE/.build/sample-library-tests"
 swiftc \
   "$HERE/Sources/llmLibrarian/Model/Models.swift" \
   "$HERE/Sources/llmLibrarian/Model/Config.swift" \
+  "$HERE/Sources/llmLibrarian/Model/Activity.swift" \
+  "$HERE/Sources/llmLibrarian/Services/ActivityLedger.swift" \
   "$HERE/Sources/llmLibrarian/Services/SampleLibrary.swift" \
   "$HERE/Tests/SampleLibraryTests/main.swift" \
+  -lsqlite3 \
   -o "$SAMPLE_BIN"
 "$SAMPLE_BIN"
+
+LEDGER_BIN="$HERE/.build/activity-ledger-tests"
+swiftc \
+  "$HERE/Sources/llmLibrarian/Model/Models.swift" \
+  "$HERE/Sources/llmLibrarian/Model/Activity.swift" \
+  "$HERE/Sources/llmLibrarian/Services/ActivityLedger.swift" \
+  "$HERE/Tests/ActivityLedgerTests/main.swift" \
+  -lsqlite3 \
+  -o "$LEDGER_BIN"
+"$LEDGER_BIN" "$HERE/../tests/fixtures/activity"

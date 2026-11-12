@@ -7,7 +7,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "llmLibrarian",
-            path: "Sources/llmLibrarian"
+            path: "Sources/llmLibrarian",
+            linkerSettings: [.linkedLibrary("sqlite3")]
         )
     ]
 )
