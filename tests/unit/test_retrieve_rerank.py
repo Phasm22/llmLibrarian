@@ -175,15 +175,16 @@ def test_duplicate_hash_does_not_shrink_the_result(monkeypatch):
     assert [c["text"] for c in res["chunks"]] == ["a", "b", "c"]
 
 
-def test_small_named_file_comes_back_in_document_order(monkeypatch):
+@pytest.mark.parametrize("section", [None, "target"])
+def test_small_named_file_comes_back_in_document_order(monkeypatch, section):
     ranked = ["second paragraph", "first paragraph"]
     metas = [
-        {"source": "/n.md", "silo": "docs", "chunk_hash": "b", "chunk_index": 1, "line_start": 2},
-        {"source": "/n.md", "silo": "docs", "chunk_hash": "a", "chunk_index": 0, "line_start": 1},
+        {"source": "/n.md", "silo": "docs", "chunk_hash": "b", "chunk_index": 1, "line_start": 2, "section": "target"},
+        {"source": "/n.md", "silo": "docs", "chunk_hash": "a", "chunk_index": 0, "line_start": 1, "section": "other"},
     ]
     stored = [
-        ("first paragraph", {"source": "/n.md", "silo": "docs", "chunk_hash": "a", "chunk_index": 0, "line_start": 1}),
-        ("second paragraph", {"source": "/n.md", "silo": "docs", "chunk_hash": "b", "chunk_index": 1, "line_start": 2}),
+        ("first paragraph", {"source": "/n.md", "silo": "docs", "chunk_hash": "a", "chunk_index": 0, "line_start": 1, "section": "other"}),
+        ("second paragraph", {"source": "/n.md", "silo": "docs", "chunk_hash": "b", "chunk_index": 1, "line_start": 2, "section": "target"}),
     ]
 
     class _Rows:
@@ -207,9 +208,13 @@ def test_small_named_file_comes_back_in_document_order(monkeypatch):
     monkeypatch.setattr("query.retrieve_locked._artifact_stream_enabled", lambda *_a: False)
     res = execute_retrieve_chroma_phase(
         db="/tmp/db", intent="LOOKUP", query="q", query_for_retrieval="q", silo_slug="docs",
-        n_stage1=4, n_results=2, section=None, doc_type=None, db_path="/tmp/db", source="/n.md",
+        n_stage1=4, n_results=2, section=section, doc_type=None, db_path="/tmp/db", source="/n.md",
         get_chroma_client=lambda _db: _RowsClient(), rerank_status="disabled",
     )
+    if section:
+        assert not res.get("whole_file")
+        assert [c["text"] for c in res["chunks"]] == ["second paragraph"]
+        return
     assert res["whole_file"] is True
     assert [c["text"] for c in res["chunks"]] == ["first paragraph", "second paragraph"]
     assert res["source_file"] == {

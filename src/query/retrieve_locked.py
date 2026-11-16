@@ -291,7 +291,11 @@ def execute_retrieve_chroma_phase(
     # order, whole. Ranked chunks of a two-paragraph note hide the note.
     whole_file = False
     source_file = None
-    if source and docs:
+    has_content_filters = any(value is not None and value != "" and value != [] for value in (
+        section, doc_type, category, main_protein, min_servings, max_servings,
+        max_total_time, tags, course, era,
+    ))
+    if source and docs and not has_content_filters:
         file_silo = silo_slug or str((metas[0] or {}).get("silo") or "")
         file_source = str((metas[0] or {}).get("source") or "")
         if file_silo and file_source:
