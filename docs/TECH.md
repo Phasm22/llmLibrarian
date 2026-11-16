@@ -187,8 +187,23 @@ If `LLMLIBRARIAN_TRACE` is set, asks append JSON-lines traces.
 
 `src/activity_ledger.py` keeps a durable, time-ranged history in
 `<LLMLIBRARIAN_DB>/llmli_activity.sqlite3` (WAL, machine-local like the index).
-`pal activity [--window today|7d|30d] [--silo S] [--json]` reads it; the macOS
-Overview reads the same file.
+Two reads, used by both `pal activity` and the macOS app:
+
+- `summary(window)` — totals with previous-period deltas, sparkline buckets, one row
+  per registered collection, open failure groups. O(collections + buckets).
+  `pal activity [--window today|7d|30d] [--json]`.
+- `detail(kind, window, silo=, no_source_only=)` — the rows behind one number
+  (`changes`, `searches`, `documents`, `clients`, `failures`), paged.
+  `pal activity --detail searches --no-sources`.
+
+Event semantics live once, in SQL views the ledger creates (`activity_changes_v1`,
+`activity_searches_v1`, `activity_search_silos_v1`, `activity_failure_groups_v1`,
+`activity_collection_events_v1`): re-index origins excluded, local-time day/hour
+buckets, a search touches its scoped silo plus every silo it surfaced a file from.
+Readers only filter by `ts` and group; `SUMMARY_SQL` and `ActivityLedger.swift`
+carry identical query strings, and `tests/fixtures/activity` pins both readers to
+the same output. A ledger written before the views existed gains them the next
+time any current Python process opens it.
 
 | Table | Written from | Notes |
 |---|---|---|

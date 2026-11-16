@@ -1,0 +1,64 @@
+{
+  "silos": {
+    "notes-2": {
+      "files": {
+        "/library/Project Notes/a.md": {
+          "hash": "a",
+          "mtime": 1.0,
+          "size": 10
+        },
+        "/library/Project Notes/b.md": {
+          "hash": "b",
+          "mtime": 1.0,
+          "size": 10
+        }
+      },
+      "path": "/library/Project Notes"
+    },
+    "photos-4": {
+      "files": {
+        "/library/Photo Journal/a.md": {
+          "hash": "a",
+          "mtime": 1.0,
+          "size": 10
+        },
+        "/library/Photo Journal/b.md": {
+          "hash": "b",
+          "mtime": 1.0,
+          "size": 10
+        }
+      },
+      "path": "/library/Photo Journal"
+    },
+    "research-1": {
+      "files": {
+        "/library/Research/a.md": {
+          "hash": "a",
+          "mtime": 1.0,
+          "size": 10
+        },
+        "/library/Research/b.md": {
+          "hash": "b",
+          "mtime": 1.0,
+          "size": 10
+        }
+      },
+      "path": "/library/Research"
+    },
+    "tax-3": {
+      "files": {
+        "/library/Tax/a.md": {
+          "hash": "a",
+          "mtime": 1.0,
+          "size": 10
+        },
+        "/library/Tax/b.md": {
+          "hash": "b",
+          "mtime": 1.0,
+          "size": 10
+        }
+      },
+      "path": "/library/Tax"
+    }
+  }
+}

@@ -3,8 +3,8 @@ import Foundation
 /// Gathers everything the UI shows. Runs off the main actor; pure functions over
 /// files, launchctl, ps, and two local HTTP endpoints. No Python is started.
 enum Collector {
-    static func collect(config: PalConfig) async -> Snapshot {
-        if SampleLibrary.enabled { return SampleLibrary.snapshot() }
+    static func collect(config: PalConfig, window: ActivityWindow = .week) async -> Snapshot {
+        if SampleLibrary.enabled { return SampleLibrary.snapshot(window: window) }
         var snap = Snapshot()
         let (silos, regErr) = readSilos(config)
         snap.silos = silos
@@ -68,10 +68,37 @@ enum Collector {
         }
 
         snap.queries = readQueries(config, limit: 100)
+        snap.activity = ActivityLedger.summary(dbPath: config.dbPath, window: window)
+        snap.activityUnreadable = snap.activity == nil
+            && FileManager.default.fileExists(atPath: ActivityLedger.path(dbPath: config.dbPath))
         snap.unindexedBookmarks = readBookmarks(config).filter { path in
             !silos.contains { $0.path == path }
         }
         return snap
+    }
+
+    /// Rows behind one Overview number; read only while the Activity page shows them.
+    static func activityDetail(config: PalConfig, request r: ActivityDetailRequest) -> ActivityDetail {
+        if SampleLibrary.enabled { return SampleLibrary.detail(r) }
+        let db = config.dbPath
+        var d = ActivityDetail()
+        switch r.tab {
+        case .searches:
+            let rows = ActivityLedger.searches(dbPath: db, window: r.window, silo: r.silo, noSourceOnly: r.noSourceOnly)
+            d.available = rows != nil
+            d.searches = rows ?? []
+            d.documents = ActivityLedger.documents(dbPath: db, window: r.window, silo: r.silo, limit: 8) ?? []
+            d.clients = ActivityLedger.clients(dbPath: db, window: r.window) ?? []
+        case .changes:
+            let rows = ActivityLedger.changes(dbPath: db, window: r.window, silo: r.silo)
+            d.available = rows != nil
+            d.changes = rows ?? []
+        case .problems:
+            let rows = ActivityLedger.failures(dbPath: db, silo: r.silo)
+            d.available = rows != nil
+            d.failures = rows ?? []
+        }
+        return d
     }
 
     // MARK: silos

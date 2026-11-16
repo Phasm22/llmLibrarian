@@ -1,0 +1,35 @@
+{
+  "notes-2": {
+    "chunks_count": 4,
+    "display_name": "Project Notes",
+    "files_indexed": 2,
+    "path": "/library/Project Notes",
+    "slug": "notes-2",
+    "updated": "2026-10-01T00:00:00"
+  },
+  "photos-4": {
+    "chunks_count": 4,
+    "display_name": "Photo Journal",
+    "files_indexed": 2,
+    "path": "/library/Photo Journal",
+    "slug": "photos-4",
+    "updated": "2026-10-01T00:00:00"
+  },
+  "research-1": {
+    "chunks_count": 4,
+    "display_name": "Research",
+    "files_indexed": 2,
+    "path": "/library/Research",
+    "slug": "research-1",
+    "updated": "2026-10-01T00:00:00"
+  },
+  "tax-3": {
+    "chunks_count": 4,
+    "display_name": "Tax",
+    "files_indexed": 2,
+    "path": "/library/Tax",
+    "private": true,
+    "slug": "tax-3",
+    "updated": "2026-10-01T00:00:00"
+  }
+}

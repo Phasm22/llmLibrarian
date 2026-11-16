@@ -1,0 +1,175 @@
+{
+  "buckets": [
+    {
+      "added": 0,
+      "no_source": 0,
+      "removed": 0,
+      "searches": 0,
+      "start": "2026-10-12T00:00:00+00:00",
+      "updated": 0
+    },
+    {
+      "added": 0,
+      "no_source": 1,
+      "removed": 0,
+      "searches": 1,
+      "start": "2026-10-13T00:00:00+00:00",
+      "updated": 1
+    },
+    {
+      "added": 0,
+      "no_source": 2,
+      "removed": 0,
+      "searches": 2,
+      "start": "2026-10-14T00:00:00+00:00",
+      "updated": 0
+    },
+    {
+      "added": 0,
+      "no_source": 1,
+      "removed": 1,
+      "searches": 1,
+      "start": "2026-10-15T00:00:00+00:00",
+      "updated": 0
+    },
+    {
+      "added": 1,
+      "no_source": 0,
+      "removed": 0,
+      "searches": 1,
+      "start": "2026-10-16T00:00:00+00:00",
+      "updated": 1
+    },
+    {
+      "added": 1,
+      "no_source": 0,
+      "removed": 0,
+      "searches": 2,
+      "start": "2026-10-17T00:00:00+00:00",
+      "updated": 1
+    },
+    {
+      "added": 1,
+      "no_source": 0,
+      "removed": 0,
+      "searches": 1,
+      "start": "2026-10-18T00:00:00+00:00",
+      "updated": 0
+    }
+  ],
+  "collection_events": [
+    {
+      "files": 2,
+      "kind": "silo_added",
+      "name": "Photo Journal",
+      "silo": "photos-4",
+      "ts": "2026-10-14T15:00:00+00:00"
+    }
+  ],
+  "collections": [
+    {
+      "changes": 4,
+      "files": 2,
+      "last_activity": "2026-10-18T13:00:00+00:00",
+      "last_change": "2026-10-18T13:00:00+00:00",
+      "last_search": "2026-10-17T15:00:00+00:00",
+      "name": "Research",
+      "open_failures": 2,
+      "private": false,
+      "searches": 3,
+      "silo": "research-1"
+    },
+    {
+      "changes": 2,
+      "files": 2,
+      "last_activity": "2026-10-18T12:36:00+00:00",
+      "last_change": "2026-10-17T15:00:00+00:00",
+      "last_search": "2026-10-18T12:36:00+00:00",
+      "name": "Project Notes",
+      "open_failures": 1,
+      "private": false,
+      "searches": 4,
+      "silo": "notes-2"
+    },
+    {
+      "changes": 1,
+      "files": 2,
+      "last_activity": "2026-10-16T15:00:00+00:00",
+      "last_change": "2026-10-16T15:00:00+00:00",
+      "last_search": "2026-10-14T03:00:00+00:00",
+      "name": "Tax",
+      "open_failures": 0,
+      "private": true,
+      "searches": 1,
+      "silo": "tax-3"
+    },
+    {
+      "changes": 0,
+      "files": 2,
+      "last_activity": null,
+      "last_change": null,
+      "last_search": null,
+      "name": "Photo Journal",
+      "open_failures": 0,
+      "private": false,
+      "searches": 0,
+      "silo": "photos-4"
+    }
+  ],
+  "enabled": true,
+  "failures": [
+    {
+      "error_class": "encrypted",
+      "files": 2,
+      "last_seen": "2026-10-17T15:00:00+00:00",
+      "name": "Research",
+      "occurrences": 4,
+      "sample_error": "PdfReadError: encrypted",
+      "silo": "research-1"
+    },
+    {
+      "error_class": "too_large",
+      "files": 1,
+      "last_seen": "2026-10-15T15:00:00+00:00",
+      "name": "Project Notes",
+      "occurrences": 1,
+      "sample_error": "file too large",
+      "silo": "notes-2"
+    }
+  ],
+  "generated_at": "2026-10-18T15:00:00+00:00",
+  "headline": "Research was the busiest collection this week.",
+  "history": {
+    "files_since": "2026-07-20T15:00:00+00:00",
+    "full_file_comparison": true,
+    "full_search_comparison": true,
+    "searches_since": "2026-07-20T15:00:00+00:00"
+  },
+  "period": {
+    "bucket_unit": "day",
+    "end": "2026-10-18T15:00:00+00:00",
+    "start": "2026-10-12T00:00:00+00:00"
+  },
+  "previous_period": {
+    "end": "2026-10-11T15:00:00+00:00",
+    "start": "2026-10-05T00:00:00+00:00"
+  },
+  "sentences": [
+    "Most document changes were in Research and Project Notes.",
+    "Photo Journal was added with 2 files.",
+    "Searches increased to 8 from 2 compared with the previous week; 4 returned no sources.",
+    "3 files could not be indexed."
+  ],
+  "totals": {
+    "added": 3,
+    "changes": 7,
+    "no_source": 4,
+    "previous_changes": 2,
+    "previous_no_source": 0,
+    "previous_searches": 2,
+    "removed": 1,
+    "searches": 8,
+    "updated": 3
+  },
+  "window": "7d"
+}

@@ -1,5 +1,11 @@
+import Charts
 import SwiftUI
 
+/// Answers four questions in priority order (docs/plans/overview-information-design.md):
+/// does anything need me, is the library changing / being used, which collection
+/// is busiest, how is each collection doing. Every number clicks through to the
+/// Activity page, where the rows behind it live; nothing on this page is a list
+/// of files or queries.
 struct OverviewView: View {
     @EnvironmentObject private var store: LibrarianStore
 
@@ -7,163 +13,271 @@ struct OverviewView: View {
         Page {
             header
             if store.config.isInstalled {
-                stats
-                if !store.issues.isEmpty { issuesSection }
-                HStack(alignment: .top, spacing: 16) {
-                    servicesSection
-                    queriesSection
-                }
-                connectSection
+                AttentionStrip()
+                TileRow(summary: store.activity)
+                CollectionsTable(summary: store.activity)
             }
         }
     }
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            StatusDot(state: store.overall, size: 10)
-            Text(store.overallHeadline).zfont(.title2, weight: .semibold)
-            Text(store.overallDetail).zfont(.callout).foregroundStyle(.secondary)
+            Text(headline).zfont(.title2, weight: .semibold).lineLimit(1)
             Spacer()
             if store.isRefreshing && store.hasLoaded { ProgressView().controlSize(.small) }
-        }
-    }
-
-    private var stats: some View {
-        HStack(spacing: 10) {
-            StatTile(title: "Silos", value: store.silos.count.grouped,
-                     footnote: "\(store.silos.filter { !$0.pathExists }.count) with missing folders")
-            StatTile(title: "Files", value: store.totalFiles.grouped, footnote: "in the manifest")
-            StatTile(title: "Chunks", value: store.totalChunks.grouped, footnote: "in the vector store")
-            StatTile(title: "Watchers", value: "\(store.watchersRunning) of \(store.watchers.count)",
-                     footnote: "running", state: store.watchersRunning == store.watchers.count ? .running : .attention)
-            StatTile(title: "Queries", value: store.queries.count.grouped,
-                     footnote: store.queries.first.map { "last \(Dates.relativeString($0.timestamp))" } ?? "none recorded")
-        }
-    }
-
-    private var issuesSection: some View {
-        Section("Issues", detail: "\(store.issues.count)") {
-            VStack(spacing: 0) {
-                ForEach(Array(store.issues.enumerated()), id: \.element.id) { i, issue in
-                    HStack(spacing: 10) {
-                        StatusDot(state: issue.severity)
-                        Text(issue.title).zfont(.callout).lineLimit(1)
-                        Text(issue.detail).zfont(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                        Spacer()
-                        issueActions(issue)
-                    }
-                    .controlSize(.small)
-                    .padding(.vertical, 5)
-                    .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { store.show(issue: issue) }
-                    if i < store.issues.count - 1 { Divider() }
-                }
+            Picker("Range", selection: $store.activityWindow) {
+                ForEach(ActivityWindow.allCases) { Text($0.title).tag($0) }
             }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
         }
     }
 
-    @ViewBuilder
-    private func issueActions(_ issue: Issue) -> some View {
-        let service = store.service(label: issue.serviceLabel)
-        let silo = store.silo(slug: issue.siloSlug)
-        if let silo, !silo.pathExists {
-            SiloFixButtons(silo: silo)
-        } else if let service {
-            if service.state == .stopped, service.installed {
-                Button("Start") { store.start(service) }
-            } else if service.loaded {
-                Button("Restart") { store.restart(service) }
-            }
-            Button("Log") { store.openLog(service.logPath) }
-        }
-        Button("Show") { store.show(issue: issue) }
+    private var headline: String {
+        guard store.config.isInstalled else { return store.overallHeadline }
+        guard let s = store.activity else { return store.activityUnreadable ? "Activity history needs an update" : "No activity history yet" }
+        return s.headline(store.silos.map { ($0.slug, $0.displayName) })
     }
+}
 
-    private var servicesSection: some View {
-        Section("Services", trailing: {
-            Button("Show all") { store.page = .services }.buttonStyle(.link).zfont(.callout)
-        }) {
-            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 0) {
-                GridRow {
-                    Text("").frame(width: 8)
-                    ForEach(["Service", "State", "PID", "Uptime", "Memory"], id: \.self) { h in
-                        Text(h).zfont(.caption).foregroundStyle(.secondary)
-                    }
+// MARK: attention — one row, only when something needs action
+
+private struct AttentionStrip: View {
+    @EnvironmentObject private var store: LibrarianStore
+
+    var body: some View {
+        let issues = store.issues
+        let failures = store.activity?.failures ?? []
+        let count = issues.count + failures.count
+        if count > 0 {
+            let lead: (title: String, detail: String, state: HealthState) =
+                issues.first.map { ($0.title, $0.detail, $0.severity) }
+                ?? failures.first.map { g in
+                    ("\(g.files) file\(g.files == 1 ? "" : "s") in \(store.silo(slug: g.slug)?.displayName ?? g.slug) failed to index",
+                     ActivityFailureGroup.reason(g.errorClass), .attention)
+                }!
+            Button { store.showActivity(.problems) } label: {
+                HStack(spacing: 10) {
+                    StatusDot(state: lead.state == .stopped ? .stopped : .attention, size: 9)
+                    Text(count == 1 ? "1 thing needs you" : "\(count) things need you").zfont(.callout, weight: .semibold)
+                    Text(lead.title).zfont(.callout).lineLimit(1)
+                    Text(lead.detail).zfont(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Text("Review").zfont(.callout).foregroundStyle(Color.accentColor)
+                    Image(systemName: "chevron.right").zfont(.caption).foregroundStyle(.secondary)
                 }
-                .padding(.bottom, 4)
-                Divider().gridCellUnsizedAxes(.horizontal)
-                ForEach(store.allServices) { s in
-                    GridRow {
-                        StatusDot(state: s.state, size: 7)
-                        Text(s.title).lineLimit(1)
-                        Text(s.stateText).foregroundStyle(.secondary).lineLimit(1)
-                        Text(s.pid.map(String.init) ?? "—").monospacedDigit()
-                        Text(s.uptime ?? "—").monospacedDigit()
-                        Text(s.memoryText).monospacedDigit()
-                    }
-                    .zfont(.callout)
-                    .padding(.vertical, 3)
-                    .contentShape(Rectangle())
-                    .onTapGesture(count: 2) { store.show(service: s) }
-                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.10)))
+                .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.orange.opacity(0.25)))
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help("Open Problems")
         }
     }
+}
 
-    private var queriesSection: some View {
-        Section("Recent queries", trailing: {
-            Button("Show all") { store.page = .activity }.buttonStyle(.link).zfont(.callout)
-        }) {
-            if store.queries.isEmpty {
-                Text("No MCP queries recorded yet.").zfont(.callout).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 60)
+// MARK: three numbers
+
+private struct TileRow: View {
+    @EnvironmentObject private var store: LibrarianStore
+    let summary: ActivitySummary?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if let s = summary {
+                ActivityTile(title: "Documents changed", value: s.changes, previous: s.previousChanges,
+                             since: s.filesSince, window: s.window, series: s.buckets.map(\.changes), tint: .blue) {
+                    store.showActivity(.changes)
+                }
+                ActivityTile(title: "Searches", value: s.searches, previous: s.previousSearches,
+                             since: s.searchesSince, window: s.window, series: s.buckets.map(\.searches), tint: Theme.accent) {
+                    store.showActivity(.searches)
+                }
+                ActivityTile(title: "Found no sources", value: s.noSource, previous: s.previousNoSource,
+                             since: s.searchesSince, window: s.window, series: s.buckets.map(\.noSource), tint: .orange,
+                             share: s.searches > 0 ? Double(s.noSource) / Double(s.searches) : nil, lowerIsBetter: true) {
+                    store.showActivity(.searches, noSourceOnly: true)
+                }
             } else {
-                Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 0) {
-                    GridRow {
-                        ForEach(["When", "Silo", "Query", "Chunks"], id: \.self) { h in
-                            Text(h).zfont(.caption).foregroundStyle(.secondary)
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 3) {
+                        if store.activityUnreadable {
+                            Text("The activity ledger was written by an older build and can't be read yet.")
+                                .zfont(.callout)
+                            Text("Run pal activity once (or restart the MCP server) to update it; no history is lost.")
+                                .zfont(.callout).foregroundStyle(.secondary)
+                        } else {
+                            Text("Changes and searches appear here once the activity ledger has history.")
+                                .zfont(.callout)
+                            Text("Run pal activity backfill to import past searches from the query audit.")
+                                .zfont(.callout).foregroundStyle(.secondary)
                         }
                     }
-                    .padding(.bottom, 4)
-                    Divider().gridCellUnsizedAxes(.horizontal)
-                    ForEach(store.queries.prefix(8)) { q in
-                        GridRow {
-                            Text(Dates.relativeString(q.timestamp)).foregroundStyle(.secondary).lineLimit(1)
-                            Text(store.silo(slug: q.silo)?.displayName ?? q.silo ?? "All").lineLimit(1)
-                            Text(q.queries.first ?? "—").lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                            Text(String(q.chunks)).monospacedDigit()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(4)
+                }
+            }
+        }
+    }
+}
+
+private struct ActivityTile: View {
+    let title: String
+    let value: Int
+    let previous: Int?
+    let since: Date?
+    let window: ActivityWindow
+    let series: [Int]
+    let tint: Color
+    var share: Double? = nil
+    var lowerIsBetter = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            GroupBox {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title).zfont(.caption).foregroundStyle(.secondary)
+                    HStack(alignment: .lastTextBaseline, spacing: 6) {
+                        Text(value.grouped).zfont(size: 26, weight: .semibold).monospacedDigit()
+                        if let share {
+                            Text(share.formatted(.percent.precision(.fractionLength(0))))
+                                .zfont(.callout).foregroundStyle(.secondary)
                         }
-                        .zfont(.callout)
-                        .padding(.vertical, 3)
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) { store.selectedQuery = q.id; store.page = .activity; store.showInspector = true }
+                        Spacer(minLength: 8)
+                        Sparkline(values: series, tint: tint).frame(width: 96, height: 28)
                     }
+                    delta
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(2)
+                .contentShape(Rectangle())
+            }
+        }
+        .buttonStyle(.plain)
+        .help("Show the \(title.lowercased()) behind this number")
+    }
+
+    @ViewBuilder private var delta: some View {
+        if let previous {
+            let diff = value - previous
+            let good = lowerIsBetter ? diff < 0 : diff > 0
+            HStack(spacing: 3) {
+                Image(systemName: diff > 0 ? "arrow.up.right" : diff < 0 ? "arrow.down.right" : "equal")
+                    .foregroundStyle(diff == 0 ? Color.secondary : good ? Color.green : Color.orange)
+                Text(deltaText(diff: diff, previous: previous))
+            }
+            .zfont(.caption).foregroundStyle(.secondary)
+        } else {
+            Text(since.map { "History since \($0.formatted(.dateTime.month(.abbreviated).day()))" } ?? "No history yet")
+                .zfont(.caption).foregroundStyle(.tertiary)
+        }
+    }
+
+    private func deltaText(diff: Int, previous: Int) -> String {
+        if diff == 0 { return "Same as \(window.previous)" }
+        if previous == 0 { return "Up from 0 \(window.previous)" }
+        let pct = Double(abs(diff)) / Double(previous)
+        return "\(pct.formatted(.percent.precision(.fractionLength(0)))) vs \(window.previous) (\(previous.grouped))"
+    }
+}
+
+/// Bars without axes: shape over the window, not values.
+private struct Sparkline: View {
+    let values: [Int]
+    let tint: Color
+    var body: some View {
+        Chart(Array(values.enumerated()), id: \.offset) { i, v in
+            BarMark(x: .value("Bucket", i), y: .value("Count", v))
+                .foregroundStyle(tint.opacity(0.75))
+                .cornerRadius(1.5)
+        }
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .chartYScale(domain: 0...max(1, values.max() ?? 1))
+        .accessibilityHidden(true)
+    }
+}
+
+// MARK: collections — every silo, searched or not, one row each
+
+private struct CollectionsTable: View {
+    @EnvironmentObject private var store: LibrarianStore
+    let summary: ActivitySummary?
+
+    var body: some View {
+        let rows = ordered
+        Section("Collections", detail: "\(rows.count)") {
+            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 0) {
+                GridRow {
+                    Text("Collection").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Changed").gridColumnAlignment(.trailing)
+                    Text("Searches").gridColumnAlignment(.trailing)
+                    Text("Last activity")
+                    Text("Status")
+                }
+                .zfont(.caption).foregroundStyle(.secondary)
+                .padding(.bottom, 5)
+                Divider().gridCellUnsizedAxes(.horizontal)
+                ForEach(rows) { silo in
+                    row(silo)
+                    if silo.id != rows.last?.id { Divider().gridCellUnsizedAxes(.horizontal).opacity(0.5) }
                 }
             }
         }
     }
 
-    private var connectSection: some View {
-        Section("Connect") {
-            VStack(alignment: .leading, spacing: 4) {
-                CopyableValueRow(key: "MCP endpoint", value: store.config.mcpURL) {
-                    store.copy(store.config.mcpURL, note: "Copied MCP endpoint")
-                }
-                if let lite = store.mcpHealth?.litePath {
-                    CopyableValueRow(key: "Lite endpoint", value: store.config.mcpURL(path: lite)) {
-                        store.copy(store.config.mcpURL(path: lite), note: "Copied lite MCP endpoint")
-                    }
-                } else if let lite = store.config.mcpLitePath {
-                    KeyValueRow(key: "Lite endpoint", value: "\(lite) is configured but not being served")
-                        .foregroundStyle(.secondary)
-                }
-                KeyValueRow(key: "Index", value: (store.config.dbPath as NSString).abbreviatingWithTildeInPath, mono: true)
-                KeyValueRow(key: "Checkout", value: (store.config.workdir as NSString).abbreviatingWithTildeInPath, mono: true)
-                KeyValueRow(key: "Logs", value: (store.config.logsDir as NSString).abbreviatingWithTildeInPath, mono: true)
-                if let v = store.mcpHealth?.version {
-                    KeyValueRow(key: "Server", value: "llmLibrarian-mcp \(v), up since \(Dates.absoluteString(store.mcpHealth?.startedAt))")
+    private var ordered: [Silo] {
+        guard let s = summary else { return store.silos.sorted { $0.displayName.lowercased() < $1.displayName.lowercased() } }
+        let order = s.ranked(store.silos.map { ($0.slug, $0.displayName) }).map(\.slug)
+        let bySlug = Dictionary(uniqueKeysWithValues: store.silos.map { ($0.slug, $0) })
+        return order.compactMap { bySlug[$0] }
+    }
+
+    private func row(_ silo: Silo) -> some View {
+        let stats = summary?.stats(silo.slug) ?? ActivityCollectionStats()
+        let status = status(silo, stats: stats)
+        return GridRow {
+            HStack(spacing: 5) {
+                Text(silo.displayName).lineLimit(1)
+                if silo.isPrivate {
+                    Image(systemName: "lock.fill").zfont(.caption).foregroundStyle(.secondary)
+                        .help("Private: excluded from unscoped retrieval")
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            count(stats.changes)
+            count(stats.searches)
+            Text(stats.lastActivity.map { Dates.relativeString($0) } ?? "Never").foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                StatusDot(state: status.state, size: 7)
+                Text(status.text).foregroundStyle(status.state == .running ? .secondary : .primary).lineLimit(1)
+            }
         }
+        .zfont(.callout)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+        .onTapGesture { store.showActivity(stats.changes > 0 || stats.searches == 0 ? .changes : .searches, silo: silo.slug) }
+        .help("Show \(silo.displayName)'s activity")
+        .contextMenu {
+            Button("Show Changes") { store.showActivity(.changes, silo: silo.slug) }
+            Button("Show Searches") { store.showActivity(.searches, silo: silo.slug) }
+            Button("Show in Silos") { store.show(silo: silo) }
+        }
+    }
+
+    private func count(_ n: Int) -> some View {
+        Text(n == 0 ? "—" : n.grouped).monospacedDigit().foregroundStyle(n == 0 ? .tertiary : .primary)
+    }
+
+    private func status(_ silo: Silo, stats: ActivityCollectionStats) -> (state: HealthState, text: String) {
+        if !silo.pathExists { return (.attention, "Folder missing") }
+        if stats.openFailures > 0 { return (.attention, "\(stats.openFailures) failing") }
+        guard let watcher = store.watcher(for: silo) else { return (.unknown, "Not watched") }
+        if watcher.state != .running { return (.attention, "Watcher \(watcher.state == .stopped ? "stopped" : "needs attention")") }
+        return (.running, "Watching")
     }
 }
