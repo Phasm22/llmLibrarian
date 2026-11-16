@@ -12,6 +12,7 @@ from typing import Any
 
 MIN_CHARS = 500
 MAX_CHARS = 20000
+DEFAULT_PAGE_CHARS = 6000
 _PAGE_SIZE = 500
 # The chunker keeps whole lines in the overlap, so a seam can be as long as one
 # max-size chunk (LLMLIBRARIAN_CHUNK_SIZE caps at 4000), not the 150-char target.
@@ -121,6 +122,14 @@ def read_span(
     return "".join(parts), index, 0, False
 
 
+def document_char_count(ordered: list[tuple[str, dict[str, Any]]]) -> int:
+    """Seam-trimmed length of the whole file: what one uncapped read would return."""
+    total = 0
+    for index, (raw, _meta) in enumerate(ordered):
+        total += len(raw or "") - seam_length(ordered, index)
+    return total
+
+
 def document_fingerprint(ordered: list[tuple[str, dict[str, Any]]]) -> str:
     """Changes whenever the source is reindexed with different chunks."""
     h = hashlib.sha1()
@@ -159,7 +168,7 @@ def read_indexed_document(
     source: str,
     start_chunk: int = 0,
     cursor: str | None = None,
-    max_chars: int = 6000,
+    max_chars: int = DEFAULT_PAGE_CHARS,
 ) -> dict[str, Any]:
     """Join a source's chunks in document order from ``cursor`` (or ``start_chunk``) up to ``max_chars``."""
     max_chars = max(MIN_CHARS, min(MAX_CHARS, int(max_chars)))
@@ -197,10 +206,19 @@ def read_indexed_document(
     text, index, char, truncated = read_span(
         ordered, start_chunk, start_char, max_chars, trim_leading_seam=anchor is None
     )
+    # A short page must not spend its budget on the lead-in and leave the hit
+    # for the next page. Drop the chunk before the anchor and give the hit the page.
+    if anchor is not None and start_chunk < anchor and index <= anchor:
+        start_chunk = anchor
+        start_char = 0
+        text, index, char, truncated = read_span(
+            ordered, anchor, 0, max_chars, trim_leading_seam=False
+        )
     out: dict[str, Any] = {
         "source": source,
         "silo": silo,
         "total_chunks": total,
+        "total_chars": document_char_count(ordered),
         "start_chunk": start_chunk,
         "end_chunk": index,
         "text": text,

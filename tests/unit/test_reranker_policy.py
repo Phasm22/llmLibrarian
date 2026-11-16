@@ -61,3 +61,25 @@ def test_rerank_failure_keeps_incoming_order_and_reports(monkeypatch):
     docs, _metas, dists = reranker.rerank("q", ["a", "b", "c"], [None] * 3, [0.1, 0.2, 0.3], top_k=2)
     assert docs == ["a", "b"]
     assert dists == [0.1, 0.2]
+
+
+@pytest.mark.parametrize("transport", ["http", "streamable-http", "sse"])
+def test_http_defaults_off_and_forces_cpu(monkeypatch, transport):
+    import mcp_server
+    monkeypatch.delenv("LLMLIBRARIAN_RERANK", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_RERANK_DEVICE", "mps")
+    mcp_server._configure_reranker_for_transport(transport)
+    assert reranker.is_reranker_enabled() is False
+    assert reranker._get_reranker_device() == "cpu"
+    monkeypatch.setenv("LLMLIBRARIAN_RERANK", "1")
+    mcp_server._configure_reranker_for_transport(transport)
+    assert reranker.rerank_decision("tomato soup", True) == "eligible"
+    assert reranker._get_reranker_device() == "cpu"
+
+
+def test_stdio_preserves_operator_rerank_policy(monkeypatch):
+    import mcp_server
+    monkeypatch.setenv("LLMLIBRARIAN_RERANK", "1")
+    monkeypatch.setenv("LLMLIBRARIAN_RERANK_DEVICE", "mps")
+    mcp_server._configure_reranker_for_transport("stdio")
+    assert reranker._get_reranker_device() == "mps"

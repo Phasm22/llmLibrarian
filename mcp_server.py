@@ -46,6 +46,18 @@ def _bootstrap_process_env() -> None:
 
 _bootstrap_process_env()
 
+
+def _configure_reranker_for_transport(transport: str) -> None:
+    """HTTP is opt-in and CPU-only; CLI/stdio retain their own policy."""
+    if transport != "stdio":
+        os.environ.setdefault("LLMLIBRARIAN_RERANK", "0")
+        os.environ["LLMLIBRARIAN_RERANK_DEVICE"] = "cpu"
+
+
+_configure_reranker_for_transport(
+    os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower()
+)
+
 _logger = logging.getLogger("llmLibrarian.mcp")
 
 import mcp_contract  # noqa: E402  (needs src/ on sys.path; stdlib-only)
@@ -1663,17 +1675,24 @@ def query_personal_knowledge(
 
     Specify silo to scope retrieval by slug or display name (a private silo opens only
     by its exact slug); call list_silos first
-    rather than inferring a silo's domain from its slug. Returns chunks with text, score (0–1),
-    source path, silo, doc_type, section/page/date when known, and a ``metadata`` object
-    when the source had YAML frontmatter (title, category, servings, tags, …). Image chunks
-    also carry source_modality and, once per photo, capture/camera/GPS data under photo_metadata.
+    rather than inferring a silo's domain from its slug. Chunks come back in rank
+    order (rank 1 is the best hit). Do not re-sort them: the distance score is not
+    the order, and this payload does not include it. explain_retrieval shows that
+    score. Each chunk has text, source path, silo, doc_type, section/page/date when
+    known, and a ``metadata`` object when the source had YAML frontmatter (title,
+    category, servings, tags, …). Image chunks also carry source_modality and, once
+    per photo, capture/camera/GPS data under photo_metadata.
     n_results defaults to 12; raise it only when a broad survey needs more.
 
     Pass section= to restrict to a document section.
     Pass doc_type= to restrict by file type.
     Pass source= (a path or unique filename from `find_files`) to search inside one
-    file; use `read_document` to read it start to finish instead. To read around one
-    chunk, call read_document(path=its source, cursor=its read_cursor).
+    file. A file whose indexed text fits in one page (6000 characters) comes back
+    whole, in document order, with source_file.total_chars. A longer file stays
+    ranked chunks plus source_file so you can decide; use `read_document` to read
+    it start to finish. To read around one chunk, call read_document(path=its
+    source, cursor=its read_cursor). read_document reports total_chars for the
+    whole file.
     Metadata filters (from frontmatter indexed as Chroma metadata — reindex the silo
     after upgrading for these to take effect):
       category / main_protein / course / era — exact match
@@ -3175,16 +3194,20 @@ def silo_roster() -> dict:
     return out
 
 
-def _compact_lite_chunk(chunk: dict) -> dict:
-    """Keep answer evidence a small model needs to cite and filter."""
+def _compact_lite_chunk(chunk: dict, rank: int = 1) -> dict:
+    """Keep answer evidence a small model needs to cite and filter.
+
+    rank is the list position. The distance score is omitted so a caller cannot
+    re-sort the list out of retrieval order.
+    """
     out = {
+        "rank": rank,
         "text": str(chunk.get("text") or ""),
-        "score": chunk.get("score"),
         "source": str(chunk.get("source") or ""),
         "section": str(chunk.get("section") or ""),
         "doc_type": str(chunk.get("doc_type") or "other"),
     }
-    for field in ("page", "line_start", "mtime_iso", "silo"):
+    for field in ("page", "line_start", "mtime_iso", "silo", "read_cursor"):
         value = chunk.get(field)
         if value not in (None, ""):
             out[field] = value
@@ -3208,8 +3231,8 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
         "query": result.get("query") if isinstance(result, dict) else None,
         "silo": silo,
         "chunks": [
-            _compact_lite_chunk(chunk)
-            for chunk in chunks
+            _compact_lite_chunk(chunk, position)
+            for position, chunk in enumerate(chunks, start=1)
             if isinstance(chunk, dict)
         ],
     }
@@ -3228,9 +3251,11 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
     if isinstance(result, dict):
         # An empty chunk list with no reason attached is what sent the 2026-10-02
         # client into a rephrase loop; keep whatever explains it.
-        for field in ("recommended_action", "note", "error"):
+        for field in ("recommended_action", "note", "error", "source_file"):
             if result.get(field):
                 out[field] = result[field]
+        if result.get("whole_file"):
+            out["whole_file"] = True
     return out
 
 
@@ -3457,11 +3482,14 @@ def read_document(
     Pairs with: `find_files` before it; call again with cursor=next_cursor to keep reading.
 
     Returns the file's indexed text in document order, up to max_chars (default
-    6000, max 20000), with overlapping chunk seams removed. path may be a full path
+    6000, max 20000), with overlapping chunk seams removed. total_chars is the
+    seam-trimmed length of the whole file, so you can tell whether one more call
+    finishes it. path may be a full path
     or a bare filename if it is unique. When more remains, next_cursor is set: pass
     it back as cursor to continue with nothing skipped or repeated. A retrieval
-    chunk's read_cursor, passed as cursor with that chunk's source, starts reading
-    one chunk before it. Reads the index, not the disk, so PDFs and
+    chunk's read_cursor, passed as cursor with that chunk's source, starts one
+    chunk before the hit. If that lead-in does not leave room for the hit, the
+    page is the hit itself. Reads the index, not the disk, so PDFs and
     images come back as their extracted text. A private silo's file opens only when
     its exact slug is passed as silo.
     """

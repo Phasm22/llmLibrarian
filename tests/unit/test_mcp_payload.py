@@ -74,8 +74,8 @@ def test_slim_chunks_keeps_answer_fields_only():
     (slim,) = mcp_contract.slim_chunks([_chunk("/r/bread.txt")])
 
     assert slim == {
+        "rank": 1,
         "text": "Bulk ferment for four hours.",
-        "score": 0.61,
         "source": "/r/bread.txt",
         "silo": "recipes-1",
         "doc_type": "other",

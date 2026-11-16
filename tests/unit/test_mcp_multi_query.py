@@ -91,9 +91,9 @@ def test_multi_query_sorts_by_score_desc(monkeypatch, mcp):
 
     res = mcp.multi_query_knowledge(["q1", "q2", "q3"])
     assert res["merge_method"] == "score_sort"
-    scores = [c["score"] for c in res["chunks"]]
-    assert scores == sorted(scores, reverse=True)
-    assert res["chunks"][0]["text"] == "high"
+    assert [c["text"] for c in res["chunks"]] == ["high", "mid", "low"]
+    assert [c["rank"] for c in res["chunks"]] == [1, 2, 3]
+    assert "score" not in res["chunks"][0]
 
 
 def test_multi_query_fuses_by_rank_when_reranked(monkeypatch, mcp):

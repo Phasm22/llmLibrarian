@@ -14,6 +14,31 @@ def _rows(source: str = "/notes/a.txt"):
     return text, sorted(rows, key=lambda r: r[1]["line_start"])
 
 
+def test_short_page_keeps_the_anchor_and_drops_the_lead_in():
+    """The lead-in filled a 1500-char page and the hit never appeared."""
+    lead = "One-time install " + "x" * 1400
+    hit = "Daily use " + "y" * 1400
+    ordered = [
+        (lead, {"chunk_hash": "lead", "chunk_index": 0, "line_start": 1}),
+        (hit, {"chunk_hash": "hit", "chunk_index": 1, "line_start": 2}),
+    ]
+    page = read_indexed_document(
+        _Collection(ordered), silo="s", source="/x", cursor="a1.hit", max_chars=1500
+    )
+    assert page["text"].startswith("Daily use")
+    assert "One-time install" not in page["text"]
+    assert page["anchor_chunk"] == 1 and page["start_chunk"] == 1
+
+
+def test_read_reports_the_whole_file_length_on_a_short_page():
+    text, ordered = _rows()
+    page = read_indexed_document(
+        _Collection(ordered), silo="s", source="/x", max_chars=1500
+    )
+    assert page["total_chars"] == len(text)
+    assert len(page["text"]) < page["total_chars"]
+
+
 def test_anchor_cursor_reads_from_one_chunk_before_the_hit():
     _text, ordered = _rows()
     hit_doc, hit_meta = ordered[5]

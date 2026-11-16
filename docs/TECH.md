@@ -53,7 +53,12 @@ cannot fill an unscoped result. Naming `silo=` / `--in` on a LOOKUP, or passing
 `source=`, lifts that cap to `n_results`. Auto-bound and catalog-retry scopes
 stay at the unscoped cap. Unscoped retrieval applies the per-file cap to the
 stage-one window, then the per-silo cap, then cuts to `n_results`, so the silo
-cap can still fill the request.
+cap can still fill the request. Duplicate chunks are removed before that cut,
+so a repeated hash cannot leave the result short of `n_results`.
+
+The order of `chunks` is the ranking. `rank` 1 is the best hit. The distance
+score is not that order; `explain_retrieval` still returns it, and the answer
+payload does not, so a caller cannot re-sort the list by it.
 
 Hybrid retrieval (`query/retrieval.py`, `run_hybrid_retrieve`) fuses the vector
 list with a lexical list by RRF, which reads list position as relevance. The
@@ -270,3 +275,14 @@ Rules the overview relies on:
 - `pal pull --watch` parks a non-retryable file instead of retrying it. It re-checks the backend every 5 minutes and re-queues parked images once `image_backend` is `ok`. A retryable failure is capped at 5 attempts, then parked until the file's mtime changes. An unreachable MCP is retried without a cap and without a failure record.
 
 **Ledger.** `failures` keeps one open row per (silo, path). A repeat report for the same `file_mtime` does not count again. A removed file resolves its row. A one-time migration adds `file_mtime` and resolves rows whose file is gone (only when the parent directory still exists).
+
+
+### HTTP MCP reranking
+
+HTTP MCP defaults to `LLMLIBRARIAN_RERANK=0`. Set it to `1` in the
+server environment to rerank a bounded candidate head before diversity and
+deduplication. HTTP pins `LLMLIBRARIAN_RERANK_DEVICE=cpu`, including when an
+accelerator was configured. `explain_retrieval` reports whether reranking was
+applied, skipped for a year query, disabled, or failed with retrieval-order
+fallback. The idle model reaper remains active (900 seconds by default).
+CLI and stdio retain their configured device policy.
