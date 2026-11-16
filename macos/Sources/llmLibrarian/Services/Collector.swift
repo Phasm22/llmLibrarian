@@ -94,7 +94,7 @@ enum Collector {
             d.available = rows != nil
             d.changes = rows ?? []
         case .problems:
-            let rows = ActivityLedger.failures(dbPath: db, silo: r.silo)
+            let rows = ActivityLedger.failures(dbPath: db, silo: r.silo, limit: r.failureLimit)
             d.available = rows != nil
             d.failures = rows ?? []
         }

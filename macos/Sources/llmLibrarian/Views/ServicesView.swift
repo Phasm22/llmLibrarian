@@ -3,15 +3,15 @@ import SwiftUI
 struct ServicesView: View {
     @EnvironmentObject private var store: LibrarianStore
     @State private var search = ""
+    @State private var sortOrder = [KeyPathComparator(\ServiceStatus.title)]
     @SceneStorage("servicesColumns") private var columns: TableColumnCustomization<ServiceStatus>
-    @State private var confirmStop: ServiceStatus?
 
     private var rows: [ServiceStatus] {
-        guard !search.isEmpty else { return store.allServices }
+        guard !search.isEmpty else { return store.allServices.sorted(using: sortOrder) }
         return store.allServices.filter {
             $0.title.localizedCaseInsensitiveContains(search) || $0.subtitle.localizedCaseInsensitiveContains(search)
                 || $0.label.localizedCaseInsensitiveContains(search)
-        }
+        }.sorted(using: sortOrder)
     }
     private var selected: ServiceStatus? { store.service(label: store.selectedService) }
     private var selectedFolderMissing: Bool { store.silo(slug: selected?.siloSlug).map { !$0.pathExists } ?? false }
@@ -22,31 +22,31 @@ struct ServicesView: View {
                 EmptyState(symbol: "gearshape.2", title: "Not installed",
                            detail: "No pal installation found at \((store.config.palPath as NSString).abbreviatingWithTildeInPath).")
             } else {
-                Table(rows, selection: $store.selectedService, columnCustomization: $columns) {
-                    TableColumn("Service") { s in
+                Table(rows, selection: $store.selectedService, sortOrder: $sortOrder, columnCustomization: $columns) {
+                    TableColumn("Service", value: \.title) { s in
                         HStack(spacing: 7) {
                             StatusDot(state: s.state, size: 7)
                             Text(s.title)
                         }
                     }
                     .width(min: 150, ideal: 200).customizationID("service")
-                    TableColumn("Kind") { s in Text(s.kindText).foregroundStyle(.secondary) }
+                    TableColumn("Kind", value: \.kindText) { s in Text(s.kindText).foregroundStyle(.secondary) }
                         .width(min: 80, ideal: 90).customizationID("kind")
-                    TableColumn("State") { s in Text(s.stateText) }
+                    TableColumn("State", value: \.stateText) { s in Text(s.stateText) }
                         .width(min: 120, ideal: 170).customizationID("state")
-                    TableColumn("PID") { s in Text(s.pid.map(String.init) ?? "—").monospacedDigit() }
+                    TableColumn("PID", value: \.sortPID) { s in Text(s.pid.map(String.init) ?? "—").monospacedDigit() }
                         .width(55).customizationID("pid")
-                    TableColumn("Uptime") { s in Text(s.uptime ?? "—").monospacedDigit() }
+                    TableColumn("Uptime", value: \.uptimeSeconds) { s in Text(s.uptime ?? "—").monospacedDigit() }
                         .width(65).customizationID("uptime")
-                    TableColumn("Memory") { s in Text(s.memoryText).monospacedDigit() }
+                    TableColumn("Memory", value: \.sortMemory) { s in Text(s.memoryText).monospacedDigit() }
                         .width(75).customizationID("memory")
-                    TableColumn("Endpoint") { s in Text(s.endpointText).foregroundStyle(.secondary) }
+                    TableColumn("Endpoint", value: \.endpointText) { s in Text(s.endpointText).foregroundStyle(.secondary) }
                     .width(90).customizationID("endpoint")
-                    TableColumn("Last exit") { s in
+                    TableColumn("Last exit", value: \.sortLastExit) { s in
                         Text(s.lastExit.map(String.init) ?? "—").monospacedDigit().foregroundStyle(.secondary)
                     }
                     .width(60).customizationID("lastExit")
-                    TableColumn("Address / folder") { s in
+                    TableColumn("Address / folder", value: \.subtitle) { s in
                         Text(s.subtitle).foregroundStyle(.secondary).truncationMode(.middle).help(s.subtitle)
                     }
                     .width(min: 180, ideal: 300).customizationID("address")
@@ -67,9 +67,14 @@ struct ServicesView: View {
             }
         }
         .searchable(text: $search, placement: .toolbar, prompt: "Filter services")
+        .onChange(of: search) { _, _ in
+            if !rows.contains(where: { $0.label == store.selectedService }) { store.selectedService = nil }
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Group {
+                    Button("Sync Watchers") { store.syncDaemon() }
+                        .help("Reconcile watcher jobs with the indexed collections")
                     Button { if let s = selected { store.start(s) } } label: { Label("Start", systemImage: "play.fill") }
                         .help(selectedFolderMissing ? "This watcher's folder is missing; use Locate Folder or Remove Silo in the details" : "Start the selected service")
                         .disabled(!(selected.map { $0.state == .stopped && $0.installed } ?? false) || selectedFolderMissing)
@@ -92,19 +97,9 @@ struct ServicesView: View {
             }
         }
         .inspectorColumnWidth(min: 260, ideal: 320, max: 420)
-        .confirmationDialog("Stop \(confirmStop?.title ?? "")?", isPresented: Binding(get: { confirmStop != nil }, set: { if !$0 { confirmStop = nil } }),
-                            titleVisibility: .visible, presenting: confirmStop) { s in
-            Button("Stop", role: .destructive) { store.stop(s) }
-        } message: { s in
-            Text(s.kind == .chroma
-                 ? "The MCP server and every watcher depend on Chroma. Queries will fail until it is started again."
-                 : "Claude and other MCP clients will lose the endpoint until it is started again.")
-        }
     }
 
-    private func requestStop(_ s: ServiceStatus) {
-        if s.kind == .watcher { store.stop(s) } else { confirmStop = s }
-    }
+    private func requestStop(_ s: ServiceStatus) { store.requestStop(s) }
 
     @ViewBuilder
     private func actionButtons(for s: ServiceStatus) -> some View {
@@ -135,7 +130,9 @@ struct ServiceDetail: View {
                 }
 
                 if let silo, !silo.pathExists {
-                    Warning("Folder \(silo.tildePath) is missing, so this watcher exits immediately. Point it at the folder's new location or remove the silo.")
+                    Warning(silo.isPrivate
+                            ? "The private folder is missing. Restore it to \(silo.tildePath) to preserve its private scope."
+                            : "Folder \(silo.tildePath) is missing. Index and review a replacement before removing this old collection.")
                     HStack(spacing: 6) {
                         SiloFixButtons(silo: silo, compact: true)
                         Button("Log") { store.openLog(service.logPath) }

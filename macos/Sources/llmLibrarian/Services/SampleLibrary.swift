@@ -104,11 +104,16 @@ enum SampleLibrary {
     }
 
     static func sampleFailures(now: Date, silos: [Silo]) -> [ActivityFailureRow] {
-        ["contract.pdf", "receipt.pdf"].enumerated().map { i, f in
+        let protected = ["contract.pdf", "receipt.pdf"].enumerated().map { i, f in
             ActivityFailureRow(id: i, slug: silos[0].slug, path: silos[0].path + "/scans/" + f, errorClass: "encrypted",
                                error: "PdfReadError: file has not been decrypted", lastSeen: now.addingTimeInterval(Double(-7200 - i * 600)),
                                occurrences: [3, 2][i])
         }
+        let photos = (0..<7).map { i in
+            ActivityFailureRow(id: 10 + i, slug: silos[2].slug, path: silos[2].path + "/sample-photo-\(i + 1).jpeg",
+                               errorClass: "other", error: "image model not ready", lastSeen: now.addingTimeInterval(-60), occurrences: 1953)
+        }
+        return protected + photos
     }
 
     /// Summary built from the same synthetic rows the Activity page lists, so every
@@ -143,10 +148,11 @@ enum SampleLibrary {
         s.previousSearchCount = s.searches * 2 / 3
         s.previousNoSourceCount = max(0, s.noSource - 2)
         let failures = sampleFailures(now: now, silos: silos)
-        s.failures = [ActivityFailureGroup(slug: silos[0].slug, errorClass: "encrypted", files: failures.count,
-                                           occurrences: failures.reduce(0) { $0 + $1.occurrences },
-                                           lastSeen: failures[0].lastSeen, sampleError: failures[0].error)]
-        s.perSilo[silos[0].slug, default: .init()].openFailures = failures.count
+        s.failures = Dictionary(grouping: failures) { $0.slug + "\u{0}" + $0.errorClass }.values.map { rows in
+            ActivityFailureGroup(slug: rows[0].slug, errorClass: rows[0].errorClass, files: rows.count,
+                                 occurrences: rows.reduce(0) { $0 + $1.occurrences }, lastSeen: rows[0].lastSeen, sampleError: rows[0].error)
+        }.sorted { $0.id < $1.id }
+        for group in s.failures { s.perSilo[group.slug, default: .init()].openFailures += group.files }
         s.perSilo[silos[2].slug, default: .init()].lastChange = now.addingTimeInterval(-12 * 86_400)
         return s
     }

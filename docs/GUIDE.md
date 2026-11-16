@@ -32,6 +32,42 @@ Classic search matches strings. **Vector search** encodes meaning: “API redesi
 
 ---
 
+## macOS app: following a problem through to recovery
+
+Click a failing collection on Overview to open its **Problems**. Each group
+explains the next step and offers the relevant watcher log, pause/resume, and
+reindex controls. Expand a file for its full error and **Copy Error Details**.
+For an unavailable image model, inspect the log and fix the model or dependency
+before retrying. Pausing a watcher stops repeated attempts; resume it after the fix.
+Use **Load More** to inspect failures beyond the first 200 loaded rows.
+
+The **Jobs** toolbar button retains command output, outcomes, and retry actions
+for this app session. **Open Saved Logs** reaches full logs from previous
+sessions. A successful process exit is not a guarantee that all files indexed:
+unresolved failures and unconfirmed watcher startup are reported separately.
+
+For a missing folder, **Locate Folder** indexes a replacement while retaining
+the old index for review. Removing the old collection is a separate explicit
+action. Private collections currently require restoring the original folder
+path; the app will not create a shared replacement for a private index.
+
+**About llmLibrarian** shows the app's build time, commit, branch, local-change
+state, and source checkout. **Rebuild and Relaunch** updates the native app;
+Python services load code separately when they start. The About window's
+**Copy Build Details**, together with a failed job's log, identifies the code
+and operation involved in a report.
+
+Click a table column heading to sort; click it again to reverse the order.
+This works in Overview, Silos, Services, Searches, and Changes. Counts and dates
+sort by their values, and text filters keep the chosen sort order.
+
+To remove a collection, select it in **Silos** and use the trash button,
+**Remove Collection…** in its details, or the right-click menu. Confirmation
+shows the folder and chunk count. Removal deletes the index, bookmark, and
+watcher; original files stay on disk. Add the folder again to rebuild its index.
+Removal progress and errors appear in **Recent Jobs**; incomplete removal offers
+**Retry Removal…**, which asks for confirmation again.
+
 ## Cursor and MCP
 
 **What MCP does here:** exposes your index as **tools**, not as “the model already knows your life.”

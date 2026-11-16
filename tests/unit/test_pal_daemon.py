@@ -210,3 +210,19 @@ def test_cleanup_command_supports_dry_run(monkeypatch, tmp_path: Path):
     assert res.exit_code == 0
     assert "Would remove 1 generated log(s)" in res.stdout
     assert stale.exists()
+
+
+def test_remove_reports_incomplete_chunk_cleanup(monkeypatch):
+    seen = []
+    monkeypatch.setattr("operations.op_remove_silo", lambda *_: {
+        "removed_slug": "docs", "cleaned_slug": "docs", "not_found": False,
+        "chroma_warning": "Connection refused",
+    })
+    monkeypatch.setattr("pal._resolve_registry_source_for_remove", lambda *_: "/tmp/source")
+    monkeypatch.setattr("pal._remove_source_path", lambda path: seen.append(path))
+    monkeypatch.setattr("pal._sync_daemon_if_installed", lambda: seen.append("sync"))
+    result = runner.invoke(pal.app, ["remove", "docs"])
+    assert result.exit_code == 1
+    assert "Removal incomplete" in result.output
+    assert "pal remove docs" in result.output
+    assert seen == ["/tmp/source", "sync"]

@@ -8,12 +8,16 @@ import SwiftUI
 final class Job: ObservableObject, Identifiable {
     let id = UUID()
     let title: String
-    let siloSlug: String?
+    var siloSlug: String?
     let arguments: [String]
     @Published var output = ""
     @Published var isRunning = true
     @Published var exitCode: Int32?
+    @Published var outcome: String?
+    var logPath: String?
     let startedAt = Date()
+
+    var removalTarget: Silo?
 
     init(title: String, siloSlug: String?, arguments: [String]) {
         self.title = title
@@ -46,7 +50,8 @@ struct AddSiloRequest: Identifiable {
 @MainActor
 final class LibrarianStore: ObservableObject {
     // Data
-    @Published private(set) var config = PalConfig.load()
+    @Published private(set) var config: PalConfig
+    private let runtime: StoreRuntime
     @Published private(set) var silos: [Silo] = []
     @Published private(set) var services: [ServiceStatus] = []
     @Published private(set) var watchers: [ServiceStatus] = []
@@ -65,7 +70,13 @@ final class LibrarianStore: ObservableObject {
     @Published private(set) var lastRefresh: Date?
     @Published private(set) var isRefreshing = false
     @Published private(set) var hasLoaded = false
+    @Published private(set) var isRebuildingApp = false
+    private var rebuildProcess: Process?
     @Published var jobs: [Job] = []
+    @Published var showJobs = false
+    @Published var pendingStop: ServiceStatus?
+    @Published var pendingRemoval: Silo?
+    @Published private(set) var pendingServiceActions: Set<String> = []
     @Published var lastActionMessage: String?
     @Published var problem: ActionProblem?
     /// Set when the user asks to un-private a silo. Widening exposure is confirmed;
@@ -95,14 +106,16 @@ final class LibrarianStore: ObservableObject {
     @Published private(set) var zoomStep: Int = UserDefaults.standard.integer(forKey: "zoomStep")
 
     private var loopTask: Task<Void, Never>?
-    private var pendingRefresh = false
 
-    init() {
+    init(runtime: StoreRuntime = .live, autoRefresh: Bool = true) {
+        self.runtime = runtime
+        config = runtime.config()
         if SampleLibrary.enabled {
             do { try SampleLibrary.prepare() }
             catch { fatalError("Cannot prepare screenshot fixtures: \(error)") }
             zoomStep = 0
         }
+        guard autoRefresh else { return }
         loopTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -216,6 +229,21 @@ final class LibrarianStore: ObservableObject {
     func silo(slug: String?) -> Silo? { slug.flatMap { s in silos.first { $0.slug == s } } }
     func service(label: String?) -> ServiceStatus? { label.flatMap { l in allServices.first { $0.label == l } } }
     func activeJob(for silo: Silo) -> Job? { jobs.first { $0.siloSlug == silo.slug && $0.isRunning } }
+    func latestJob(for silo: Silo) -> Job? { jobs.first { $0.siloSlug == silo.slug } }
+
+    /// One collection health rule for Overview, the table, and recovery links.
+    func collectionStatus(_ silo: Silo) -> (state: HealthState, text: String) {
+        if !silo.pathExists { return (.attention, "Folder missing") }
+        if let failures = activity?.stats(silo.slug).openFailures, failures > 0 {
+            return (.attention, "\(failures) files failing")
+        }
+        if activityUnreadable { return (.unknown, "Index status unavailable") }
+        guard let watcher = watcher(for: silo) else { return (.unknown, "Not watched") }
+        if watcher.state != .running {
+            return (.attention, watcher.state == .stopped ? "Watcher stopped" : "Watcher needs attention")
+        }
+        return (.running, "Watching")
+    }
 
     /// The selected row as plain text, for the Services menu and copying.
     var selectionText: String? {
@@ -285,12 +313,16 @@ final class LibrarianStore: ObservableObject {
     // MARK: refresh
 
     func refresh() async {
-        if isRefreshing { pendingRefresh = true; return }
+        while isRefreshing {
+            guard !Task.isCancelled else { return }
+            try? await Task.sleep(for: .milliseconds(30))
+        }
         isRefreshing = true
-        config = PalConfig.load()
+        config = runtime.config()
         let cfg = config
         let window = activityWindow
-        let snap = await Task.detached(priority: .userInitiated) { await Collector.collect(config: cfg, window: window) }.value
+        let collect = runtime.collect
+        let snap = await Task.detached(priority: .userInitiated) { await collect(cfg, window) }.value
         silos = snap.silos
         services = snap.services
         watchers = snap.watchers
@@ -308,7 +340,6 @@ final class LibrarianStore: ObservableObject {
             if selectedService == nil { selectedService = watchers.first { $0.state != .running }?.label ?? services.first?.label }
             if selectedQuery == nil { selectedQuery = queries.first?.id }
         }
-        if pendingRefresh { pendingRefresh = false; await refresh() }
     }
 
     /// Refresh a couple of times after an action so launchd state catches up.
@@ -321,64 +352,109 @@ final class LibrarianStore: ObservableObject {
         }
     }
 
+    // MARK: app rebuild
+
+    var rebuildLogPath: String { config.logsDir + "/app-build.log" }
+    var canRebuildApp: Bool { !SampleLibrary.enabled && !isRebuildingApp && !jobs.contains(where: \.isRunning) }
+
+    func rebuildApp() {
+        guard canRebuildApp else { return }
+        AppDelegate.showMainWindow()
+        let script = config.workdir + "/macos/build.sh"
+        guard FileManager.default.fileExists(atPath: script) else {
+            problem = ActionProblem(title: "Cannot rebuild the app",
+                                    message: "The build script is missing at \(script). Restore the local checkout before rebuilding.")
+            return
+        }
+        let logPath = rebuildLogPath
+        isRebuildingApp = true
+        do {
+            rebuildProcess = try AppRebuild.start(workdir: config.workdir, logPath: logPath,
+                                                  environment: config.subprocessEnvironment()) { [weak self] status in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.isRebuildingApp = false
+                    self.rebuildProcess = nil
+                    if status != 0 {
+                        self.problem = ActionProblem(title: "App rebuild failed",
+                                                     message: "The build exited with status \(status). Open the build log for details.",
+                                                     logPath: logPath)
+                    } else {
+                        self.lastActionMessage = "App rebuilt and relaunched"
+                    }
+                }
+            }
+        } catch {
+            isRebuildingApp = false
+            problem = ActionProblem(title: "Could not start app rebuild", message: error.localizedDescription,
+                                    logPath: logPath)
+        }
+    }
+
     // MARK: service actions
 
     func restart(_ s: ServiceStatus) {
-        guard !SampleLibrary.enabled else { return }
-        Task.detached { [weak self] in
-            let r = Launchctl.kickstart(s.label)
-            await self?.finishAction(r, success: "Restarted \(s.title)", failure: "Could not restart \(s.title)")
-        }
+        changeService(s, command: .restart)
     }
 
     func stop(_ s: ServiceStatus) {
-        guard !SampleLibrary.enabled else { return }
-        Task.detached { [weak self] in
-            let r = Launchctl.bootout(s.label)
-            await self?.finishAction(r, success: "Stopped \(s.title)", failure: "Could not stop \(s.title)")
-        }
+        changeService(s, command: .stop)
     }
 
-    func start(_ s: ServiceStatus) {
-        guard !SampleLibrary.enabled else { return }
-        if let silo = silo(slug: s.siloSlug), !silo.pathExists {
+    func requestStop(_ s: ServiceStatus) {
+        if s.kind == .watcher { stop(s) }
+        else { AppDelegate.showMainWindow(); pendingStop = s }
+    }
+
+    func start(_ s: ServiceStatus) { changeService(s, command: .start) }
+
+    private func changeService(_ s: ServiceStatus, command: ServiceCommand) {
+        guard !SampleLibrary.enabled, !pendingServiceActions.contains(s.label) else { return }
+        if command != .stop, let silo = silo(slug: s.siloSlug), !silo.pathExists {
             problem = ActionProblem(
                 title: "The watcher for \(s.title) can't start",
                 message: "Its folder \(silo.tildePath) no longer exists, so the watcher exits as soon as launchd starts it (last exit code \(s.lastExit ?? 1)). Point the silo at the folder's new location, or remove the silo.",
                 service: s, silo: silo, logPath: s.logPath)
             return
         }
-        guard s.installed else {
+        guard s.installed || command == .stop else {
             problem = ActionProblem(title: "\(s.title) is not installed",
-                                    message: "There is no launchd plist for \(s.label). Run `pal daemon sync` (Services → Sync with registry) to recreate watcher jobs, or `pal mcp install` / `pal chroma install` for the core services.",
+                                    message: "There is no launchd plist for \(s.label). Use Sync Watchers in Services to recreate watcher jobs, or run `pal mcp install` / `pal chroma install` for the core services.",
                                     service: s)
             return
         }
-        let plist = s.plistPath
-        let loaded = s.loaded
-        Task.detached { [weak self] in
-            // A job launchd already knows about must be kickstarted; bootstrap
-            // on a loaded job fails with "5: Input/output error".
-            let r = loaded ? Launchctl.kickstart(s.label) : Launchctl.bootstrap(plist: plist)
-            await self?.finishAction(r, service: s, success: "Started \(s.title)", failure: "Couldn't start \(s.title)")
+        pendingServiceActions.insert(s.label)
+        let run = runtime.serviceCommand, cfg = config
+        Task {
+            defer { pendingServiceActions.remove(s.label) }
+            let result = await Task.detached { run(command, s, cfg) }.value
+            guard result.ok else {
+                let raw = result.combined.isEmpty ? "launchctl exited with status \(result.status)." : result.combined
+                problem = ActionProblem(title: "Could not change \(s.title)", message: Self.explainLaunchctl(raw),
+                                        service: s, silo: silo(slug: s.siloSlug), logPath: s.logPath)
+                return
+            }
+            for delay in runtime.settleDelays {
+                try? await Task.sleep(for: delay)
+                await refresh()
+                let current = service(label: s.label)
+                let reached = command == .stop ? (current == nil || current?.loaded == false)
+                    : current?.state == .running
+                if reached {
+                    lastActionMessage = command == .stop ? "Stopped \(s.title)" : "\(s.title) is running"
+                    return
+                }
+            }
+            problem = ActionProblem(title: "\(s.title) has not reached the requested state",
+                                    message: "The service command was accepted, but the follow-up check did not confirm \(command == .stop ? "that it stopped" : "a running, healthy service"). It may still be starting or may have exited. Open its log and check Services before retrying.",
+                                    service: service(label: s.label) ?? s, silo: silo(slug: s.siloSlug), logPath: s.logPath)
         }
-    }
-
-    private func finishAction(_ r: Shell.Result, service: ServiceStatus? = nil, success: String, failure: String) {
-        if r.ok {
-            lastActionMessage = success
-        } else {
-            let raw = r.combined.isEmpty ? "launchctl exited with status \(r.status)." : r.combined
-            problem = ActionProblem(title: failure, message: Self.explainLaunchctl(raw),
-                                    service: service, silo: silo(slug: service?.siloSlug), logPath: service?.logPath)
-        }
-        refreshSoon()
     }
 
     /// Translate launchctl's terse errors into something a person can act on.
     static func explainLaunchctl(_ raw: String) -> String {
         if raw.contains("Input/output error") {
-            return "launchd already has this job loaded, so it can't be bootstrapped again. It was restarted instead; if it is still down, the process is exiting right after launch. Open the log for the reason."
+            return "launchd could not complete the request. A conflicting loaded job or a startup failure can cause this. Check the service state and log before retrying.\n\(raw)"
         }
         if raw.contains("Operation not permitted") || raw.contains("Permission denied") {
             return "launchd refused the request. \(raw)"
@@ -458,6 +534,14 @@ final class LibrarianStore: ObservableObject {
         let jobs = SiloAddWorkflow.jobs(for: newFolders, imageVision: imageVision)
         runPalJobs(jobs[...]) { [weak self] succeeded in
             guard succeeded, let self else { return }
+            let added = newFolders.compactMap { folder in
+                self.silos.first { SiloAddWorkflow.normalizedPath(for: URL(fileURLWithPath: $0.path)) == SiloAddWorkflow.normalizedPath(for: folder) }
+            }
+            guard added.count == newFolders.count, added.allSatisfy({ self.watcher(for: $0)?.state == .running }) else {
+                self.problem = ActionProblem(title: "Indexed, but watcher setup needs attention",
+                                             message: "The indexing steps completed, but running watchers were not confirmed for every folder. Open Services, use Sync Watchers, and inspect the watcher logs. Job logs are available from Recent Jobs.")
+                return
+            }
             let lastPath = SiloAddWorkflow.normalizedPath(for: newFolders.last!)
             self.selectedSilo = self.silos.first(where: {
                 SiloAddWorkflow.normalizedPath(for: URL(fileURLWithPath: $0.path)) == lastPath
@@ -471,9 +555,14 @@ final class LibrarianStore: ObservableObject {
 
     /// Ask for the folder's new location, index it, then remove the old silo.
     func relocate(_ silo: Silo) {
+        guard !silo.isPrivate else {
+            problem = ActionProblem(title: "Restore the private collection's folder",
+                                    message: "Restore this folder to \(silo.path). Creating a replacement through Add Silo would create a shared collection, so this action cannot safely move a private collection. The existing private index has been kept.")
+            return
+        }
         let panel = NSOpenPanel()
         panel.title = "Locate \(silo.displayName)"
-        panel.message = "Choose where \(silo.tildePath) is now. It will be indexed as a new silo and the old one removed."
+        panel.message = "Index the new location as a separate collection. The old index is kept until you review the replacement and explicitly remove the old collection."
         panel.prompt = "Use This Folder"
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -482,23 +571,69 @@ final class LibrarianStore: ObservableObject {
         panel.directoryURL = URL(fileURLWithPath: FileManager.default.fileExists(atPath: parent) ? parent : NSHomeDirectory())
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let newPath = url.path
+        prepareReplacement(silo, at: url)
+    }
+
+    /// Keep the old index throughout staging. Removal is a separate, explicit
+    /// action after the user has inspected the replacement's files and scope.
+    func prepareReplacement(_ silo: Silo, at url: URL) {
+        guard !silo.isPrivate else {
+            problem = ActionProblem(title: "Private relocation is unavailable", message: "Restore the folder to \(silo.path) to preserve its private scope. The old index is unchanged.")
+            return
+        }
+        let newPath = SiloAddWorkflow.normalizedPath(for: url)
+        guard newPath != SiloAddWorkflow.normalizedPath(for: URL(fileURLWithPath: silo.path)) else {
+            reindex(silo)
+            return
+        }
         problem = nil
-        runPal(title: "Index \(url.lastPathComponent)", siloSlug: silo.slug, args: ["pull", newPath]) { [weak self] code in
-            guard code == 0 else { return }
-            self?.runPal(title: "Remove old silo \(silo.displayName)", siloSlug: silo.slug, args: ["remove", silo.slug])
+        var args = ["pull", newPath]
+        if silo.imageVision { args.append("--image-vision") }
+        runPal(title: "Index replacement for \(silo.displayName)", siloSlug: nil, args: args) { [weak self] code in
+            guard code == 0, let self else { return }
+            if let replacement = self.silos.first(where: { SiloAddWorkflow.normalizedPath(for: URL(fileURLWithPath: $0.path)) == newPath }) {
+                self.show(silo: replacement)
+            }
+            self.lastActionMessage = "Replacement indexed. Review it before removing the old collection; use Sync Watchers to watch the new folder."
         }
     }
 
+    func canRemove(_ silo: Silo) -> Bool {
+        !isRebuildingApp && activeJob(for: silo) == nil
+            && !jobs.contains { $0.isRunning && ($0.arguments == ["daemon", "sync"] || SiloAddWorkflow.pullTarget(of: $0.arguments) == silo.path) }
+            && !(watcher(for: silo).map { pendingServiceActions.contains($0.label) } ?? false)
+    }
+
+    func requestRemoval(_ silo: Silo) {
+        guard canRemove(silo) else { return }
+        AppDelegate.showMainWindow()
+        showJobs = false
+        pendingRemoval = silo
+    }
+
     func removeSilo(_ silo: Silo) {
+        pendingRemoval = nil
+        guard canRemove(silo) else {
+            problem = ActionProblem(title: "Collection is busy", message: "Wait for its current job to finish before removing this collection.", silo: silo)
+            return
+        }
         problem = nil
-        runPal(title: "Remove silo \(silo.displayName)", siloSlug: silo.slug, args: ["remove", silo.slug])
+        showJobs = true
+        runPal(title: "Remove collection \(silo.displayName)", siloSlug: silo.slug, args: ["remove", silo.slug], removing: silo) { [weak self] code in
+            guard code == 0, let self else { return }
+            if self.selectedSilo == silo.slug { self.selectedSilo = nil }
+            self.lastActionMessage = "Removed \(silo.displayName). Original files were kept."
+        }
     }
 
     // MARK: pal jobs
 
     func reindex(_ silo: Silo) {
         guard activeJob(for: silo) == nil else { return }
+        guard silo.pathExists else {
+            problem = ActionProblem(title: "Collection folder is missing", message: "Restore or locate \(silo.path) before reindexing.", silo: silo)
+            return
+        }
         runPal(title: "Reindex \(silo.displayName)", siloSlug: silo.slug, args: ["pull", silo.path])
     }
 
@@ -549,10 +684,11 @@ final class LibrarianStore: ObservableObject {
     }
 
     func syncDaemon() {
+        guard !jobs.contains(where: { $0.isRunning && $0.arguments == ["daemon", "sync"] }) else { return }
         runPal(title: "Sync daemon jobs", siloSlug: nil, args: ["daemon", "sync"])
     }
 
-    private func runPal(title: String, siloSlug: String?, args: [String], completion: ((Int32) -> Void)? = nil) {
+    private func runPal(title: String, siloSlug: String?, args: [String], removing: Silo? = nil, completion: ((Int32) -> Void)? = nil) {
         guard !SampleLibrary.enabled else { return }
         // One index job per folder. pal also refuses (exit 75) via a folder lock,
         // which covers pulls this app instance did not start, e.g. one orphaned
@@ -564,63 +700,124 @@ final class LibrarianStore: ObservableObject {
             completion?(SiloAddWorkflow.alreadyIndexingExit)
             return
         }
+        let removalTarget = removing
         let job = Job(title: title, siloSlug: siloSlug, arguments: args)
+        job.removalTarget = removalTarget
         jobs.insert(job, at: 0)
-        if jobs.count > 20 { jobs.removeLast(jobs.count - 20) }
+        // Keep running jobs, even when many folders were added together.
+        let completed = jobs.filter { !$0.isRunning }.dropFirst(20).map(\.id)
+        jobs.removeAll { completed.contains($0.id) }
         let cfg = config
+        let logPath = cfg.logsDir + "/jobs/" + job.id.uuidString + ".log"
+        job.logPath = logPath
         let p = Process()
         p.executableURL = URL(fileURLWithPath: cfg.python)
         p.arguments = [cfg.palPath] + args
         p.currentDirectoryURL = URL(fileURLWithPath: cfg.workdir)
         p.environment = cfg.subprocessEnvironment()
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let text = String(decoding: data, as: UTF8.self)
-            Task { @MainActor in job.output += text }
-        }
-        p.terminationHandler = { proc in
-            pipe.fileHandleForReading.readabilityHandler = nil
-            let rest = pipe.fileHandleForReading.readDataToEndOfFile()
-            let code = proc.terminationStatus
-            Task { @MainActor [weak self] in
-                if !rest.isEmpty { job.output += String(decoding: rest, as: UTF8.self) }
-                job.isRunning = false
-                job.exitCode = code
-                if code == 0 {
-                    self?.lastActionMessage = "\(title) finished"
-                } else if code == SiloAddWorkflow.alreadyIndexingExit {
-                    let detail = job.output.split(whereSeparator: \.isNewline).last.map(String.init)
-                    self?.problem = ActionProblem(title: "Already being indexed",
-                                                  message: detail ?? "Another pal pull is indexing this folder.")
-                } else {
-                    let tail = job.output.split(whereSeparator: \.isNewline).suffix(6).joined(separator: "\n")
-                    self?.problem = ActionProblem(title: "\(title) failed (exit \(code))",
-                                                  message: tail.isEmpty ? "pal exited with status \(code) and no output." : tail)
-                }
-                await self?.refresh()
-                completion?(code)
-            }
-        }
+        p.standardInput = FileHandle.nullDevice
         do {
+            try FileManager.default.createDirectory(atPath: cfg.logsDir + "/jobs", withIntermediateDirectories: true)
+            let header = "\(title)\nStarted: \(ISO8601DateFormatter().string(from: job.startedAt))\nArguments: \(args.description)\n\(AppBuildInfo().report)\n\n"
+            try Data(header.utf8).write(to: URL(fileURLWithPath: logPath))
+            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: logPath))
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            p.standardOutput = handle
+            p.standardError = handle
             try p.run()
         } catch {
             job.output = "Could not start pal: \(error.localizedDescription)"
             job.isRunning = false
             job.exitCode = -1
-            problem = ActionProblem(title: "Couldn't run pal", message: "\(error.localizedDescription)\n\(cfg.python) \(cfg.palPath)")
+            job.outcome = "Could not start"
+            problem = ActionProblem(title: "Couldn't run pal", message: "\(error.localizedDescription)\n\(cfg.python) \(cfg.palPath)", logPath: logPath)
+            completion?(-1)
+            return
         }
+        // A file survives app relaunch and cannot deadlock when compiler/model
+        // output exceeds a pipe buffer. Only its tail is kept in the UI.
+        Task { [weak self] in
+            while p.isRunning {
+                job.output = Self.logTail(logPath)
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+            p.waitUntilExit()
+            job.output = Self.logTail(logPath)
+            job.exitCode = p.terminationStatus
+            guard let self else { job.isRunning = false; return }
+            await refresh()
+            var completionCode = p.terminationStatus
+            if let target = SiloAddWorkflow.pullTarget(of: args) {
+                job.siloSlug = silos.first { SiloAddWorkflow.normalizedPath(for: URL(fileURLWithPath: $0.path)) == target }?.slug ?? siloSlug
+            }
+            if p.terminationStatus == 0, let target = SiloAddWorkflow.pullTarget(of: args) {
+                let indexed = silos.first { SiloAddWorkflow.normalizedPath(for: URL(fileURLWithPath: $0.path)) == target }
+                if indexed == nil || indexed?.filesIndexed == 0 {
+                    completionCode = 1
+                    job.outcome = "No indexed files confirmed"
+                    problem = ActionProblem(title: "Indexing needs attention",
+                                            message: "The command finished, but no indexed files were confirmed for \(target). Check the job log for exclusions, unsupported files, or indexing errors before continuing.", logPath: logPath)
+                } else if let slug = indexed?.slug, activity?.stats(slug).openFailures ?? 0 > 0 {
+                    completionCode = 1
+                    job.outcome = "Finished with unresolved indexing problems"
+                    problem = ActionProblem(title: "Indexing still has problems", message: "The collection still has recorded failures. Review Problems before retrying; the command exiting successfully does not mean every file indexed.",
+                                            silo: indexed, logPath: logPath)
+                } else if activityUnreadable {
+                    completionCode = 1
+                    job.outcome = "Index updated; problem status unavailable"
+                    problem = ActionProblem(title: "Could not verify indexing problems", message: "The command finished, but the activity history could not be read. Open the log and review the collection before continuing.", silo: indexed, logPath: logPath)
+                }
+            }
+            if p.terminationStatus == 0, args.first == "remove", let slug = siloSlug {
+                let bookmarkRemains = removalTarget.map { self.unindexedBookmarks.contains($0.path) } ?? false
+                if registryError != nil || silos.contains(where: { $0.slug == slug }) || watchers.contains(where: { $0.siloSlug == slug }) || bookmarkRemains {
+                    completionCode = 1
+                    job.outcome = "Removal could not be confirmed"
+                    problem = ActionProblem(title: "Removal needs attention",
+                                            message: "The collection or its watcher is still listed, or the registry could not be read. Review the log and refresh. If the watcher remains, use Sync Watchers in Services. Original files were kept.",
+                                            silo: removalTarget, logPath: logPath)
+                }
+            }
+            if completionCode == 0 {
+                job.outcome = "Finished"
+                lastActionMessage = "\(title) finished"
+            } else if p.terminationStatus != 0 {
+                job.outcome = p.terminationStatus == SiloAddWorkflow.alreadyIndexingExit ? "Another job is indexing this folder" : "Failed (exit \(p.terminationStatus))"
+                let tail = job.output.split(whereSeparator: \.isNewline).suffix(8).joined(separator: "\n")
+                problem = ActionProblem(title: job.outcome!, message: tail.isEmpty ? "No output was recorded. Check the installation and retry." : tail,
+                                        silo: removalTarget ?? silo(slug: job.siloSlug), logPath: logPath)
+            }
+            job.isRunning = false
+            if let log = FileHandle(forWritingAtPath: logPath) {
+                _ = try? log.seekToEnd()
+                try? log.write(contentsOf: Data("\nFinished: \(ISO8601DateFormatter().string(from: Date()))\nExit: \(p.terminationStatus)\nOutcome: \(job.outcome ?? "Unknown")\n".utf8))
+                try? log.close()
+                job.output = Self.logTail(logPath)
+            }
+            completion?(completionCode)
+        }
+    }
+
+    private static func logTail(_ path: String) -> String {
+        guard let file = FileHandle(forReadingAtPath: path) else { return "" }
+        defer { try? file.close() }
+        let size = (try? file.seekToEnd()) ?? 0
+        try? file.seek(toOffset: size > 128_000 ? size - 128_000 : 0)
+        return String(decoding: (try? file.readToEnd()) ?? Data(), as: UTF8.self)
+    }
+
+    func retry(_ job: Job) {
+        guard !job.isRunning, job.arguments.first == "pull" || job.arguments == ["daemon", "sync"] else { return }
+        runPal(title: job.title, siloSlug: job.siloSlug, args: job.arguments)
     }
 
     private func runPalJobs(_ pending: ArraySlice<PalJobSpec>, completion: @escaping (Bool) -> Void) {
         guard let next = pending.first else { completion(true); return }
         runPal(title: next.title, siloSlug: next.siloSlug, args: next.arguments) { [weak self] code in
-            // A folder another pull is already indexing is skipped, not fatal:
-            // that pull finishes it and syncs the watchers itself.
-            guard code == 0 || code == SiloAddWorkflow.alreadyIndexingExit, let self else { completion(false); return }
+            // Busy, partial success, and launch failure all stop the chain.
+            // Never claim a folder was added because another process owns it.
+            guard code == 0, let self else { completion(false); return }
             self.runPalJobs(pending.dropFirst(), completion: completion)
         }
     }
@@ -628,13 +825,30 @@ final class LibrarianStore: ObservableObject {
     // MARK: helpers
 
     func reveal(_ path: String) {
+        guard FileManager.default.fileExists(atPath: path) else {
+            lastActionMessage = "Path not found: \(path)"
+            return
+        }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    func openJobLogs() {
+        let path = config.logsDir + "/jobs"
+        do {
+            try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+            reveal(path)
+        } catch {
+            problem = ActionProblem(title: "Cannot open saved logs", message: error.localizedDescription)
+        }
     }
 
     func openLog(_ path: String) {
         let url = URL(fileURLWithPath: path)
         if FileManager.default.fileExists(atPath: path) {
-            NSWorkspace.shared.open(url)
+            if !NSWorkspace.shared.open(url) {
+                problem = ActionProblem(title: "Cannot open log", message: "Choose an app to open \(path) from Finder.")
+                reveal(path)
+            }
         } else {
             lastActionMessage = "No log yet at \((path as NSString).abbreviatingWithTildeInPath)"
         }
