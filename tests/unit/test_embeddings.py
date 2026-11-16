@@ -321,3 +321,13 @@ def test_qwen_adapter_roundtrip_and_rejects_old_collection(monkeypatch, tmp_path
     assert "prompt_name" not in model.calls[0]
     assert model.calls[1]["prompt_name"] == "query"
     assert col.metadata["llmli_embedding_model"] == QWEN3_MODEL
+
+
+def test_watch_service_environment_keeps_embedding_contract():
+    from jobs_runtime import _env_for_service
+    settings = {
+        "LLMLIBRARIAN_EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-0.6B",
+        "LLMLIBRARIAN_EMBEDDING_DEVICE": "cpu",
+        "LLMLIBRARIAN_EMBEDDING_BATCH_SIZE": "8",
+    }
+    assert _env_for_service(settings) == settings
