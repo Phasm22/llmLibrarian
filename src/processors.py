@@ -569,6 +569,11 @@ def _get_paddle_ocr_engine() -> Any | None:
         _PADDLE_OCR_ENGINE = PaddleOCR(
             use_textline_orientation=use_angle,
             lang="en",
+            # oneDNN (MKL-DNN) CPU acceleration has known crashes/regressions on
+            # some images and hardware (e.g. PaddlePaddle/PaddleOCR#15782,
+            # #17955); the accuracy/speed cost of the plain CPU path is worth
+            # not failing ingest.
+            enable_mkldnn=False,
         )
     except Exception as e:
         _PADDLE_OCR_ENGINE = None
