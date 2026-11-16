@@ -82,13 +82,18 @@ def test_lite_catalog_is_five_tools_and_stays_small():
         assert key in props, key
 
 
-def test_lite_harness_tasks_pass(tmp_path):
+def test_lite_harness_tasks_pass(tmp_path, monkeypatch):
     """Empirical full-vs-lite harness; marks gaps as failures when lite regresses."""
-    from tests.harness.lite_mcp_compare import _bind_mcp, run_tasks, summarize
+    from tests.harness.lite_mcp_compare import run_tasks, summarize
     from tests.harness.lite_mcp_fixtures import build_index
 
     index = build_index(tmp_path)
-    mcp = _bind_mcp(index.db_path)
+    import mcp_server as mcp
+    # The standalone harness mutates its process. In pytest these bindings
+    # must be restored before the audit/ledger tests run in the same process.
+    monkeypatch.setattr(mcp, "_DB_PATH", str(index.db_path))
+    monkeypatch.setattr(mcp, "_release_chroma", lambda: None)
+    monkeypatch.setattr(mcp, "_emit_query_audit", lambda **kw: None)
     results = run_tasks(index, mcp)
     report = summarize(results, [])
     gaps = report["lite_gaps_vs_full"]

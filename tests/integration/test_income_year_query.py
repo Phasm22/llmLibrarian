@@ -85,6 +85,11 @@ def test_income_year_query_uses_ocr_for_scanned_employer_w2(tmp_path, monkeypatc
 
 
 def test_income_year_query_uses_ocr_for_standalone_image(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    # This synthetic file has no real pixels; exercise OCR text retrieval with
+    # a deterministic image vector, without optional model downloads.
+    adapter = SimpleNamespace(embed_image_paths=lambda paths: [[1.0, 0.0, 0.0] for _ in paths])
+    monkeypatch.setattr("ingest.ensure_image_embedding_adapter_ready", lambda: adapter)
     root = tmp_path / "Tax"
     (root / "2025").mkdir(parents=True)
     image_path = root / "2025" / "ymca-w2-2025.png"
