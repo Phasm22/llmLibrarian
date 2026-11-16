@@ -63,3 +63,18 @@ def test_getters_mark_use(monkeypatch):
     monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING_BATCH_SIZE", raising=False)
     embeddings.get_embedding_function(batch_size=1)
     assert model_idle.idle_seconds() < 5
+
+
+def test_unload_drops_client_and_chroma_model_references(monkeypatch):
+    _fake_modules(monkeypatch)
+    ef_cache = {"llmli": object()}
+    st_cache = {"model": object()}
+    monkeypatch.setitem(sys.modules, "chroma_client", types.SimpleNamespace(
+        _lock=threading.Lock(), _clients={"db": types.SimpleNamespace(_effective_efs=ef_cache)}
+    ))
+    monkeypatch.setitem(sys.modules,
+        "chromadb.utils.embedding_functions.sentence_transformer_embedding_function",
+        types.SimpleNamespace(SentenceTransformerEmbeddingFunction=types.SimpleNamespace(models=st_cache)))
+    model_idle.unload_models()
+    assert not ef_cache
+    assert not st_cache

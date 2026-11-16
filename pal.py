@@ -2959,6 +2959,12 @@ _CHROMA_ENV_KEYS = {
 }
 
 
+_EMBEDDING_ENV_KEYS = {
+    "LLMLIBRARIAN_EMBEDDING", "LLMLIBRARIAN_EMBEDDING_MODEL",
+    "LLMLIBRARIAN_EMBEDDING_DEVICE", "LLMLIBRARIAN_EMBEDDING_BATCH_SIZE",
+}
+
+
 def _daemon_env(db_path: str | Path) -> dict[str, str]:
     env = os.environ.copy()
     env["LLMLIBRARIAN_DB"] = str(Path(db_path).resolve())
@@ -2968,7 +2974,9 @@ def _daemon_env(db_path: str | Path) -> dict[str, str]:
     # so watch-service unit files always get the correct MCP path. Check every
     # known location: the daemon workdir is site-packages for package installs,
     # while .env.mcp lives in the install/checkout directory.
-    if not any(k in env for k in _MCP_CLIENT_ENV_KEYS) or not any(k in env for k in _CHROMA_ENV_KEYS):
+    if (not any(k in env for k in _MCP_CLIENT_ENV_KEYS)
+            or not any(k in env for k in _CHROMA_ENV_KEYS)
+            or "LLMLIBRARIAN_EMBEDDING_MODEL" not in env):
         for env_mcp in _mcp_env_file_candidates():
             try:
                 if not env_mcp.is_file():
@@ -2976,12 +2984,12 @@ def _daemon_env(db_path: str | Path) -> dict[str, str]:
             except OSError:
                 continue
             parsed = _parse_env_file(env_mcp)
-            if not any(k in parsed for k in (_MCP_CLIENT_ENV_KEYS | _CHROMA_ENV_KEYS)):
+            if not any(k in parsed for k in (_MCP_CLIENT_ENV_KEYS | _CHROMA_ENV_KEYS | _EMBEDDING_ENV_KEYS)):
                 continue
             for key, val in parsed.items():
                 if key in _MCP_CLIENT_ENV_KEYS and val and key not in env:
                     env[key] = val
-                if key in _CHROMA_ENV_KEYS and val and key not in env:
+                if key in (_CHROMA_ENV_KEYS | _EMBEDDING_ENV_KEYS) and val and key not in env:
                     env[key] = val
             break
 

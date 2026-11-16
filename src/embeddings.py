@@ -25,6 +25,7 @@ from typing import Any
 
 # Empirically measured crossover on Apple M-series: MPS beats CPU at ~24+ texts per batch.
 _DEFAULT_MPS_THRESHOLD = 24
+QWEN3_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
 # Cache sentence-transformer embedding functions across calls. Without this,
 # every ingest / update_file / remove_file call in a long-lived MCP server
@@ -127,6 +128,37 @@ def get_embedding_function(batch_size: int | None = None, device: str | None = N
                 # Explicit opt-in to ONNX MiniLM path; onnxruntime will automatically
                 # use CoreMLExecutionProvider on macOS when available.
                 ef: Any = embedding_functions.DefaultEmbeddingFunction()
+            elif model == QWEN3_MODEL:
+                # Qwen retrieval is asymmetric: instruction on queries only.
+                # A per-instance cache avoids Chroma's model-name-only class cache
+                # retaining tensors after the idle reaper or sharing CPU/MPS models.
+                base_cls = embedding_functions.SentenceTransformerEmbeddingFunction
+
+                class Qwen3EmbeddingFunction(base_cls):
+                    expected_dimension = 1024
+                    def __init__(self) -> None:
+                        self.models = {}
+                        super().__init__(model_name=model, device=resolved, normalize_embeddings=True)
+
+                    def _encode(self, input: Any, *, query: bool) -> Any:
+                        import numpy as np
+
+                        model_idle.touch()
+                        kwargs = {"convert_to_numpy": True, "normalize_embeddings": True}
+                        if encode_batch_size is not None:
+                            kwargs["batch_size"] = encode_batch_size
+                        if query:
+                            kwargs["prompt_name"] = "query"
+                        result = self._model.encode(list(input), **kwargs)
+                        return [np.asarray(row, dtype=np.float32) for row in result]
+
+                    def __call__(self, input: Any) -> Any:
+                        return self._encode(input, query=False)
+
+                    def embed_query(self, input: Any) -> Any:
+                        return self._encode(input, query=True)
+
+                ef = Qwen3EmbeddingFunction()
             elif encode_batch_size is not None:
                 base_cls = embedding_functions.SentenceTransformerEmbeddingFunction
 
@@ -173,7 +205,9 @@ def validate_embedding_dimension(collection: Any, ef: Any) -> None:
     """
     try:
         existing_count = collection.count()
-    except Exception:
+    except Exception as exc:
+        if os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "").strip():
+            raise RuntimeError("Cannot validate configured embedding model against the collection") from exc
         return
     if not existing_count:
         return
@@ -184,13 +218,19 @@ def validate_embedding_dimension(collection: Any, ef: Any) -> None:
         if existing_embeddings is None or len(existing_embeddings) == 0:
             return
         existing_dim = len(existing_embeddings[0])
-    except Exception:
+    except Exception as exc:
+        if os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "").strip():
+            raise RuntimeError("Cannot validate configured embedding model against the collection") from exc
         return
 
     try:
-        probe = ef(["dimension probe"])
-        new_dim = len(probe[0])
-    except Exception:
+        new_dim = getattr(ef, "expected_dimension", None)
+        if new_dim is None:
+            probe = ef(["dimension probe"])
+            new_dim = len(probe[0])
+    except Exception as exc:
+        if os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "").strip():
+            raise RuntimeError("Cannot validate configured embedding model against the collection") from exc
         return
 
     if existing_dim and new_dim and existing_dim != new_dim:

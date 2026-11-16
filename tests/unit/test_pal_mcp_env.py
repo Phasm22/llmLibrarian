@@ -251,3 +251,14 @@ def test_mcp_call_raises_tool_error_text(monkeypatch):
     with pytest.raises(RuntimeError, match="LLMLIBRARIAN_MCP_ENABLE_WRITE_TOOLS=true"):
         pal._mcp_call_sync("add_silo", path="/tmp/x", confirm=True)
     srv.server_close()
+
+
+def test_daemon_loads_embedding_model_even_when_transport_is_configured(monkeypatch, tmp_path):
+    env_file = _write_env_mcp(tmp_path, extra="LLMLIBRARIAN_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B\n")
+    monkeypatch.setattr(pal, "_mcp_env_file_candidates", lambda: [env_file])
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_PORT", "8766")
+    monkeypatch.setenv("LLMLIBRARIAN_CHROMA_HOST", "127.0.0.1")
+    monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING_MODEL", raising=False)
+    assert pal._daemon_env(tmp_path / "db")["LLMLIBRARIAN_EMBEDDING_MODEL"] == "Qwen/Qwen3-Embedding-0.6B"
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", "explicit-model")
+    assert pal._daemon_env(tmp_path / "db")["LLMLIBRARIAN_EMBEDDING_MODEL"] == "explicit-model"

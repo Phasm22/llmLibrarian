@@ -56,6 +56,19 @@ def unload_models() -> int:
         with embeddings._ef_cache_lock:
             dropped += len(embeddings._ef_cache)
             embeddings._ef_cache.clear()
+    # Clients retain the effective EF for parallel ingest; those references and
+    # Chroma's class-level SentenceTransformer cache must also be dropped.
+    # Active callers still hold their own collection/model references.
+    clients = sys.modules.get("chroma_client")
+    if clients is not None:
+        with clients._lock:
+            for client in clients._clients.values():
+                client._effective_efs.clear()
+    st_module = sys.modules.get(
+        "chromadb.utils.embedding_functions.sentence_transformer_embedding_function"
+    )
+    if st_module is not None:
+        st_module.SentenceTransformerEmbeddingFunction.models.clear()
     image_embeddings = sys.modules.get("image_embeddings")
     if image_embeddings is not None:
         dropped += len(image_embeddings._IMAGE_ADAPTER_CACHE)

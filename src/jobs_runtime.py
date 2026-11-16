@@ -180,6 +180,11 @@ def _env_for_service(env: dict[str, str] | None = None) -> dict[str, str]:
         "LLMLIBRARIAN_CHROMA_HOST",
         "LLMLIBRARIAN_CHROMA_PORT",
         "LLMLIBRARIAN_CHROMA_SSL",
+        # Watchers must write the same vector space as the foreground/MCP client.
+        "LLMLIBRARIAN_EMBEDDING",
+        "LLMLIBRARIAN_EMBEDDING_MODEL",
+        "LLMLIBRARIAN_EMBEDDING_DEVICE",
+        "LLMLIBRARIAN_EMBEDDING_BATCH_SIZE",
         # Without these the watcher re-ingests a changed photo with no location,
         # silently stripping the place name a foreground `llmli add` resolved.
         "LLMLIBRARIAN_REVERSE_GEOCODE",
