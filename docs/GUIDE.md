@@ -191,6 +191,19 @@ chmod 600 ~/.config/llmLibrarian/.llmlibrarian.env
 
 Or point systemd/MCP at repo `.env.mcp` via `LLMLI_MCP_ENV_FILE` / `LLMLIBRARIAN_ENV_FILE`.
 
+On the Mac configured for `gemma4:12b`, select the installed model explicitly:
+
+```bash
+LLMLIBRARIAN_MODEL=gemma4:12b pal ask --in Recipes "Suggest a vegetable soup"
+```
+
+The shared code default is `qwen3.5:9b`; an existing user environment file can
+override it with a different model. Check `ollama list` and choose a model that
+is installed on this host. Repository `.env` files are not loaded by default;
+`LLMLIBRARIAN_ENV_FILE=/path/to/.env` selects one explicitly. HTTP MCP reads its
+own `.env.mcp` through the service launcher and returns chunks without Ollama
+synthesis. Keep these local files and their backups out of Git.
+
 Common variables:
 
 | Variable | Purpose |
