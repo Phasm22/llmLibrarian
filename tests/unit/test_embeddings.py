@@ -231,3 +231,93 @@ def test_best_device_falls_back_to_cpu_without_torch(monkeypatch: Any) -> None:
     monkeypatch.setitem(sys.modules, "torch", None)  # Forces ImportError on `import torch`
 
     assert _best_device(batch_size=100) == "cpu"
+
+
+def test_qwen_queries_use_instruction_but_documents_do_not(monkeypatch):
+    from embeddings import QWEN3_MODEL
+    _install_fake_chroma(monkeypatch)
+    monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", QWEN3_MODEL)
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_DEVICE", "cpu")
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_BATCH_SIZE", "8")
+    ef = get_embedding_function()
+    ef(["a document"])
+    ef.embed_query(["a question"])
+    docs, query = ef._model.calls
+    assert "prompt_name" not in docs
+    assert query["prompt_name"] == "query"
+    assert docs["normalize_embeddings"] is query["normalize_embeddings"] is True
+    assert docs["batch_size"] == query["batch_size"] == 8
+    assert ef.expected_dimension == 1024
+
+
+def test_explicit_model_validation_refuses_unreadable_collection(monkeypatch):
+    from embeddings import validate_embedding_dimension
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+    def broken():
+        raise OSError("offline")
+    with pytest.raises(RuntimeError, match="Cannot validate"):
+        validate_embedding_dimension(SimpleNamespace(count=broken), object())
+
+
+def test_qwen_rejects_768_collection_before_encoding(monkeypatch):
+    from embeddings import validate_embedding_dimension
+    collection = SimpleNamespace(count=lambda: 3, get=lambda **kw: {"embeddings": [[0.0] * 768]})
+    with pytest.raises(RuntimeError, match="768-dimensional.*1024-dimensional"):
+        validate_embedding_dimension(collection, SimpleNamespace(expected_dimension=1024))
+
+
+def test_explicit_model_never_falls_back_to_onnx(monkeypatch):
+    from chroma_client import _SafeClient
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+    calls = []
+    def conflict(**kwargs):
+        calls.append(kwargs)
+        raise ValueError("embedding function conflict with default")
+    client = _SafeClient(SimpleNamespace(get_or_create_collection=conflict))
+    with pytest.raises(ValueError, match="conflict"):
+        client.get_or_create_collection("llmli", embedding_function=object())
+    assert len(calls) == 1
+
+
+def test_collection_model_identity_blocks_same_dimension_mixing(monkeypatch):
+    from chroma_client import _SafeClient
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", "new-model")
+    collection = SimpleNamespace(metadata={"llmli_embedding_model": "old-model"})
+    client = _SafeClient(SimpleNamespace(get_or_create_collection=lambda **kw: collection))
+    with pytest.raises(RuntimeError, match="Embedding model mismatch"):
+        client.get_or_create_collection("llmli", embedding_function=SimpleNamespace(model_name="new-model"))
+
+
+def test_qwen_adapter_roundtrip_and_rejects_old_collection(monkeypatch, tmp_path):
+    import chromadb
+    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+    from chroma_client import _SafeClient
+    from embeddings import QWEN3_MODEL, _reset_ef_cache_for_tests
+    model = _FakeModel()
+    def encode(docs, **kwargs):
+        model.calls.append({"docs": docs, **kwargs})
+        return [[1.0] + [0.0] * 1023 for _ in docs]
+    model.encode = encode
+    def init(self, model_name, device, normalize_embeddings):
+        self.model_name, self.device = model_name, device
+        self.normalize_embeddings, self.kwargs, self._model = normalize_embeddings, {}, model
+    monkeypatch.setattr(SentenceTransformerEmbeddingFunction, "__init__", init)
+    monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", QWEN3_MODEL)
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_DEVICE", "cpu")
+    _reset_ef_cache_for_tests()
+    ef = get_embedding_function()
+    raw = chromadb.PersistentClient(path=str(tmp_path / "db"))
+    client = _SafeClient(raw)
+    old = raw.create_collection("old", embedding_function=None)
+    old.add(ids=["old"], embeddings=[[1.0] * 768])
+    with pytest.raises(RuntimeError, match="Embedding dimension mismatch"):
+        client.get_or_create_collection("old", embedding_function=ef)
+    col = client.get_or_create_collection("fresh", embedding_function=ef)
+    col.add(ids=["new"], documents=["vegetable soup"])
+    result = col.query(query_texts=["soup recipe"], n_results=1)
+    assert result["ids"] == [["new"]]
+    assert "prompt_name" not in model.calls[0]
+    assert model.calls[1]["prompt_name"] == "query"
+    assert col.metadata["llmli_embedding_model"] == QWEN3_MODEL

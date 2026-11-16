@@ -136,3 +136,39 @@ Boolean variables accept `1`, `true`, `yes`, or `on` (case-insensitive).
 
 - [orchestration-matrix.md](./orchestration-matrix.md) — entry points and locks
 - [AGENTS.md](../AGENTS.md) — agent session checklist
+
+
+## Switching to Qwen3 text embeddings
+
+Set `LLMLIBRARIAN_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B` in every
+reader and writer environment, including MCP and launchd watchers. Leave
+`LLMLIBRARIAN_EMBEDDING` unset (or non-`default`). The adapter uses normalized
+1024-dimensional vectors, with the model's `query` prompt only for retrieval;
+documents have no query instruction. See the
+[official model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B).
+The legacy default remains `all-mpnet-base-v2` so an upgrade alone does not
+invalidate an existing index.
+
+This is a full-index migration from mpnet's 768 dimensions. Incremental pulls,
+per-silo repairs, and changing the environment alone cannot migrate the shared
+collection. An explicitly selected model never falls back to ONNX. Collection
+model metadata and a dimension check reject incompatible reads and writes.
+
+1. Record counts and search results; pause all watchers and stop MCP/Chroma.
+2. Copy the complete database directory to a dated backup while Chroma is stopped.
+3. Rebuild in a fresh database directory, copying the registry (including privacy,
+   exclusions, and image-vision flags) and reusable image artifacts. Do not copy
+   the old text collection or file manifest. Use `llmli rehydrate` with the new
+   model, the fresh `LLMLIBRARIAN_DB`, and embedded Chroma explicitly selected
+   (`LLMLIBRARIAN_CHROMA_AUTODETECT=0`, no `LLMLIBRARIAN_CHROMA_HOST`).
+4. Check every rehydrate result, vector dimensions, counts, privacy, and sample
+   queries before moving the rebuilt database into the canonical path.
+5. Set the same model in all local service environments, restart Chroma and MCP,
+   resume only previously running watchers, and verify `health` and retrieval.
+
+Keep the original database and environment settings for rollback. Image vectors
+remain in their separate OpenCLIP collection and are not mixed with text vectors.
+On Apple Silicon, pin `LLMLIBRARIAN_EMBEDDING_DEVICE=mps` with a modest
+`LLMLIBRARIAN_EMBEDDING_BATCH_SIZE` for bulk migration; CPU remains suitable for
+small resident-server queries. The Qwen model is held only by the embedding cache
+and active callers, so the existing idle unloader can release it.

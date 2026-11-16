@@ -707,11 +707,27 @@ class _SafeClient:
             coll = self._client.get_or_create_collection(
                 name=name, embedding_function=embedding_function, **kwargs
             )
+            # An explicit model selection is a contract, never a fallback hint.
+            # Check before returning the handle so reads and writes fail before
+            # mixing a migrated query or ingest with old vectors.
+            if os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "").strip() and embedding_function is not None:
+                from embeddings import validate_embedding_dimension
+                stored = (getattr(coll, "metadata", None) or {}).get("llmli_embedding_model")
+                configured = getattr(embedding_function, "model_name", None)
+                if stored and configured and stored != configured:
+                    raise RuntimeError(
+                        f"Embedding model mismatch: collection uses {stored}, configured {configured}. "
+                        "Back up the DB and fully reindex all silos into a fresh collection."
+                    )
+                validate_embedding_dimension(coll, embedding_function)
+                if configured and not stored:
+                    coll.modify(metadata={**(coll.metadata or {}), "llmli_embedding_model": configured})
             self._effective_efs[name] = embedding_function
             return self._wrap(coll)
         except Exception as exc:
             msg = str(exc).lower()
-            if embedding_function is not None and "conflict" in msg and "default" in msg:
+            if (embedding_function is not None and "conflict" in msg and "default" in msg
+                    and not os.environ.get("LLMLIBRARIAN_EMBEDDING_MODEL", "").strip()):
                 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
                 fallback_ef = DefaultEmbeddingFunction()
                 coll = self._client.get_or_create_collection(
