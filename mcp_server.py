@@ -299,7 +299,7 @@ class StaticBearerTokenAuth(AuthProvider):
         return AccessToken(
             token=token,
             client_id=caller.client_id,
-            scopes=list(caller.scopes),
+            scopes=mcp_http_security.access_scopes(caller),
         )
 
 
@@ -494,6 +494,37 @@ class _CallerAttribution(Middleware):
             return None
 
 
+class _EndpointGate(Middleware):
+    """Refuse tool calls from caller tokens not issued for this endpoint.
+
+    Callers restricted via "endpoints" in LLMLIBRARIAN_MCP_AUTH_TOKENS carry
+    ``endpoint:*`` scope markers on their AccessToken. No marker — or no
+    AccessToken at all (stdio, auth disabled) — means every endpoint is
+    allowed, so legacy tokens keep working unchanged.
+    """
+
+    def __init__(self, endpoint: str) -> None:
+        self.endpoint = endpoint
+
+    async def on_call_tool(self, context, call_next):
+        try:
+            from fastmcp.server.dependencies import get_access_token
+
+            access = get_access_token()
+        except Exception:
+            access = None
+        if access is not None and not mcp_http_security.scopes_allow_endpoint(
+            access.scopes, self.endpoint
+        ):
+            from fastmcp.exceptions import ToolError
+
+            raise ToolError(
+                f"This caller token is not valid on the {self.endpoint} endpoint; "
+                "call the endpoint this token was issued for."
+            )
+        return await call_next(context)
+
+
 mcp.add_middleware(_CallerAttribution())
 
 
@@ -503,6 +534,7 @@ if _MCP_PROFILE not in {"full", "lite"}:
         "LLMLIBRARIAN_MCP_PROFILE must be 'full' or 'lite' "
         f"(got {_MCP_PROFILE!r})."
     )
+mcp.add_middleware(_EndpointGate(_MCP_PROFILE))
 
 _LITE_INSTRUCTIONS = (
     "Use silo_roster only when you need an exact silo slug. "
@@ -3694,6 +3726,7 @@ def _build_lite_server() -> FastMCP:
     policy = os.environ.get("LLMLIBRARIAN_MCP_LITE_PRIVATE_READS", "none").strip().lower() or "none"
     lite.add_middleware(_LiteEndpointPolicy("none" if policy == "none" else "named"))
     lite.add_middleware(_CallerAttribution())
+    lite.add_middleware(_EndpointGate("lite"))
     for name, fn in _lite_tools():
         lite.tool(name=name)(fn)
     if mcp.auth is not None:
@@ -3963,8 +3996,19 @@ class _HttpRateLimitMiddleware:
             tool_name = mcp_http_security.mcp_tool_name_from_jsonrpc(body_bytes)
             cost_class = mcp_http_security.tool_cost_class(tool_name)
 
+            # Replay the buffered body once, then forward to the real channel:
+            # streamable-HTTP/SSE responses keep awaiting receive() for
+            # http.disconnect, and an always-ready replay starves the event
+            # loop (every HTTP MCP request hangs, server pegs a core).
+            original_receive = receive
+            replayed = False
+
             async def replay_receive():
-                return {"type": "http.request", "body": body_bytes, "more_body": False}
+                nonlocal replayed
+                if not replayed:
+                    replayed = True
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                return await original_receive()
 
             receive = replay_receive
 
