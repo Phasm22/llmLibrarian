@@ -652,7 +652,29 @@ def test_get_paddle_ocr_engine_uses_paddleocr_3_constructor(monkeypatch):
     engine = processors._get_paddle_ocr_engine()
 
     assert engine is not None
-    assert calls == [{"use_textline_orientation": False, "lang": "en"}]
+    assert calls == [{"use_textline_orientation": False, "lang": "en", "enable_mkldnn": False}]
+
+
+def test_get_paddle_ocr_engine_always_disables_mkldnn(monkeypatch):
+    """oneDNN (MKL-DNN) CPU acceleration has known crashes on some images/hardware
+    (PaddlePaddle/PaddleOCR#15782, #17955); keep it off regardless of angle mode."""
+    calls: list[dict] = []
+
+    class _FakePaddleOCR:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+    fake_module = types.SimpleNamespace(PaddleOCR=_FakePaddleOCR)
+    monkeypatch.setitem(sys.modules, "paddleocr", fake_module)
+    monkeypatch.setattr(processors, "_paddleocr_available", lambda: True)
+    _reset_paddle_cache()
+
+    monkeypatch.setenv("LLMLIBRARIAN_OCR_PREPROCESS", "0")
+    processors._get_paddle_ocr_engine()
+    monkeypatch.setenv("LLMLIBRARIAN_OCR_PREPROCESS", "1")
+    processors._get_paddle_ocr_engine()
+
+    assert all(call["enable_mkldnn"] is False for call in calls)
 
 
 def test_ocr_with_paddle_uses_paddleocr_3_predict_and_structured_text(monkeypatch):

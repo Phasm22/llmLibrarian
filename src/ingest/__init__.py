@@ -1828,7 +1828,17 @@ def _clone_chunks_from_existing_silo(
             continue
         cloned_meta = dict(meta)
         cloned_meta["silo"] = target_silo
-        chunk_id = str(meta.get("chunk_hash") or f"clone-{i}-{source_path}")
+        # chunk_hash is a content fingerprint (deliberately equal for repeated text
+        # such as a running header), not a unique chunk identity. Deriving the clone
+        # id from it collapses distinct same-text chunks onto one Chroma row. Rebuild
+        # the id the same way initial ingest does -- (source, mtime, position) -- so
+        # it is both unique per chunk and stable across repeated clone calls.
+        mtime = meta.get("mtime")
+        chunk_index = meta.get("chunk_index")
+        if mtime is not None and chunk_index is not None:
+            chunk_id = _stable_chunk_id(source_path, mtime, int(chunk_index))
+        else:
+            chunk_id = str(meta.get("chunk_hash") or f"clone-{i}-{source_path}")
         out.append((chunk_id, doc, cloned_meta))
     return out
 
@@ -2790,12 +2800,16 @@ def run_add(
                 }
         chunks_count = len(all_chunks)
         total_files = files_indexed
+        # len(all_chunks) counts tuples built, not rows actually stored -- an id
+        # collision (e.g. two chunks upserting to the same key) silently writes
+        # fewer rows than that. Prefer the real post-write count so the registry
+        # tracks what Chroma actually holds instead of drifting out of sync with it.
+        try:
+            result = collection.get(where={"silo": silo_slug}, include=["metadatas"])
+            chunks_count = len(result.get("metadatas") or [])
+        except Exception:
+            pass
         if incremental:
-            try:
-                result = collection.get(where={"silo": silo_slug}, include=["metadatas"])
-                chunks_count = len(result.get("metadatas") or [])
-            except Exception:
-                pass
             try:
                 manifest = _read_file_manifest(db_path)
                 silo_manifest = (manifest.get("silos") or {}).get(silo_slug, {})
