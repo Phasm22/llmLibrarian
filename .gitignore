@@ -51,3 +51,6 @@ macos/build/
 
 # Shared activity-ledger fixture (synthetic; read by pytest and macos/test.sh)
 !tests/fixtures/activity/db/llmli_registry.json
+
+# Local backups can contain credentials (including .env and .env.mcp).
+*.bak*
