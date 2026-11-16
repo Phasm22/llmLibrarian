@@ -16,7 +16,7 @@ llmLibrarian indexes **folders you choose** into a local vector store and answer
 
 ```bash
 uv venv && source .venv/bin/activate && uv sync
-ollama pull llama3.2:latest   # DEFAULT_MODEL; only needed for `pal ask` / `llmli ask`
+ollama pull qwen3.5:9b        # default for local ask and opt-in image vision
 ```
 
 ```bash
@@ -81,7 +81,8 @@ macos/build.sh --install       # builds macos/build/llmLibrarian.app and replace
 |----------|------|
 | `LLMLIBRARIAN_DB` | Persist path |
 | `LLMLIBRARIAN_CHROMA_HOST` / `PORT` | HTTP to `chroma run` |
-| `LLMLIBRARIAN_MODEL` | Ollama model for ask |
+| `LLMLIBRARIAN_MODEL` | Ollama model for ask (default `qwen3.5:9b`) |
+| `LLMLIBRARIAN_VISION_MODEL` | Vision-capable Ollama model used when image vision is enabled (default `qwen3.5:9b`) |
 | `LLMLIBRARIAN_RERANK=1` | Cross-encoder rerank (CLI ask) |
 | `LLMLIBRARIAN_EXIT_ON_STALE_GENERATION` | MCP embedded reader restart (default on in mcp_server) |
 | `LLMLIBRARIAN_MCP_PRIVATE_READS` | `named` (default) or `none`: when `none`, read tools refuse private silos unless allow-listed; rosters hide unreadable private rows |

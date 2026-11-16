@@ -163,7 +163,7 @@ Adaptive image behavior:
 Requirements for standalone images:
 - install the image embedding dependencies with `uv sync --extra image`
 - the image extra includes `pillow-heif`; HEIC/HEIF is not decodable by base Pillow alone
-- `LLMLIBRARIAN_VISION_MODEL` must be a vision-capable Ollama model when `image_vision_enabled` is true
+- `LLMLIBRARIAN_VISION_MODEL` defaults to the vision-capable local Ollama model `qwen3.5:9b` and is only used when `image_vision_enabled` is true
 - OpenCLIP image embedding dependencies must be installed
 - OpenCLIP runs on CPU by default: on Apple Silicon, MPS pinned ~1.6 GB of GPU memory in the
   resident MCP server with no measurable per-image speedup. Set

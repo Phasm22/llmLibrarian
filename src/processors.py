@@ -20,6 +20,7 @@ from html.parser import HTMLParser
 from typing import Any, Protocol
 
 # ChunkTuple imported from ingest to avoid circular; use forward reference in type hints.
+from constants import DEFAULT_VISION_MODEL
 from geocode import reverse_geocode
 
 ChunkTuple = tuple[str, str, dict[str, Any]]
@@ -220,7 +221,7 @@ def _configured_ocr_backend() -> str:
 
 
 def _configured_vision_model() -> str:
-    return (os.environ.get("LLMLIBRARIAN_VISION_MODEL") or "").strip()
+    return (os.environ.get("LLMLIBRARIAN_VISION_MODEL") or DEFAULT_VISION_MODEL).strip()
 
 
 def _vision_helper_source_path() -> Path:

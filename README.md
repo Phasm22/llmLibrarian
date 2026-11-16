@@ -103,7 +103,7 @@ git clone https://github.com/Phasm22/llmLibrarian.git
 cd llmLibrarian
 uv venv && source .venv/bin/activate
 uv sync --extra image --extra ocr  # image search plus OCR for image/scanned-PDF text
-ollama pull llama3.2:latest    # only needed for pal ask / llmli ask
+ollama pull qwen3.5:9b         # default for local ask and opt-in image vision
 ```
 
 **Every `uv sync` removes extras it was not asked to keep.** A plain `uv sync`

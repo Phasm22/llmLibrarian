@@ -16,7 +16,8 @@
       "args": ["run", "--python", ">=3.10,<3.14", "mcp_server.py"],
       "env": {
         "LLMLIBRARIAN_DB": "${user.db_path}",
-        "LLMLIBRARIAN_MODEL": "${user.model}"
+        "LLMLIBRARIAN_MODEL": "${user.model}",
+        "LLMLIBRARIAN_VISION_MODEL": "${user.vision_model}"
       }
     }
   },
@@ -31,7 +32,14 @@
       "type": "string",
       "title": "Ollama model",
       "description": "Ollama model for local `pal ask` / llmli (not used by MCP retrieval tools)",
-      "default": "llama3.2:latest",
+      "default": "qwen3.5:9b",
+      "required": false
+    },
+    "vision_model": {
+      "type": "string",
+      "title": "Ollama vision model",
+      "description": "Vision-capable Ollama model used when image vision is enabled",
+      "default": "qwen3.5:9b",
       "required": false
     }
   },
