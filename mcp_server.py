@@ -46,6 +46,18 @@ def _bootstrap_process_env() -> None:
 
 _bootstrap_process_env()
 
+
+def _configure_reranker_for_transport(transport: str) -> None:
+    """HTTP is opt-in and CPU-only; CLI/stdio retain their own policy."""
+    if transport != "stdio":
+        os.environ.setdefault("LLMLIBRARIAN_RERANK", "0")
+        os.environ["LLMLIBRARIAN_RERANK_DEVICE"] = "cpu"
+
+
+_configure_reranker_for_transport(
+    os.environ.get("LLMLIBRARIAN_MCP_TRANSPORT", "stdio").strip().lower()
+)
+
 _logger = logging.getLogger("llmLibrarian.mcp")
 
 import mcp_contract  # noqa: E402  (needs src/ on sys.path; stdlib-only)
@@ -764,7 +776,7 @@ def _compute_answer_confidence(chunks: list[dict]) -> tuple[str, float, str]:
     scores = [c["score"] for c in chunks[:10] if c.get("score") is not None]
     if not scores:
         return "low", 0.0, "no chunks returned"
-    top = scores[0]
+    top = max(scores)
     mean = sum(scores) / len(scores)
     high_count = sum(1 for s in scores if s >= 0.5)
     sources = len({c.get("source", "") for c in chunks[:10]})
@@ -1663,16 +1675,24 @@ def query_personal_knowledge(
 
     Specify silo to scope retrieval by slug or display name (a private silo opens only
     by its exact slug); call list_silos first
-    rather than inferring a silo's domain from its slug. Returns chunks with text, score (0–1),
-    source path, silo, doc_type, section/page/date when known, and a ``metadata`` object
-    when the source had YAML frontmatter (title, category, servings, tags, …). Image chunks
-    also carry source_modality and, once per photo, capture/camera/GPS data under photo_metadata.
+    rather than inferring a silo's domain from its slug. Chunks come back in rank
+    order (rank 1 is the best hit). Do not re-sort them: the distance score is not
+    the order, and this payload does not include it. explain_retrieval shows that
+    score. Each chunk has text, source path, silo, doc_type, section/page/date when
+    known, and a ``metadata`` object when the source had YAML frontmatter (title,
+    category, servings, tags, …). Image chunks also carry source_modality and, once
+    per photo, capture/camera/GPS data under photo_metadata.
     n_results defaults to 12; raise it only when a broad survey needs more.
 
     Pass section= to restrict to a document section.
     Pass doc_type= to restrict by file type.
     Pass source= (a path or unique filename from `find_files`) to search inside one
-    file; use `read_document` to read it start to finish instead.
+    file. A file whose indexed text fits in one page (6000 characters) comes back
+    whole, in document order, with source_file.total_chars. A longer file stays
+    ranked chunks plus source_file so you can decide; use `read_document` to read
+    it start to finish. To read around one chunk, call read_document(path=its
+    source, cursor=its read_cursor). read_document reports total_chars for the
+    whole file.
     Metadata filters (from frontmatter indexed as Chroma metadata — reindex the silo
     after upgrading for these to take effect):
       category / main_protein / course / era — exact match
@@ -1745,8 +1765,9 @@ def query_personal_knowledge(
                 **meta_params,
             )
             chunks = result.get("chunks", [])
-            # Lexical-leg diagnostics belong to explain_retrieval; keep this payload slim.
+            # Lexical-leg and rerank diagnostics belong to explain_retrieval; keep this payload slim.
             result.pop("lexical_retrieval", None)
+            result.pop("rerank", None)
 
             _emit_usage_event("usage.llmlibrarian.query", {"silo": silo or "unscoped"})
 
@@ -1837,9 +1858,11 @@ def multi_query_knowledge(
 
     Call this when a task needs multiple angles of context from personal knowledge.
     Fire multiple semantic queries and return merged, deduplicated chunks ranked
-    by best score. Use when a topic requires several retrieval angles — for example,
+    by best score (merge_method="score_sort"), or, when the cross-encoder reordered
+    any sub-query, by reciprocal-rank fusion of each query's order
+    (merge_method="rrf"). Use when a topic requires several retrieval angles — for example,
     to cover the user's thinking on related topics in one call instead of many.
-    Each chunk is tagged with the query that retrieved it. Pass section= to restrict
+    Each chunk is tagged with the query that retrieved it (the one that ranked it best under rrf). Pass section= to restrict
     all queries to a document section. Pass doc_type= to restrict by file type
     (e.g. 'transcript', 'resume', 'tax_return', 'code', 'other').
     Metadata filters (same as query_personal_knowledge; applied to every sub-query):
@@ -1877,8 +1900,10 @@ def multi_query_knowledge(
     }
 
     def _compute() -> tuple[dict, dict]:
-        seen: set[str] = set()
-        all_chunks: list[dict] = []
+        from query.multi_merge import merge_query_results
+
+        per_query: list[tuple[str, list[dict]]] = []
+        reranked = False
         errors: list[str] = []
         busy = False
         write_states: list[dict] = []
@@ -1900,21 +1925,16 @@ def multi_query_knowledge(
                     write_states.append(res["write_in_progress"])
                 if res.get("deterministic_intent") and not deterministic_intent:
                     deterministic_intent = res["deterministic_intent"]
-                for chunk in res.get("chunks", []):
-                    key = (chunk.get("text") or "")[:200]
-                    if key and key not in seen:
-                        seen.add(key)
-                        chunk["query"] = q
-                        all_chunks.append(chunk)
+                per_query.append((q, res.get("chunks", [])))
+                reranked = reranked or (res.get("rerank") or {}).get("status") == "applied"
             except Exception as e:
                 if _is_lock_timeout(e):
                     busy = True
                     _HEALTH.set("degraded", _HEALTH_CHROMA_BUSY)
                 errors.append(f"{q!r}: {type(e).__name__}: {e}")
-        all_chunks.sort(key=lambda c: c.get("score") or 0, reverse=True)
-        truncated = len(all_chunks) > max_total_chunks
-        if truncated:
-            all_chunks = all_chunks[:max_total_chunks]
+        all_chunks, truncated, merge_method = merge_query_results(
+            per_query, max_total_chunks, reranked=reranked
+        )
 
         # Feature 6: answer-level confidence on merged results
         conf_level, conf_score, coverage_note = _compute_answer_confidence(all_chunks)
@@ -1955,6 +1975,7 @@ def multi_query_knowledge(
             "queries": queries,
             "total_chunks": len(all_chunks),
             "truncated": truncated,
+            "merge_method": merge_method,
             "answer_confidence": conf_level,
             "answer_confidence_score": conf_score,
             "coverage_note": coverage_note,
@@ -2181,6 +2202,7 @@ def explain_retrieval(
                 **{k: guidance[k] for k in ("recommended_action", "alternative_tool") if guidance.get(k)},
                 "retrieval_method": method,
                 "lexical_terms": lexical_terms,
+                **({"rerank": result["rerank"]} if result.get("rerank") else {}),
                 "lexical_hit_count": len(lexical_hits),
                 "vector_only_chunk_count": len(vector_only_hits),
                 "chunk_with_vector_rank_count": with_vector_rank,
@@ -3172,16 +3194,20 @@ def silo_roster() -> dict:
     return out
 
 
-def _compact_lite_chunk(chunk: dict) -> dict:
-    """Keep answer evidence a small model needs to cite and filter."""
+def _compact_lite_chunk(chunk: dict, rank: int = 1) -> dict:
+    """Keep answer evidence a small model needs to cite and filter.
+
+    rank is the list position. The distance score is omitted so a caller cannot
+    re-sort the list out of retrieval order.
+    """
     out = {
+        "rank": rank,
         "text": str(chunk.get("text") or ""),
-        "score": chunk.get("score"),
         "source": str(chunk.get("source") or ""),
         "section": str(chunk.get("section") or ""),
         "doc_type": str(chunk.get("doc_type") or "other"),
     }
-    for field in ("page", "line_start", "mtime_iso", "silo"):
+    for field in ("page", "line_start", "mtime_iso", "silo", "read_cursor"):
         value = chunk.get(field)
         if value not in (None, ""):
             out[field] = value
@@ -3205,8 +3231,8 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
         "query": result.get("query") if isinstance(result, dict) else None,
         "silo": silo,
         "chunks": [
-            _compact_lite_chunk(chunk)
-            for chunk in chunks
+            _compact_lite_chunk(chunk, position)
+            for position, chunk in enumerate(chunks, start=1)
             if isinstance(chunk, dict)
         ],
     }
@@ -3225,9 +3251,11 @@ def _compact_lite_retrieval(result: dict, *, silo: str) -> dict:
     if isinstance(result, dict):
         # An empty chunk list with no reason attached is what sent the 2026-10-02
         # client into a rephrase loop; keep whatever explains it.
-        for field in ("recommended_action", "note", "error"):
+        for field in ("recommended_action", "note", "error", "source_file"):
             if result.get(field):
                 out[field] = result[field]
+        if result.get("whole_file"):
+            out["whole_file"] = True
     return out
 
 
@@ -3446,16 +3474,22 @@ def read_document(
     silo: str | None = None,
     start_chunk: int = 0,
     max_chars: int = 6000,
+    cursor: str | None = None,
 ) -> dict:
     """
     Use when: you have a file path (from `find_files`, a chunk's source, or the user) and need to read that file, not search for an answer.
     Do not use when: you are looking for which file answers a question (`query_personal_knowledge`), or searching inside one file for a passage (`query_personal_knowledge` with source=).
-    Pairs with: `find_files` before it; call again with next_start_chunk to keep reading.
+    Pairs with: `find_files` before it; call again with cursor=next_cursor to keep reading.
 
     Returns the file's indexed text in document order, up to max_chars (default
-    6000, max 20000), with overlapping chunk seams removed. path may be a full path
-    or a bare filename if it is unique. When more remains, next_start_chunk is set:
-    pass it as start_chunk to continue. Reads the index, not the disk, so PDFs and
+    6000, max 20000), with overlapping chunk seams removed. total_chars is the
+    seam-trimmed length of the whole file, so you can tell whether one more call
+    finishes it. path may be a full path
+    or a bare filename if it is unique. When more remains, next_cursor is set: pass
+    it back as cursor to continue with nothing skipped or repeated. A retrieval
+    chunk's read_cursor, passed as cursor with that chunk's source, starts one
+    chunk before the hit. If that lead-in does not leave room for the hit, the
+    page is the hit itself. Reads the index, not the disk, so PDFs and
     images come back as their extracted text. A private silo's file opens only when
     its exact slug is passed as silo.
     """
@@ -3486,13 +3520,22 @@ def read_document(
                 silo=str(slug),
                 source=str(resolved),
                 start_chunk=start_chunk,
+                cursor=cursor,
                 max_chars=max_chars,
             )
+        if result.get("error"):
+            if result.get("cursor_stale"):
+                result["recommended_action"] = {
+                    "tool": "read_document",
+                    "args": {"path": str(resolved), **({"silo": silo} if silo else {})},
+                    "reason": "The file changed since this cursor was issued. Read it again from the start.",
+                }
+            return result
         _emit_query_audit(
             tool="read_document",
             queries=[str(resolved)],
             silo=slug,
-            params={"start_chunk": start_chunk, "max_chars": max_chars},
+            params={"start_chunk": start_chunk, "cursor": cursor, "max_chars": max_chars},
             chunks=[{"source": resolved, "silo": slug}] * max(0, result["end_chunk"] - result["start_chunk"]),
             outcome={},
         )

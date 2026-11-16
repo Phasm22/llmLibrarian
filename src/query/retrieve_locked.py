@@ -32,6 +32,8 @@ from query.retrieval import (
     source_diversity_cap,
 )
 from processors import PHOTO_METADATA_FIELDS
+from reranker import rerank_head, rerank_head_size
+from document_read import DEFAULT_PAGE_CHARS, anchor_cursor, document_char_count, fetch_ordered_chunks
 from frontmatter import frontmatter_fields_for_response
 from query.meta_filters import (
     apply_tag_postfilter,
@@ -73,8 +75,18 @@ def execute_retrieve_chroma_phase(
     tags: str | list[str] | None = None,
     course: str | None = None,
     era: str | None = None,
+    rerank_status: str = "disabled",
 ) -> dict:
     _gc = get_chroma_client or get_client
+    rerank_diag: dict[str, Any] = {"status": rerank_status}
+
+    def _note_rerank(diag: dict[str, Any]) -> None:
+        # One block per call: raw and artifact streams each rerank their own head.
+        failed = rerank_diag.get("status") == "failed" or diag["status"] == "failed"
+        rerank_diag.update({k: v for k, v in diag.items() if k not in ("candidates", "elapsed_ms")})
+        rerank_diag["candidates"] = rerank_diag.get("candidates", 0) + diag["candidates"]
+        rerank_diag["elapsed_ms"] = round(rerank_diag.get("elapsed_ms", 0.0) + diag.get("elapsed_ms", 0.0), 1)
+        rerank_diag["status"] = "failed" if failed else "applied"
     ef = get_embedding_function(batch_size=1)
     client = _gc(str(db))
     collection = client.get_or_create_collection(name=LLMLI_COLLECTION, embedding_function=ef)
@@ -113,6 +125,26 @@ def execute_retrieve_chroma_phase(
             return {"$and": parts}
         return None
 
+    # section= is a substring match Chroma's where cannot express, so it filters each
+    # stream's stage-1 pool before diversity and the n_results cut. No match means no
+    # chunks: falling back to unfiltered results hands back text from other sections.
+    section_lower = (section or "").strip().lower()
+    section_stats = {"candidates": 0, "matched": 0}
+
+    def _apply_rerank(
+        docs_h: list[str],
+        metas_h: list[dict | None],
+        dists_h: list[float | None],
+    ) -> tuple[list[str], list[dict | None], list[float | None]]:
+        """Score a bounded head, then leave the tail in retrieval order for diversity."""
+        if rerank_status != "eligible" or not docs_h:
+            return docs_h, metas_h, dists_h
+        docs_h, metas_h, dists_h, diag = rerank_head(
+            query, docs_h, metas_h, dists_h, rerank_head_size(n_results)
+        )
+        _note_rerank(diag)
+        return docs_h, metas_h, dists_h
+
     def _query_stream(
         target_silo: str | None,
     ) -> tuple[list[str], list[dict | None], list[float | None], str | None, str, dict[str, Any]]:
@@ -140,15 +172,30 @@ def execute_retrieve_chroma_phase(
             lexical_phrases=_lexical_phrases,
             diagnostics=lexical_diag,
         )
+        if section_lower:
+            section_stats["candidates"] += len(docs_h)
+            kept = [
+                (d, m, x) for d, m, x in zip(docs_h, metas_h, dists_h)
+                if section_lower in str((m or {}).get("section") or "").lower()
+            ]
+            section_stats["matched"] += len(kept)
+            docs_h, metas_h, dists_h = (list(col) for col in zip(*kept)) if kept else ([], [], [])
+        docs_h, metas_h, dists_h = apply_tag_postfilter(docs_h, metas_h, dists_h, required_tags)
+        docs_h, metas_h, dists_h = _apply_rerank(docs_h, metas_h, dists_h)
+        # Dedup before the cut. Doing it after leaves a hole where the duplicate sat,
+        # and the stream comes back shorter than n_results.
+        docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
+        scoped = bool(target_silo or source)
         per_cap = source_diversity_cap(
             intent,
             n_results,
-            silo_scoped=bool(target_silo),
+            silo_scoped=scoped,
             default=MAX_CHUNKS_PER_FILE,
         )
-        docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, n_results, max_per_source=per_cap)
-        docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
-        docs_h, metas_h, dists_h = apply_tag_postfilter(docs_h, metas_h, dists_h, required_tags)
+        # Unscoped calls still have a silo cap ahead. Cutting each stream to
+        # n_results first leaves that cap with too few chunks to fill the request.
+        stream_k = n_results if scoped else n_stage1
+        docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, stream_k, max_per_source=per_cap)
         return docs_h, metas_h, dists_h, _warn, method, lexical_diag
 
     # Report the path actually taken; this used to be a constant "hybrid_or_vector",
@@ -165,14 +212,16 @@ def execute_retrieve_chroma_phase(
                 artifact_docs,
                 artifact_metas,
                 artifact_dists,
-                top_k=n_results,
+                top_k=len(docs) + len(artifact_docs),
             )
             docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+            if silo_slug or source:
+                docs, metas, dists = docs[:n_results], metas[:n_results], dists[:n_results]
             retrieval_method = "dual_stream_rrf"
 
     image_search: dict[str, Any] = {"attempted": False, "status": "not_applicable", "matches": 0}
     explicit_image_query = _query_explicitly_requests_image(query)
-    if _query_is_image_relevant(query, docs, metas):
+    if not section_lower and _query_is_image_relevant(query, docs, metas):
         image_search["attempted"] = True
         image_adapter = get_image_embedding_adapter()
         if image_adapter is None:
@@ -204,6 +253,9 @@ def execute_retrieve_chroma_phase(
             image_search["status"] = "ok" if image_docs else "no_matches"
             if image_docs:
                 if explicit_image_query:
+                    image_docs, image_metas, image_dists = dedup_by_chunk_hash(
+                        image_docs, image_metas, image_dists
+                    )
                     docs, metas, dists = diversify_by_source(
                         image_docs,
                         image_metas,
@@ -220,26 +272,54 @@ def execute_retrieve_chroma_phase(
                         docs,
                         metas,
                         dists,
-                        top_k=n_results,
+                        top_k=len(image_docs) + len(docs),
                     )
+                    docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+                    if silo_slug or source:
+                        docs, metas, dists = docs[:n_results], metas[:n_results], dists[:n_results]
                     retrieval_method = f"{retrieval_method}+image_rrf"
-                docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
 
-    if silo_slug is None:
+    # source= pins one file, so there is nothing for silo balancing to spread across.
+    if silo_slug is None and not source:
         per_silo_cap = n_results if explicit_image_query and image_search["status"] == "ok" else max_silo_chunks_for_intent(intent, 3)
         silo_cache = [str(((m or {}).get("silo") or "")) for m in metas]
         docs, metas, dists = diversify_by_silo(
             docs, metas, dists, n_results, max_per_silo=per_silo_cap, silos=silo_cache
         )
 
-    if section:
-        section_lower = section.lower()
-        filtered = [
-            (d, m, dist) for d, m, dist in zip(docs, metas, dists)
-            if section_lower in (m or {}).get("section", "").lower()
-        ]
-        if filtered:
-            docs, metas, dists = zip(*filtered)
+    # A named file that fits in one read_document page comes back in document
+    # order, whole. Ranked chunks of a two-paragraph note hide the note.
+    whole_file = False
+    source_file = None
+    has_content_filters = any(value is not None and value != "" and value != [] for value in (
+        section, doc_type, category, main_protein, min_servings, max_servings,
+        max_total_time, tags, course, era,
+    ))
+    if source and docs and not has_content_filters:
+        file_silo = silo_slug or str((metas[0] or {}).get("silo") or "")
+        file_source = str((metas[0] or {}).get("source") or "")
+        if file_silo and file_source:
+            try:
+                ordered = fetch_ordered_chunks(collection, silo=file_silo, source=file_source)
+            except Exception:
+                ordered = []
+            if ordered:
+                file_chars = document_char_count(ordered)
+                source_file = {"total_chunks": len(ordered), "total_chars": file_chars}
+                if file_chars <= DEFAULT_PAGE_CHARS:
+                    distance_by_hash: dict[str, float | None] = {}
+                    for meta, dist in zip(metas, dists):
+                        hashed = str((meta or {}).get("chunk_hash") or "")
+                        if hashed and hashed not in distance_by_hash:
+                            distance_by_hash[hashed] = dist
+                    docs = [doc for doc, _meta in ordered]
+                    metas = [meta for _doc, meta in ordered]
+                    dists = [
+                        distance_by_hash.get(str((meta or {}).get("chunk_hash") or ""))
+                        for meta in metas
+                    ]
+                    whole_file = True
+                    retrieval_method = "whole_file"
 
     chunks = []
     for rank, (doc, meta, dist) in enumerate(zip(docs, metas, dists), start=1):
@@ -277,7 +357,6 @@ def execute_retrieve_chroma_phase(
             "mtime_iso": mtime_iso,
             "page": m.get("page"),
             "line_start": m.get("line_start"),
-            "chunk_index": m.get("chunk_index"),
             "record_type": m.get("record_type"),
             "source_modality": m.get("source_modality"),
             "summary_status": m.get("summary_status"),
@@ -285,11 +364,15 @@ def execute_retrieve_chroma_phase(
             "indexed_at": m.get("indexed_at"),
             "_signals": signals,
         }
+        if m.get("chunk_index") is not None:
+            chunk["chunk_index"] = m.get("chunk_index")
         fm_fields = frontmatter_fields_for_response(m)
         if fm_fields:
             chunk["metadata"] = fm_fields
         if photo_metadata:
             chunk["photo_metadata"] = photo_metadata
+        if m.get("chunk_hash"):
+            chunk["read_cursor"] = anchor_cursor(str(m["chunk_hash"]))
         chunks.append(chunk)
 
     result: dict = {
@@ -298,9 +381,14 @@ def execute_retrieve_chroma_phase(
         "silo_filter": silo_slug,
         "retrieval_method": retrieval_method,
         "lexical_retrieval": lexical_retrieval,
+        "rerank": rerank_diag,
         "image_search": image_search,
         "chunks": chunks,
     }
+    if source_file is not None:
+        result["source_file"] = source_file
+    if whole_file:
+        result["whole_file"] = True
     visual_follow_up = [
         str(chunk.get("source") or "")
         for chunk in chunks
@@ -323,6 +411,8 @@ def execute_retrieve_chroma_phase(
         }
     if _silo_warning:
         result["silo_warning"] = _silo_warning
+    if section_lower and not section_stats["matched"]:
+        result["section_filter"] = {"section": section, **section_stats}
 
     if intent == INTENT_TAX_QUERY:
         try:

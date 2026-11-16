@@ -67,6 +67,7 @@ Brown the beef. Simmer.
     assert meta["total_time"] == 120
     assert meta["tags"] == ",winter,pot,"
     assert "---" not in doc
+    assert meta["chunk_index"] == 0
     assert "title: Chili" not in doc
     assert "Chili" in doc
     assert "Brown the beef" in doc
@@ -84,3 +85,35 @@ def test_malformed_frontmatter_still_indexes_body():
     _cid, doc, meta = chunks[0]
     assert "title" not in meta
     assert "Body text" in doc
+
+
+def test_new_ingests_number_chunks_in_order():
+    from ingest import _chunks_from_csv_text, _chunks_from_image_result, _chunks_from_pdf_pages
+    from processors import ExtractedImage, ExtractedPage, ImageRegion
+
+    text = _chunks_from_content("f", "alpha\n\n" + ("word " * 400), "/n.md", 1.0)
+    assert [m["chunk_index"] for _c, _d, m in text] == list(range(len(text)))
+    assert all(isinstance(m["chunk_index"], int) for _c, _d, m in text)
+
+    csv_rows = _chunks_from_csv_text("f", "a,b\n1,2\n3,4\n", "/t.csv", 1.0)
+    assert [m["chunk_index"] for _c, _d, m in csv_rows] == [0, 1]
+
+    pages = _chunks_from_pdf_pages(
+        "f",
+        [ExtractedPage("page one", 1), ExtractedPage("page two", 2)],
+        "/t.pdf",
+        1.0,
+    )
+    assert [m["chunk_index"] for _c, _d, m in pages] == [0, 1]
+
+    image = _chunks_from_image_result(
+        "f",
+        ExtractedImage(
+            summary="a dog",
+            visible_text="",
+            regions=(ImageRegion("the dog", "subject", 0, 0, 1, 1),),
+        ),
+        "/p.jpg",
+        1.0,
+    )
+    assert [m["chunk_index"] for _c, _d, m in image] == [0, 1]

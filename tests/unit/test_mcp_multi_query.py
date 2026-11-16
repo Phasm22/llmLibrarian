@@ -90,9 +90,33 @@ def test_multi_query_sorts_by_score_desc(monkeypatch, mcp):
     )
 
     res = mcp.multi_query_knowledge(["q1", "q2", "q3"])
-    scores = [c["score"] for c in res["chunks"]]
-    assert scores == sorted(scores, reverse=True)
-    assert res["chunks"][0]["text"] == "high"
+    assert res["merge_method"] == "score_sort"
+    assert [c["text"] for c in res["chunks"]] == ["high", "mid", "low"]
+    assert [c["rank"] for c in res["chunks"]] == [1, 2, 3]
+    assert "score" not in res["chunks"][0]
+
+
+def test_multi_query_fuses_by_rank_when_reranked(monkeypatch, mcp):
+    applied = {"status": "applied"}
+    _install_run_retrieve(
+        monkeypatch,
+        {
+            "q1": {"rerank": applied, "chunks": [{"text": "both", "score": 0.1}, {"text": "q1-only", "score": 0.95}]},
+            "q2": {"rerank": {"status": "year_skipped"}, "chunks": [{"text": "high", "score": 0.9}, {"text": "both", "score": 0.1}]},
+        },
+    )
+
+    res = mcp.multi_query_knowledge(["q1", "q2"])
+    assert res["merge_method"] == "rrf"
+    assert [c["text"] for c in res["chunks"]] == ["both", "high", "q1-only"]
+
+
+def test_answer_confidence_reads_best_score_not_first(mcp):
+    level, _mean, note = mcp._compute_answer_confidence(
+        [{"text": "a", "score": 0.3, "source": "/a"}, {"text": "b", "score": 0.7, "source": "/b"}]
+    )
+    assert level == "high"
+    assert "rephrased" not in note
 
 
 def test_multi_query_truncates_at_max_total_chunks(monkeypatch, mcp):
@@ -183,8 +207,7 @@ def test_multi_query_empty_chunks_returns_empty_chunks(monkeypatch, mcp):
 
 
 def test_multi_query_empty_text_chunk_skipped(monkeypatch, mcp):
-    """Dedup key uses text[:200] — empty text yields empty key, which is
-    explicitly skipped to avoid collapsing empties together."""
+    """Empty text has no identity and is skipped rather than collapsed together."""
     _install_run_retrieve(
         monkeypatch,
         {"q": {"chunks": [{"text": "", "score": 0.5}, {"text": "real", "score": 0.4}]}},
@@ -197,8 +220,8 @@ def test_multi_query_empty_text_chunk_skipped(monkeypatch, mcp):
     assert "real" in texts
 
 
-def test_multi_query_dedup_uses_first_200_chars(monkeypatch, mcp):
-    """Two chunks that share the first 200 chars should dedup as one."""
+def test_multi_query_keeps_distinct_chunks_sharing_200_chars(monkeypatch, mcp):
+    """Templates repeat >200 chars of header; only identical text is one chunk."""
     base = "x" * 250
     _install_run_retrieve(
         monkeypatch,
@@ -209,4 +232,4 @@ def test_multi_query_dedup_uses_first_200_chars(monkeypatch, mcp):
     )
 
     res = mcp.multi_query_knowledge(["q"])
-    assert res["total_chunks"] == 1
+    assert res["total_chunks"] == 2

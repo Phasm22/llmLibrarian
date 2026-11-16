@@ -41,7 +41,9 @@ ocr = [
     # PaddleOCR does not declare its inference runtime as a dependency.
     "paddlepaddle>=3.0.0",
 ]
-# Cross-encoder reranking (LLMLIBRARIAN_RERANK=1) — sentence-transformers in core deps
+# Cross-encoder reranking is on when sentence-transformers imports.
+# Set LLMLIBRARIAN_RERANK=0 to disable. The `rerank` extra is empty because
+# sentence-transformers is already a core dependency.
 rerank = []
 # File watching for pal watch/pull --watch
 watch = [

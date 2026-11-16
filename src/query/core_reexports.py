@@ -13,7 +13,7 @@ from constants import (
 from embeddings import get_embedding_function
 from image_embeddings import get_image_embedding_adapter, image_collection_name
 from load_config import load_config, get_archetype, get_archetype_optional, get_query_options
-from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chunks
+from reranker import RERANK_STAGE1_N, is_reranker_enabled, rerank as rerank_chunks, rerank_decision, rerank_head, rerank_head_size
 from state import get_silo_display_name, get_silo_prompt_override, resolve_silo_to_slug
 from style import bold, dim, label_style
 
@@ -113,6 +113,7 @@ from query.retrieval import (
     rrf_merge,
     run_hybrid_retrieve,
     soft_promote_silo_diversity,
+    source_diversity_cap,
     sort_by_academic_priority,
     sort_by_image_chunk_priority,
     sort_by_source_priority,
@@ -256,6 +257,7 @@ __all__ = [
     "max_chunks_for_intent",
     "merge_dual_streams_rrf",
     "max_silo_chunks_for_intent",
+    "source_diversity_cap",
     "normalize_answer_direct_address",
     "normalize_inline_numbered_lists",
     "normalize_ownership_claims",
@@ -280,6 +282,9 @@ __all__ = [
     "resolve_silo_to_slug",
     "resolve_subscope",
     "rerank_chunks",
+    "rerank_decision",
+    "rerank_head",
+    "rerank_head_size",
     "route_intent",
     "rrf_merge",
     "run_academic_resolver",

@@ -46,6 +46,30 @@ for _sym in (
     globals()[_sym] = getattr(qc, _sym)
 
 
+def _unscoped_privacy_note(db_path: str) -> str:
+    """Same sentence MCP puts on an unscoped query, for the ask answer text."""
+    try:
+        from state import private_silo_slugs
+
+        skipped = private_silo_slugs(db_path)
+    except Exception:
+        return ""
+    if not skipped:
+        return ""
+    return (
+        "Unscoped query: "
+        + ", ".join(skipped)
+        + " were not searched because they are marked private. If the question is "
+        "actually about one of them, pass --in <slug> or run `pal ask --in <slug>`."
+    )
+
+
+def _append_privacy_note(text: str, note: str) -> str:
+    if not note or note in text:
+        return text
+    return text.rstrip() + "\n\n" + note
+
+
 def _apply_context_budget(
     docs: list[str],
     metas: list[dict | None],
@@ -187,6 +211,16 @@ def execute_run_ask(
     academic_identity_name = str(query_opts.get("user_name") or "").strip() or None
     direct_canonical_available = False
     explicit_silo = silo
+    # A named --in is the consent signal. Auto-binding and catalog retry set `silo`
+    # later; they must not be treated as the caller naming a private silo.
+    privacy_note = _unscoped_privacy_note(db) if use_unified and explicit_silo is None else ""
+    if privacy_note:
+        system_prompt = (
+            system_prompt.rstrip()
+            + "\n\n"
+            + privacy_note
+            + " Do not treat their absence as evidence that nothing relevant exists."
+        )
     scope_binding_reason: str | None = None
     scope_binding_confidence: float | None = None
     scope_bound_slug: str | None = None
@@ -695,11 +729,12 @@ def execute_run_ask(
 
     n_effective = qc.effective_k(intent, n_results)
     if intent in (INTENT_EVIDENCE_PROFILE, INTENT_AGGREGATE, INTENT_ACADEMIC_HISTORY):
-        n_stage1 = max(n_effective, RERANK_STAGE1_N if use_reranker else 60)
+        n_stage1 = max(n_effective, 60)
     elif intent == INTENT_REFLECT:
         n_stage1 = n_effective
     else:
-        n_stage1 = RERANK_STAGE1_N if use_reranker else min(100, max(n_results * 5, 60))
+        n_stage1 = min(100, max(n_results * 5, 60))
+    n_stage1 = max(n_stage1, n_results)
 
     hybrid_used = False
     query_for_retrieval = (scope_cleaned_query or query).strip()
@@ -1078,6 +1113,16 @@ def execute_run_ask(
             where_parts.append({"silo": silo})
         elif subscope_where:
             where_parts.append(subscope_where)
+        if use_unified and not silo and explicit_silo is None:
+            # Unscoped ask used to query with where=None, so private silos (tax,
+            # lab results) reached the answer context. MCP retrieval already
+            # applies this clause; the CLI path has to as well. A catalog
+            # sub-scope is not consent, so it keeps the exclusion too.
+            from state import private_filter_clause
+
+            private_clause = private_filter_clause(db)
+            if private_clause is not None:
+                where_parts.append(private_clause)
         if code_year_where:
             where_parts.append(code_year_where)
         if len(where_parts) == 1:
@@ -1271,7 +1316,12 @@ def execute_run_ask(
                     top_k=n_stage1,
                     lexical_phrases=_lexical_phrases,
                 )
-                per_intent_cap_dual = qc.max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
+                per_intent_cap_dual = qc.source_diversity_cap(
+                    intent,
+                    n_results,
+                    silo_scoped=bool(use_unified and explicit_silo and intent == INTENT_LOOKUP),
+                    default=MAX_CHUNKS_PER_FILE,
+                )
                 raw_docs_stream, raw_metas_stream, raw_dists_stream = qc.diversify_by_source(
                     docs,
                     metas,
@@ -1383,9 +1433,11 @@ def execute_run_ask(
             metas = [metas[i] if i < len(metas) else None for i in order]
             dists = [dists[i] if i < len(dists) else None for i in order]
         
-        # Skip reranker when query mentions specific years so year-boosted order is preserved into diversify
-        if use_reranker and docs and not mentioned_years:
-            docs, metas, dists = qc.rerank_chunks(query, docs, metas, dists, top_k=n_results, force=True)
+        # Skip the cross-encoder when the query names a year so the year-boosted order survives.
+        if docs and qc.rerank_decision(query, use_reranker) == "eligible":
+            docs, metas, dists, _rerank_diag = qc.rerank_head(
+                query, docs, metas, dists, qc.rerank_head_size(n_results)
+            )
         else:
             # Heuristic: prefer README/overview chunks for overview queries; preserve year order when years mentioned
             q_lower = query.lower()
@@ -1459,8 +1511,17 @@ def execute_run_ask(
             per_intent_cap = 3
             diversity_top_k = max(48, len(docs))
         else:
-            per_intent_cap = qc.max_chunks_for_intent(intent, MAX_CHUNKS_PER_FILE)
-            diversity_top_k = n_stage1 if unified_analytical_query else n_results
+            # Only an explicit --in lifts the cap; auto-bound and catalog-retry scopes are guesses.
+            per_intent_cap = qc.source_diversity_cap(
+                intent,
+                n_results,
+                silo_scoped=bool(use_unified and explicit_silo and intent == INTENT_LOOKUP),
+                default=MAX_CHUNKS_PER_FILE,
+            )
+            # Unscoped balancing happens after this. Cutting to n_results first
+            # can leave the silo cap with too few chunks to fill the request.
+            silo_balance = use_unified and explicit_silo is None and silo is None
+            diversity_top_k = n_stage1 if (unified_analytical_query or silo_balance) else n_results
         docs, metas, dists = qc.diversify_by_source(
             docs,
             metas,
@@ -1499,7 +1560,7 @@ def execute_run_ask(
                     docs,
                     metas,
                     dists,
-                    diversity_top_k,
+                    n_results,
                     max_per_silo=per_silo_cap,
                     silos=silo_cache,
                 )
@@ -1623,7 +1684,10 @@ def execute_run_ask(
                 lines = [text, "", qc.dim(no_color, "---"), qc.label_style(no_color, f"Answered by: {source_label}")]
                 return "\n".join(lines)
             if use_unified:
-                return f"No indexed content for {source_label}. Run: llmli add <path>"
+                return _append_privacy_note(
+                    f"No indexed content for {source_label}. Run: llmli add <path>",
+                    privacy_note,
+                )
             return f"No indexed content for {source_label}. Run: index --archetype {archetype_id}"
         
         if code_activity_year_lookup and code_activity_requested_year is not None:
@@ -2017,7 +2081,7 @@ def execute_run_ask(
         _mark_stage("answer_postprocess")
         
         if quiet:
-            return answer
+            return _append_privacy_note(answer, privacy_note)
         
         out = [
             answer,
@@ -2077,4 +2141,4 @@ def execute_run_ask(
             slowest_stage=slowest_stage,
             slowest_stage_ms=slowest_stage_ms,
         )
-        return "\n".join(out)
+        return _append_privacy_note("\n".join(out), privacy_note)

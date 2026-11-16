@@ -106,6 +106,17 @@ def empty_result_action(
                 "evidence of absence. Retry the same call once the rebuild finishes."
             ),
         }
+    section_filter = result.get("section_filter") or {}
+    if section_filter and not section_filter.get("matched"):
+        return {
+            "tool": "retrieve_knowledge" if profile == "lite" else "query_personal_knowledge",
+            "args": {"query": query, **({"silo": silo} if silo else {})},
+            "reason": (
+                f"No matching passage is in a section named like {section_filter.get('section')!r}. "
+                "Retry once without section=; section names come from document headings "
+                "and a guessed name rarely matches."
+            ),
+        }
     alternative = deterministic_alternative(
         result.get("deterministic_intent"), query=query, silo=silo, profile=profile
     )
@@ -180,10 +191,10 @@ def apply_guidance(
 # with one 40-entry exclude_patterns list repeated per silo. A 16k-context client
 # pays for every byte on every turn.
 
-# Per-chunk fields a model reads to answer and cite. Everything else (rank,
-# per-chunk confidence, chunk_index, record_type, indexed_at, _signals) is
-# pipeline state; explain_retrieval still returns the signals.
-_CHUNK_FIELDS = ("text", "score", "source", "silo", "doc_type", "section", "page", "line_start", "mtime_iso", "query")
+# Per-chunk fields a model reads to answer and cite. rank is the list position
+# (1 is the best hit). score stays off this payload: it is a distance, and sorting
+# by it undoes hybrid and rerank order. explain_retrieval still returns it.
+_CHUNK_FIELDS = ("text", "source", "silo", "doc_type", "section", "page", "line_start", "mtime_iso", "query", "read_cursor")
 _IMAGE_FIELDS = ("source_modality", "summary_status")
 
 
@@ -195,10 +206,11 @@ def slim_chunks(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     out: list[dict[str, Any]] = []
     photo_seen: set[str] = set()
-    for chunk in chunks:
+    for position, chunk in enumerate(chunks, start=1):
         if not isinstance(chunk, dict):
             continue
-        slim = {k: chunk[k] for k in _CHUNK_FIELDS if chunk.get(k) not in (None, "")}
+        slim = {"rank": position}
+        slim.update({k: chunk[k] for k in _CHUNK_FIELDS if chunk.get(k) not in (None, "")})
         meta = chunk.get("metadata")
         if isinstance(meta, dict) and meta:
             slim["metadata"] = meta

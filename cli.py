@@ -349,7 +349,24 @@ def cmd_ask(args: argparse.Namespace) -> int:
             return busy_rc
         return _emit_result(args, error_payload(str(e)))
     if _wants_json(args):
-        return _emit_result(args, ok_payload({"answer": out, "silo": silo_slug, "query": query}))
+        body: dict = {"answer": out, "silo": silo_slug, "query": query}
+        if not silo_slug:
+            try:
+                from state import private_silo_slugs
+
+                skipped = private_silo_slugs(_db_path(args))
+            except Exception:
+                skipped = []
+            if skipped:
+                body["excluded_private_silos"] = skipped
+                body["privacy_note"] = (
+                    "Unscoped query: "
+                    + ", ".join(skipped)
+                    + " were not searched because they are marked private. If the user's "
+                    "question is actually about one of them, pass --in <slug> or tell them "
+                    "to run `pal ask --in <slug>` locally."
+                )
+        return _emit_result(args, ok_payload(body))
     print(out)
     return 0
 
@@ -615,6 +632,7 @@ def cmd_read(args: argparse.Namespace) -> int:
                 silo=str(slug),
                 source=str(resolved),
                 start_chunk=int(getattr(args, "start_chunk", 0) or 0),
+                cursor=getattr(args, "cursor", None),
                 max_chars=int(getattr(args, "max_chars", 6000) or 6000),
             )
     except Exception as e:
@@ -1323,7 +1341,8 @@ def main() -> int:
     p_read.add_argument("path", help="Indexed path or unique filename")
     r_in = p_read.add_argument("--in", dest="in_silo", metavar="SILO", help="Silo slug (exact slug required for private)")
     r_in.completer = _silo_completer  # type: ignore[attr-defined]
-    p_read.add_argument("--start-chunk", type=int, default=0, help="Paging offset")
+    p_read.add_argument("--start-chunk", type=int, default=0, help="Paging offset (chunk-aligned; prefer --cursor)")
+    p_read.add_argument("--cursor", help="Resume from next_cursor of the previous page")
     p_read.add_argument("--max-chars", type=int, default=6000, help="Page size in characters")
     p_read.add_argument("--text", action="store_true", help="Print document text only")
     _json_flag(p_read)
