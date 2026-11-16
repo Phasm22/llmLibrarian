@@ -64,6 +64,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(ClosureMenuItem(title: "Open llmLibrarian", key: "o") { AppDelegate.showMainWindow() })
+        menu.addItem(ClosureMenuItem(title: "Recent Jobs") { [store] in AppDelegate.showMainWindow(); store.showJobs = true })
         menu.addItem(ClosureMenuItem(title: "Copy MCP Endpoint") { [store] in
             store.copy(store.config.mcpURL, note: "Copied MCP endpoint")
         })
@@ -72,6 +73,13 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
                 store.copy(store.config.mcpURL(path: lite), note: "Copied lite MCP endpoint")
             })
         }
+        menu.addItem(.separator())
+        let rebuild = ClosureMenuItem(title: store.isRebuildingApp ? "Rebuilding App…" : "Rebuild and Relaunch") { [store] in
+            store.rebuildApp()
+        }
+        rebuild.isEnabled = store.canRebuildApp
+        menu.addItem(rebuild)
+        menu.addItem(ClosureMenuItem(title: "Open Build Log") { [store] in store.openLog(store.rebuildLogPath) })
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem(title: "Quit llmLibrarian", key: "q") { NSApp.terminate(nil) })
     }

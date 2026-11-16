@@ -298,37 +298,44 @@ struct SiloFixButtons: View {
     @EnvironmentObject private var store: LibrarianStore
     let silo: Silo
     var compact = false
-    @State private var confirmRemove = false
 
     var body: some View {
-        Button(compact ? "Locate…" : "Locate Folder…") { store.relocate(silo) }
-            .help("Choose the folder's new location; it is indexed as a new silo and this one is removed")
-        Button(compact ? "Remove…" : "Remove Silo…") { confirmRemove = true }
-            .help("Delete this silo's \(silo.chunks.grouped) chunks, its bookmark, and its watcher")
-            .confirmationDialog("Remove \(silo.displayName)?", isPresented: $confirmRemove, titleVisibility: .visible) {
-                Button("Remove Silo", role: .destructive) { store.removeSilo(silo) }
-            } message: {
-                Text("Deletes \(silo.chunks.grouped) indexed chunks for \(silo.tildePath), the bookmark, and the watcher job. The folder itself is not touched.")
-            }
+        if silo.isPrivate {
+            Button("Copy Original Path") { store.copy(silo.path, note: "Restore the private folder to this path") }
+                .help("Restore the folder to this path to preserve private scope; private relocation is not supported")
+        } else {
+            Button(compact ? "Locate…" : "Locate Folder…") { store.relocate(silo) }
+                .help("Index a replacement folder; keep the old index until you review and remove it")
+        }
+        Button(compact ? "Remove…" : "Remove Collection…", role: .destructive) { store.requestRemoval(silo) }
+            .disabled(!store.canRemove(silo))
+            .help("Remove the index and watcher; keep the original files")
     }
 }
 
 /// Error dialog with the fix attached, driven by `store.problem`.
 struct ProblemAlert: ViewModifier {
     @EnvironmentObject private var store: LibrarianStore
-    @State private var confirmRemove = false
 
     func body(content: Content) -> some View {
         content
             .alert(store.problem?.title ?? "", isPresented: Binding(get: { store.problem != nil }, set: { if !$0 { store.problem = nil } }),
                    presenting: store.problem) { p in
                 if let silo = p.silo, p.folderMissing {
-                    Button("Locate Folder…") { store.relocate(silo) }
-                    Button("Remove Silo…") { lastProblemSilo = silo; store.problem = nil; confirmRemove = true }
+                    if silo.isPrivate {
+                        Button("Copy Original Path") { store.copy(silo.path, note: "Restore the private folder to this path") }
+                    } else {
+                        Button("Locate Folder…") { store.relocate(silo) }
+                    }
+                    Button("Remove Collection…") { store.problem = nil; store.requestRemoval(silo) }
                 }
                 if let log = p.logPath, FileManager.default.fileExists(atPath: log) {
                     Button("Open Log") { store.problem = nil; store.openLog(log) }
                 }
+                if let silo = p.silo, !p.folderMissing {
+                    Button("Review Problems") { store.problem = nil; store.showActivity(.problems, silo: silo.slug) }
+                }
+                Button("Copy Details") { store.copy("\(p.title)\n\(p.message)", note: "Copied problem details") }
                 if let s = p.service {
                     Button("Show Service") { store.problem = nil; store.show(service: s) }
                 }
@@ -336,10 +343,21 @@ struct ProblemAlert: ViewModifier {
             } message: { p in
                 Text(p.message)
             }
-            .confirmationDialog("Remove \(pendingSilo?.displayName ?? "silo")?", isPresented: $confirmRemove, titleVisibility: .visible, presenting: pendingSilo) { silo in
-                Button("Remove Silo", role: .destructive) { store.removeSilo(silo) }
+            .confirmationDialog("Stop \(store.pendingStop?.title ?? "service")?",
+                                isPresented: Binding(get: { store.pendingStop != nil }, set: { if !$0 { store.pendingStop = nil } }),
+                                titleVisibility: .visible, presenting: store.pendingStop) { service in
+                Button("Stop", role: .destructive) { store.pendingStop = nil; store.stop(service) }
+                Button("Cancel", role: .cancel) { store.pendingStop = nil }
+            } message: { service in
+                Text(service.kind == .chroma ? "Queries and indexing depend on Chroma. They will be unavailable until it is started again." : "Assistants will lose the MCP endpoint until it is started again.")
+            }
+            .confirmationDialog("Remove \(store.pendingRemoval?.displayName ?? "collection")?",
+                                isPresented: Binding(get: { store.pendingRemoval != nil }, set: { if !$0 { store.pendingRemoval = nil } }),
+                                titleVisibility: .visible, presenting: store.pendingRemoval) { silo in
+                Button("Remove Collection", role: .destructive) { store.removeSilo(silo) }
+                Button("Cancel", role: .cancel) { store.pendingRemoval = nil }
             } message: { silo in
-                Text("Deletes \(silo.chunks.grouped) indexed chunks for \(silo.tildePath), the bookmark, and the watcher job. The folder itself is not touched.")
+                Text("Removes \(silo.chunks.grouped) indexed chunks, the collection bookmark, and its watcher. Original files at \(silo.path) stay on disk. This cannot be undone; add the folder again to rebuild its index.")
             }
             .confirmationDialog(
                 "Make \(store.pendingUnprivate?.displayName ?? "silo") shared?",
@@ -367,8 +385,6 @@ struct ProblemAlert: ViewModifier {
             }
     }
 
-    private var pendingSilo: Silo? { lastProblemSilo }
-    @State private var lastProblemSilo: Silo?
 }
 
 struct AddSiloSheet: View {

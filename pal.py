@@ -4087,6 +4087,9 @@ def remove_command(
     else:
         _remove_source_path(name)
     _sync_daemon_if_installed()
+    if result.get("chroma_warning"):
+        print(f"Removal incomplete: indexed chunks may remain. After restoring Chroma, retry `pal remove {result['cleaned_slug']}`. Original files were not changed.", file=sys.stderr)
+        raise typer.Exit(code=1)
 
 
 @chroma_app.command("install", help="Install user-space ChromaDB server (chroma run) service.")

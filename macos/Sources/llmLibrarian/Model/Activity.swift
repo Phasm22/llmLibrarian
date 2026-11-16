@@ -142,6 +142,70 @@ struct ActivityFailureRow: Identifiable, Hashable, Sendable {
     let lastSeen: Date
     let occurrences: Int
     var name: String { (path as NSString).lastPathComponent }
+    var remedy: FailureRemedy { FailureRemedy.classify(errorClass: errorClass, error: error) }
+    func matches(_ filter: String) -> Bool {
+        filter.isEmpty || [path, error, slug, remedy.title].contains { $0.localizedCaseInsensitiveContains(filter) }
+    }
+}
+
+/// Presentation guidance only; retain the ledger's original error and category.
+enum FailureRemedy: String, Sendable {
+    case imageModel, encrypted, tooLarge, unsupported, timeout, permission, noText, busy, notFound, unknown
+
+    static func classify(errorClass: String, error: String) -> Self {
+        if error.lowercased().contains("image model not ready") { return .imageModel }
+        switch errorClass {
+        case "encrypted": return .encrypted
+        case "too_large": return .tooLarge
+        case "unsupported": return .unsupported
+        case "timeout": return .timeout
+        case "permission": return .permission
+        case "no_text": return .noText
+        case "busy": return .busy
+        case "not_found": return .notFound
+        default: return .unknown
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .imageModel: return "Image indexing is not ready"
+        case .encrypted: return "Files are password-protected"
+        case .tooLarge: return "Files exceed the size limit"
+        case .unsupported: return "File format is not supported"
+        case .timeout: return "Indexing timed out"
+        case .permission: return "Files could not be read"
+        case .noText: return "No text could be extracted"
+        case .busy: return "The index was busy"
+        case .notFound: return "Files were not found"
+        case .unknown: return "Indexing needs investigation"
+        }
+    }
+
+    var nextStep: String {
+        switch self {
+        case .imageModel:
+            return "Open the watcher log to identify the image model or dependency that could not start. Fix that issue before reindexing. Pause the watcher if it keeps repeating the same failure; resume it when ready."
+        case .encrypted:
+            return "Save an unlocked copy of each document in the collection, then reindex. Retrying the same locked file will not help."
+        case .tooLarge:
+            return "Split or reduce these files, then reindex the collection. Open the log for the size limit that was exceeded."
+        case .unsupported:
+            return "Export these files to a supported format such as PDF or plain text, then reindex the collection."
+        case .timeout:
+            return "Check the watcher log for the operation that timed out. Once the local model or service is responding, reindex the collection."
+        case .permission:
+            return "Reveal the file in Finder and check that it opens and is readable by your account. Fix access, then reindex."
+        case .noText:
+            return "Open the file to check its content. For a scanned document, save a searchable copy with OCR, then reindex."
+        case .busy:
+            return "Wait for the current indexing job to finish, then reindex this collection. Check Services if the index stays busy."
+        case .notFound:
+            return "Check whether the files or collection folder moved. Update the folder location from the collection details, then reindex."
+        case .unknown:
+            return "Expand a file below to read its full error, then open the watcher log for context. Fix the reported cause before reindexing. Copy the error details if you need help."
+        }
+    }
 }
 
 extension ActivityFailureGroup {
@@ -186,4 +250,5 @@ struct ActivityDetailRequest: Hashable, Sendable {
     let tab: ActivityTab
     let silo: String?
     let noSourceOnly: Bool
+    var failureLimit = 200
 }

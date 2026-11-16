@@ -105,10 +105,11 @@ private struct TileRow: View {
                 GroupBox {
                     VStack(alignment: .leading, spacing: 3) {
                         if store.activityUnreadable {
-                            Text("The activity ledger was written by an older build and can't be read yet.")
+                            Text("Activity history could not be read. Counts are unavailable.")
                                 .zfont(.callout)
-                            Text("Run pal activity once (or restart the MCP server) to update it; no history is lost.")
+                            Text("Check Services and the logs. An older history schema, a locked database, or a damaged file may need attention.")
                                 .zfont(.callout).foregroundStyle(.secondary)
+                            Button("Open Services") { store.page = .services }
                         } else {
                             Text("Changes and searches appear here once the activity ledger has history.")
                                 .zfont(.callout)
@@ -207,17 +208,20 @@ private struct Sparkline: View {
 private struct CollectionsTable: View {
     @EnvironmentObject private var store: LibrarianStore
     let summary: ActivitySummary?
+    private enum Column { case collection, changed, searches, lastActivity, status }
+    @State private var sortColumn: Column?
+    @State private var ascending = true
 
     var body: some View {
         let rows = ordered
         Section("Collections", detail: "\(rows.count)") {
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 0) {
                 GridRow {
-                    Text("Collection").frame(maxWidth: .infinity, alignment: .leading)
-                    Text("Changed").gridColumnAlignment(.trailing)
-                    Text("Searches").gridColumnAlignment(.trailing)
-                    Text("Last activity")
-                    Text("Status")
+                    sortHeader("Collection", column: .collection).frame(maxWidth: .infinity, alignment: .leading)
+                    sortHeader("Changed", column: .changed).gridColumnAlignment(.trailing)
+                    sortHeader("Searches", column: .searches).gridColumnAlignment(.trailing)
+                    sortHeader("Last activity", column: .lastActivity)
+                    sortHeader("Status", column: .status)
                 }
                 .zfont(.caption).foregroundStyle(.secondary)
                 .padding(.bottom, 5)
@@ -230,7 +234,37 @@ private struct CollectionsTable: View {
         }
     }
 
+    private func sortHeader(_ title: String, column: Column) -> some View {
+        Button {
+            if sortColumn == column { ascending.toggle() }
+            else { sortColumn = column; ascending = true }
+        } label: {
+            HStack(spacing: 4) {
+                Text(title)
+                Image(systemName: sortColumn == column ? (ascending ? "chevron.up" : "chevron.down") : "chevron.up.chevron.down")
+                    .font(.system(size: 8))
+            }
+        }
+        .buttonStyle(.plain)
+        .help("Sort by \(title.lowercased()); click again to reverse")
+        .accessibilityValue(sortColumn == column ? (ascending ? "Ascending" : "Descending") : "Not sorted")
+    }
+
     private var ordered: [Silo] {
+        if let sortColumn {
+            let rows = store.silos.map { CollectionTableRow(silo: $0, status: store.collectionStatus($0).text,
+                                                           stats: summary?.stats($0.slug) ?? ActivityCollectionStats()) }
+            let order: SortOrder = ascending ? .forward : .reverse
+            let comparator: KeyPathComparator<CollectionTableRow>
+            switch sortColumn {
+            case .collection: comparator = KeyPathComparator(\.name, order: order)
+            case .changed: comparator = KeyPathComparator(\.changed, order: order)
+            case .searches: comparator = KeyPathComparator(\.searches, order: order)
+            case .lastActivity: comparator = KeyPathComparator(\.lastActivity, order: order)
+            case .status: comparator = KeyPathComparator(\.status, order: order)
+            }
+            return rows.sorted(using: [comparator, KeyPathComparator(\.name)]).map(\.silo)
+        }
         guard let s = summary else { return store.silos.sorted { $0.displayName.lowercased() < $1.displayName.lowercased() } }
         let order = s.ranked(store.silos.map { ($0.slug, $0.displayName) }).map(\.slug)
         let bySlug = Dictionary(uniqueKeysWithValues: store.silos.map { ($0.slug, $0) })
@@ -239,7 +273,7 @@ private struct CollectionsTable: View {
 
     private func row(_ silo: Silo) -> some View {
         let stats = summary?.stats(silo.slug) ?? ActivityCollectionStats()
-        let status = status(silo, stats: stats)
+        let status = store.collectionStatus(silo)
         return GridRow {
             HStack(spacing: 5) {
                 Text(silo.displayName).lineLimit(1)
@@ -260,9 +294,12 @@ private struct CollectionsTable: View {
         .zfont(.callout)
         .padding(.vertical, 6)
         .contentShape(Rectangle())
-        .onTapGesture { store.showActivity(stats.changes > 0 || stats.searches == 0 ? .changes : .searches, silo: silo.slug) }
-        .help("Show \(silo.displayName)'s activity")
+        .onTapGesture {
+            store.showActivity(status.state == .attention ? .problems : (stats.changes > 0 || stats.searches == 0 ? .changes : .searches), silo: silo.slug)
+        }
+        .help(status.state == .attention ? "Review \(silo.displayName)'s problems" : "Show \(silo.displayName)'s activity")
         .contextMenu {
+            Button("Review Problems") { store.showActivity(.problems, silo: silo.slug) }
             Button("Show Changes") { store.showActivity(.changes, silo: silo.slug) }
             Button("Show Searches") { store.showActivity(.searches, silo: silo.slug) }
             Button("Show in Silos") { store.show(silo: silo) }
@@ -273,11 +310,4 @@ private struct CollectionsTable: View {
         Text(n == 0 ? "—" : n.grouped).monospacedDigit().foregroundStyle(n == 0 ? .tertiary : .primary)
     }
 
-    private func status(_ silo: Silo, stats: ActivityCollectionStats) -> (state: HealthState, text: String) {
-        if !silo.pathExists { return (.attention, "Folder missing") }
-        if stats.openFailures > 0 { return (.attention, "\(stats.openFailures) failing") }
-        guard let watcher = store.watcher(for: silo) else { return (.unknown, "Not watched") }
-        if watcher.state != .running { return (.attention, "Watcher \(watcher.state == .stopped ? "stopped" : "needs attention")") }
-        return (.running, "Watching")
-    }
 }
