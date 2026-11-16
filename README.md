@@ -102,14 +102,15 @@ From a fresh checkout:
 git clone https://github.com/Phasm22/llmLibrarian.git
 cd llmLibrarian
 uv venv && source .venv/bin/activate
-uv sync --extra image          # core + image embeddings (open_clip, torch, torchvision, HEIC)
+uv sync --extra image --extra ocr  # image search plus OCR for image/scanned-PDF text
 ollama pull llama3.2:latest    # only needed for pal ask / llmli ask
 ```
 
 **Every `uv sync` removes extras it was not asked to keep.** A plain `uv sync`
-after a `uv sync --extra image` silently uninstalls the image stack, and photo
-indexing then parks without an error. Pass `--extra image` on every sync if
-you index photos.
+after a sync with extras silently uninstalls them. Pass every extra you use on
+every sync: `uv sync --extra image` for image search, `uv sync --extra ocr` for
+OCR, or `uv sync --extra image --extra ocr` when you use both. Without the
+image extra, photo indexing parks rather than writing an incomplete index.
 When configured silos contain images and the stack is missing, the MCP server
 and each watcher log one `WARNING` at startup, and `/healthz` reports
 `image_backend: "missing"` with `image_backend_required: true`.
@@ -207,7 +208,7 @@ not a prerequisite shipped with this project.
 | Vague or empty answers | `pal inspect <silo>`; narrow with `--in`; reindex if stale (`pal ls --status`) |
 | `Error finding id` / Chroma weirdness | `llmli repair <silo> --yes` (or `--dry-run` first) |
 | MCP returns 0 chunks but silo has chunks | `health()` + `list_silos` — index/tool issue, not “no data” |
-| Scan PDFs with no text | OCR path depends on OS; see [docs/GUIDE.md](docs/GUIDE.md#troubleshooting) |
+| Images or scan PDFs have no extracted text | Install the OCR extra and an available backend; see [docs/GUIDE.md](docs/GUIDE.md#troubleshooting) |
 
 ---
 

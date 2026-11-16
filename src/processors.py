@@ -565,13 +565,10 @@ def _get_paddle_ocr_engine() -> Any | None:
         os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
         from paddleocr import PaddleOCR
 
-        try:
-            _PADDLE_OCR_ENGINE = PaddleOCR(use_angle_cls=use_angle, lang="en", show_log=False)
-        except Exception as e:
-            # PaddleOCR versions differ on constructor kwargs (e.g., no show_log).
-            if "show_log" not in str(e):
-                raise
-            _PADDLE_OCR_ENGINE = PaddleOCR(use_angle_cls=use_angle, lang="en")
+        _PADDLE_OCR_ENGINE = PaddleOCR(
+            use_textline_orientation=use_angle,
+            lang="en",
+        )
     except Exception as e:
         _PADDLE_OCR_ENGINE = None
         _log_processor_event(
@@ -584,10 +581,22 @@ def _get_paddle_ocr_engine() -> Any | None:
 
 
 def _extract_paddleocr_text(result: Any) -> str:
-    """Extract OCR text fragments from PaddleOCR result payload."""
+    """Extract OCR text fragments from PaddleOCR 3.x or legacy result payloads."""
     parts: list[str] = []
 
     def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            rec_texts = node.get("rec_texts")
+            if isinstance(rec_texts, (list, tuple)):
+                parts.extend(
+                    cleaned
+                    for item in rec_texts
+                    if isinstance(item, str) and (cleaned := item.strip())
+                )
+            for key, child in node.items():
+                if key != "rec_texts":
+                    _walk(child)
+            return
         if not isinstance(node, (list, tuple)):
             return
         if len(node) >= 2 and isinstance(node[1], (list, tuple)) and node[1]:
@@ -936,7 +945,14 @@ def _ocr_with_paddle_path(image_path: str) -> str | None:
         return None
     try:
         use_angle = _ocr_preprocess_enabled()
-        result = engine.ocr(str(image_path), cls=use_angle)
+        if callable(getattr(engine, "predict", None)):
+            result = engine.predict(
+                str(image_path),
+                use_textline_orientation=use_angle,
+            )
+        else:
+            # Compatibility for an injected or older PaddleOCR 2.x engine.
+            result = engine.ocr(str(image_path), cls=use_angle)
         text = _extract_paddleocr_text(result)
         return text or None
     except Exception as e:
