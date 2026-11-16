@@ -27,6 +27,26 @@ from typing import Any
 _DEFAULT_MPS_THRESHOLD = 24
 QWEN3_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
+# Known Qwen3-Embedding variants and their output dimension. Keyed by size tag
+# because HF repo ids vary (owner prefix, casing); falls back to the 0.6B
+# default below for any variant not listed here.
+_QWEN3_EMBEDDING_DIMENSIONS = {"0.6b": 1024, "4b": 2560, "8b": 4096}
+# Sane ceilings so a stray huge query/doc doesn't blow up latency or memory.
+_QWEN3_QUERY_MAX_SEQ_LENGTH = 512
+_QWEN3_DOC_MAX_SEQ_LENGTH = 8192
+
+
+def _is_qwen3_embedding_model(model_name: str) -> bool:
+    return "qwen3-embedding" in model_name.lower()
+
+
+def _qwen3_expected_dimension(model_name: str) -> int:
+    lowered = model_name.lower()
+    for tag, dim in _QWEN3_EMBEDDING_DIMENSIONS.items():
+        if tag in lowered:
+            return dim
+    return _QWEN3_EMBEDDING_DIMENSIONS["0.6b"]
+
 # Cache sentence-transformer embedding functions across calls. Without this,
 # every ingest / update_file / remove_file call in a long-lived MCP server
 # instantiates a fresh SentenceTransformer (~500 MB of torch tensors), fragments
@@ -128,17 +148,26 @@ def get_embedding_function(batch_size: int | None = None, device: str | None = N
                 # Explicit opt-in to ONNX MiniLM path; onnxruntime will automatically
                 # use CoreMLExecutionProvider on macOS when available.
                 ef: Any = embedding_functions.DefaultEmbeddingFunction()
-            elif model == QWEN3_MODEL:
+            elif _is_qwen3_embedding_model(model):
                 # Qwen retrieval is asymmetric: instruction on queries only.
                 # A per-instance cache avoids Chroma's model-name-only class cache
                 # retaining tensors after the idle reaper or sharing CPU/MPS models.
                 base_cls = embedding_functions.SentenceTransformerEmbeddingFunction
 
                 class Qwen3EmbeddingFunction(base_cls):
-                    expected_dimension = 1024
+                    expected_dimension = _qwen3_expected_dimension(model)
+
                     def __init__(self) -> None:
                         self.models = {}
-                        super().__init__(model_name=model, device=resolved, normalize_embeddings=True)
+                        extra: dict[str, Any] = {}
+                        if resolved.startswith("cuda"):
+                            # bf16 halves memory and is the dtype Qwen3-Embedding
+                            # was trained/evaluated in; CPU/MPS stay fp32.
+                            import torch
+
+                            extra["model_kwargs"] = {"torch_dtype": torch.bfloat16}
+                        super().__init__(model_name=model, device=resolved, normalize_embeddings=True, **extra)
+                        self._seq_len_lock = threading.Lock()
 
                     def _encode(self, input: Any, *, query: bool) -> Any:
                         import numpy as np
@@ -149,7 +178,15 @@ def get_embedding_function(batch_size: int | None = None, device: str | None = N
                             kwargs["batch_size"] = encode_batch_size
                         if query:
                             kwargs["prompt_name"] = "query"
-                        result = self._model.encode(list(input), **kwargs)
+                        # Shared model instance: pin the seq-length cap for this
+                        # call's side (query vs. doc) and encode under the same
+                        # lock so a concurrent call for the other side can't
+                        # mutate it mid-encode.
+                        with self._seq_len_lock:
+                            self._model.max_seq_length = (
+                                _QWEN3_QUERY_MAX_SEQ_LENGTH if query else _QWEN3_DOC_MAX_SEQ_LENGTH
+                            )
+                            result = self._model.encode(list(input), **kwargs)
                         return [np.asarray(row, dtype=np.float32) for row in result]
 
                     def __call__(self, input: Any) -> Any:

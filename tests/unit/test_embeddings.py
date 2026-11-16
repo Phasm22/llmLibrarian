@@ -29,6 +29,7 @@ class _FakeSentenceTransformerEmbeddingFunction:
         self.model_name = model_name
         self.device = device
         self.normalize_embeddings = normalize_embeddings
+        self.kwargs = _kwargs
         self._model = _FakeModel()
 
 
@@ -249,6 +250,52 @@ def test_qwen_queries_use_instruction_but_documents_do_not(monkeypatch):
     assert docs["normalize_embeddings"] is query["normalize_embeddings"] is True
     assert docs["batch_size"] == query["batch_size"] == 8
     assert ef.expected_dimension == 1024
+
+
+def test_qwen_matching_is_by_name_substring_not_exact_string(monkeypatch):
+    """Any Qwen3-Embedding variant (4B, 8B, ...) gets the query-instruction
+    adapter, not just the exact 0.6B model string."""
+    _install_fake_chroma(monkeypatch)
+    monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-4B")
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_DEVICE", "cpu")
+    ef = get_embedding_function()
+    ef(["a document"])
+    ef.embed_query(["a question"])
+    docs, query = ef._model.calls
+    assert "prompt_name" not in docs
+    assert query["prompt_name"] == "query"
+    assert ef.expected_dimension == 2560
+
+
+def test_qwen_caps_max_seq_length_per_call_side(monkeypatch):
+    from embeddings import QWEN3_MODEL
+    _install_fake_chroma(monkeypatch)
+    monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", QWEN3_MODEL)
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_DEVICE", "cpu")
+    ef = get_embedding_function()
+    ef(["a document"])
+    assert ef._model.max_seq_length == 8192
+    ef.embed_query(["a question"])
+    assert ef._model.max_seq_length == 512
+
+
+def test_qwen_loads_bf16_on_cuda_but_not_cpu(monkeypatch):
+    from embeddings import QWEN3_MODEL
+    import torch
+
+    _install_fake_chroma(monkeypatch)
+    monkeypatch.delenv("LLMLIBRARIAN_EMBEDDING", raising=False)
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_MODEL", QWEN3_MODEL)
+
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_DEVICE", "cpu")
+    cpu_ef = get_embedding_function()
+    assert "model_kwargs" not in cpu_ef.kwargs
+
+    monkeypatch.setenv("LLMLIBRARIAN_EMBEDDING_DEVICE", "cuda")
+    cuda_ef = get_embedding_function(device="cuda")
+    assert cuda_ef.kwargs["model_kwargs"]["torch_dtype"] is torch.bfloat16
 
 
 def test_explicit_model_validation_refuses_unreadable_collection(monkeypatch):
