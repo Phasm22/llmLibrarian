@@ -35,7 +35,26 @@ with `pal pull <folder> --image-vision`.
 ```bash
 macos/build.sh            # → macos/build/llmLibrarian.app
 macos/build.sh --install  # also replaces /Applications/llmLibrarian.app
+macos/build.sh --install --relaunch  # install and reopen
 ```
+
+In the app, choose **llmLibrarian → Rebuild and Relaunch**, or the same action
+from the menu bar status icon. It builds the current local checkout in the
+background, stages the new bundle, then closes and reopens the app. The toolbar
+shows progress; **Open Build Log** opens `~/.pal/logs/app-build.log` (under
+`PAL_HOME` when customized). Build failures appear in the app with a log link.
+The action is disabled while a rebuild or indexing job is running and in sample mode.
+It uses the configured daemon checkout and the same install destination as the
+script (`/Applications` by default). It does not pull Git changes, run the Python
+test suite, or restart background services. Swift retains its build cache, and
+the icon is regenerated only when its generator changes or the cached icon is missing.
+
+The native app release version is tracked in `Resources/Info.plist` independently
+of the Python package version. Each successful bundle build increments
+`.build/app-build-number`, using the installed app's build number as a floor.
+About shows that number plus the build time, source commit, branch, and whether
+the checkout contained local edits. Version `0.2.0 (2)` had been fixed since the
+native app's September 14, 2026 introduction; the recovery-flow changes are `0.3.0`.
 
 Requires the Xcode Command Line Tools (Swift 5.9+, macOS 14 SDK). The bundle
 is ad-hoc signed. `Contents/Resources` keeps the two launcher shims that the
@@ -47,6 +66,13 @@ cross-platform Add Silo command planner, the watcher-log parser, the sample
 library, and the activity-ledger reader directly, so XCTest is not required. The
 ledger test reads the shared fixture; after changing the overview contract,
 regenerate it with `TZ=UTC uv run python tests/fixtures/activity/make_fixture.py`.
+
+`macos/test.sh` also runs `bash macos/test-flows.sh`: the production store is
+tested with real subprocesses and temporary directories, with injected service
+responses instead of live launchd or index writes. See
+[UI recovery checks](../docs/macos-ui-recovery-checks.md) for the scenario matrix
+and the remaining boundaries. Snapshot mode includes Activity Changes/Problems,
+About, and the empty Jobs panel in light and dark appearances.
 
 ## Layout
 

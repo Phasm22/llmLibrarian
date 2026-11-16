@@ -18,6 +18,10 @@ struct LibrarianApp: App {
         .commands {
             LibrarianCommands(store: store)
         }
+        Window("About llmLibrarian", id: "about") {
+            AboutView().environmentObject(store)
+        }
+        .windowResizability(.contentSize)
     }
 }
 

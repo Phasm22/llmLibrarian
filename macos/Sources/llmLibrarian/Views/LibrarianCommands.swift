@@ -4,6 +4,7 @@ import AppKit
 /// Keep menu actions on the same store paths as toolbar and contextual actions.
 struct LibrarianCommands: Commands {
     @ObservedObject var store: LibrarianStore
+    @Environment(\.openWindow) private var openWindow
 
     private var selectedSilo: Silo? {
         store.page == .silos ? store.silo(slug: store.selectedSilo) : nil
@@ -13,6 +14,15 @@ struct LibrarianCommands: Commands {
     }
 
     var body: some Commands {
+        CommandGroup(replacing: .appInfo) {
+            Button("About llmLibrarian") { openWindow(id: "about") }
+        }
+        CommandGroup(after: .appInfo) {
+            Button(store.isRebuildingApp ? "Rebuilding App…" : "Rebuild and Relaunch") { store.rebuildApp() }
+                .disabled(!store.canRebuildApp)
+            Button("Open Build Log") { store.openLog(store.rebuildLogPath) }
+            Divider()
+        }
         CommandGroup(replacing: .newItem) {
             Button("Add Silo…") { AppDelegate.showMainWindow(); store.chooseSiloFolder() }
                 .keyboardShortcut("o", modifiers: [.command, .shift])
@@ -59,6 +69,10 @@ struct LibrarianCommands: Commands {
                 .disabled(store.isRefreshing)
         }
         CommandMenu("Silo") {
+            Button("Remove Selected Collection…", role: .destructive) {
+                if let silo = selectedSilo { store.requestRemoval(silo) }
+            }.disabled(!(selectedSilo.map { store.canRemove($0) } ?? false))
+            Divider()
             Button("Reindex Selected Silo") { if let silo = selectedSilo { store.reindex(silo) } }
                 .disabled(selectedSilo.map { !$0.pathExists || store.activeJob(for: $0) != nil } ?? true)
             Button(selectedSilo?.isPrivate == true ? "Make Shared…" : "Make Private") {
@@ -68,6 +82,7 @@ struct LibrarianCommands: Commands {
                 .disabled(selectedSilo.map { $0.imageVision || !$0.pathExists || store.activeJob(for: $0) != nil } ?? true)
         }
         CommandGroup(before: .windowList) {
+            Button("Recent Jobs") { AppDelegate.showMainWindow(); store.showJobs = true }
             Button("Show llmLibrarian") { AppDelegate.showMainWindow() }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
         }

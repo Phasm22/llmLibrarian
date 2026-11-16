@@ -38,6 +38,8 @@ struct MainWindow: View {
             ToolbarItem(placement: .principal) { StatusStrip() }
             ToolbarItemGroup(placement: .primaryAction) {
                 Group {
+                    Button { store.showJobs = true } label: { Label("Jobs", systemImage: "list.bullet.rectangle") }
+                        .help("View running jobs, results, and saved logs")
                     if store.page != .silos {
                         Button { store.chooseSiloFolder() } label: { Label("Add Silo", systemImage: "plus") }
                             .help("Add a folder (⇧⌘O)")
@@ -56,6 +58,7 @@ struct MainWindow: View {
         .task { await SnapshotMode.run(store: store) }
         .overlay(alignment: .bottom) { toast }
         .modifier(ProblemAlert())
+        .sheet(isPresented: $store.showJobs) { JobsView().environmentObject(store) }
         .sheet(item: $store.pendingAddRequest) { request in
             AddSiloSheet(request: request)
                 .environmentObject(store)
@@ -119,6 +122,12 @@ struct StatusStrip: View {
     @EnvironmentObject private var store: LibrarianStore
     var body: some View {
         HStack(spacing: 16) {
+            if store.isRebuildingApp {
+                ProgressView().controlSize(.mini)
+                Button("Rebuilding app…") { store.openLog(store.rebuildLogPath) }
+                    .buttonStyle(.plain)
+                    .help("Open build log")
+            }
             ForEach(store.services) { s in
                 Button { store.show(service: s) } label: { HStack(spacing: 5) {
                     StatusDot(state: s.state, size: 7)
@@ -137,11 +146,15 @@ struct StatusStrip: View {
                 .buttonStyle(.plain)
                 .help("Folder watchers running")
             }
+            if !store.pendingServiceActions.isEmpty {
+                ProgressView().controlSize(.mini)
+                Text("Checking services…")
+            }
             if store.jobs.contains(where: { $0.isRunning }) {
-                HStack(spacing: 5) {
+                Button { store.showJobs = true } label: { HStack(spacing: 5) {
                     ProgressView().controlSize(.mini)
                     Text(store.jobs.first { $0.isRunning }?.title ?? "Working")
-                }
+                } }.buttonStyle(.plain)
             }
         }
         .zfont(.callout)

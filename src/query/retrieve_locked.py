@@ -33,7 +33,7 @@ from query.retrieval import (
 )
 from processors import PHOTO_METADATA_FIELDS
 from reranker import rerank_head, rerank_head_size
-from document_read import anchor_cursor
+from document_read import DEFAULT_PAGE_CHARS, anchor_cursor, document_char_count, fetch_ordered_chunks
 from frontmatter import frontmatter_fields_for_response
 from query.meta_filters import (
     apply_tag_postfilter,
@@ -182,6 +182,9 @@ def execute_retrieve_chroma_phase(
             docs_h, metas_h, dists_h = (list(col) for col in zip(*kept)) if kept else ([], [], [])
         docs_h, metas_h, dists_h = apply_tag_postfilter(docs_h, metas_h, dists_h, required_tags)
         docs_h, metas_h, dists_h = _apply_rerank(docs_h, metas_h, dists_h)
+        # Dedup before the cut. Doing it after leaves a hole where the duplicate sat,
+        # and the stream comes back shorter than n_results.
+        docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
         scoped = bool(target_silo or source)
         per_cap = source_diversity_cap(
             intent,
@@ -193,7 +196,6 @@ def execute_retrieve_chroma_phase(
         # n_results first leaves that cap with too few chunks to fill the request.
         stream_k = n_results if scoped else n_stage1
         docs_h, metas_h, dists_h = diversify_by_source(docs_h, metas_h, dists_h, stream_k, max_per_source=per_cap)
-        docs_h, metas_h, dists_h = dedup_by_chunk_hash(docs_h, metas_h, dists_h)
         return docs_h, metas_h, dists_h, _warn, method, lexical_diag
 
     # Report the path actually taken; this used to be a constant "hybrid_or_vector",
@@ -210,9 +212,11 @@ def execute_retrieve_chroma_phase(
                 artifact_docs,
                 artifact_metas,
                 artifact_dists,
-                top_k=n_results,
+                top_k=len(docs) + len(artifact_docs),
             )
             docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+            if silo_slug or source:
+                docs, metas, dists = docs[:n_results], metas[:n_results], dists[:n_results]
             retrieval_method = "dual_stream_rrf"
 
     image_search: dict[str, Any] = {"attempted": False, "status": "not_applicable", "matches": 0}
@@ -249,6 +253,9 @@ def execute_retrieve_chroma_phase(
             image_search["status"] = "ok" if image_docs else "no_matches"
             if image_docs:
                 if explicit_image_query:
+                    image_docs, image_metas, image_dists = dedup_by_chunk_hash(
+                        image_docs, image_metas, image_dists
+                    )
                     docs, metas, dists = diversify_by_source(
                         image_docs,
                         image_metas,
@@ -265,10 +272,12 @@ def execute_retrieve_chroma_phase(
                         docs,
                         metas,
                         dists,
-                        top_k=n_results,
+                        top_k=len(image_docs) + len(docs),
                     )
+                    docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
+                    if silo_slug or source:
+                        docs, metas, dists = docs[:n_results], metas[:n_results], dists[:n_results]
                     retrieval_method = f"{retrieval_method}+image_rrf"
-                docs, metas, dists = dedup_by_chunk_hash(docs, metas, dists)
 
     # source= pins one file, so there is nothing for silo balancing to spread across.
     if silo_slug is None and not source:
@@ -277,6 +286,36 @@ def execute_retrieve_chroma_phase(
         docs, metas, dists = diversify_by_silo(
             docs, metas, dists, n_results, max_per_silo=per_silo_cap, silos=silo_cache
         )
+
+    # A named file that fits in one read_document page comes back in document
+    # order, whole. Ranked chunks of a two-paragraph note hide the note.
+    whole_file = False
+    source_file = None
+    if source and docs:
+        file_silo = silo_slug or str((metas[0] or {}).get("silo") or "")
+        file_source = str((metas[0] or {}).get("source") or "")
+        if file_silo and file_source:
+            try:
+                ordered = fetch_ordered_chunks(collection, silo=file_silo, source=file_source)
+            except Exception:
+                ordered = []
+            if ordered:
+                file_chars = document_char_count(ordered)
+                source_file = {"total_chunks": len(ordered), "total_chars": file_chars}
+                if file_chars <= DEFAULT_PAGE_CHARS:
+                    distance_by_hash: dict[str, float | None] = {}
+                    for meta, dist in zip(metas, dists):
+                        hashed = str((meta or {}).get("chunk_hash") or "")
+                        if hashed and hashed not in distance_by_hash:
+                            distance_by_hash[hashed] = dist
+                    docs = [doc for doc, _meta in ordered]
+                    metas = [meta for _doc, meta in ordered]
+                    dists = [
+                        distance_by_hash.get(str((meta or {}).get("chunk_hash") or ""))
+                        for meta in metas
+                    ]
+                    whole_file = True
+                    retrieval_method = "whole_file"
 
     chunks = []
     for rank, (doc, meta, dist) in enumerate(zip(docs, metas, dists), start=1):
@@ -342,6 +381,10 @@ def execute_retrieve_chroma_phase(
         "image_search": image_search,
         "chunks": chunks,
     }
+    if source_file is not None:
+        result["source_file"] = source_file
+    if whole_file:
+        result["whole_file"] = True
     visual_follow_up = [
         str(chunk.get("source") or "")
         for chunk in chunks

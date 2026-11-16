@@ -101,6 +101,10 @@ expect(ActivityLedger.documents(dbPath: dbPath, window: .week, now: weekNow, cal
 expect(ActivityLedger.clients(dbPath: dbPath, window: .week, now: weekNow, calendar: utc)!.reduce(0) { $0 + $1.searches }
        == week.searches, "clients add up")
 expect(ActivityLedger.failures(dbPath: dbPath)!.count == week.failures.reduce(0) { $0 + $1.files }, "failure rows")
+let firstFailure = ActivityLedger.failures(dbPath: dbPath, limit: 1)!
+let moreFailures = ActivityLedger.failures(dbPath: dbPath, limit: 200)!
+expect(firstFailure.count == 1 && moreFailures.starts(with: firstFailure), "Loading more failures preserves ordering and includes later rows")
+expect(ActivityLedger.failures(dbPath: dbPath + "/missing") == nil, "Missing history must not be represented as a successful empty result")
 
 // Window math
 let today = ActivityLedger.bounds(.today, now: weekNow, calendar: utc)

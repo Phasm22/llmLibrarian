@@ -5,6 +5,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_BIN="$HERE/.build/silo-add-workflow-tests"
 
 mkdir -p "$HERE/.build"
+UI_BIN="$HERE/.build/ui-contract-tests"
+swiftc \
+  "$HERE/Sources/llmLibrarian/Model/Activity.swift" \
+  "$HERE/Sources/llmLibrarian/Model/AppBuildInfo.swift" \
+  "$HERE/Tests/UIContractTests/main.swift" \
+  -o "$UI_BIN"
+"$UI_BIN"
+REBUILD_BIN="$HERE/.build/app-rebuild-tests"
+swiftc \
+  "$HERE/Sources/llmLibrarian/Services/AppRebuild.swift" \
+  "$HERE/Tests/AppRebuildTests/main.swift" \
+  -o "$REBUILD_BIN"
+"$REBUILD_BIN"
+
 swiftc \
   "$HERE/Sources/llmLibrarian/Model/SiloAddWorkflow.swift" \
   "$HERE/Tests/SiloAddWorkflowTests/main.swift" \
@@ -41,3 +55,5 @@ swiftc \
   -lsqlite3 \
   -o "$LEDGER_BIN"
 "$LEDGER_BIN" "$HERE/../tests/fixtures/activity"
+
+bash "$HERE/test-flows.sh"

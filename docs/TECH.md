@@ -53,7 +53,12 @@ cannot fill an unscoped result. Naming `silo=` / `--in` on a LOOKUP, or passing
 `source=`, lifts that cap to `n_results`. Auto-bound and catalog-retry scopes
 stay at the unscoped cap. Unscoped retrieval applies the per-file cap to the
 stage-one window, then the per-silo cap, then cuts to `n_results`, so the silo
-cap can still fill the request.
+cap can still fill the request. Duplicate chunks are removed before that cut,
+so a repeated hash cannot leave the result short of `n_results`.
+
+The order of `chunks` is the ranking. `rank` 1 is the best hit. The distance
+score is not that order; `explain_retrieval` still returns it, and the answer
+payload does not, so a caller cannot re-sort the list by it.
 
 Hybrid retrieval (`query/retrieval.py`, `run_hybrid_retrieve`) fuses the vector
 list with a lexical list by RRF, which reads list position as relevance. The

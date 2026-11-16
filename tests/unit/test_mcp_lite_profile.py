@@ -135,8 +135,8 @@ def test_retrieve_knowledge_projects_evidence_and_rebuild_signal(monkeypatch, mc
     assert out["results_may_be_incomplete"] is True
     assert out["retryable"] is True
     assert set(out["chunks"][0]) == {
+        "rank",
         "text",
-        "score",
         "source",
         "section",
         "doc_type",

@@ -146,3 +146,73 @@ def test_head_bound_limits_cross_encoder_work(monkeypatch):
     res = _run(5)
     assert model.calls == [reranker.rerank_head_size(5)] == [20]
     assert "doc-30" not in [c["text"] for c in res["chunks"]]
+
+
+def test_duplicate_hash_does_not_shrink_the_result(monkeypatch):
+    docs = ["a", "a-dup", "b", "c"]
+    metas = [
+        {"source": "/f.md", "silo": "docs", "chunk_hash": "h1"},
+        {"source": "/f.md", "silo": "docs", "chunk_hash": "h1"},
+        {"source": "/f.md", "silo": "docs", "chunk_hash": "h2"},
+        {"source": "/f.md", "silo": "docs", "chunk_hash": "h3"},
+    ]
+    dists = [0.1, 0.11, 0.2, 0.3]
+    monkeypatch.setattr(
+        "query.retrieve_locked._safe_query",
+        lambda *_a, **_k: (docs, [dict(m) for m in metas], list(dists), ["1", "2", "3", "4"], None),
+    )
+    monkeypatch.setattr(
+        "query.retrieve_locked.run_hybrid_retrieve",
+        lambda **kw: (kw["docs_v"], kw["metas_v"], kw["dists_v"], "vector_only"),
+    )
+    monkeypatch.setattr("query.retrieve_locked.get_embedding_function", lambda batch_size=1: object())
+    monkeypatch.setattr("query.retrieve_locked._artifact_stream_enabled", lambda *_a: False)
+    res = execute_retrieve_chroma_phase(
+        db="/tmp/db", intent="LOOKUP", query="q", query_for_retrieval="q", silo_slug="docs",
+        n_stage1=4, n_results=3, section=None, doc_type=None, db_path="/tmp/db",
+        get_chroma_client=lambda _db: _Client(), rerank_status="disabled",
+    )
+    assert [c["text"] for c in res["chunks"]] == ["a", "b", "c"]
+
+
+def test_small_named_file_comes_back_in_document_order(monkeypatch):
+    ranked = ["second paragraph", "first paragraph"]
+    metas = [
+        {"source": "/n.md", "silo": "docs", "chunk_hash": "b", "chunk_index": 1, "line_start": 2},
+        {"source": "/n.md", "silo": "docs", "chunk_hash": "a", "chunk_index": 0, "line_start": 1},
+    ]
+    stored = [
+        ("first paragraph", {"source": "/n.md", "silo": "docs", "chunk_hash": "a", "chunk_index": 0, "line_start": 1}),
+        ("second paragraph", {"source": "/n.md", "silo": "docs", "chunk_hash": "b", "chunk_index": 1, "line_start": 2}),
+    ]
+
+    class _Rows:
+        def get(self, *, where, include, limit, offset):
+            page = stored[offset : offset + limit]
+            return {"documents": [d for d, _m in page], "metadatas": [m for _d, m in page]}
+
+    class _RowsClient:
+        def get_or_create_collection(self, **_kw):
+            return _Rows()
+
+    monkeypatch.setattr(
+        "query.retrieve_locked._safe_query",
+        lambda *_a, **_k: (ranked, [dict(m) for m in metas], [0.1, 0.2], ["2", "1"], None),
+    )
+    monkeypatch.setattr(
+        "query.retrieve_locked.run_hybrid_retrieve",
+        lambda **kw: (kw["docs_v"], kw["metas_v"], kw["dists_v"], "vector_only"),
+    )
+    monkeypatch.setattr("query.retrieve_locked.get_embedding_function", lambda batch_size=1: object())
+    monkeypatch.setattr("query.retrieve_locked._artifact_stream_enabled", lambda *_a: False)
+    res = execute_retrieve_chroma_phase(
+        db="/tmp/db", intent="LOOKUP", query="q", query_for_retrieval="q", silo_slug="docs",
+        n_stage1=4, n_results=2, section=None, doc_type=None, db_path="/tmp/db", source="/n.md",
+        get_chroma_client=lambda _db: _RowsClient(), rerank_status="disabled",
+    )
+    assert res["whole_file"] is True
+    assert [c["text"] for c in res["chunks"]] == ["first paragraph", "second paragraph"]
+    assert res["source_file"] == {
+        "total_chunks": 2,
+        "total_chars": len("first paragraph") + len("second paragraph"),
+    }
