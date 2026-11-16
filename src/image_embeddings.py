@@ -191,3 +191,32 @@ def image_backend_status(
         "checked_at": ts,
     }
     return dict(_IMAGE_BACKEND_CHECK)
+
+
+IMAGE_EXTRA_MISSING_MESSAGE = (
+    "image files are in a configured folder but the image extra is not installed; "
+    "they will park until fixed. Run `uv sync --extra image` in the project checkout."
+)
+_IMAGE_SCAN_MAX_ENTRIES = 50_000
+
+
+def folder_has_image_files(root: str | Path, *, max_entries: int = _IMAGE_SCAN_MAX_ENTRIES) -> bool:
+    """True when ``root`` holds a file the image backend would index.
+
+    Early exit on the first image; hidden directories are skipped and the walk
+    is capped at ``max_entries`` so a huge tree cannot stall startup. Returns
+    only a boolean: no filenames leave this function.
+    """
+    base = Path(root)
+    if not base.is_dir():
+        return False
+    seen = 0
+    for _dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in filenames:
+            if Path(name).suffix.lower() in IMAGE_SUFFIXES:
+                return True
+            seen += 1
+            if seen >= max_entries:
+                return False
+    return False

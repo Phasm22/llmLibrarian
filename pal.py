@@ -2338,6 +2338,27 @@ class SiloWatcher:
             except Exception as exc:
                 self._log(f"{self.label}: exclude verify failed: {exc}")
 
+    def _warn_if_image_extra_missing(self) -> None:
+        """One WARNING at startup when this folder has images but the image extra is absent."""
+        try:
+            _ensure_src_on_path()
+            from image_embeddings import (
+                IMAGE_EXTRA_MISSING_MESSAGE,
+                folder_has_image_files,
+                image_backend_status,
+            )
+
+            if image_backend_status()["status"] == "ok":
+                return
+            if not folder_has_image_files(self.root):
+                return
+        except Exception:
+            self._logger.debug("image extra check failed", exc_info=True)
+            return
+        message = f"WARNING: {self.label}: {IMAGE_EXTRA_MISSING_MESSAGE}"
+        self._logger.warning(message)
+        print(message, file=sys.stderr, flush=True)
+
     def run(self) -> None:
         if self.startup_message:
             self._log(self.startup_message)
@@ -2357,6 +2378,7 @@ class SiloWatcher:
             debounce=self.debounce,
             db_path=self.db_path,
         )
+        self._warn_if_image_extra_missing()
         self._observer.schedule(self._handler, str(self.root), recursive=True)
         self._observer.start()
         worker = threading.Thread(target=self._process_loop, daemon=True)

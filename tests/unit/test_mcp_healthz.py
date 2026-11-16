@@ -29,7 +29,8 @@ def test_healthz_returns_probe_fields(mcp_module, tmp_path, monkeypatch):
         "image_backend_status",
         lambda **_kw: {"status": "ok", "reason": None, "checked_at": 0.0},
     )
-    scope = {"type": "http", "method": "GET", "path": "/healthz", "headers": []}
+    # Direct loopback caller: only these callers receive db_path.
+    scope = {"type": "http", "method": "GET", "path": "/healthz", "headers": [], "client": ("127.0.0.1", 50000)}
     request = Request(scope)
     expected_db = str(tmp_path / "db")
 
