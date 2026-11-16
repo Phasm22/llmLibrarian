@@ -153,8 +153,10 @@ def _virtual_clock(monkeypatch):
         sleeps.append(seconds)
         now[0] += seconds
 
-    monkeypatch.setattr(cl.time, "sleep", fake_sleep)
-    monkeypatch.setattr(cl.time, "monotonic", lambda: now[0])
+    # Do not patch the process-wide time module: background Chroma threads
+    # also sleep, which otherwise advances this test's virtual deadline.
+    from types import SimpleNamespace
+    monkeypatch.setattr(cl, "time", SimpleNamespace(sleep=fake_sleep, monotonic=lambda: now[0]))
     return sleeps
 
 

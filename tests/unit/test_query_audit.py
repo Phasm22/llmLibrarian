@@ -191,7 +191,8 @@ def mcp(monkeypatch, tmp_path):
 
 
 def test_query_tools_write_audit_records_readable_by_recent_queries(mcp):
-    mcp.query_personal_knowledge("Amentum contract types", silo="hot_seat", n_results=12)
+    result = mcp.query_personal_knowledge("Amentum contract types", silo="hot_seat", n_results=12)
+    assert "error" not in result, result
     mcp.multi_query_knowledge(["AVAV revenue", "AVAV backlog"], silo="hot_seat", n_results=5)
 
     out = mcp.recent_queries(limit=10)
