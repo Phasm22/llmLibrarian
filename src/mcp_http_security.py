@@ -129,16 +129,27 @@ def find_caller_by_token(candidate: str, callers: Iterable[CallerToken]) -> Call
     return matched
 
 
+# Endpoint catalogs a caller token may call tools on. "full" is the main
+# catalog at LLMLIBRARIAN_MCP_PATH; "lite" is the mounted lite catalog at
+# LLMLIBRARIAN_MCP_LITE_PATH. Absent/empty per-caller "endpoints" = both.
+VALID_ENDPOINTS: tuple[str, ...] = ("full", "lite")
+ENDPOINT_SCOPE_PREFIX = "endpoint:"
+
+
 @dataclass(frozen=True)
 class CallerToken:
-    """One configured bearer token and its scopes."""
+    """One configured bearer token, its scopes, and allowed endpoints."""
 
     client_id: str
     token: str
     scopes: tuple[str, ...]
+    endpoints: tuple[str, ...] = VALID_ENDPOINTS
 
     def has_scope(self, scope: str) -> bool:
         return scope in self.scopes
+
+    def allows_endpoint(self, endpoint: str) -> bool:
+        return endpoint in self.endpoints
 
 
 def _parse_scopes(raw: str | None, *, default: tuple[str, ...] = ("read",)) -> tuple[str, ...]:
@@ -162,6 +173,57 @@ def _parse_scopes(raw: str | None, *, default: tuple[str, ...] = ("read",)) -> t
         if scope not in normalized:
             normalized.append(scope)
     return tuple(normalized) or default
+
+
+def _parse_endpoints(client_id: str, raw: Any) -> tuple[str, ...]:
+    """Per-caller "endpoints" entry: list or comma/space string of full|lite."""
+    if raw is None:
+        return VALID_ENDPOINTS
+    if isinstance(raw, str):
+        parts = [p for p in raw.replace(",", " ").split() if p]
+    elif isinstance(raw, list):
+        parts = [str(p).strip() for p in raw if str(p).strip()]
+    else:
+        raise RuntimeError(
+            f"LLMLIBRARIAN_MCP_AUTH_TOKENS[{client_id!r}] endpoints must be a "
+            "list or string of full|lite"
+        )
+    if not parts:
+        return VALID_ENDPOINTS
+    normalized: list[str] = []
+    for part in parts:
+        value = part.lower()
+        if value not in VALID_ENDPOINTS:
+            raise RuntimeError(
+                f"LLMLIBRARIAN_MCP_AUTH_TOKENS[{client_id!r}] endpoint {part!r} "
+                f"is not one of {', '.join(VALID_ENDPOINTS)}"
+            )
+        if value not in normalized:
+            normalized.append(value)
+    return tuple(normalized)
+
+
+def access_scopes(caller: CallerToken) -> list[str]:
+    """Scopes for the AccessToken: caller scopes plus endpoint markers.
+
+    Endpoint markers (``endpoint:lite``/``endpoint:full``) are only added when
+    the caller is restricted, so unrestricted tokens keep their exact legacy
+    scope list and absence of any marker means "all endpoints".
+    """
+    scopes = list(caller.scopes)
+    if set(caller.endpoints) != set(VALID_ENDPOINTS):
+        scopes.extend(f"{ENDPOINT_SCOPE_PREFIX}{e}" for e in caller.endpoints)
+    return scopes
+
+
+def scopes_allow_endpoint(scopes: Iterable[str] | None, endpoint: str) -> bool:
+    """True when an AccessToken's scopes permit tool calls on this endpoint."""
+    if scopes is None:
+        return True
+    markers = [s for s in scopes if s.startswith(ENDPOINT_SCOPE_PREFIX)]
+    if not markers:
+        return True
+    return f"{ENDPOINT_SCOPE_PREFIX}{endpoint}" in markers
 
 
 def load_caller_tokens() -> list[CallerToken]:
@@ -190,6 +252,7 @@ def load_caller_tokens() -> list[CallerToken]:
                 "LLMLIBRARIAN_MCP_AUTH_TOKENS must be a non-empty JSON object"
             )
         for client_id, entry in parsed.items():
+            endpoints = VALID_ENDPOINTS
             if isinstance(entry, str):
                 token = entry.strip()
                 scopes = ("read",)
@@ -202,6 +265,7 @@ def load_caller_tokens() -> list[CallerToken]:
                     scopes = _parse_scopes(" ".join(str(s) for s in scopes_val))
                 else:
                     scopes = ("read",)
+                endpoints = _parse_endpoints(client_id, entry.get("endpoints"))
             else:
                 raise RuntimeError(
                     f"LLMLIBRARIAN_MCP_AUTH_TOKENS[{client_id!r}] must be a "
@@ -211,7 +275,7 @@ def load_caller_tokens() -> list[CallerToken]:
                 raise RuntimeError(
                     f"LLMLIBRARIAN_MCP_AUTH_TOKENS[{client_id!r}] has an empty token"
                 )
-            callers.append(CallerToken(str(client_id), token, scopes))
+            callers.append(CallerToken(str(client_id), token, scopes, endpoints))
 
     single = os.environ.get("LLMLIBRARIAN_MCP_AUTH_TOKEN", "").strip()
     if single and not any(c.token == single for c in callers):
@@ -243,6 +307,10 @@ def select_client_bearer_token(parsed_env: dict[str, str] | None = None) -> str 
                 if isinstance(entry, str):
                     token, scopes = entry.strip(), ("read",)
                 elif isinstance(entry, dict):
+                    # pal connects to the full endpoint. A newly configured
+                    # lite-only Hermes token must not displace its legacy token.
+                    if "full" not in _parse_endpoints(client_id, entry.get("endpoints")):
+                        continue
                     token = str(entry.get("token") or "").strip()
                     scopes_val = entry.get("scopes", ["read"])
                     if isinstance(scopes_val, list):

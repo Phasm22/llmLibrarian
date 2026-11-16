@@ -56,10 +56,13 @@ def test_missing_folder_is_not_an_image_folder(tmp_path):
     assert image_embeddings.folder_has_image_files(tmp_path / "nope") is False
 
 
-def test_scan_is_capped(tmp_path):
-    for i in range(3):
-        (tmp_path / f"t{i}.txt").write_text("x")
-    (tmp_path / "zzz.png").write_bytes(b"x")
+def test_scan_is_capped(tmp_path, monkeypatch):
+    # os.walk does not guarantee filesystem order; pin the image after the cap.
+    monkeypatch.setattr(
+        image_embeddings.os,
+        "walk",
+        lambda _root: iter([(str(tmp_path), [], ["t0.txt", "t1.txt", "t2.txt", "zzz.png"])]),
+    )
     assert image_embeddings.folder_has_image_files(tmp_path, max_entries=2) is False
     assert image_embeddings.folder_has_image_files(tmp_path, max_entries=50) is True
 

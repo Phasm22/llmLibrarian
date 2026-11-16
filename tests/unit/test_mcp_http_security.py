@@ -392,3 +392,212 @@ def test_select_client_bearer_prefers_write_token():
         }
     )
     assert tok == "ops-write"
+
+
+def test_caller_endpoints_parse(monkeypatch):
+    import mcp_http_security as sec
+
+    monkeypatch.setenv(
+        "LLMLIBRARIAN_MCP_AUTH_TOKENS",
+        json.dumps(
+            {
+                "hermes": {"token": "t-hermes", "scopes": ["read"], "endpoints": ["lite"]},
+                "mesh": {"token": "t-mesh", "endpoints": "lite, full"},
+                "pal": {"token": "t-pal", "scopes": ["read", "write"]},
+            }
+        ),
+    )
+    by_id = {c.client_id: c for c in sec.load_caller_tokens()}
+    assert by_id["hermes"].endpoints == ("lite",)
+    assert by_id["hermes"].allows_endpoint("lite")
+    assert not by_id["hermes"].allows_endpoint("full")
+    assert by_id["mesh"].endpoints == ("lite", "full")
+    assert by_id["pal"].endpoints == sec.VALID_ENDPOINTS
+
+
+def test_caller_endpoints_invalid_value_raises(monkeypatch):
+    import mcp_http_security as sec
+
+    monkeypatch.setenv(
+        "LLMLIBRARIAN_MCP_AUTH_TOKENS",
+        json.dumps({"hermes": {"token": "t", "endpoints": ["public"]}}),
+    )
+    with pytest.raises(RuntimeError, match="endpoint 'public'"):
+        sec.load_caller_tokens()
+
+
+def test_access_scopes_endpoint_markers():
+    import mcp_http_security as sec
+
+    unrestricted = sec.CallerToken("pal", "t", ("read", "write"))
+    assert sec.access_scopes(unrestricted) == ["read", "write"]
+    reversed_endpoints = sec.CallerToken("pal", "t", ("read", "write"), ("lite", "full"))
+    assert sec.access_scopes(reversed_endpoints) == ["read", "write"]
+
+    lite_only = sec.CallerToken("hermes", "t", ("read",), ("lite",))
+    assert sec.access_scopes(lite_only) == ["read", "endpoint:lite"]
+
+
+def test_scopes_allow_endpoint():
+    import mcp_http_security as sec
+
+    assert sec.scopes_allow_endpoint(None, "full")
+    assert sec.scopes_allow_endpoint(["read"], "full")
+    assert sec.scopes_allow_endpoint(["read", "endpoint:lite"], "lite")
+    assert not sec.scopes_allow_endpoint(["read", "endpoint:lite"], "full")
+    assert sec.scopes_allow_endpoint(["read", "endpoint:lite", "endpoint:full"], "full")
+
+
+def test_verify_token_carries_endpoint_markers(monkeypatch):
+    import mcp_server
+
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv(
+        "LLMLIBRARIAN_MCP_AUTH_TOKENS",
+        json.dumps(
+            {
+                "hermes": {"token": "t-hermes", "scopes": ["read"], "endpoints": ["lite"]},
+                "pal": {"token": "t-pal", "scopes": ["read", "write"]},
+            }
+        ),
+    )
+    provider = mcp_server._auth_for_transport("http")
+    hermes = asyncio.run(provider.verify_token("t-hermes"))
+    assert hermes.scopes == ["read", "endpoint:lite"]
+    pal = asyncio.run(provider.verify_token("t-pal"))
+    assert pal.scopes == ["read", "write"]
+
+
+def test_rate_limit_middleware_replays_body_once_then_forwards():
+    """Regression: replay_receive must not return the body forever.
+
+    Streamable-HTTP responses await receive() for http.disconnect after the
+    body is consumed; an always-ready replay starves the event loop and every
+    HTTP MCP request hangs (seen live 2026-11-14).
+    """
+    import mcp_server
+
+    seen = []
+
+    async def fake_app(scope, receive, send):
+        seen.append(await receive())
+        seen.append(await receive())
+
+    messages = [
+        {"type": "http.request", "body": b'{"method":"tools/list"}', "more_body": False},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive():
+        return messages.pop(0)
+
+    async def send(message):
+        pass
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/x/mcp",
+        "headers": [],
+        "client": ("127.0.0.1", 40000),
+    }
+    mw = mcp_server._HttpRateLimitMiddleware(fake_app)
+    asyncio.run(mw(scope, receive, send))
+    assert [m["type"] for m in seen] == ["http.request", "http.disconnect"]
+    assert seen[0]["body"] == b'{"method":"tools/list"}'
+
+
+@pytest.mark.parametrize("scopes", [["read"], ["read", "write"]])
+def test_lite_only_token_is_enforced_on_mounted_http_app(monkeypatch, tmp_path, scopes):
+    """A restricted token must never gain full tools by changing only the URL."""
+    from starlette.testclient import TestClient
+    import mcp_server
+
+    monkeypatch.setenv("LLMLIBRARIAN_MCP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv(
+        "LLMLIBRARIAN_MCP_AUTH_TOKENS",
+        json.dumps({
+            "hermes": {"token": "hermes-test-only", "scopes": scopes, "endpoints": ["lite"]},
+            "pal": {"token": "pal-test-only", "scopes": ["read", "write"]},
+        }),
+    )
+    monkeypatch.setattr(mcp_server, "_DB_PATH", str(tmp_path))
+    monkeypatch.setattr(mcp_server, "_LITE_URL_PATH", None)
+    monkeypatch.setattr(mcp_server.mcp, "auth", mcp_server._auth_for_transport("http"))
+    app = mcp_server._http_app_with_lite(path="/mcp", lite_mount="/lite", stateless_http=True, transport="http")
+    headers = {"Authorization": "Bearer hermes-test-only", "Accept": "application/json, text/event-stream"}
+
+    def call(client, path, name, *, token="hermes-test-only"):
+        response = client.post(path, headers={**headers, "Authorization": f"Bearer {token}"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": {}}})
+        assert response.status_code == 200
+        raw = response.text
+        data = "\n".join(line[5:] for line in raw.splitlines() if line.startswith("data:")) or raw
+        return json.loads(data)["result"]
+
+    with TestClient(mcp_server._wrap_http_app(app)) as client:
+        anonymous = client.post("/lite/mcp", headers={"Accept": "application/json, text/event-stream"}, json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        assert anonymous.status_code == 401
+        assert not call(client, "/lite/mcp", "silo_roster").get("isError")
+        refused = call(client, "/mcp", "list_silos")
+        assert refused["isError"]
+        assert "not valid on the full endpoint" in json.dumps(refused)
+        assert call(client, "/lite/mcp", "remove_file")["isError"]
+        assert not call(client, "/mcp", "list_silos", token="pal-test-only").get("isError")
+        assert not call(client, "/lite/mcp", "silo_roster", token="pal-test-only").get("isError")
+        # Both catalogs share the app with #24's unauthenticated health route.
+        response = client.get("/healthz")
+        assert response.status_code == 200
+        health = response.json()
+        assert health["ok"] is True
+        assert health["db_path_withheld"] is True
+        assert "db_path" not in health
+        assert health["lite_path"] == "/lite/mcp"
+
+
+@pytest.mark.parametrize("scopes", [["read"], ["read", "write"]])
+def test_full_client_token_selection_skips_lite_only_callers(scopes):
+    import mcp_http_security as sec
+
+    env = {
+        "LLMLIBRARIAN_MCP_AUTH_TOKENS": json.dumps({
+            "hermes": {"token": "lite-token", "scopes": scopes, "endpoints": ["lite"]}
+        }),
+        "LLMLIBRARIAN_MCP_AUTH_TOKEN": "existing-full-token",
+    }
+    assert sec.select_client_bearer_token(env) == "existing-full-token"
+    del env["LLMLIBRARIAN_MCP_AUTH_TOKEN"]
+    assert sec.select_client_bearer_token(env) is None
+
+
+def test_lite_only_token_works_with_standalone_lite_profile(tmp_path):
+    script = r'''
+import json
+from starlette.testclient import TestClient
+import mcp_server
+
+mcp_server.mcp.auth = mcp_server._auth_for_transport("http")
+app = mcp_server.mcp.http_app(path="/mcp", stateless_http=True)
+with TestClient(mcp_server._wrap_http_app(app)) as client:
+    response = client.post("/mcp", headers={
+        "Authorization": "Bearer hermes-test-only",
+        "Accept": "application/json, text/event-stream",
+    }, json={"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "silo_roster", "arguments": {}}})
+    assert response.status_code == 200
+    data = "\n".join(line[5:] for line in response.text.splitlines() if line.startswith("data:")) or response.text
+    assert not json.loads(data)["result"].get("isError"), response.text
+'''
+    env = os.environ.copy()
+    env.update({
+        "LLMLIBRARIAN_ENV_BOOTSTRAPPED": "1",
+        "LLMLIBRARIAN_DB": str(tmp_path),
+        "LLMLIBRARIAN_MCP_PROFILE": "lite",
+        "LLMLIBRARIAN_MCP_REQUIRE_AUTH": "true",
+        "LLMLIBRARIAN_MCP_AUTH_TOKENS": json.dumps({
+            "hermes": {"token": "hermes-test-only", "endpoints": ["lite"]},
+        }),
+    })
+    subprocess.run(
+        [sys.executable, "-c", script], cwd=ROOT, env=env,
+        check=True, capture_output=True, text=True, timeout=30,
+    )
