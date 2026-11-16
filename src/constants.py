@@ -64,7 +64,8 @@ MAX_WORKERS = 8
 
 # Query defaults
 DEFAULT_N_RESULTS = 12
-DEFAULT_MODEL = "llama3.2:latest"
+DEFAULT_MODEL = "qwen3.5:9b"
+DEFAULT_VISION_MODEL = "qwen3.5:9b"
 
 
 def query_keep_alive() -> str | int:

@@ -137,6 +137,9 @@ def _bootstrap_src_path() -> None:
 
 _bootstrap_src_path()
 
+from constants import DEFAULT_MODEL  # noqa: E402
+
+
 def _bootstrap_process_env() -> None:
     """Load non-repo-local env files (preferred) before command dispatch."""
     try:
@@ -325,7 +328,7 @@ def cmd_ask(args: argparse.Namespace) -> int:
             query,
             config_path=config,
             n_results=getattr(args, "n_results", 12),
-            model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.2:latest"),
+            model=getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", DEFAULT_MODEL),
             no_color=args.no_color or getattr(args, "quiet", False) or _wants_json(args),
             silo=silo_slug,
             db_path=_db_path(args),
@@ -1202,7 +1205,7 @@ def cmd_eval_adversarial(args: argparse.Namespace) -> int:
 
     db = _db_path(args)
     out = getattr(args, "out", None)
-    model = getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", "llama3.2:latest")
+    model = getattr(args, "model", None) or os.environ.get("LLMLIBRARIAN_MODEL", DEFAULT_MODEL)
     limit = getattr(args, "limit", None)
     strict_mode = bool(getattr(args, "strict_mode", True))
     direct_decisive_mode = getattr(args, "direct_decisive_mode", None)
@@ -1282,7 +1285,7 @@ def main() -> int:
     p_ask.add_argument("--quiet", "-q", action="store_true", help="Answer only (no source footer); useful for scripting")
     p_ask.add_argument("--explain", action="store_true", help="Print deterministic catalog diagnostics to stderr when applicable")
     p_ask.add_argument("--force", action="store_true", help="Allow deterministic catalog queries to run on stale scope")
-    p_ask.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.2:latest)")
+    p_ask.add_argument("--model", "-m", help=f"Ollama model (default: LLMLIBRARIAN_MODEL or {DEFAULT_MODEL})")
     p_ask.add_argument("--n-results", type=int, default=12, help="Retrieval count")
     p_ask.add_argument("query", nargs="+", help="Question")
     _json_flag(p_ask)
@@ -1450,7 +1453,7 @@ def main() -> int:
     p_reindex_names.set_defaults(_run=cmd_reindex_names)
 
     p_eval = sub.add_parser("eval-adversarial", help="Run synthetic adversarial trustfulness eval")
-    p_eval.add_argument("--model", "-m", help="Ollama model (default: LLMLIBRARIAN_MODEL or llama3.2:latest)")
+    p_eval.add_argument("--model", "-m", help=f"Ollama model (default: LLMLIBRARIAN_MODEL or {DEFAULT_MODEL})")
     p_eval.add_argument("--out", help="Write JSON report to this path")
     p_eval.add_argument("--limit", type=int, help="Run only first N queries from the fixed suite")
     p_eval.add_argument("--strict-mode", dest="strict_mode", action="store_true", default=True, help="Run eval queries with strict ask mode (default: on)")
