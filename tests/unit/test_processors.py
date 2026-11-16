@@ -50,6 +50,12 @@ def test_paddleocr_available_requires_paddle(monkeypatch):
     assert processors._paddleocr_available() is False
 
 
+@pytest.mark.parametrize(("resolved_path", "expected"), [(None, False), ("/usr/bin/tesseract", True)])
+def test_tesseract_available_tracks_system_binary(monkeypatch, resolved_path, expected):
+    monkeypatch.setattr(processors.shutil, "which", lambda executable: resolved_path if executable == "tesseract" else None)
+    assert processors._tesseract_available() is expected
+
+
 def test_text_processor_extracts_utf8_text():
     proc = TextProcessor()
     out = proc.extract(b"hello", "a.txt")
@@ -378,8 +384,8 @@ def test_get_paddle_ocr_engine_uses_angle_mode_from_env(monkeypatch):
     monkeypatch.setenv("LLMLIBRARIAN_OCR_PREPROCESS", "1")
     processors._get_paddle_ocr_engine()
 
-    assert calls[0]["use_angle_cls"] is False
-    assert calls[1]["use_angle_cls"] is True
+    assert calls[0]["use_textline_orientation"] is False
+    assert calls[1]["use_textline_orientation"] is True
 
 
 def test_available_ocr_backends_prefers_vision_on_darwin(monkeypatch):
@@ -631,14 +637,12 @@ def test_image_processor_disabled_mode_emits_ocr_only_summary(monkeypatch):
     assert out.regions[0].needs_vision_enrichment is False
 
 
-def test_get_paddle_ocr_engine_falls_back_when_show_log_is_unsupported(monkeypatch):
+def test_get_paddle_ocr_engine_uses_paddleocr_3_constructor(monkeypatch):
     calls: list[dict] = []
 
     class _FakePaddleOCR:
         def __init__(self, **kwargs):
             calls.append(kwargs)
-            if "show_log" in kwargs:
-                raise TypeError("Unknown argument: show_log")
 
     fake_module = types.SimpleNamespace(PaddleOCR=_FakePaddleOCR)
     monkeypatch.setitem(sys.modules, "paddleocr", fake_module)
@@ -648,24 +652,24 @@ def test_get_paddle_ocr_engine_falls_back_when_show_log_is_unsupported(monkeypat
     engine = processors._get_paddle_ocr_engine()
 
     assert engine is not None
-    assert len(calls) == 2
-    assert "show_log" in calls[0]
-    assert "show_log" not in calls[1]
+    assert calls == [{"use_textline_orientation": False, "lang": "en"}]
 
 
-def test_ocr_with_paddle_passes_cls_flag_from_env(monkeypatch):
-    seen_cls: list[bool] = []
+def test_ocr_with_paddle_uses_paddleocr_3_predict_and_structured_text(monkeypatch):
+    calls: list[tuple[str, bool]] = []
 
     class _FakeEngine:
-        def ocr(self, _path, cls):
-            seen_cls.append(cls)
-            return [[None, ("hello", 0.99)]]
+        def predict(self, path, *, use_textline_orientation):
+            calls.append((path, use_textline_orientation))
+            return [{"rec_texts": ["hello", "world"], "rec_scores": [0.99, 0.98]}]
 
     monkeypatch.setattr(processors, "_get_paddle_ocr_engine", lambda: _FakeEngine())
     monkeypatch.setenv("LLMLIBRARIAN_OCR_PREPROCESS", "1")
     out = processors._ocr_with_paddle(b"image")
-    assert out == "hello"
-    assert seen_cls == [True]
+    assert out == "hello world"
+    assert len(calls) == 1
+    assert calls[0][0].endswith("/page.png")
+    assert calls[0][1] is True
 
 
 def test_ocr_with_tesseract_uses_psm6_when_preprocess_disabled(monkeypatch):

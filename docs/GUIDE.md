@@ -172,6 +172,16 @@ Common variables:
 - **`Error finding id`** — `llmli repair <silo> --yes` (or `--dry-run` first).
 - **MCP + `pal pull` conflicts** — enable Chroma server mode; don’t use embedded writers while HTTP MCP holds the DB without server mode.
 - **Cloud-sync paths** — blocked by default; use `--allow-cloud` only if files are truly local copies.
+- **Images or scanned PDFs have no extracted text** — install the optional OCR
+  stack with `uv sync --extra ocr`. PaddleOCR and its CPU PaddlePaddle runtime
+  are included in that extra. The tesseract fallback uses the `tesseract`
+  executable on `PATH`, not a Python package. On a Debian/Ubuntu Linux host,
+  install it with `sudo apt install -y tesseract-ocr`; on macOS with Homebrew,
+  use `brew install tesseract`. Reindex affected files after adding a backend.
+  Every later `uv sync` must repeat all extras you want to retain—for example,
+  `uv sync --extra image --extra ocr` when both image search and OCR are in use.
+  OCR text extraction does not enable vision summaries; those remain opt-in via
+  `--image-vision` and `LLMLIBRARIAN_VISION_MODEL`.
 
 ---
 
